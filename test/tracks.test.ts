@@ -6,6 +6,7 @@
 //
 // Covers:
 //   - GET /:id/tracks (empty + populated)
+//   - videoTracks[] projection on GET /:id/tracks (issue #978)
 //   - POST/DELETE /:id/audio-tracks
 //   - POST/DELETE /:id/subtitle-tracks (with + without storage configured)
 //   - validation, 404 semantics, and workspace isolation
@@ -31,7 +32,7 @@ vi.mock('../src/auth/workspace.js', async () => {
 
 import { registerAuth } from '../src/auth/middleware.js';
 import { assetsRouter } from '../src/routes/assets.js';
-import { InMemoryAssetRepository } from '../src/data/asset-repo.js';
+import { InMemoryAssetRepository, type Asset, type VideoTrack } from '../src/data/asset-repo.js';
 import type { WorkspaceStorage } from '../src/data/storage.js';
 
 const auth = (token: string) => ({ authorization: `Bearer ${token}` });
@@ -45,15 +46,31 @@ function fakeStorage(): WorkspaceStorage {
   } as unknown as WorkspaceStorage;
 }
 
-async function buildApp(opts: { withStorage?: boolean } = {}): Promise<{
+// A repository whose reads carry `videoTracks` (issue #978), standing in for the
+// CouchDB tier where `fromAssetDocument` projects the stored `technical.video[]`
+// onto the flat asset. The in-memory tier has no document round-trip, so this is
+// the only way to exercise a MULTI-track asset and the optional `index` /
+// `frameRate` the persisted VideoTrackSchema allows.
+class ProjectedVideoRepository extends InMemoryAssetRepository {
+  videoTracks: VideoTrack[] | undefined;
+
+  override async get(id: string): Promise<Asset | undefined> {
+    const asset = await super.get(id);
+    return asset ? { ...asset, videoTracks: this.videoTracks } : undefined;
+  }
+}
+
+async function buildApp<R extends InMemoryAssetRepository>(
+  opts: { withStorage?: boolean; repository?: R } = {}
+): Promise<{
   app: FastifyInstance;
-  repo: InMemoryAssetRepository;
+  repo: R | InMemoryAssetRepository;
 }> {
   const app = Fastify();
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
   registerAuth(app);
-  const repo = new InMemoryAssetRepository();
+  const repo = opts.repository ?? new InMemoryAssetRepository();
   await app.register(assetsRouter, {
     prefix: '/api/v1/assets',
     repository: repo,
@@ -84,13 +101,120 @@ describe('multi-language tracks (issue #18)', () => {
       const id = await createAsset(app);
       const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/tracks`, headers: A });
       expect(res.statusCode).toBe(200);
-      expect(res.json()).toEqual({ audioTracks: [], subtitleTracks: [] });
+      expect(res.json()).toEqual({ videoTracks: [], audioTracks: [], subtitleTracks: [] });
     });
 
     it('returns 404 for an unknown asset', async () => {
       const res = await app.inject({
         method: 'GET',
         url: '/api/v1/assets/nope/tracks',
+        headers: A
+      });
+      expect(res.statusCode).toBe(404);
+    });
+  });
+
+  // Video tracks (issue #978) are MACHINE-probed, not editorial: they are
+  // projected from the persisted `technical.video[]` (VideoTrackSchema,
+  // src/data/asset-document.ts) and have no POST/DELETE route of their own.
+  describe('GET /:id/tracks — videoTracks projection (issue #978)', () => {
+    const PROBED = {
+      codec: 'h264',
+      width: 1920,
+      height: 1080,
+      durationSeconds: 12.5,
+      bitrateBps: 5_000_000,
+      containerFormat: 'matroska',
+      audioTracks: [{ index: 1, codec: 'aac', channels: 2, sampleRateHz: 48_000 }],
+      extractedAt: '2026-01-01T00:00:00.000Z'
+    };
+
+    it('stays empty for an unprobed asset, without disturbing the other arrays', async () => {
+      const { app: a, repo } = await buildApp();
+      const id = await createAsset(a);
+      await a.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${id}/audio-tracks`,
+        headers: A,
+        payload: { language: 'en' }
+      });
+      expect((await repo.get(id))?.technicalMetadata ?? null).toBeNull();
+
+      const res = await a.inject({ method: 'GET', url: `/api/v1/assets/${id}/tracks`, headers: A });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()['videoTracks']).toEqual([]);
+      expect(res.json()['audioTracks']).toHaveLength(1);
+    });
+
+    it('projects the probed video stream once extraction has landed', async () => {
+      const { app: a, repo } = await buildApp();
+      const id = await createAsset(a);
+      await repo.update(id, { technicalMetadata: PROBED });
+
+      const res = await a.inject({ method: 'GET', url: `/api/v1/assets/${id}/tracks`, headers: A });
+      expect(res.statusCode).toBe(200);
+      // Exactly the four attributes the persistence layer stores for a probed
+      // track (asset-document.ts `technicalFromAsset`) — no `id`, and the
+      // never-probed optionals are absent rather than null.
+      expect(res.json()['videoTracks']).toEqual([
+        { codec: 'h264', width: 1920, height: 1080, bitrateBps: 5_000_000 }
+      ]);
+    });
+
+    it('projects every stored track, including index and frameRate', async () => {
+      const repository = new ProjectedVideoRepository();
+      repository.videoTracks = [
+        { index: 0, codec: 'h264', width: 1920, height: 1080, bitrateBps: 5_000_000, frameRate: 25 },
+        { index: 2, codec: 'hevc', width: 3840, height: 2160 }
+      ];
+      const { app: a } = await buildApp({ repository });
+      const id = await createAsset(a);
+
+      const res = await a.inject({ method: 'GET', url: `/api/v1/assets/${id}/tracks`, headers: A });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()['videoTracks']).toEqual([
+        { index: 0, codec: 'h264', width: 1920, height: 1080, bitrateBps: 5_000_000, frameRate: 25 },
+        { index: 2, codec: 'hevc', width: 3840, height: 2160 }
+      ]);
+    });
+
+    it('serializes an empty stored array as empty, not as the flattened fallback', async () => {
+      const repository = new ProjectedVideoRepository();
+      repository.videoTracks = [];
+      const { app: a, repo } = await buildApp({ repository });
+      const id = await createAsset(a);
+      await repo.update(id, { technicalMetadata: PROBED });
+
+      const res = await a.inject({ method: 'GET', url: `/api/v1/assets/${id}/tracks`, headers: A });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()['videoTracks']).toEqual([]);
+    });
+
+    it('is additive: audio and subtitle tracks are unchanged alongside it', async () => {
+      const { app: a, repo } = await buildApp();
+      const id = await createAsset(a);
+      await repo.update(id, { technicalMetadata: PROBED });
+      await a.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${id}/subtitle-tracks`,
+        headers: A,
+        payload: { language: 'sv', format: 'vtt' }
+      });
+
+      const body = (
+        await a.inject({ method: 'GET', url: `/api/v1/assets/${id}/tracks`, headers: A })
+      ).json();
+      expect(Object.keys(body).sort()).toEqual(['audioTracks', 'subtitleTracks', 'videoTracks']);
+      expect(body['videoTracks']).toHaveLength(1);
+      expect(body['audioTracks']).toEqual([]);
+      expect(body['subtitleTracks']).toHaveLength(1);
+    });
+
+    it('404s for an unknown asset before any projection happens', async () => {
+      const { app: a } = await buildApp();
+      const res = await a.inject({
+        method: 'GET',
+        url: '/api/v1/assets/01J9ZZZZZZZZZZZZZZZZZZZZZZ/tracks',
         headers: A
       });
       expect(res.statusCode).toBe(404);

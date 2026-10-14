@@ -1,7 +1,7 @@
 // Scaler config values must say where they came from (issue #1079).
 //
-// Runtime config lives in the scaler router's closure and nothing persists it,
-// so a restart silently reverts every PATCH. The wire could not tell the two
+// A PATCH is persisted to the parameter store (#1077) but nothing re-reads that
+// record at boot yet (#1078), so a restart silently reverts every PATCH. The wire could not tell the two
 // apart: `{"maxInstances": 3}` looked identical whether 3 was the deployment's
 // environment value or a number an operator had just set. Each value now
 // carries `{ source: "env" | "runtime", updatedAt? }`.
@@ -39,11 +39,17 @@ async function buildApp(): Promise<FastifyInstance> {
   app.setSerializerCompiler(serializerCompiler);
   // No redis: the scaler-off branch. Config provenance is independent of
   // whether a pool exists, and this keeps the test to the config surface.
+  //
+  // A config store is wired because PATCH answers 501 without one (#1077: never
+  // 2xx without a durable write). This stub accepts every save, so a PATCH here
+  // succeeds and the tests exercise provenance, not persistence — that is
+  // covered by src/routes/scaler.config-persistence.test.ts.
   await app.register(scalerRouter, {
     prefix: '/scaler',
     maxInstances: ENV_MAX_INSTANCES,
     minInstances: ENV_MIN_INSTANCES,
-    idleTimeoutMs: ENV_IDLE_TIMEOUT_MS
+    idleTimeoutMs: ENV_IDLE_TIMEOUT_MS,
+    configStore: { save: async () => undefined, load: async () => undefined }
   });
   await app.ready();
   return app;

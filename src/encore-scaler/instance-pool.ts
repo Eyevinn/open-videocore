@@ -507,6 +507,12 @@ async function createOrAdoptCallbackListener(
   callbackSat: string
 ): Promise<{ instance: OscInstance; adopted: boolean }> {
   try {
+    console.info(
+      '[encore-scaler] spawn: creating callback listener %s for Encore instance %s (workspace=%s)',
+      instanceId,
+      encoreUrl,
+      config.workspaceId
+    );
     const created = (await createInstance(
       config.oscContext,
       ENCORE_CALLBACK_LISTENER_SERVICE_ID,
@@ -520,6 +526,12 @@ async function createOrAdoptCallbackListener(
     )) as OscInstance;
     return { instance: created, adopted: false };
   } catch (err) {
+    console.warn(
+      '[encore-scaler] spawn: create of callback listener %s failed (workspace=%s): %s',
+      instanceId,
+      config.workspaceId,
+      err instanceof Error ? err.message : String(err)
+    );
     // Adopt-on-"already taken": the listener is named after its Encore
     // instance, so a create that landed behind a 504 makes the retry collide
     // with itself.
@@ -594,15 +606,38 @@ async function spawnPooledInstance(
       if (config.profilesUrl) {
         instanceBody['profilesUrl'] = config.profilesUrl;
       }
+      // Say what is being created before the call: a create that hangs or
+      // fails at the gateway otherwise leaves no record of having been tried.
+      console.info(
+        '[encore-scaler] spawn: creating Encore instance %s (workspace=%s attempt=%d/%d)',
+        name,
+        config.workspaceId,
+        attempt,
+        maxAttempts
+      );
       instance = (await createInstance(
         config.oscContext,
         ENCORE_SERVICE_ID,
         sat,
         instanceBody
       )) as OscInstance;
+      console.info(
+        '[encore-scaler] spawn: created Encore instance %s (workspace=%s attempt=%d)',
+        name,
+        config.workspaceId,
+        attempt
+      );
       break;
     } catch (err) {
       lastErr = err;
+      console.warn(
+        '[encore-scaler] spawn: create of Encore instance %s failed (workspace=%s attempt=%d/%d): %s',
+        name,
+        config.workspaceId,
+        attempt,
+        maxAttempts,
+        err instanceof Error ? err.message : String(err)
+      );
       // #1071 ADOPT-ON-"ALREADY TAKEN". `name` is computed ONCE, outside this
       // loop, so every attempt sends the same name. That is deliberate: when a
       // previous attempt timed out at the gateway (504) but completed behind it,
@@ -881,6 +916,29 @@ async function serviceTokenOrUndefined(
   }
 }
 
+// #1109: back-off between the resolver's callback-listener create attempts for
+// one pending instance. Exponential from 30s, capped at 5 minutes — the resolver
+// runs once per tick (10s by default) against a readiness budget of 15 minutes
+// (DEFAULT_SPAWN_READY_TIMEOUT_MS), so an uncapped per-tick retry meant ~90
+// failing creates per stuck instance. With this it is at most a handful, and a
+// listener that becomes creatable a minute in is still picked up well inside the
+// budget. The schedule is deliberately coarser than spawnPooledInstance's
+// 5s/10s: that loop blocks a single spawn and has to finish, this one spans
+// ticks and only has to beat the deadline.
+export const PENDING_LISTENER_CREATE_BACKOFF_BASE_MS = 30_000;
+export const PENDING_LISTENER_CREATE_BACKOFF_MAX_MS = 300_000;
+
+export function pendingListenerCreateBackoffMs(attempt: number): number {
+  const n = Math.max(1, Math.floor(attempt));
+  // 2 ** (n - 1) is clamped before the multiply so a wild attempt count cannot
+  // overflow into Infinity on the way to the cap.
+  const factor = Math.min(2 ** Math.min(n - 1, 20), Number.MAX_SAFE_INTEGER);
+  return Math.min(
+    PENDING_LISTENER_CREATE_BACKOFF_BASE_MS * factor,
+    PENDING_LISTENER_CREATE_BACKOFF_MAX_MS
+  );
+}
+
 // Resolve every PENDING pool entry for this workspace (#1071): FINISH the spawns
 // that can be finished, destroy the ones that have run out of time.
 //
@@ -963,34 +1021,99 @@ export async function resolvePendingSpawns(
       // one. Best effort per tick; a failure leaves the record pending and is
       // retried on the next tick until the deadline.
       if (!record.callbackListenerUrl) {
-        try {
-          const callbackSat = await config.oscContext.getServiceAccessToken(
-            ENCORE_CALLBACK_LISTENER_SERVICE_ID
-          );
-          const { instance: listener } = await createOrAdoptCallbackListener(
-            config,
-            record.instanceId,
-            record.url,
-            callbackSat
-          );
-          record = { ...record, callbackListenerUrl: instanceUrl(listener) };
-          await updateInstance(config.redis, config.workspaceId, record);
-          console.warn(
-            '[encore-scaler] pending spawn %s (workspace=%s): created the paired ' +
-              'callback listener its timed-out spawn never got to (#1071)',
-            record.instanceId,
-            config.workspaceId
-          );
-        } catch (err) {
-          blockedBy = 'callback listener could not be created';
-          console.error(
-            '[encore-scaler] pending spawn %s (workspace=%s): could not create its ' +
-              'paired callback listener — NOT promoted, because an instance with no ' +
-              'listener completes jobs into nowhere (#1071):',
-            record.instanceId,
-            config.workspaceId,
-            err
-          );
+        // #1109: this create is retried ACROSS ticks, so the "should I try
+        // again?" decision the spawn path makes inside its own loop has to be
+        // persisted on the record instead. Two gates come first:
+        //
+        //   a) a create that already failed PERMANENTLY is never attempted
+        //      again — the instance simply runs out its deadline below;
+        //   b) a create that failed transiently waits out its back-off.
+        //
+        // Previously neither existed and the resolver issued one create per
+        // tick until the deadline (~90 against the OSC API for a 15-minute
+        // budget at a 10s tick), including for errors that could never succeed.
+        const now = Date.now();
+        if (record.listenerCreateBlockedAt !== undefined) {
+          blockedBy = 'callback listener create failed permanently';
+        } else if (
+          record.listenerCreateNextAttemptAt !== undefined &&
+          now < record.listenerCreateNextAttemptAt
+        ) {
+          blockedBy = 'callback listener create backing off';
+        } else {
+          try {
+            const callbackSat = await config.oscContext.getServiceAccessToken(
+              ENCORE_CALLBACK_LISTENER_SERVICE_ID
+            );
+            const { instance: listener } = await createOrAdoptCallbackListener(
+              config,
+              record.instanceId,
+              record.url,
+              callbackSat
+            );
+            // The listener exists: drop the back-off bookkeeping so the record
+            // that gets promoted is a normal one.
+            const {
+              listenerCreateAttempts: _attempts,
+              listenerCreateNextAttemptAt: _nextAttemptAt,
+              ...completed
+            } = record;
+            record = { ...completed, callbackListenerUrl: instanceUrl(listener) };
+            await updateInstance(config.redis, config.workspaceId, record);
+            console.warn(
+              '[encore-scaler] pending spawn %s (workspace=%s): created the paired ' +
+                'callback listener its timed-out spawn never got to (#1071)',
+              record.instanceId,
+              config.workspaceId
+            );
+          } catch (err) {
+            // EXACTLY the spawn path's classification (spawnPooledInstance
+            // above), not a second one: isTransientOscError on the error's
+            // structural httpCode, plus the "name is already taken but
+            // getInstance could not confirm it" case the spawn loop also treats
+            // as retry-worthy — the name being taken is strong evidence the
+            // listener exists, and the name is fixed so a retry cannot
+            // duplicate it. createOrAdoptCallbackListener has already tried the
+            // adoption and re-thrown, so reaching here means unconfirmed.
+            const retryable =
+              isTransientOscError(err) || isNameAlreadyTakenError(err);
+            const attempts = (record.listenerCreateAttempts ?? 0) + 1;
+            record = retryable
+              ? {
+                  ...record,
+                  listenerCreateAttempts: attempts,
+                  listenerCreateNextAttemptAt:
+                    now + pendingListenerCreateBackoffMs(attempts)
+                }
+              : {
+                  ...record,
+                  listenerCreateAttempts: attempts,
+                  listenerCreateBlockedAt: now
+                };
+            // Best effort: a failed bookkeeping write only costs the back-off
+            // (the next tick retries as it always did) and must never take out
+            // the tick — this function does not throw.
+            await updateInstance(config.redis, config.workspaceId, record).catch(
+              () => undefined
+            );
+            blockedBy = retryable
+              ? 'callback listener could not be created'
+              : 'callback listener create failed permanently';
+            console.error(
+              '[encore-scaler] pending spawn %s (workspace=%s): could not create its ' +
+                'paired callback listener (attempt=%d retryable=%s) — NOT promoted, ' +
+                'because an instance with no listener completes jobs into nowhere; ' +
+                '%s (#1071/#1109):',
+              record.instanceId,
+              config.workspaceId,
+              attempts,
+              String(retryable),
+              retryable
+                ? `retrying no sooner than ${pendingListenerCreateBackoffMs(attempts)}ms from now`
+                : 'no further attempts will be made, it will be destroyed on its deadline',
+              err
+            );
+          }
         }
       }
 
@@ -1094,6 +1217,11 @@ export async function destroyInstance(
   config: EncoreScalerConfig
 ): Promise<void> {
   const sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
+  console.info(
+    '[encore-scaler] destroy: removing Encore instance %s and its callback listener (workspace=%s)',
+    instanceId,
+    config.workspaceId
+  );
   try {
     await removeInstance(config.oscContext, ENCORE_SERVICE_ID, instanceId, sat);
   } catch (err) {
@@ -1116,14 +1244,84 @@ export async function destroyInstance(
       instanceId,
       callbackSat
     );
-  } catch {
-    // Listener already removed or unreachable — nothing to do.
+  } catch (err) {
+    // Listener already removed or unreachable — nothing more to do here; the
+    // orphan reaper (#778) picks up a listener that outlives its instance.
+    console.warn(
+      '[encore-scaler] destroy: callback listener %s removal failed (workspace=%s): %s',
+      instanceId,
+      config.workspaceId,
+      err instanceof Error ? err.message : String(err)
+    );
   }
   // Only drop the pool record after OSC removal succeeds (or confirmed gone).
   // Dropping it on a transient failure would cause the pool to lose track of a
   // still-running instance, making the next tick spawn a replacement — which is
   // exactly the runaway-spawning bug this fixes.
   await config.redis.hdel(keys.pool(config.workspaceId), instanceId);
+}
+
+// Evict pool records whose Encore instance no longer exists on OSC.
+//
+// reconcile() keeps an instance whose Encore API cannot be reached: an outage
+// mid-job must never cost the job. But a pool record can also outlive its
+// instance — a teardown that removed the Encore instance and died before the
+// pool write, or an instance removed outside the scaler. Such a record is
+// permanently "unreachable": it is counted as idle capacity (activeJobs 0), so
+// the loop never scales up, every dispatch to it fails and re-queues the job,
+// and the queue sits there for good. Observed on OSC as a job `running` for 16+
+// minutes with queueDepth 1 and one pool instance that no longer existed.
+//
+// Only the ids the caller found unreachable are checked, against OSC's own
+// list of the Encore service — the authoritative existence answer (getInstance
+// swallows every error but 401, so its undefined means "could not confirm", not
+// "gone"). An instance OSC still lists is kept, as before. One that is absent is
+// destroyed through destroyInstance, which tolerates the 404 on the Encore
+// removal, removes the paired callback listener (the half of the pair that was
+// left behind on OSC) and drops the pool record. A listing failure evicts
+// nothing. Returns the evicted ids so the loop can re-queue the jobs that were
+// mapped to them.
+export async function evictVanishedInstances(
+  config: EncoreScalerConfig,
+  unreachableIds: readonly string[]
+): Promise<string[]> {
+  if (unreachableIds.length === 0) return [];
+  let onOsc: OscInstance[];
+  try {
+    const sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
+    onOsc = (await oscListInstances(config.oscContext, ENCORE_SERVICE_ID, sat)) as OscInstance[];
+    if (!Array.isArray(onOsc)) return [];
+  } catch {
+    // Cannot confirm anything this pass; the records stay and are re-checked
+    // on the next tick.
+    return [];
+  }
+  const existing = new Set<string>();
+  for (const inst of onOsc) {
+    if (typeof inst.name === 'string' && inst.name.length > 0) existing.add(inst.name);
+  }
+  const evicted: string[] = [];
+  for (const instanceId of unreachableIds) {
+    if (existing.has(instanceId)) continue;
+    console.warn(
+      '[encore-scaler] reconcile: pool instance %s is unreachable and no longer exists on OSC ' +
+        '(workspace=%s) — evicting its pool record and removing its callback listener',
+      instanceId,
+      config.workspaceId
+    );
+    try {
+      await destroyInstance(instanceId, config);
+      evicted.push(instanceId);
+    } catch (err) {
+      console.error(
+        '[encore-scaler] reconcile: failed to evict vanished instance %s (workspace=%s):',
+        instanceId,
+        config.workspaceId,
+        err
+      );
+    }
+  }
+  return evicted;
 }
 
 // Default grace window for the orphan reaper (#778): how long an instance must

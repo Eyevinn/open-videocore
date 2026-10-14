@@ -72,6 +72,49 @@ describe('ADR-005 asset document model', () => {
     expect(back.objectKey).toBe('sources/x');
   });
 
+  // Issue #978: `technical.video[]` is the per-track record; the flat
+  // `technicalMetadata` only ever carried the FIRST track's four always-probed
+  // attributes, so `videoTracks` is what the read API projects.
+  it('projects technical.video[] onto Asset.videoTracks and round-trips index/frameRate', async () => {
+    const repo = new InMemoryAssetRepository();
+    const created = await repo.create({ name: 'Multi' });
+    const parsed = AssetDocumentSchema.parse(toAssetDocument(created));
+    const doc = {
+      ...parsed,
+      technical: {
+        ...parsed.technical,
+        container: 'matroska',
+        durationMs: 12_500,
+        probe: { source: 'eyevinn-ffmpeg-s3', probedAt: '2026-01-01T00:00:00.000Z' },
+        video: [
+          {
+            index: 0, codec: 'h264', width: 1920, height: 1080,
+            bitrateBps: 5_000_000, frameRate: 25
+          },
+          { index: 2, codec: 'hevc', width: 3840, height: 2160 }
+        ]
+      }
+    };
+
+    const back = fromAssetDocument(AssetDocumentSchema.parse(doc));
+    expect(back.videoTracks).toEqual(doc.technical.video);
+    // The flattened view still reports the first track only, unchanged.
+    expect(back.technicalMetadata).toMatchObject({ codec: 'h264', width: 1920, height: 1080 });
+
+    // Writing the asset back preserves every track plus the optional fields the
+    // flattened view cannot carry.
+    const rewritten = AssetDocumentSchema.parse(toAssetDocument(back));
+    expect(rewritten.technical.video).toEqual(doc.technical.video);
+  });
+
+  it('leaves videoTracks undefined for a document with no technical.video block', async () => {
+    const repo = new InMemoryAssetRepository();
+    const created = await repo.create({ name: 'Unprobed' });
+    const back = fromAssetDocument(AssetDocumentSchema.parse(toAssetDocument(created)));
+    expect(back.videoTracks).toBeUndefined();
+    expect(AssetDocumentSchema.parse(toAssetDocument(back)).technical.video).toBeUndefined();
+  });
+
   it('records creation provenance and grows the log per namespace write (issue #53)', async () => {
     const repo = new InMemoryAssetRepository();
     const created = await repo.create({ name: 'A', sourceMethod: 'url-pull' });

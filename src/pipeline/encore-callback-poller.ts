@@ -34,14 +34,22 @@
 import type { Redis } from 'ioredis';
 import type { Context } from '@osaas/client-core';
 import type { JobRepository } from '../data/job-repo.js';
+import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import type { AssetRepository } from '../data/asset-repo.js';
 import { isStepComplete } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { completeTranscode, type CallbackRendition } from './transcode.js';
 import type { PipelineLogSink } from '../services/pipeline-log.js';
 import { dispatchTranscodeCompletionEvents } from './transcode-completion-events.js';
+// #1060: structured source-read failure detail for the failed `transcode` step.
+import { buildSourceReadErrorDetail } from './encore-source-read-failure.js';
 import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
+import {
+  PERSISTED_STACK_FALLBACK_MESSAGE,
+  runWithPersistedStack,
+  runWithRequestStack
+} from '../services/request-stack-context.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import { DEFAULT_RECONCILE_GRACE_MS } from '../encore-scaler/scaler-loop.js';
 import { decideRetry, clearRetryState, makePriorAttemptCanceler } from '../encore-scaler/retry-store.js';
@@ -73,6 +81,34 @@ async function resolveUrlFromEncoreUuid(
 const DEFAULT_QUEUE_KEY = 'ovc:transcode-done';
 const BZPOPMIN_TIMEOUT_SECONDS = 5;
 
+// Bounded retry for a completion message whose handling throws.
+//
+// A failed message used to be put back with its ORIGINAL score, and BZPOPMIN
+// pops the lowest score first, so the same message came straight back — about
+// once a second, forever. One message that can never be applied (a job whose
+// document is gone, a transition the repository rejects) therefore blocked
+// every later completion on that Valkey, and their jobs were then failed by
+// the reconcile as "dropped by Encore" although Encore had finished them.
+//
+// Now a failed message is re-added BEHIND everything currently queued (a score
+// in the future), the loop backs off longer on each consecutive failure of the
+// same message, and after MAX_MESSAGE_ATTEMPTS it is moved to the dead-letter
+// set `<queueKey>:dead` for an operator, with the last error logged. The
+// attempt counter lives in the hash `<queueKey>:attempts`, keyed by the raw
+// message, so it survives a restart; the hash's TTL is refreshed on every
+// failure so an abandoned counter expires on its own.
+export const MAX_MESSAGE_ATTEMPTS = 8;
+export const DEAD_LETTER_SUFFIX = ':dead';
+const ATTEMPTS_SUFFIX = ':attempts';
+const ATTEMPTS_TTL_MS = 24 * 60 * 60_000;
+const MAX_MESSAGE_BACKOFF_MS = 30_000;
+
+// Back-off before the loop pops again after `attempt` consecutive failures of
+// one message: 1s, 2s, 4s, ... capped at 30s.
+export function messageRetryBackoffMs(attempt: number): number {
+  return Math.min(MAX_MESSAGE_BACKOFF_MS, 1000 * 2 ** Math.max(0, attempt - 1));
+}
+
 // The eyevinn-encore-packager's INPUT queue (#94). Must match the RedisQueue
 // set on the provisioned packager instance (provision.ts). We use the same key
 // as PackagingService / makeOscPackagerQueue ('encore-packager:jobs') so all
@@ -92,9 +128,12 @@ type Logger = {
   info(...a: any[]): void;
   warn(...a: any[]): void;
   error(...a: any[]): void;
+  // Optional (issue #1097): used only for the legacy-document fallback notice,
+  // so a logger without a debug level (several test fakes) still satisfies this.
+  debug?(...a: any[]): void;
 };
 
-type PollerDeps = {
+export type PollerDeps = {
   redis: Redis;
   jobRepository: JobRepository;
   assetRepository: AssetRepository;
@@ -105,6 +144,16 @@ type PollerDeps = {
   // "packaging-queue". Overridable so a deployment can point at a differently
   // named packager queue without a code change.
   packagingQueueKey?: string;
+  // Resolves the queue key the ambient stack's packager consumes (per-stack
+  // packager queues), given the key above as the fallback. Called inside the
+  // job's persisted stack, so a completion on any stack enqueues for that
+  // stack's packager. Optional: unset enqueues onto packagingQueueKey as before.
+  resolvePackagingQueueKey?: (defaultKey: string) => Promise<string>;
+  // Bounded retry of a message whose handling throws (see MAX_MESSAGE_ATTEMPTS).
+  // Both optional, defaulting to the module constants; injectable so a test can
+  // drive a message to the dead-letter set without waiting out the back-off.
+  maxMessageAttempts?: number;
+  messageRetryBackoffMs?: (attempt: number) => number;
   // #464: bounds for the independent reconciliation sweep. All optional; when
   // unset the poller applies the defaults below so behaviour is identical to
   // before these knobs existed. Threaded the same way queueKey/packagingQueueKey
@@ -241,7 +290,7 @@ async function enqueuePackagingJob(
   assetId: string,
   encoreJobUrl: string
 ): Promise<void> {
-  const queueKey = deps.packagingQueueKey ?? DEFAULT_PACKAGING_QUEUE_KEY;
+  let queueKey = deps.packagingQueueKey ?? DEFAULT_PACKAGING_QUEUE_KEY;
   const message = JSON.stringify({ jobId: assetId, url: encoreJobUrl });
   // Record the observable `package` Job and stamp it onto the execution's
   // running `package` step (issue #976) BEFORE the ZADD, so the packager cannot
@@ -256,8 +305,17 @@ async function enqueuePackagingJob(
   // an ancient job whose no-jobId failure callback would be misattributed to THIS
   // fresh, healthy run. Best-effort — purgeStalePackagingJobs never throws, so a
   // purge hiccup cannot block the enqueue below.
-  await purgeStalePackagingJobs(deps.redis, queueKey, { logger: deps.logger });
+  // Packaging is handed off on THIS poller's Valkey: a stack's packager consumes
+  // its own stack's Valkey (src/main.ts ensurePackaging), and this poller drains
+  // exactly that stack's completions, so the queue the packager reads and the
+  // one this writes are the same store.
   try {
+    // Inside the try: a parameter-store failure resolving the per-stack key
+    // fails this job like a failed ZADD, rather than throwing into the poller.
+    if (deps.resolvePackagingQueueKey) {
+      queueKey = await deps.resolvePackagingQueueKey(queueKey);
+    }
+    await purgeStalePackagingJobs(deps.redis, queueKey, { logger: deps.logger });
     await deps.redis.zadd(queueKey, Date.now(), message);
     deps.logger.info({ msg: 'encore-callback-poller: enqueued packaging job', queueKey, assetId, url: encoreJobUrl });
   } catch (err) {
@@ -383,14 +441,85 @@ async function decrementActiveJobs(
   }
 }
 
-// Process one queue message: fetch the Encore job, resolve our job, complete the
-// transcode, and advance the matching PipelineExecution.
+// The stack a queue message's transcode job belongs to (issue #1097).
+//
+// This loop is the restart/resume path for transcode completions: messages left
+// in the processing set by a killed process are returned to the queue on startup
+// (recoverProcessingQueue below) and drained here with NO ambient stack context
+// at all. Every repository call in handleMessage therefore resolved the
+// FIRST-LISTED stack, so a completion for a job on any other stack found no
+// local job and was dropped ("no local job for externalId"), leaving the job
+// `running` and its asset `processing` forever.
+//
+// Two identity sources, in priority order:
+//   1. `Job.stackName` (src/data/job-repo.ts) — the stack the job was created
+//      against, persisted at create time. Authoritative.
+//   2. the contextId embedded in the externalId we issued
+//      (`encodeEncoreJobId(contextId, jobLocalId)`, src/data/job-repo.ts), which
+//      is the resolved stack name for a provisioned stack and the fixed
+//      DEPLOYMENT_CONTEXT otherwise. This is the #1058 identity source and it is
+//      what makes the lookup in (1) land on the right stack in the first place.
+// The externalId is read from the dispatch-time UUID mapping
+// (`keys.uuidToExternalId`, src/encore-scaler/types.ts) so no Encore round-trip
+// is needed. Returns undefined when neither source answers (no mapping, no
+// decodable context) — the documented legacy case, which keeps today's
+// first-listed-stack behaviour.
+//
+// Exported for tests only.
+export async function stackForQueueMessage(
+  deps: PollerDeps,
+  raw: string
+): Promise<string | undefined> {
+  try {
+    const { jobId: encoreUuid } = JSON.parse(raw) as { jobId?: string };
+    if (!encoreUuid) return undefined;
+    const externalId = await deps.redis.get(keys.uuidToExternalId(encoreUuid));
+    if (!externalId) return undefined;
+    const decoded = decodeEncoreJobId(externalId)?.workspaceId;
+    const found = await runWithRequestStack(decoded, () =>
+      deps.jobRepository.findByEncoreJobId(externalId)
+    );
+    if (found?.job.stackName) return found.job.stackName;
+    // The decoded contextId is the fixed DEPLOYMENT_CONTEXT ('default',
+    // src/auth/workspace.ts:46) — not a stack name — for a single-stack
+    // env-override deployment and for every job dispatched before stacks were
+    // provisioned. Returning it as if it WERE a stack name degrades safely (an
+    // unknown name resolves first-listed), but it suppresses the documented
+    // legacy-document debug notice on this path, so an operator grepping for
+    // pre-#1097 jobs would not see them. Report it as "no persisted identity"
+    // instead, which is what it is.
+    return decoded === DEPLOYMENT_CONTEXT ? undefined : decoded;
+  } catch {
+    // Best-effort: a corrupt message, a Valkey hiccup or a repository error here
+    // must never stop the message from being processed. It degrades to the
+    // ambient (first-listed) resolution, exactly as before this resolution
+    // existed.
+    return undefined;
+  }
+}
+
+// Process one queue message in the stack its job belongs to (issue #1097), then
+// fetch the Encore job, resolve our job, complete the transcode, and advance the
+// matching PipelineExecution.
 //
 // Throws on retryable failures (network errors, non-2xx Encore fetch, DB write
 // errors) so the outer loop can re-queue the message and retry. Non-retryable
 // cases (unparseable message, unknown externalId) log and return cleanly so the
 // message is dropped rather than looped forever.
 async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
+  const stackName = await stackForQueueMessage(deps, raw);
+  return runWithPersistedStack(
+    stackName,
+    () => handleMessageInStack(deps, raw),
+    () =>
+      deps.logger.debug?.({
+        msg: `encore-callback-poller: ${PERSISTED_STACK_FALLBACK_MESSAGE}`,
+        raw
+      })
+  );
+}
+
+async function handleMessageInStack(deps: PollerDeps, raw: string): Promise<void> {
   let message: { jobId?: string; url?: string };
   try {
     message = JSON.parse(raw);
@@ -627,6 +756,24 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
     }
   }
 
+  // A completion is proof the job was dispatched. A job still `queued` here
+  // missed its onDispatched hook — the scaler's hooks ran outside the job's
+  // stack and looked it up in the wrong CouchDB (fixed in src/main.ts
+  // inEncoreJobStack), or the process restarted between dispatch and the hook
+  // — and the repository rejects `queued -> done` as an invalid transition,
+  // which would make this message a permanently failing one. Advance it to
+  // `running` first, exactly as the hook would have.
+  if (found.job.status === 'queued' || found.job.status === 'pending') {
+    deps.logger.warn({
+      msg: 'encore-callback-poller: completion for a job never marked running — advancing it before settling',
+      jobId: found.job.id,
+      externalId,
+      status: found.job.status
+    });
+    await deps.jobRepository.update(found.job.id, { status: 'running' });
+    found.job.status = 'running';
+  }
+
   // completeTranscode touches CouchDB — let any throw propagate so the outer
   // loop re-queues and retries on transient DB errors.
   const result = await completeTranscode(
@@ -810,10 +957,23 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
       const tIdx = steps.findIndex((s) => s.name === 'transcode' && s.encoreJobId === externalId);
 
       if (!success) {
+        const failureText = job.message ?? `encore status: ${status}`;
+        // #1060: when the failure is a SOURCE-READ failure (the storage answered
+        // 404/403 for the input object, or the connection to it failed), attach
+        // the structured detail alongside the unchanged free text. Same builder
+        // the other two settle paths use (failed-transcode-reconciler.ts
+        // releasePipelineLock, routes/internal.ts), so the same Encore message
+        // yields the same detail whichever path observed the failure.
+        const errorDetail = buildSourceReadErrorDetail({
+          failureText,
+          encoreJobId: externalId,
+          assetId: found.job.assetId
+        });
         steps[tIdx] = {
           ...steps[tIdx],
           status: 'failed',
-          error: job.message ?? `encore status: ${status}`,
+          error: failureText,
+          ...(errorDetail ? { errorDetail } : {}),
           completedAt: now
         };
         await deps.pipelineRepository.update(execution.id, { steps, status: 'failed' });
@@ -1282,11 +1442,61 @@ async function recoverProcessingQueue(
   }
 }
 
+// A message's handling threw: put it back for a bounded number of retries,
+// behind everything currently queued, or dead-letter it once the bound is hit.
+// Returns how long the loop should back off before popping again. Never throws
+// — a Valkey hiccup here is logged and the message is left wherever it is
+// (the processing set, recovered on the next start).
+async function requeueOrDeadLetter(
+  deps: PollerDeps,
+  queueKey: string,
+  processingKey: string,
+  raw: string,
+  err: unknown
+): Promise<number> {
+  const attemptsKey = `${queueKey}${ATTEMPTS_SUFFIX}`;
+  const maxAttempts = deps.maxMessageAttempts ?? MAX_MESSAGE_ATTEMPTS;
+  const backoffFor = deps.messageRetryBackoffMs ?? messageRetryBackoffMs;
+  try {
+    const attempt = await deps.redis.hincrby(attemptsKey, raw, 1);
+    await deps.redis.pexpire(attemptsKey, ATTEMPTS_TTL_MS);
+    if (attempt >= maxAttempts) {
+      await deps.redis.zadd(`${queueKey}${DEAD_LETTER_SUFFIX}`, Date.now(), raw);
+      await deps.redis.zrem(processingKey, raw);
+      await deps.redis.hdel(attemptsKey, raw);
+      deps.logger.error({
+        msg: `encore-callback-poller: message failed ${attempt} times — moved to the dead-letter set`,
+        deadLetterKey: `${queueKey}${DEAD_LETTER_SUFFIX}`,
+        raw,
+        err
+      });
+      return backoffFor(1);
+    }
+    const backoffMs = backoffFor(attempt);
+    // Score in the future: every completion already queued (and any that
+    // arrives within the back-off) is popped before this one is retried.
+    await deps.redis.zadd(queueKey, Date.now() + backoffMs, raw);
+    await deps.redis.zrem(processingKey, raw);
+    deps.logger.warn({
+      msg: 'encore-callback-poller: message failed — re-queued behind the current queue',
+      attempt,
+      maxAttempts,
+      backoffMs,
+      raw
+    });
+    return backoffMs;
+  } catch (requeueErr) {
+    deps.logger.warn({ msg: 'encore-callback-poller: failed to re-queue message', raw, err: requeueErr });
+    return backoffFor(1);
+  }
+}
+
 // Start the background poller loop. Returns a stop() function that aborts the
 // loop after the in-flight BZPOPMIN times out (up to BZPOPMIN_TIMEOUT_SECONDS).
 export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
   const queueKey = deps.queueKey ?? DEFAULT_QUEUE_KEY;
   const processingKey = `${queueKey}:processing`;
+  const attemptsKey = `${queueKey}${ATTEMPTS_SUFFIX}`;
   const controller = new AbortController();
   const { signal } = controller;
 
@@ -1379,16 +1589,21 @@ export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
 
         await handleMessage(deps, raw);
 
-        // Phase 2: processing succeeded — remove from the processing set.
+        // Phase 2: processing succeeded — remove from the processing set and
+        // forget any failed attempts a previous pop of this message recorded.
         await deps.redis.zrem(processingKey, raw);
+        await deps.redis.hdel(attemptsKey, raw).catch(() => {});
       } catch (err) {
         deps.logger.error({ msg: 'encore-callback-poller: loop error', err });
-        // Return the message to the main queue so it is retried, then back off.
-        if (raw !== undefined && score !== undefined) {
-          await deps.redis.zadd(queueKey, score, raw).catch(() => {});
-          await deps.redis.zrem(processingKey, raw).catch(() => {});
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        // Return the message for a bounded retry (or dead-letter it), then back
+        // off before the next pop. A pop that itself failed (raw undefined)
+        // just backs off.
+        const backoffMs =
+          raw !== undefined && score !== undefined
+            ? await requeueOrDeadLetter(deps, queueKey, processingKey, raw, err)
+            : (deps.messageRetryBackoffMs ?? messageRetryBackoffMs)(1);
+        if (signal.aborted) break;
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
       }
     }
     deps.logger.info({ msg: 'encore-callback-poller: stopped', queueKey });

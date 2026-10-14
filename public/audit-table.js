@@ -83,6 +83,10 @@
 
 import { createOpsTable, escHtml, PAGING_OFFSET } from './ops-ui-table.js';
 import { decodeTableState, encodeTableState } from './table-url-state.js';
+// Muted empty state for placeholder-less filter controls (issue #984). The class
+// name is a CSS contract, so it is imported rather than restated — see
+// public/filter-unset.js.
+import { markUnset } from './filter-unset.js';
 
 // ─── Contract-grounded constants ─────────────────────────────────────────────
 
@@ -249,16 +253,10 @@ export function summariseDetail(detail, maxLen) {
 // surface/border/text variables the Jobs controls use and cannot render
 // white-on-dark.
 //
-// An UNSET control must READ as unset (issue #984): the same `is-unset` class
-// jobs-table.js toggles (public/jobs-table.js:194-198) is applied here, since a
-// <select>'s placeholder option and an empty date input have no native
-// placeholder to dim.
-
-const UNSET_CLASS = 'is-unset';
-
-function markUnset(control) {
-  control.classList.toggle(UNSET_CLASS, control.value === '');
-}
+// An UNSET control must READ as unset (issue #984): the shared markUnset()
+// (public/filter-unset.js, imported above — the same helper the Jobs, Assets and
+// Logs bars call) toggles `is-unset` here too, since a <select>'s placeholder
+// option and an empty date input have no native placeholder to dim.
 
 // Mirrors jobs-table.js labelled(): a small uppercase caption above the control,
 // programmatically associated with it (label.htmlFor) for screen readers.

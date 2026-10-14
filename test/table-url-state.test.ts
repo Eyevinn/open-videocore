@@ -70,6 +70,10 @@ describe('decodeTableState — defaults & absent params', () => {
       sort: null,
       status: [],
       q: '',
+      // Structured asset filters (issue #914). Both default to [] = NO filter,
+      // like `status` — an absent param must never narrow a list.
+      tags: [],
+      meta: [],
       from: null,
       to: null,
       page: 1,
