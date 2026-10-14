@@ -21341,6 +21341,61 @@
                     },
                     "scalerActive": {
                       "type": "boolean"
+                    },
+                    "sources": {
+                      "type": "object",
+                      "properties": {
+                        "maxInstances": {
+                          "type": "object",
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "env",
+                                "runtime"
+                              ],
+                              "description": "\"env\" \u2014 the value this deployment started with, from its environment (the environment variable, or the built-in default when it is unset). \"runtime\" \u2014 the value was set through PATCH /config on this running process. A field is \"runtime\" from the moment a PATCH body carries it, even if the submitted number equals the environment value: this reports who set the value, not whether the number changed."
+                            },
+                            "updatedAt": {
+                              "type": "string",
+                              "description": "ISO 8601 UTC timestamp of the PATCH that set this value. Present only when source is \"runtime\" \u2014 an \"env\" value has no set-time to report, because it was read from the environment at process start rather than written by anyone."
+                            }
+                          },
+                          "required": [
+                            "source"
+                          ],
+                          "additionalProperties": false,
+                          "description": "Provenance of a single scaler config value. Read-only and server-asserted: a PATCH /config body accepts only the config values themselves, and an echoed `sources` object is ignored rather than honoured."
+                        },
+                        "idleTimeoutMs": {
+                          "type": "object",
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "env",
+                                "runtime"
+                              ],
+                              "description": "\"env\" \u2014 the value this deployment started with, from its environment (the environment variable, or the built-in default when it is unset). \"runtime\" \u2014 the value was set through PATCH /config on this running process. A field is \"runtime\" from the moment a PATCH body carries it, even if the submitted number equals the environment value: this reports who set the value, not whether the number changed."
+                            },
+                            "updatedAt": {
+                              "type": "string",
+                              "description": "ISO 8601 UTC timestamp of the PATCH that set this value. Present only when source is \"runtime\" \u2014 an \"env\" value has no set-time to report, because it was read from the environment at process start rather than written by anyone."
+                            }
+                          },
+                          "required": [
+                            "source"
+                          ],
+                          "additionalProperties": false,
+                          "description": "Provenance of a single scaler config value. Read-only and server-asserted: a PATCH /config body accepts only the config values themselves, and an echoed `sources` object is ignored rather than honoured."
+                        }
+                      },
+                      "required": [
+                        "maxInstances",
+                        "idleTimeoutMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Where the config values in this response came from (#1079). Covers the values this endpoint reports that an operator can change; see GET /config for the full set, including minInstances."
                     }
                   },
                   "required": [
@@ -21349,7 +21404,8 @@
                     "maxInstances",
                     "jobsPerInstance",
                     "idleTimeoutMs",
-                    "scalerActive"
+                    "scalerActive",
+                    "sources"
                   ],
                   "additionalProperties": false
                 }
@@ -21365,7 +21421,7 @@
         "tags": [
           "admin"
         ],
-        "description": "Change the auto-scaler settings of the process serving this request. `maxInstances` and `idleTimeoutMs` take effect on the next scaler tick, with no restart.\n\n**Storage.** The values are written to the parameter store first and applied second, as one complete snapshot of all three fields, so a 200 always means \"saved AND applied\". A deployment with no parameter store configured gets a 501 and nothing is applied; a store that rejects the write or cannot be reached gets a 503 and nothing is applied, so `GET /api/v1/scaler/config` still reports the previous values. The live copy is per process and is not pushed to other replicas.\n\n**Precedence.** The most recent PATCH accepted by this process wins. Until one arrives, the values read at boot from `ENCORE_MAX_INSTANCES` (default 3) and `ENCORE_IDLE_TIMEOUT_MS` (default 300000) apply. So the order is: runtime PATCH, else environment.\n\n**Restart.** The stored record survives a restart, but it is not read back at boot yet, so a restarted process serves the environment values again until the PATCH is re-sent. Treat a PATCH as durable but not self-restoring.\n\n**Reset to the environment default.** There is no reset endpoint and no sentinel value. PATCH the environment values back explicitly, which overwrites the stored snapshot; restarting reverts the live values but leaves the stored record in place. `GET /api/v1/scaler/config` shows what is in force, but not whether it came from a PATCH or from the environment.\n\n**Caveats.** `minInstances` is recorded, persisted and echoed back but is not applied to the running scaler loops (see the field description). A PATCH sent while `GET /api/v1/scaler/status` reports `scalerActive: false` is accepted and reported back, but is not carried into the scaler that later activates against a newly provisioned stack \u2014 that activation uses the environment values, so re-send the PATCH afterwards.",
+        "description": "Change the auto-scaler settings of the process serving this request. `maxInstances` and `idleTimeoutMs` take effect on the next scaler tick, with no restart.\n\n**Storage.** The values are written to the parameter store first and applied second, as one complete snapshot of all three fields, so a 200 always means \"saved AND applied\". A deployment with no parameter store configured gets a 501 and nothing is applied; a store that rejects the write or cannot be reached gets a 503 and nothing is applied, so `GET /api/v1/scaler/config` still reports the previous values. The live copy is per process and is not pushed to other replicas.\n\n**Precedence.** The most recent PATCH accepted by this process wins. Until one arrives, the values read at boot from `ENCORE_MAX_INSTANCES` (default 3) and `ENCORE_IDLE_TIMEOUT_MS` (default 300000) apply. So the order is: runtime PATCH, else environment.\n\n**Restart.** The stored record survives a restart, but it is not read back at boot yet, so a restarted process serves the environment values again until the PATCH is re-sent. Treat a PATCH as durable but not self-restoring.\n\n**Reset to the environment default.** There is no reset endpoint and no sentinel value. PATCH the environment values back explicitly, which overwrites the stored snapshot; restarting reverts the live values but leaves the stored record in place. `GET /api/v1/scaler/config` shows what is in force, and `sources` says per field whether the value came from a PATCH on this process or from the environment (#1079) \u2014 note that PATCHing an environment value back still reports `source: \"runtime\"`, because `sources` reports who set the value, not whether the number changed; only a restart puts a field back to `source: \"env\"`.\n\n**Caveats.** `minInstances` is recorded, persisted and echoed back but is not applied to the running scaler loops (see the field description). A PATCH sent while `GET /api/v1/scaler/status` reports `scalerActive: false` is accepted and reported back, but is not carried into the scaler that later activates against a newly provisioned stack \u2014 that activation uses the environment values, so re-send the PATCH afterwards.",
         "requestBody": {
           "required": true,
           "content": {
@@ -21420,12 +21476,91 @@
                       "type": "integer",
                       "minimum": 10000,
                       "description": "Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset)."
+                    },
+                    "sources": {
+                      "type": "object",
+                      "properties": {
+                        "maxInstances": {
+                          "type": "object",
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "env",
+                                "runtime"
+                              ],
+                              "description": "\"env\" \u2014 the value this deployment started with, from its environment (the environment variable, or the built-in default when it is unset). \"runtime\" \u2014 the value was set through PATCH /config on this running process. A field is \"runtime\" from the moment a PATCH body carries it, even if the submitted number equals the environment value: this reports who set the value, not whether the number changed."
+                            },
+                            "updatedAt": {
+                              "type": "string",
+                              "description": "ISO 8601 UTC timestamp of the PATCH that set this value. Present only when source is \"runtime\" \u2014 an \"env\" value has no set-time to report, because it was read from the environment at process start rather than written by anyone."
+                            }
+                          },
+                          "required": [
+                            "source"
+                          ],
+                          "additionalProperties": false,
+                          "description": "Provenance of a single scaler config value. Read-only and server-asserted: a PATCH /config body accepts only the config values themselves, and an echoed `sources` object is ignored rather than honoured."
+                        },
+                        "minInstances": {
+                          "type": "object",
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "env",
+                                "runtime"
+                              ],
+                              "description": "\"env\" \u2014 the value this deployment started with, from its environment (the environment variable, or the built-in default when it is unset). \"runtime\" \u2014 the value was set through PATCH /config on this running process. A field is \"runtime\" from the moment a PATCH body carries it, even if the submitted number equals the environment value: this reports who set the value, not whether the number changed."
+                            },
+                            "updatedAt": {
+                              "type": "string",
+                              "description": "ISO 8601 UTC timestamp of the PATCH that set this value. Present only when source is \"runtime\" \u2014 an \"env\" value has no set-time to report, because it was read from the environment at process start rather than written by anyone."
+                            }
+                          },
+                          "required": [
+                            "source"
+                          ],
+                          "additionalProperties": false,
+                          "description": "Provenance of `minInstances`, with one caveat specific to this field: `source: \"env\"` means the built-in default 0 this process started with, NOT the value of ENCORE_MIN_INSTANCES. That variable is read only by the scaler loops and never reaches this endpoint, so a deployment running with ENCORE_MIN_INSTANCES=2 still reports `minInstances: 0` with `source: \"env\"` here until a PATCH sets it. `source: \"runtime\"` has its usual meaning \u2014 set by PATCH /config on this process \u2014 but note that even then the value is only recorded and echoed, not applied to the running scaler loops (see the `minInstances` field description). Read-only and server-asserted."
+                        },
+                        "idleTimeoutMs": {
+                          "type": "object",
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "env",
+                                "runtime"
+                              ],
+                              "description": "\"env\" \u2014 the value this deployment started with, from its environment (the environment variable, or the built-in default when it is unset). \"runtime\" \u2014 the value was set through PATCH /config on this running process. A field is \"runtime\" from the moment a PATCH body carries it, even if the submitted number equals the environment value: this reports who set the value, not whether the number changed."
+                            },
+                            "updatedAt": {
+                              "type": "string",
+                              "description": "ISO 8601 UTC timestamp of the PATCH that set this value. Present only when source is \"runtime\" \u2014 an \"env\" value has no set-time to report, because it was read from the environment at process start rather than written by anyone."
+                            }
+                          },
+                          "required": [
+                            "source"
+                          ],
+                          "additionalProperties": false,
+                          "description": "Provenance of a single scaler config value. Read-only and server-asserted: a PATCH /config body accepts only the config values themselves, and an echoed `sources` object is ignored rather than honoured."
+                        }
+                      },
+                      "required": [
+                        "maxInstances",
+                        "minInstances",
+                        "idleTimeoutMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Where each config value in this response came from (#1079)."
                     }
                   },
                   "required": [
                     "maxInstances",
                     "minInstances",
-                    "idleTimeoutMs"
+                    "idleTimeoutMs",
+                    "sources"
                   ],
                   "additionalProperties": false,
                   "description": "The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, but nothing re-reads that record at boot yet, so after a restart this reports the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values again until the PATCH is re-sent."
@@ -21484,7 +21619,7 @@
         "tags": [
           "admin"
         ],
-        "description": "Report the auto-scaler settings this process is using. These are the live values: the most recent `PATCH /api/v1/scaler/config` if one has been accepted since startup, otherwise the boot values from `ENCORE_MAX_INSTANCES` and `ENCORE_IDLE_TIMEOUT_MS`. A PATCHed value is persisted in the parameter store, but that record is not read back at boot yet, so after a restart this reports the environment values again. This endpoint reads the live copy only \u2014 it never reads the store, so it cannot be used to check what is persisted, and it does not distinguish the two sources. `minInstances` is reported from this endpoint's own record and is not the floor the scaler loops enforce (see the field description).",
+        "description": "Report the auto-scaler settings this process is using. These are the live values: the most recent `PATCH /api/v1/scaler/config` if one has been accepted since startup, otherwise the boot values from `ENCORE_MAX_INSTANCES` and `ENCORE_IDLE_TIMEOUT_MS`. A PATCHed value is persisted in the parameter store, but that record is not read back at boot yet, so after a restart this reports the environment values again. This endpoint reads the live copy only \u2014 it never reads the store, so it cannot be used to check what is persisted. `sources` says, per field, whether the value is the deployment's environment value or was set through PATCH on this process (#1079). `minInstances` is reported from this endpoint's own record and is not the floor the scaler loops enforce (see the field description).",
         "responses": {
           "200": {
             "description": "The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, but nothing re-reads that record at boot yet, so after a restart this reports the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values again until the PATCH is re-sent.",
@@ -21509,12 +21644,91 @@
                       "type": "integer",
                       "minimum": 10000,
                       "description": "Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset)."
+                    },
+                    "sources": {
+                      "type": "object",
+                      "properties": {
+                        "maxInstances": {
+                          "type": "object",
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "env",
+                                "runtime"
+                              ],
+                              "description": "\"env\" \u2014 the value this deployment started with, from its environment (the environment variable, or the built-in default when it is unset). \"runtime\" \u2014 the value was set through PATCH /config on this running process. A field is \"runtime\" from the moment a PATCH body carries it, even if the submitted number equals the environment value: this reports who set the value, not whether the number changed."
+                            },
+                            "updatedAt": {
+                              "type": "string",
+                              "description": "ISO 8601 UTC timestamp of the PATCH that set this value. Present only when source is \"runtime\" \u2014 an \"env\" value has no set-time to report, because it was read from the environment at process start rather than written by anyone."
+                            }
+                          },
+                          "required": [
+                            "source"
+                          ],
+                          "additionalProperties": false,
+                          "description": "Provenance of a single scaler config value. Read-only and server-asserted: a PATCH /config body accepts only the config values themselves, and an echoed `sources` object is ignored rather than honoured."
+                        },
+                        "minInstances": {
+                          "type": "object",
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "env",
+                                "runtime"
+                              ],
+                              "description": "\"env\" \u2014 the value this deployment started with, from its environment (the environment variable, or the built-in default when it is unset). \"runtime\" \u2014 the value was set through PATCH /config on this running process. A field is \"runtime\" from the moment a PATCH body carries it, even if the submitted number equals the environment value: this reports who set the value, not whether the number changed."
+                            },
+                            "updatedAt": {
+                              "type": "string",
+                              "description": "ISO 8601 UTC timestamp of the PATCH that set this value. Present only when source is \"runtime\" \u2014 an \"env\" value has no set-time to report, because it was read from the environment at process start rather than written by anyone."
+                            }
+                          },
+                          "required": [
+                            "source"
+                          ],
+                          "additionalProperties": false,
+                          "description": "Provenance of `minInstances`, with one caveat specific to this field: `source: \"env\"` means the built-in default 0 this process started with, NOT the value of ENCORE_MIN_INSTANCES. That variable is read only by the scaler loops and never reaches this endpoint, so a deployment running with ENCORE_MIN_INSTANCES=2 still reports `minInstances: 0` with `source: \"env\"` here until a PATCH sets it. `source: \"runtime\"` has its usual meaning \u2014 set by PATCH /config on this process \u2014 but note that even then the value is only recorded and echoed, not applied to the running scaler loops (see the `minInstances` field description). Read-only and server-asserted."
+                        },
+                        "idleTimeoutMs": {
+                          "type": "object",
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "env",
+                                "runtime"
+                              ],
+                              "description": "\"env\" \u2014 the value this deployment started with, from its environment (the environment variable, or the built-in default when it is unset). \"runtime\" \u2014 the value was set through PATCH /config on this running process. A field is \"runtime\" from the moment a PATCH body carries it, even if the submitted number equals the environment value: this reports who set the value, not whether the number changed."
+                            },
+                            "updatedAt": {
+                              "type": "string",
+                              "description": "ISO 8601 UTC timestamp of the PATCH that set this value. Present only when source is \"runtime\" \u2014 an \"env\" value has no set-time to report, because it was read from the environment at process start rather than written by anyone."
+                            }
+                          },
+                          "required": [
+                            "source"
+                          ],
+                          "additionalProperties": false,
+                          "description": "Provenance of a single scaler config value. Read-only and server-asserted: a PATCH /config body accepts only the config values themselves, and an echoed `sources` object is ignored rather than honoured."
+                        }
+                      },
+                      "required": [
+                        "maxInstances",
+                        "minInstances",
+                        "idleTimeoutMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Where each config value in this response came from (#1079)."
                     }
                   },
                   "required": [
                     "maxInstances",
                     "minInstances",
-                    "idleTimeoutMs"
+                    "idleTimeoutMs",
+                    "sources"
                   ],
                   "additionalProperties": false,
                   "description": "The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, but nothing re-reads that record at boot yet, so after a restart this reports the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values again until the PATCH is re-sent."

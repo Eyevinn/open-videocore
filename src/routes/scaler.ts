@@ -27,6 +27,12 @@
 //     capacity the scaler loop itself treats as "busy"
 //     (scaler-loop.ts:245 `activeJobs >= JOBS_PER_INSTANCE`, :395 dispatch
 //     guard). Reported on the wire (#979) so a client never has to infer it.
+//   - Runtime config provenance (#1079): the live config values below are seeded
+//     from this router's options, which main.ts resolves from the environment
+//     (ENCORE_MAX_INSTANCES, ENCORE_IDLE_TIMEOUT_MS, minInstances defaulting to 0),
+//     and are overwritten in-process by PATCH /config. A PATCH is persisted (#1077)
+//     but not yet re-read at boot (#1078), so `sources` reports which of the two
+//     each value currently is — see `configValueSourceSchema`.
 //   - ScalerStackConnection + WorkspaceEncoreScalerRegistry.listStackConnections():
 //     src/encore-scaler/workspace-registry.ts — { stackKey, connectionId?, redis?,
 //     unobservedReason? }, resolved through the registry's own
@@ -244,6 +250,57 @@ const connectionSchema = z.object({
   unobservedReason: z.string().optional()
 });
 
+// Where one scaler config value came from (#1079).
+//
+// The reported numbers are identical whether they came from the deployment
+// environment at boot or were set at runtime through PATCH /config, so after a
+// process restart — which reverts every value to its environment default, since
+// nothing re-reads the persisted record at boot yet (#1078) — an operator could
+// not tell "my PATCH was reverted" from "that is the value I asked for". This says
+// which of the two the value is.
+const configValueSourceSchema = z
+  .object({
+    source: z
+      .enum(['env', 'runtime'])
+      .describe(
+        '"env" — the value this deployment started with, from its environment ' +
+          '(the environment variable, or the built-in default when it is unset). ' +
+          '"runtime" — the value was set through PATCH /config on this running ' +
+          'process. A field is "runtime" from the moment a PATCH body carries it, ' +
+          'even if the submitted number equals the environment value: this reports ' +
+          'who set the value, not whether the number changed.'
+      ),
+    updatedAt: z
+      .string()
+      .optional()
+      .describe(
+        'ISO 8601 UTC timestamp of the PATCH that set this value. Present only ' +
+          'when source is "runtime" — an "env" value has no set-time to report, ' +
+          'because it was read from the environment at process start rather than ' +
+          'written by anyone.'
+      )
+  })
+  .describe(
+    'Provenance of a single scaler config value. Read-only and server-asserted: ' +
+      'a PATCH /config body accepts only the config values themselves, and an ' +
+      'echoed `sources` object is ignored rather than honoured.'
+  );
+
+// Provenance for the two config values GET /status reports. `jobsPerInstance` is
+// deliberately absent: it is a compiled-in server constant (JOBS_PER_INSTANCE),
+// neither environment-derived nor settable at runtime, so neither value of
+// `source` would be true of it.
+const statusConfigSourcesSchema = z
+  .object({
+    maxInstances: configValueSourceSchema,
+    idleTimeoutMs: configValueSourceSchema
+  })
+  .describe(
+    'Where the config values in this response came from (#1079). Covers the ' +
+      'values this endpoint reports that an operator can change; see GET ' +
+      '/config for the full set, including minInstances.'
+  );
+
 const scalerStatusSchema = z.object({
   workspaces: z.array(workspaceSchema),
   // Every connection this read covered (#1074), observed or not. Without it,
@@ -278,7 +335,8 @@ const scalerStatusSchema = z.object({
         'but is not reloaded at boot, so this reverts to the environment value on ' +
         'restart.'
     ),
-  scalerActive: z.boolean()
+  scalerActive: z.boolean(),
+  sources: statusConfigSourcesSchema
 });
 
 // Project a pool record onto the response shape, dropping any timestamp that is
@@ -544,6 +602,38 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
   let liveMinInstances = opts.minInstances ?? 0;
   let liveIdleTimeoutMs = opts.idleTimeoutMs;
 
+  // Per-field provenance (#1079). A field is absent from this map until a PATCH
+  // sets it, so "never patched on this process" and "env-sourced" are the same
+  // state — which is exactly right: the values above are seeded from the router
+  // options, which main.ts resolves from the environment — ENCORE_MAX_INSTANCES
+  // and ENCORE_IDLE_TIMEOUT_MS, or their defaults (main.ts scalerRouterOptions).
+  //
+  // minInstances is the exception, and `sources.minInstances` says so on the
+  // wire: main.ts hands this router a hardcoded `minInstances: 0` and never
+  // forwards ENCORE_MIN_INSTANCES, which only ever reaches the scaler registry
+  // (main.ts, the scaler-loop options). So "env" for minInstances means the
+  // built-in 0 — the deployment's own ENCORE_MIN_INSTANCES is a separate value
+  // this endpoint does not see and does not report.
+  //
+  // The map holds the PATCH timestamp because that is a timestamp the process
+  // genuinely has. There is no equivalent for an env-sourced value: nothing
+  // records when the variable was set, and process start is the time the value
+  // was READ, not set. So `updatedAt` is omitted for env values rather than
+  // filled in with a boot time that would read as "someone changed this at boot".
+  //
+  // Lifetime is this process. A PATCH is persisted (#1077) but not yet re-read at
+  // boot (#1078), so a restart returns every field to "env" — the
+  // restart-reverts-silently behaviour this field exists to make visible. When
+  // boot-time restore ships, a restored value must keep reporting source
+  // "runtime" with its original updatedAt.
+  type ConfigField = 'maxInstances' | 'minInstances' | 'idleTimeoutMs';
+  const runtimeSetAt: Partial<Record<ConfigField, string>> = {};
+
+  function sourceOf(field: ConfigField): z.infer<typeof configValueSourceSchema> {
+    const updatedAt = runtimeSetAt[field];
+    return updatedAt === undefined ? { source: 'env' } : { source: 'runtime', updatedAt };
+  }
+
   const scalerConfigSchema = z.object({
     maxInstances: z
       .number()
@@ -579,16 +669,59 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
       )
   });
 
-  // Same shape on the way out, carrying the durability caveat (#1080) so the
-  // response itself states where these values live and what a restart does to
-  // them.
-  const scalerConfigResponseSchema = scalerConfigSchema.describe(
-    'The auto-scaler configuration this process is using right now. A value set ' +
-      'by PATCH is written durably to the parameter store before it is applied, ' +
-      'but nothing re-reads that record at boot yet, so after a restart this ' +
-      'reports the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment ' +
-      'values again until the PATCH is re-sent.'
-  );
+  // Same shape on the way out, plus provenance (#1079), and carrying the
+  // durability caveat (#1080) so the response itself states where these values
+  // live and what a restart does to them. Kept separate from `scalerConfigSchema`
+  // so the PATCH REQUEST body stays exactly what it was — the three settable
+  // numbers and nothing else. `sources` is server-owned and read-only, and the
+  // body validator strips unknown keys, so a read-modify-write client that
+  // echoes a whole GET response back into PATCH still works: the echoed
+  // `sources` is dropped rather than rejected or mistaken for an input.
+  const scalerConfigResponseSchema = scalerConfigSchema
+    .extend({
+      sources: z
+        .object({
+          maxInstances: configValueSourceSchema,
+          // Field-specific, because the generic `source` wording is not true of
+          // this field: "env" here is the built-in 0 this endpoint is seeded
+          // with, NEVER the deployment's ENCORE_MIN_INSTANCES, which is read
+          // elsewhere and never reaches this endpoint (see the comment on
+          // runtimeSetAt).
+          minInstances: configValueSourceSchema.describe(
+            'Provenance of `minInstances`, with one caveat specific to this ' +
+              'field: `source: "env"` means the built-in default 0 this process ' +
+              'started with, NOT the value of ENCORE_MIN_INSTANCES. That ' +
+              'variable is read only by the scaler loops and never reaches this ' +
+              'endpoint, so a deployment running with ENCORE_MIN_INSTANCES=2 ' +
+              'still reports `minInstances: 0` with `source: "env"` here until ' +
+              'a PATCH sets it. `source: "runtime"` has its usual meaning — set ' +
+              'by PATCH /config on this process — but note that even then the ' +
+              'value is only recorded and echoed, not applied to the running ' +
+              'scaler loops (see the `minInstances` field description). ' +
+              'Read-only and server-asserted.'
+          ),
+          idleTimeoutMs: configValueSourceSchema
+        })
+        .describe('Where each config value in this response came from (#1079).')
+    })
+    .describe(
+      'The auto-scaler configuration this process is using right now. A value set ' +
+        'by PATCH is written durably to the parameter store before it is applied, ' +
+        'but nothing re-reads that record at boot yet, so after a restart this ' +
+        'reports the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment ' +
+        'values again until the PATCH is re-sent.'
+    );
+
+  const configResponse = (): z.infer<typeof scalerConfigResponseSchema> => ({
+    maxInstances: liveMaxInstances,
+    minInstances: liveMinInstances,
+    idleTimeoutMs: liveIdleTimeoutMs,
+    sources: {
+      maxInstances: sourceOf('maxInstances'),
+      minInstances: sourceOf('minInstances'),
+      idleTimeoutMs: sourceOf('idleTimeoutMs')
+    }
+  });
 
   app.get(
     '/status',
@@ -649,7 +782,15 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
           maxInstances: liveMaxInstances,
           jobsPerInstance: JOBS_PER_INSTANCE,
           idleTimeoutMs: liveIdleTimeoutMs,
-          scalerActive: false
+          scalerActive: false,
+          // Reported on the inactive branch too (#1079), for the same reason the
+          // configured maxInstances is (#780): these are config values the server
+          // owns whether or not a pool exists, so their provenance is just as
+          // readable with the scaler off.
+          sources: {
+            maxInstances: sourceOf('maxInstances'),
+            idleTimeoutMs: sourceOf('idleTimeoutMs')
+          }
         };
       }
 
@@ -672,7 +813,11 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
         // wire value and the loop's busy threshold cannot drift (#979).
         jobsPerInstance: JOBS_PER_INSTANCE,
         idleTimeoutMs: liveIdleTimeoutMs,
-        scalerActive: true
+        scalerActive: true,
+        sources: {
+          maxInstances: sourceOf('maxInstances'),
+          idleTimeoutMs: sourceOf('idleTimeoutMs')
+        }
       };
     }
   );
@@ -722,8 +867,12 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
           'sentinel value. PATCH the environment values back explicitly, which ' +
           'overwrites the stored snapshot; restarting reverts the live values but ' +
           'leaves the stored record in place. `GET /api/v1/scaler/config` shows ' +
-          'what is in force, but not whether it came from a PATCH or from the ' +
-          'environment.\n\n' +
+          'what is in force, and `sources` says per field whether the value came ' +
+          'from a PATCH on this process or from the environment (#1079) — note ' +
+          'that PATCHing an environment value back still reports ' +
+          '`source: "runtime"`, because `sources` reports who set the value, not ' +
+          'whether the number changed; only a restart puts a field back to ' +
+          '`source: "env"`.\n\n' +
           '**Caveats.** `minInstances` is recorded, persisted and echoed back but ' +
           'is not applied to the running scaler loops (see the field description). ' +
           'A PATCH sent while `GET /api/v1/scaler/status` reports ' +
@@ -783,11 +932,23 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
         });
       }
 
+      // One timestamp for the whole request: every field this PATCH set was set at
+      // the same moment, and reporting them as microseconds apart would be fiction.
+      // Recorded only here, after the durable write has landed (#1077): a 501 or a
+      // 503 changes nothing, so it changes no provenance either.
+      const setAt = new Date().toISOString();
+      if (maxInstances !== undefined) runtimeSetAt.maxInstances = setAt;
+      if (minInstances !== undefined) runtimeSetAt.minInstances = setAt;
+      if (idleTimeoutMs !== undefined) runtimeSetAt.idleTimeoutMs = setAt;
+
       liveMaxInstances = next.maxInstances;
       liveMinInstances = next.minInstances;
       liveIdleTimeoutMs = next.idleTimeoutMs;
       opts.onConfigChange?.(next);
-      return next;
+      // The full config with provenance, so a client sees in the PATCH response
+      // itself which fields it just took ownership of and which are still the
+      // deployment's environment values — no follow-up GET needed.
+      return configResponse();
     }
   );
 
@@ -805,17 +966,14 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
           'persisted in the parameter store, but that record is not read back at ' +
           'boot yet, so after a restart this reports the environment values again. ' +
           'This endpoint reads the live copy only — it never reads the store, so it ' +
-          'cannot be used to check what is persisted, and it does not distinguish ' +
-          'the two sources. `minInstances` is reported from this endpoint\'s own ' +
+          'cannot be used to check what is persisted. `sources` says, per field, ' +
+          'whether the value is the deployment\'s environment value or was set ' +
+          'through PATCH on this process (#1079). `minInstances` is reported from this endpoint\'s own ' +
           'record and is not the floor the scaler loops enforce (see the field ' +
           'description).',
         response: { 200: scalerConfigResponseSchema }
       }
     },
-    async () => ({
-      maxInstances: liveMaxInstances,
-      minInstances: liveMinInstances,
-      idleTimeoutMs: liveIdleTimeoutMs
-    })
+    async () => configResponse()
   );
 };

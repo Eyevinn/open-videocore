@@ -62,6 +62,20 @@ function memKv(opts: { failSet?: Error } = {}): ConfigKvStore & {
 }
 
 const BOOT = { maxInstances: 3, minInstances: 0, idleTimeoutMs: 300_000 };
+// #1079: every config response also says where each value came from. Nothing has
+// been PATCHed on a fresh process, so every field is the environment's.
+const BOOT_SOURCES = {
+  maxInstances: { source: 'env' },
+  minInstances: { source: 'env' },
+  idleTimeoutMs: { source: 'env' }
+};
+// ...and a PATCH that landed durably takes ownership of every field it carried.
+const RUNTIME_SOURCE = { source: 'runtime', updatedAt: expect.any(String) };
+const ALL_RUNTIME_SOURCES = {
+  maxInstances: RUNTIME_SOURCE,
+  minInstances: RUNTIME_SOURCE,
+  idleTimeoutMs: RUNTIME_SOURCE
+};
 
 async function buildApp(options: {
   configStore?: ScalerConfigStore;
@@ -104,7 +118,8 @@ describe('PATCH /scaler/config persists to the parameter store (issue #1077)', (
     expect(res.json()).toEqual({
       maxInstances: 7,
       minInstances: 2,
-      idleTimeoutMs: 60_000
+      idleTimeoutMs: 60_000,
+      sources: ALL_RUNTIME_SOURCES
     });
 
     // Acceptance criterion: the value is IN the store once the request completes.
@@ -130,7 +145,8 @@ describe('PATCH /scaler/config persists to the parameter store (issue #1077)', (
     expect(get.json()).toEqual({
       maxInstances: 7,
       minInstances: 2,
-      idleTimeoutMs: 60_000
+      idleTimeoutMs: 60_000,
+      sources: ALL_RUNTIME_SOURCES
     });
     await app.close();
   });
@@ -184,7 +200,7 @@ describe('PATCH /scaler/config persists to the parameter store (issue #1077)', (
     // make durable.
     expect(onConfigChange).not.toHaveBeenCalled();
     const get = await app.inject({ method: 'GET', url: '/config' });
-    expect(get.json()).toEqual(BOOT);
+    expect(get.json()).toEqual({ ...BOOT, sources: BOOT_SOURCES });
     await app.close();
   });
 
@@ -202,7 +218,7 @@ describe('PATCH /scaler/config persists to the parameter store (issue #1077)', (
     expect(res.json().error).toBe('scaler_config_not_persistable');
     expect(onConfigChange).not.toHaveBeenCalled();
     const get = await app.inject({ method: 'GET', url: '/config' });
-    expect(get.json()).toEqual(BOOT);
+    expect(get.json()).toEqual({ ...BOOT, sources: BOOT_SOURCES });
     await app.close();
   });
 
