@@ -32,14 +32,19 @@ import {
   reapOrphanedInstances,
   resolvePendingSpawns,
   spawnInstance,
-  updateInstance
+  updateInstance,
+  ENCORE_CALLBACK_LISTENER_SERVICE_ID
 } from './instance-pool.js';
 import {
   makePriorAttemptCanceler,
   recordDispatch,
   requeueInterruptedByScaleDown
 } from './retry-store.js';
-import { probeCallbackTrust, buildCallbackUri } from './callback-trust-probe.js';
+import {
+  probeCallbackTrust,
+  buildCallbackUri,
+  DEFAULT_PROBE_REQUEST_TIMEOUT_MS
+} from './callback-trust-probe.js';
 import { logScalerEvent, ScalerLogThrottle, type ScalerLogPhase } from './scaler-log.js';
 import { spawnFailureSecrets } from './spawn-failure.js';
 import { hasPendingPackaging } from './packaging-pin.js';
@@ -176,6 +181,12 @@ export class EncoreScalerLoop {
   // loop — one loop per workspace, created once (workspace-registry.ts) — so the
   // state lives exactly as long as the loop whose appends it is limiting.
   private readonly logThrottle = new ScalerLogThrottle();
+  // #1171: callback-listener service access token, cached for the lifetime of
+  // the loop. Only used to disambiguate a 401/403 on the callback-trust probe
+  // (see ensureCallbackTrust), so it is fetched lazily — a pool that never
+  // probes never mints one. Never logged; `spawnFailureSecrets` redaction
+  // already covers SAT-shaped strings in log paths.
+  private callbackListenerSat: string | undefined;
 
   constructor(private config: EncoreScalerConfig) {}
 
@@ -1703,6 +1714,40 @@ export class EncoreScalerLoop {
   //      probe. A PKIX/handshake failure fast-fails (~1s) and does NOT consume
   //      the AbortSignal window, so the deadline is what actually bounds the
   //      wait across re-probes.
+  // Lazily mint + cache the callback-listener service access token used ONLY to
+  // disambiguate a 401/403 from the listener ingress (#1171). Returns undefined
+  // (never throws) if the token cannot be minted: the probe then behaves exactly
+  // as it did before, grading an unauthenticated 401/403 as 'callback-unusable'.
+  //
+  // Contract (CLAUDE.md rule 7): `@osaas/client-core@0.24.0`
+  // `lib/context.d.ts:25` — `getServiceAccessToken(serviceId: string):
+  // Promise<string>`, called with `ENCORE_CALLBACK_LISTENER_SERVICE_ID`
+  // (`src/encore-scaler/instance-pool.ts:68`), the same service id and the same
+  // accessor instance-pool.ts:722 already uses for the paired listener.
+  private async getCallbackListenerSat(): Promise<string | undefined> {
+    if (this.callbackListenerSat) return this.callbackListenerSat;
+    try {
+      const sat = await this.config.oscContext.getServiceAccessToken(
+        ENCORE_CALLBACK_LISTENER_SERVICE_ID
+      );
+      if (typeof sat === 'string' && sat.length > 0) {
+        this.callbackListenerSat = sat;
+        return sat;
+      }
+      return undefined;
+    } catch (err) {
+      // Token minting is best-effort here: without it the probe simply loses
+      // the disambiguation, it does not fail. Logged once per occurrence at
+      // warn level, never with the token itself.
+      console.warn(
+        '[encore-scaler] could not mint callback-listener service access token for the callback-trust probe (workspace=%s): %s',
+        this.config.workspaceId,
+        err instanceof Error ? err.message : String(err)
+      );
+      return undefined;
+    }
+  }
+
   private async ensureCallbackTrust(inst: EncoreInstanceRecord): Promise<boolean> {
     if (inst.callbackTrustReady) return true;
     if (inst.callbackTrustQuarantinedAt) return false;
@@ -1730,7 +1775,21 @@ export class EncoreScalerLoop {
       await updateInstance(this.config.redis, this.config.workspaceId, inst);
     }
 
-    const result = await probeCallbackTrust(inst.callbackListenerUrl, timeoutMs);
+    // #1171: hand the probe (a) a SHORT per-request bound so one hung request
+    // cannot occupy a tick for the whole 60s bounded wait and stall readiness /
+    // job assignment, and (b) the callback-listener SAT so an ingress auth-wall
+    // 401 is told apart from a genuinely closed callback path.
+    const result = await probeCallbackTrust(
+      inst.callbackListenerUrl,
+      timeoutMs,
+      undefined,
+      {
+        requestTimeoutMs:
+          this.config.callbackProbeRequestTimeoutMs ??
+          DEFAULT_PROBE_REQUEST_TIMEOUT_MS,
+        authToken: await this.getCallbackListenerSat()
+      }
+    );
 
     if (result.ok) {
       inst.callbackTrustReady = true;
@@ -1759,7 +1818,18 @@ export class EncoreScalerLoop {
     // dispatched: their completion is reconciled by the terminal-job sweep
     // (src/pipeline/encore-callback-poller.ts sweepTerminalJobs), which is
     // strictly better than quarantining every instance and halting transcoding.
-    if (result.state === 'callback-unusable') {
+    //
+    // 'ingress-auth-window' (#1171) lands here the same way, and is reported
+    // with its own `probeState` so the two are distinguishable in the logs: for
+    // that state the authenticated re-probe proved the ingress and the listener
+    // are live and only the platform's inbound auth wall answered the
+    // unauthenticated probe. It is retried for the whole bounded wait like any
+    // other non-confirmation above, and if the wall somehow outlasts the wait we
+    // still dispatch rather than sidelining a healthy instance.
+    if (
+      result.state === 'callback-unusable' ||
+      result.state === 'ingress-auth-window'
+    ) {
       inst.callbackPathUnusableAt = Date.now();
       inst.callbackPathUnusableStatus = result.status;
       await updateInstance(this.config.redis, this.config.workspaceId, inst);
@@ -1769,6 +1839,7 @@ export class EncoreScalerLoop {
           workspaceId: this.config.workspaceId,
           instanceId: inst.instanceId,
           callbackIngressHostname: hostname,
+          probeState: result.state,
           status: result.status,
           detail: result.detail,
           timeoutMs,

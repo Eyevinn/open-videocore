@@ -44,6 +44,10 @@ export type WorkspaceEncoreScalerConfig = {
   // outbound callback-listener TLS-trust probe that gates first-job dispatch
   // (issue #463). Undefined uses the loop's built-in default.
   callbackTrustTimeoutMs?: number;
+  // Per-request bound (ms) forwarded to every per-workspace scaler loop for a
+  // single callback-trust probe request (issue #1171). Undefined uses the
+  // probe's built-in default (DEFAULT_PROBE_REQUEST_TIMEOUT_MS).
+  callbackProbeRequestTimeoutMs?: number;
   // Grace window (ms) forwarded to every per-workspace scaler loop for the
   // reconcile dropped-job diff (issue #708): a job the callback poller recorded
   // completing within this window is not re-raised as silently dropped.
@@ -402,6 +406,7 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       maxQueuedJobs: this.config.maxQueuedJobs,
       idleTimeoutMs: this.config.idleTimeoutMs,
       callbackTrustTimeoutMs: this.config.callbackTrustTimeoutMs,
+      callbackProbeRequestTimeoutMs: this.config.callbackProbeRequestTimeoutMs,
       reconcileGraceMs: this.config.reconcileGraceMs,
       // #778: enable the orphan sweep for every live loop. Instances that never
       // made it into (or were lost from) the pool hash are invisible to every
