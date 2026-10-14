@@ -2169,7 +2169,8 @@ Response 200 (application/json)
       "height": 0,
       "index": 0,
       "bitrateBps": 0,
-      "frameRate": 0
+      "frameRate": 0,
+      "startTimecode": "string"
     }
   ],
   "audioTracks": [
@@ -2875,7 +2876,9 @@ Response 200 (application/json)
         "bitrateBps": 0,
         "containerFormat": "string",
         "audioTracks": [],
-        "extractedAt": "string"
+        "extractedAt": "string",
+        "frameRate": 0,
+        "startTimecode": "string"
       },
       "technicalMetadataError": "string"
     }
