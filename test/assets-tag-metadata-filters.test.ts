@@ -480,3 +480,86 @@ describe('filter captions and hints resolve against the real stylesheet', () => 
     }
   });
 });
+
+// ─── Unset Assets controls read as unset, exactly like the Jobs ones (#983) ────
+//
+// The Jobs-side seam is asserted at test/jobs-table.test.ts:398-400; these are
+// the Assets equivalents for the two NEW wireUnset() call sites on this surface.
+//
+// CONTRACT GROUNDING — read off the source, not assumed:
+//   - `wireUnset(sel)` at public/assets-table.js:602 (statusFilterControl) and
+//     `wireUnset(input)` at public/assets-table.js:842 (dateFilterControl, used
+//     for BOTH the 'from' and 'to' boxes — see the filter slot list at
+//     public/assets-table.js:1478-1481).
+//   - the shared toggle: wireUnset()/markUnset() in public/filter-unset.js,
+//     imported at public/assets-table.js:227 — adds `.is-unset` while the
+//     control's value is empty, on first render and on every change/input.
+//   - the paint keyed off the marker, public/style.css:
+//     `.ops-filter-select.is-unset, .ops-filter-date.is-unset { color: var(--text-muted) }`
+//     plus the `.ops-table-filters select.is-unset` /
+//     `input[type='date'].is-unset` pair that reaches these class-less controls.
+//   - the DOM hooks the queries below use: `wrap.className = 'ops-filter-status'`
+//     (statusFilterControl) and `'ops-filter-' + name` (dateFilterControl).
+//
+// Why the marker and not a colour: "All statuses" is a real <option> and a date
+// box's yyyy-mm-dd is UA chrome, so neither has a placeholder to mute — and
+// happy-dom resolves neither. The marker IS the seam. (The free-text box needs
+// no marker: it has a native placeholder, asserted muted on the Logs side.)
+describe('unset Assets filter controls are marked muted', () => {
+  function controls(el: HTMLElement) {
+    return {
+      status: el.querySelector<HTMLSelectElement>('.ops-filter-status select')!,
+      from: el.querySelector<HTMLInputElement>('.ops-filter-from input')!,
+      to: el.querySelector<HTMLInputElement>('.ops-filter-to input')!,
+    };
+  }
+
+  it('marks the status select and both date boxes unset on first render', async () => {
+    const { t } = await mount();
+    const c = controls(t.el);
+    expect(c.status.value).toBe('');
+    expect(c.status.classList.contains('is-unset')).toBe(true);
+    expect(c.from.type).toBe('date');
+    expect(c.from.value).toBe('');
+    expect(c.from.classList.contains('is-unset')).toBe(true);
+    expect(c.to.value).toBe('');
+    expect(c.to.classList.contains('is-unset')).toBe(true);
+    t.destroy();
+  });
+
+  it('does NOT mark them unset when the URL state already carries values', async () => {
+    const { t } = await mount(stubWin('?assets.status=ready&assets.from=2026-01-02&assets.to=2026-01-04'));
+    const c = controls(t.el);
+    expect(c.status.value).toBe('ready');
+    expect(c.status.classList.contains('is-unset')).toBe(false);
+    expect(c.from.value).toBe('2026-01-02');
+    expect(c.from.classList.contains('is-unset')).toBe(false);
+    expect(c.to.value).toBe('2026-01-04');
+    expect(c.to.classList.contains('is-unset')).toBe(false);
+    t.destroy();
+  });
+
+  it('drops the marker when a value is chosen, and restores it when cleared', async () => {
+    const { t } = await mount();
+    const c = controls(t.el);
+
+    c.status.value = 'ready';
+    c.status.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(c.status.classList.contains('is-unset')).toBe(false);
+    // Back to the "All statuses" entry — an unfiltered select must read unset
+    // again, which is the whole point of the marker.
+    c.status.value = '';
+    c.status.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(c.status.classList.contains('is-unset')).toBe(true);
+
+    for (const box of [c.from, c.to]) {
+      box.value = '2026-01-03';
+      box.dispatchEvent(new Event('change', { bubbles: true }));
+      expect(box.classList.contains('is-unset')).toBe(false);
+      box.value = '';
+      box.dispatchEvent(new Event('change', { bubbles: true }));
+      expect(box.classList.contains('is-unset')).toBe(true);
+    }
+    t.destroy();
+  });
+});
