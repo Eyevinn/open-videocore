@@ -2938,8 +2938,11 @@ abandonedUploadSweepLoop.start(abandonedUploadIntervalMsFromEnv());
 // pull streaming bytes right now and is left strictly alone. Settles the JOB
 // record and, in the same pass, the asset it was pulling into (#1085: moved
 // `uploading -> failed` with a reason naming the interrupted pull, distinct from
-// the abandoned-upload sweep's) — partial-byte cleanup is still #1086 — and does
-// NOT re-queue the pull. Idempotent, so a crash
+// the abandoned-upload sweep's) and the partial bytes the dead pull left in the
+// bucket (#1086: the asset's `objectKey` is deleted and any multipart upload
+// still open for it is discarded, best-effort — a storage failure is logged and
+// never un-settles the records). The pull is neither resumed nor
+// re-queued. Idempotent, so a crash
 // between boots cannot double-settle. Detached + swallowed: a reconcile failure
 // must never block the API from serving.
 //
@@ -2973,6 +2976,21 @@ void reconcileInterruptedIngests({
   // interruption). Only an asset still in `uploading` is touched. Resolved
   // per-stack like the job repository, via the same runInStack below.
   assets: assetRepository,
+  // Issue #1086: reclaim the bytes. Resolved per settled job and INSIDE the
+  // per-stack context below (`runInStack`), so the object is deleted from the
+  // bucket of the stack whose job we just settled and never from another
+  // stack's — the same reason the archived-asset purge builds its
+  // `storageForBucket` handle per tick instead of once at boot. `resolve()`
+  // (not `resolveCached`) because this reconciler runs ONCE AT BOOT with no
+  // request having warmed the cache for the stack being scanned, so a cached
+  // read would be a miss and silently skip cleanup. `conns.storageFor` is
+  // undefined on a stack with no object storage (in-memory fallback), which the
+  // reconciler treats as "nothing to reclaim"; a resolve that throws is logged
+  // there and leaves the already-durable job/asset settles untouched.
+  storage: async () => {
+    const conns = await stackResolver.resolve(currentRequestStackName());
+    return conns.storageFor?.();
+  },
   audit: auditEmitter,
   auditLog: app.log,
   stacks: {
