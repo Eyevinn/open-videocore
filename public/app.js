@@ -3603,10 +3603,16 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     // is unbounded and unpaginated, so nothing may sit below it.
     //
     // The panel is inserted before the action row — exactly the slot the review
-    // block occupied before — so the vertical order of every OTHER block on the
-    // pane is unchanged, and it reads: what the asset is (grid, technical) →
-    // what happened to it (status history, pipeline) → what humans decide and
-    // say about it (this panel) → what you can do to it (the action row).
+    // block occupied before — so no block moves out of the review/comments slot
+    // and nothing above it shifts. The blocks the panel ABSORBS do move relative
+    // to each other, by design: comments and tags now render inside the panel,
+    // so `#asset-comments` sits above `#asset-external-ids` and the export action
+    // instead of below them (both still anchor on the action row, which the panel
+    // now precedes), and tags come up from under the summary grid. §2's "nothing
+    // is placed below comments" therefore holds within the panel, not pane-wide.
+    // The pane still reads: what the asset is (grid, technical) → what happened
+    // to it (status history, pipeline) → what humans decide and say about it
+    // (this panel) → what you can do to it (the action row).
     //
     // The panel NEVER collapses (§3): hiding the review axis behind a click is
     // the exact failure #134 asks this layout to prevent.

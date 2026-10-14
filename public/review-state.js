@@ -1,8 +1,9 @@
 /**
  * open-videocore ops dashboard — review-state.js
  *
- * The "Editorial review" block on the asset detail view (issue #901, broken out
- * of #792): the current editorial review state, rendered DISTINCTLY from the
+ * The "Review" block on the asset detail view (issue #901, broken out of #792;
+ * a sub-section of the Editorial panel since #937): the current editorial
+ * review state, rendered DISTINCTLY from the
  * lifecycle `status` badge (#134), plus a transition control that offers
  * EXACTLY the moves the API says are legal from the current state — no more.
  *
@@ -122,7 +123,13 @@ export const REVIEW_STATES = Object.freeze(['draft', 'in-review', 'approved', 'r
 // ─── Copy deck ───────────────────────────────────────────────────────────────
 
 export const REVIEW_COPY = Object.freeze({
-  heading: 'Editorial review',
+  /** Copy deck: docs/design/editorial-panel-layout.md §9, row
+   *  `| review group heading | Review |`; also §1 (panel tree: `#editorial-review
+   *  .editorial-group "Review"`) and §5.1. Deliberately NOT "Editorial review":
+   *  since issue #937 this block is a sub-section of the Editorial panel, whose
+   *  own heading already carries that word, and repeating it inside would read
+   *  as a section of its own. */
+  heading: 'Review',
   /** The label in front of the badge — the state is never carried by colour or
    *  position alone (WCAG 1.4.1). */
   stateKey: 'Review state',
@@ -398,7 +405,7 @@ export function renderReviewBlock(read, opts) {
 // ─── Mount ───────────────────────────────────────────────────────────────────
 
 /**
- * Render the "Editorial review" block and wire its transition controls.
+ * Render the "Review" block and wire its transition controls.
  *
  * Reads `GET /api/v1/assets/{id}/review-state` — never the `reviewState` field
  * on the asset read — because only the sub-resource carries the legal moves, and

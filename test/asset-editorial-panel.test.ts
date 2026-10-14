@@ -47,6 +47,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EDITORIAL_COPY, renderAssetDetailBody } from '../public/app.js';
 import { REVIEW_COPY } from '../public/review-state.js';
+import { TAGS_COPY } from '../public/asset-tags.js';
+import { COMMENTS_COPY } from '../public/comments-panel.js';
 
 const ULID = '01J8ZZZZZZZZZZZZZZZZZZZZZZ';
 
@@ -145,6 +147,47 @@ describe('unified editorial panel on asset detail (issue #937)', () => {
       expect(block, id).not.toBeNull();
       expect(panel!.contains(block!), id).toBe(true);
     }
+  });
+
+  it('heads every group with its copy-deck string, never repeating the panel name', async () => {
+    // docs/design/editorial-panel-layout.md §9 copy deck, verbatim:
+    //   | panel heading         | Editorial |
+    //   | review group heading  | Review    |
+    //   | tags group heading    | Tags      |
+    // and §1's panel tree (`#editorial-review .editorial-group "Review"`).
+    // Pinned as literals as well as by reference: asserting only
+    // `toBe(REVIEW_COPY.heading)` passes for ANY value of the constant, which is
+    // how "Editorial review" shipped green once already.
+    expect(EDITORIAL_COPY.heading).toBe('Editorial');
+    expect(REVIEW_COPY.heading).toBe('Review');
+    expect(TAGS_COPY.heading).toBe('Tags');
+    expect(COMMENTS_COPY.heading).toBe('Comments');
+    // §5.1: "Editorial" is the panel heading, so no group may repeat it —
+    // repeating it reads as a section of its own.
+    for (const h of [REVIEW_COPY.heading, TAGS_COPY.heading, COMMENTS_COPY.heading]) {
+      expect(h, h).not.toContain(EDITORIAL_COPY.heading);
+    }
+
+    vi.stubGlobal('fetch', routedFetch());
+
+    await renderAssetDetailBody(ULID, container);
+    await settle();
+
+    // …and what actually renders in each group matches the deck. The comments
+    // heading carries the thread count ("Comments (n)"), so it is matched by
+    // prefix; the other two are exact.
+    const headingOf = (groupId: string): string => {
+      const group = container.querySelector(groupId);
+      expect(group, groupId).not.toBeNull();
+      const title = group!.querySelector('.section-title');
+      expect(title, groupId).not.toBeNull();
+      return title!.textContent ?? '';
+    };
+    expect(headingOf('#editorial-review')).toBe(REVIEW_COPY.heading);
+    expect(headingOf('#editorial-tags')).toBe(TAGS_COPY.heading);
+    expect(headingOf('#editorial-comments')).toMatch(
+      new RegExp('^' + COMMENTS_COPY.heading + '\\b')
+    );
   });
 
   it('groups each sub-panel under its own stable group id, one block per group', async () => {
