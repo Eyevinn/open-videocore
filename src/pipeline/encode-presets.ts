@@ -1,110 +1,41 @@
-// ABR encoding presets + the Encore profile shape (issue #8).
+// Encode profile selection vocabulary (issue #8; narrowed by issue #1022).
 //
 // IMPORTANT — Encore profiles are SERVER-SIDE named configurations:
-// The `profile` field in a job submission is a name string that Encore resolves
-// against profiles registered in its own configuration. We cannot send an
-// inline outputs ladder. Our preset `name` values MUST match profile names
-// configured in the provisioned Encore instance.
+// the `profile` field of a job submission is a NAME STRING that Encore resolves
+// against its own profile index. A job document cannot carry an inline outputs
+// ladder, so there is nothing for this module to model beyond the name.
 //
-// SMOKE TEST CONFIRMED (2026-06-01): The only known profile in the
-// openvideocore Encore instance is "program". The preset names below
-// (abr-1080p, abr-720p, abr-480p) are PLACEHOLDERS — they will fail until
-// matching profiles are registered in the Encore instance configuration.
+// Contract sources verified before writing (CLAUDE.md rule 7), fetched
+// 2026-10-05 from the upstream transcoding service this API submits to
+// (github.com/svt/encore, the project already cited by encore-client.ts and
+// docs/architecture/encore-audioencode-loudnorm-contract.md):
+//   - `encore-common/src/main/kotlin/se/svt/oss/encore/model/EncoreJob.kt`
+//     — the job document. Fields: `val profile: String` (:52),
+//     `val profileParams: Map<String, Any?>` (:58), `val outputFolder: String`
+//     (:66), `val baseName: String` (:74), `val inputs: List<Input>` (:180).
+//     There is NO `outputs` (or any inline-profile) field on the job document.
+//   - `encore-common/src/main/kotlin/se/svt/oss/encore/service/profile/ProfileService.kt`
+//     — `fun getProfile(job: EncoreJob): Profile` reads the configured profile
+//     index (`properties.location`) as a `Map<String, String>` and resolves
+//     `profiles[job.profile]`, throwing
+//     "Could not find location for profile ${job.profile}!" when the name is
+//     absent. Name-based resolution is the ONLY selection mechanism.
 //
-// The `outputs` field on EncoreProfile is kept for documentation/UI purposes
-// (describing what the ladder produces) but is NOT sent to Encore's API.
+// WHY THERE IS NO `EncoreProfile`/`EncoreOutput` TYPE HERE ANY MORE (issue
+// #1022): the API used to accept a `customProfile` carrying a fully-validated
+// `outputs` ladder (label/width/height/bitrates/format) and then submit only its
+// `name`, silently discarding every encoding setting the caller supplied. Per
+// the contract above that ladder can never reach the transcoding service from a
+// job submission, so the field was removed from the API rather than left as a
+// field that validates and does nothing. An encoding ladder is defined by
+// registering a profile (POST /api/v1/profiles, src/routes/profiles.ts) and then
+// naming it in `profile`; the profile store is what the transcoding instances
+// load, via the public index (GET /api/v1/profiles/index.yml).
 
-// A single output rung of an Encore profile. These map to the fields Encore's
-// transcode API expects per output rendition.
-export type EncoreOutput = {
-  // Human label for the rung; also used to name the produced child asset.
-  label: string;
-  width: number;
-  height: number;
-  // Target video bitrate in bits per second.
-  videoBitrateBps: number;
-  // Target audio bitrate in bits per second.
-  audioBitrateBps: number;
-  // Container/segment format Encore should emit (e.g. "mp4", "fmp4").
-  format: string;
-};
-
-// An Encore profile. `inputs` are filled in per job (the source object), so a
-// stored/preset profile carries only `name` + the `outputs` ladder; the worker
-// injects the concrete input when it submits the job.
-export type EncoreProfile = {
-  name: string;
-  inputs?: EncoreInput[];
-  outputs: EncoreOutput[];
-};
-
-export type EncoreInput = {
-  // S3 URI (or presigned URL) of the source object Encore should read.
-  uri: string;
-  type?: string;
-};
-
+// Preset-name vocabulary kept for the compatibility submit surface
+// (src/routes/encore-compat.ts:238), which recognises these names in an
+// incoming job document's `profile.name`. Each value is forwarded verbatim as
+// the server-side profile name, so a deployment must have a profile of that
+// name registered for it to resolve.
 export const PRESET_NAMES = ['1080p', '720p', '480p'] as const;
 export type PresetName = (typeof PRESET_NAMES)[number];
-
-// Standard audio rung shared by all rungs of every preset (128 kbps AAC).
-const AUDIO_BITRATE_BPS = 128_000;
-
-function rung(label: string, width: number, height: number, videoKbps: number): EncoreOutput {
-  return {
-    label,
-    width,
-    height,
-    videoBitrateBps: videoKbps * 1000,
-    audioBitrateBps: AUDIO_BITRATE_BPS,
-    format: 'mp4'
-  };
-}
-
-// The three built-in ABR ladders. Each is named by its top rung; lower rungs
-// are conventional steps down so adaptive players can switch under bandwidth
-// pressure.
-// All presets map to "program" — the only confirmed profile in the OSC Encore
-// instance (smoke tested 2026-06-01). The `outputs` array describes the
-// intended ladder for documentation purposes but is NOT sent to Encore.
-// When Encore is configured with named abr-1080p/720p/480p profiles these
-// names can be restored.
-export const PRESETS: Record<PresetName, EncoreProfile> = {
-  '1080p': {
-    name: 'program',
-    outputs: [
-      rung('1080p', 1920, 1080, 5000),
-      rung('720p', 1280, 720, 3000),
-      rung('480p', 854, 480, 1500),
-      rung('360p', 640, 360, 800)
-    ]
-  },
-  '720p': {
-    name: 'program',
-    outputs: [
-      rung('720p', 1280, 720, 3000),
-      rung('480p', 854, 480, 1500),
-      rung('360p', 640, 360, 800)
-    ]
-  },
-  '480p': {
-    name: 'program',
-    outputs: [
-      rung('480p', 854, 480, 1500),
-      rung('360p', 640, 360, 800)
-    ]
-  }
-};
-
-// Resolve a request's profile selection into a concrete EncoreProfile. Exactly
-// one of `preset` / `customProfile` should be supplied; a preset wins if both
-// are given is NOT allowed by the route schema, so this assumes a clean input.
-export function resolveProfile(
-  preset: PresetName | undefined,
-  customProfile: EncoreProfile | undefined
-): EncoreProfile {
-  if (customProfile) {
-    return customProfile;
-  }
-  return PRESETS[preset ?? '1080p'];
-}

@@ -80,7 +80,19 @@ export type AssetUploadRouterOptions = {
   // workspace storage (which carries the correct stack) rather than trying to
   // re-resolve it from the cache, which may not have a bare-workspaceId entry
   // when the request came in with an X-Stack-Name header.
-  onObjectStored?: (assetId: string, objectKey: string, storage?: WorkspaceStorage) => void;
+  // `stackName` is the asset's DURABLE stack identity (`Asset.stackName`,
+  // src/data/asset-repo.ts — issue #1097): an upload creates its asset OUTSIDE
+  // any job, so there is no Job record to carry the identity for the detached
+  // work that follows. The callback re-enters it, which keeps the extraction and
+  // thumbnail writes on this stack even once the ambient request context has
+  // ended. Undefined on assets created before #1097 (and outside a request),
+  // which keeps today's behaviour.
+  onObjectStored?: (
+    assetId: string,
+    objectKey: string,
+    storage?: WorkspaceStorage,
+    stackName?: string
+  ) => void;
   // Operator-configured total storage cap (issue #579, ADR-020). When provided,
   // direct-upload ingest is admitted through the running-total counter: the
   // proxied PUT reserves headroom (Content-Length hint) before accepting bytes
@@ -425,7 +437,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       // pre-dispatch source readiness check a length to compare against for
       // uploaded sources too, not just pulled ones.
       await repo.update(asset.id, { objectKey, status: 'processing', sourceSizeBytes: bytesTransferred });
-      opts.onObjectStored?.(asset.id, objectKey, storage);
+      opts.onObjectStored?.(asset.id, objectKey, storage, asset.stackName);
       return reply.code(200).send({ id: asset.id, status: 'processing' });
     }
   );
@@ -706,7 +718,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       }
       // Trigger technical metadata extraction against the stored object
       // (issue #6). Fire-and-forget; does not affect this response.
-      opts.onObjectStored?.(updated.id, objectKey, storage);
+      opts.onObjectStored?.(updated.id, objectKey, storage, updated.stackName);
       return reply.code(200).send({ id: updated.id, status: updated.status });
     }
   );

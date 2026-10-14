@@ -1,188 +1,425 @@
-// @vitest-environment happy-dom
+// Per-asset retention window on the asset READ contract (issue #1034).
 //
-// Remaining retention window on the archived asset detail view (issue #891,
-// broken out from #787). Depends on the contract verification in #888.
+// Covers exactly the acceptance criteria:
+//   (a) an archived asset's read body carries `retention` with the correct
+//       `archivedAt` / `purgeAfter` / `retentionMs`;
+//   (b) `purgeAfter` is `null` when `retentionMs === 0` (retention disabled —
+//       never purge), and `retentionMs` is reported as 0 rather than omitted;
+//   (c) a non-archived asset carries NO `retention` member at all (the change is
+//       additive: every existing body is byte-identical apart from archived
+//       assets);
+//   plus the properties that keep the field honest: it is derived from the SAME
+//   source the purge sweep uses (archivedAtOf — the last `-> archived`
+//   transition, NOT `updatedAt`), it tracks a hot-swapped retention window at
+//   read time, the 200 body of a successful restore carries none (the asset has
+//   just left `archived`), and the published spec advertises the member inside
+//   the `additionalProperties: false` asset schema.
 //
-// Contract grounding (CLAUDE.md rule 7) — read directly from this tree, not
-// assumed:
-//   - `assetSchema` (src/routes/assets.ts:1096 `retention:
-//     retentionSchema.optional()`, serialised with
-//     `additionalProperties: false`) is the schema BOTH `GET /api/v1/assets/{id}`
-//     and the `200` of `POST /api/v1/assets/{id}/restore` use. On THIS branch it
-//     carries an OPTIONAL `retention: { archivedAt, purgeAfter, retentionMs }`
-//     object (`retentionSchema`, src/routes/assets.ts:990-1017), attached by
-//     `withRetention()` (src/routes/assets.ts:2012) and present in the
-//     committed spec (openapi.json, `GET /api/v1/assets/{id}` 200 →
-//     `retention`).
-//   - The shape is the additive one recommended by
-//     docs/findings/asset-restore-contract-888.md §4 ("Preferred"). That
-//     finding recorded the field as NOT exposed when it was written, against
-//     the pre-#891 contract; this branch is what adds it.
-//   - `purgeAfter` is `null` exactly when `retentionMs === 0`
-//     (RETENTION_DISABLED_MS, src/routes/retention.ts:36) — retention disabled,
-//     never purge.
-//
-// The field is OPTIONAL, so these tests pin both directions: no countdown is
-// fabricated for a body that carries no `retention` (non-archived asset, the
-// list endpoint, or a deployment that wires no live retention window), AND the
-// remaining window is rendered near the restore action when the object is
-// present.
-//
-// Target: `formatRetentionRemaining` (pure formatter) and
-// `renderAssetDetailBody` (the real detail renderer), both imported from
-// '../public/app.js' exactly as test/asset-detail-restore.test.ts does.
+// Contract grounding (verified in THIS tree before writing, contract-first):
+//   - `assetSchema` — src/routes/assets.ts:906 (`const assetSchema = z.object({`),
+//     serialized with `additionalProperties: false`; the new member is
+//     `retention: retentionWindowSchema.optional()` (src/routes/assets.ts:983),
+//     defined by `retentionWindowSchema` (src/routes/assets.ts:868-904).
+//   - Read routes serializing it: `app.get('/:id', …)` with
+//     `response: { 200: assetSchema, 404, 410 }` — src/routes/assets.ts:3482-3488;
+//     `app.get('/', …)` with `200: listSchema` — src/routes/assets.ts:3011-3016;
+//     `app.post('/:id/restore', …)` with `200: assetSchema` —
+//     src/routes/assets.ts:5909-5914.
+//   - `archivedAtOf(asset): string` — the `at` of the LAST `-> archived`
+//     transition in `statusHistory`, falling back to `updatedAt` —
+//     src/data/asset-tombstone.ts:87-95. The purge sweep measures eligibility
+//     from the same call: src/pipeline/archived-asset-purge-sweep.ts:146
+//     (`const archivedAtMs = Date.parse(archivedAtOf(asset))`).
+//   - Disabled window: `RETENTION_DISABLED_MS = 0` — src/routes/retention.ts:36;
+//     the sweep early-returns `{ scanned: 0, purged: 0 }` for `retentionMs <= 0`
+//     — src/pipeline/archived-asset-purge-sweep.ts:124-126.
+//   - Instance-global window surface: `retentionConfigSchema`
+//     `{ retentionMs, auditRetentionMs }` on GET/PATCH `/config` —
+//     src/routes/retention.ts:81-128; hot-swapped into main.ts's live
+//     `archiveRetentionMs` via `onConfigChange` — src/main.ts:2197-2199, and read
+//     per request by the assets router through
+//     `retentionMs: () => archiveRetentionMs` — src/main.ts:1899.
+//   - `ASSET_STATUSES` includes `archived` and `ALLOWED_TRANSITIONS.archived`
+//     is `[]` (terminal) — src/data/asset-repo.ts:29,35-41.
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { formatRetentionRemaining, renderAssetDetailBody } from '../public/app.js';
+import { readFileSync } from 'node:fs';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import Fastify, { type FastifyInstance } from 'fastify';
+import { serializerCompiler, validatorCompiler } from 'fastify-type-provider-zod';
 
-const ULID = '01J8ZZZZZZZZZZZZZZZZZZZZZZ';
+vi.mock('../src/auth/workspace.js', async () => {
+  const actual = await vi.importActual<typeof import('../src/auth/workspace.js')>(
+    '../src/auth/workspace.js'
+  );
+  return {
+    ...actual,
+    resolveWorkspaceId: vi.fn(async (token?: string) => {
+      const map: Record<string, string> = { 'token-a': 'workspace-a' };
+      const ws = token ? map[token] : undefined;
+      if (!ws) throw new actual.AuthError('invalid token');
+      return ws;
+    })
+  };
+});
 
-const ARCHIVED_ASSET = {
-  id: ULID,
-  name: 'retired-promo.mov',
-  slug: 'retired-promo',
-  status: 'archived',
-  statusHistory: [
-    { at: '2026-09-20T10:00:00.000Z', from: null, to: 'uploading' },
-    { at: '2026-09-20T10:04:00.000Z', from: 'processing', to: 'ready' },
-    { at: '2026-09-25T08:30:00.000Z', from: 'ready', to: 'archived' },
-  ],
-  createdAt: '2026-09-20T10:00:00.000Z',
-  updatedAt: '2026-09-25T08:30:00.000Z',
-};
+import { registerAuth } from '../src/auth/middleware.js';
+import { assetsRouter } from '../src/routes/assets.js';
+import { InMemoryAssetRepository, type Asset, type StatusTransition } from '../src/data/asset-repo.js';
+import { archivedAtOf } from '../src/data/asset-tombstone.js';
+import { assetRetentionWindow } from '../src/data/asset-retention.js';
 
-function routedFetch(currentAsset: () => unknown) {
-  return vi.fn(async (url: string) => {
-    const path = String(url);
-    const json = (body: unknown, status = 200) =>
-      new Response(JSON.stringify(body), {
-        status,
-        headers: { 'content-type': 'application/json' },
-      });
-    if (/\/delivery$/.test(path)) return json({ urls: {} });
-    if (/\/executions$/.test(path)) return json([]);
-    if (/\/profiles$/.test(path)) return json({ profiles: ['program'] });
-    if (/\/files$/.test(path)) return json({ files: [], fileGroups: [] });
-    if (/\/assets\/[^/?]+(?:\?|$)/.test(path)) return json(currentAsset());
-    return json({}, 200);
+const A = { authorization: 'Bearer token-a' };
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Build the router with a LIVE retention getter, exactly as main.ts wires it
+// (`retentionMs: () => archiveRetentionMs`, src/main.ts:1899), so a test can
+// hot-swap the window between reads the way PATCH /api/v1/retention/config does.
+async function buildApp(
+  repo: InMemoryAssetRepository,
+  retentionMs: () => number
+): Promise<FastifyInstance> {
+  const app = Fastify();
+  app.setValidatorCompiler(validatorCompiler);
+  app.setSerializerCompiler(serializerCompiler);
+  registerAuth(app);
+  await app.register(assetsRouter, {
+    prefix: '/api/v1/assets',
+    repository: repo,
+    retentionMs
   });
+  await app.ready();
+  return app;
 }
 
-describe('formatRetentionRemaining — pure formatter (issue #891)', () => {
-  it('returns null when no retention object is present (the field is optional on the wire)', () => {
-    expect(formatRetentionRemaining(undefined)).toBeNull();
-    expect(formatRetentionRemaining(null)).toBeNull();
+// Drive a freshly-created asset to the terminal `archived` state through
+// `ready` (mirrors createArchived in test/asset-restore.test.ts).
+async function createArchived(repo: InMemoryAssetRepository, name = 'archived-one'): Promise<Asset> {
+  const created = await repo.create({ name });
+  await repo.update(created.id, { status: 'processing' });
+  await repo.update(created.id, { status: 'ready' });
+  const archived = await repo.update(created.id, { status: 'archived' });
+  if (!archived) throw new Error('fixture failed to archive');
+  return archived;
+}
+
+async function createReady(repo: InMemoryAssetRepository, name = 'live-one'): Promise<Asset> {
+  const created = await repo.create({ name });
+  await repo.update(created.id, { status: 'processing' });
+  const ready = await repo.update(created.id, { status: 'ready' });
+  if (!ready) throw new Error('fixture failed to reach ready');
+  return ready;
+}
+
+const get = (app: FastifyInstance, id: string) =>
+  app.inject({ method: 'GET', url: `/api/v1/assets/${id}`, headers: A });
+
+// -------------------------------------------------------------------------
+// The projection itself (pure) — no route, no clock
+// -------------------------------------------------------------------------
+
+describe('assetRetentionWindow — the derived projection (issue #1034)', () => {
+  // A minimal Asset-shaped fixture; only status/statusHistory/updatedAt are read.
+  const asset = (status: Asset['status'], history: StatusTransition[], updatedAt: string): Asset =>
+    ({
+      id: '01HRETENTION0000000000000',
+      name: 'x',
+      status,
+      statusHistory: history,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt
+    }) as Asset;
+
+  const archivedHistory: StatusTransition[] = [
+    { at: '2026-01-01T00:00:00.000Z', from: null, to: 'uploading' },
+    { at: '2026-01-02T00:00:00.000Z', from: 'uploading', to: 'processing' },
+    { at: '2026-01-03T00:00:00.000Z', from: 'processing', to: 'ready' },
+    { at: '2026-03-01T00:00:00.000Z', from: 'ready', to: 'archived' }
+  ];
+
+  it('derives archivedAt from the LAST `-> archived` transition, not updatedAt', () => {
+    // `updatedAt` is deliberately LATER than the archive transition (e.g. a
+    // metadata edit after archiving). The window must still be measured from
+    // the transition — the same value archivedAtOf() and the sweep use.
+    const a = asset('archived', archivedHistory, '2026-06-01T00:00:00.000Z');
+    const window = assetRetentionWindow(a, 30 * DAY_MS);
+    expect(window?.archivedAt).toBe('2026-03-01T00:00:00.000Z');
+    expect(window?.archivedAt).toBe(archivedAtOf(a));
+    expect(window?.archivedAt).not.toBe(a.updatedAt);
   });
 
-  it('returns null for a malformed retention object rather than guessing', () => {
-    expect(formatRetentionRemaining({})).toBeNull();
-    expect(formatRetentionRemaining({ purgeAfter: 123 })).toBeNull();
-    expect(formatRetentionRemaining({ purgeAfter: 'not-a-date' })).toBeNull();
+  it('purgeAfter is archivedAt + retentionMs', () => {
+    const window = assetRetentionWindow(asset('archived', archivedHistory, 'x'), 30 * DAY_MS);
+    expect(window?.retentionMs).toBe(30 * DAY_MS);
+    expect(window?.purgeAfter).toBe('2026-03-31T00:00:00.000Z');
+    expect(Date.parse(window!.purgeAfter!) - Date.parse(window!.archivedAt)).toBe(30 * DAY_MS);
   });
 
-  it('reports "no retention limit" when purgeAfter is explicitly null (retentionMs === 0)', () => {
-    const text = formatRetentionRemaining({ purgeAfter: null, retentionMs: 0 });
-    expect(text).toContain('No retention limit');
+  it('purgeAfter is null and retentionMs 0 when retention is disabled', () => {
+    for (const disabled of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const window = assetRetentionWindow(asset('archived', archivedHistory, 'x'), disabled);
+      expect(window).toBeDefined();
+      expect(window?.purgeAfter).toBeNull();
+      expect(window?.retentionMs).toBe(0);
+    }
   });
 
-  it('reports the remaining window when purgeAfter is in the future', () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-10-01T00:00:00.000Z'));
-    const text = formatRetentionRemaining({
-      archivedAt: '2026-09-25T08:30:00.000Z',
-      purgeAfter: '2026-10-25T08:30:00.000Z',
-      retentionMs: 2592000000,
-    });
-    expect(text).toContain('24 days');
-    expect(text).toContain('remain');
-    vi.useRealTimers();
+  it('purgeAfter is null when archivedAt cannot be parsed (the sweep refuses to purge too)', () => {
+    const window = assetRetentionWindow(
+      asset('archived', [{ at: 'not-a-timestamp', from: 'ready', to: 'archived' }], 'x'),
+      30 * DAY_MS
+    );
+    expect(window?.archivedAt).toBe('not-a-timestamp');
+    expect(window?.purgeAfter).toBeNull();
+    // The window itself is still reported honestly — only the instant is unknown.
+    expect(window?.retentionMs).toBe(30 * DAY_MS);
   });
 
-  it('reports the window has elapsed when purgeAfter is in the past, without claiming the asset is already gone', () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-10-26T00:00:00.000Z'));
-    const text = formatRetentionRemaining({
-      purgeAfter: '2026-10-25T08:30:00.000Z',
-      retentionMs: 2592000000,
-    });
-    expect(text).toContain('elapsed');
-    expect(text).not.toContain('remain');
-    vi.useRealTimers();
+  it('falls back to updatedAt when no `-> archived` transition was recorded', () => {
+    const a = asset(
+      'archived',
+      [{ at: '2026-01-01T00:00:00.000Z', from: null, to: 'uploading' }],
+      '2026-05-01T00:00:00.000Z'
+    );
+    const window = assetRetentionWindow(a, DAY_MS);
+    expect(window?.archivedAt).toBe('2026-05-01T00:00:00.000Z');
+    expect(window?.archivedAt).toBe(archivedAtOf(a));
+    expect(window?.purgeAfter).toBe('2026-05-02T00:00:00.000Z');
+  });
+
+  it('returns undefined for every non-archived status', () => {
+    for (const status of ['uploading', 'processing', 'ready', 'failed'] as const) {
+      expect(assetRetentionWindow(asset(status, archivedHistory, 'x'), 30 * DAY_MS)).toBeUndefined();
+    }
   });
 });
 
-describe('asset detail — retention window near the restore action (issue #891)', () => {
-  let container: HTMLElement;
+// -------------------------------------------------------------------------
+// The read contract over HTTP
+// -------------------------------------------------------------------------
+
+describe('GET /api/v1/assets/:id — retention on the read contract (issue #1034)', () => {
+  let repo: InMemoryAssetRepository;
 
   beforeEach(() => {
-    localStorage.clear();
-    container = document.createElement('div');
-    document.body.appendChild(container);
+    repo = new InMemoryAssetRepository();
   });
 
-  afterEach(() => {
-    container.remove();
-    vi.restoreAllMocks();
-    vi.unstubAllGlobals();
-    vi.useRealTimers();
+  it('an archived asset returns retention with archivedAt/purgeAfter/retentionMs', async () => {
+    const app = await buildApp(repo, () => 30 * DAY_MS);
+    const archived = await createArchived(repo);
+    const res = await get(app, archived.id);
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+
+    expect(body.status).toBe('archived');
+    // The serializer must not strip the new member (assetSchema is serialized
+    // with additionalProperties: false — an unlisted key would vanish silently).
+    expect(body.retention).toBeDefined();
+    expect(Object.keys(body.retention).sort()).toEqual([
+      'archivedAt',
+      'purgeAfter',
+      'retentionMs'
+    ]);
+
+    // archivedAt is the `at` of the asset's own last `-> archived` transition,
+    // readable from the same body — no second source of truth.
+    const archivedTransition = (body.statusHistory as StatusTransition[])
+      .filter((t) => t.to === 'archived')
+      .at(-1);
+    expect(body.retention.archivedAt).toBe(archivedTransition?.at);
+    expect(body.retention.archivedAt).toBe(archivedAtOf(archived));
+
+    expect(body.retention.retentionMs).toBe(30 * DAY_MS);
+    expect(body.retention.purgeAfter).toBe(
+      new Date(Date.parse(body.retention.archivedAt) + 30 * DAY_MS).toISOString()
+    );
   });
 
-  it('omits the retention window when the body carries no retention object — no fabricated countdown', async () => {
-    vi.stubGlobal('fetch', routedFetch(() => ARCHIVED_ASSET));
-
-    await renderAssetDetailBody(ARCHIVED_ASSET.id, container);
-
-    // The restore action is still offered...
-    expect(container.querySelector('#btn-restore-asset')).not.toBeNull();
-    // ...but no retention-window element is rendered, because this fixture
-    // body carries no `retention` field — the case of an older server, or a
-    // deployment that wires no live retention window, where `withRetention()`
-    // omits the object (src/routes/assets.ts:2012).
-    expect(container.querySelector('#retention-window')).toBeNull();
-    expect(container.textContent).not.toMatch(/remain before/);
+  it('purgeAfter is null when retentionMs is 0 (retention disabled — never purge)', async () => {
+    const app = await buildApp(repo, () => 0);
+    const archived = await createArchived(repo);
+    const body = (await get(app, archived.id)).json();
+    expect(body.retention).toBeDefined();
+    expect(body.retention.retentionMs).toBe(0);
+    // `null`, not absent and not a zero-length countdown: "never purge" is
+    // stated explicitly so a client cannot render a deadline that does not exist.
+    expect(body.retention.purgeAfter).toBeNull();
+    expect('purgeAfter' in body.retention).toBe(true);
   });
 
-  it('renders the remaining window near the restore action once the server sends asset.retention', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-10-01T00:00:00.000Z'));
-    const assetWithRetention = {
-      ...ARCHIVED_ASSET,
-      retention: {
-        archivedAt: '2026-09-25T08:30:00.000Z',
-        purgeAfter: '2026-10-25T08:30:00.000Z',
-        retentionMs: 2592000000,
-      },
-    };
-    vi.stubGlobal('fetch', routedFetch(() => assetWithRetention));
-
-    await renderAssetDetailBody(ARCHIVED_ASSET.id, container);
-
-    const restoreBtn = container.querySelector('#btn-restore-asset');
-    const note = container.querySelector('#restore-note');
-    const retentionEl = container.querySelector('#retention-window');
-    expect(restoreBtn).not.toBeNull();
-    expect(note).not.toBeNull();
-    expect(retentionEl).not.toBeNull();
-    expect(retentionEl?.textContent).toContain('24 days');
-
-    // "Near the restore action": the retention note sits alongside the
-    // restore note, inside the same detail body, immediately after it in
-    // document order.
-    expect(note?.compareDocumentPosition(retentionEl as Node) &
-      Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  it('a non-archived asset omits retention entirely (additive, non-breaking)', async () => {
+    const app = await buildApp(repo, () => 30 * DAY_MS);
+    const ready = await createReady(repo);
+    const body = (await get(app, ready.id)).json();
+    expect(body.status).toBe('ready');
+    expect('retention' in body).toBe(false);
+    expect(body.retention).toBeUndefined();
   });
 
-  it('offers no retention-window text at all for a non-archived asset', async () => {
-    const readyAsset = {
-      ...ARCHIVED_ASSET,
-      status: 'ready',
-      retention: { archivedAt: null, purgeAfter: '2026-10-25T08:30:00.000Z', retentionMs: 2592000000 },
-    };
-    vi.stubGlobal('fetch', routedFetch(() => readyAsset));
+  it('reports the window live, so a hot-swapped retention config is never stale', async () => {
+    // Mirrors PATCH /api/v1/retention/config mutating main.ts's live
+    // `archiveRetentionMs` (src/main.ts:2197-2199) between two reads.
+    let live = 7 * DAY_MS;
+    const app = await buildApp(repo, () => live);
+    const archived = await createArchived(repo);
 
-    await renderAssetDetailBody(ARCHIVED_ASSET.id, container);
+    const first = (await get(app, archived.id)).json();
+    expect(first.retention.retentionMs).toBe(7 * DAY_MS);
+    const firstPurgeAfter = first.retention.purgeAfter;
 
-    expect(container.querySelector('#btn-restore-asset')).toBeNull();
-    expect(container.querySelector('#retention-window')).toBeNull();
+    live = 14 * DAY_MS;
+    const second = (await get(app, archived.id)).json();
+    expect(second.retention.retentionMs).toBe(14 * DAY_MS);
+    expect(second.retention.purgeAfter).not.toBe(firstPurgeAfter);
+    expect(
+      Date.parse(second.retention.purgeAfter) - Date.parse(firstPurgeAfter)
+    ).toBe(7 * DAY_MS);
+    // archivedAt is a property of the asset, not of the policy — unchanged.
+    expect(second.retention.archivedAt).toBe(first.retention.archivedAt);
+
+    live = 0;
+    const third = (await get(app, archived.id)).json();
+    expect(third.retention.retentionMs).toBe(0);
+    expect(third.retention.purgeAfter).toBeNull();
+  });
+
+  it('is resolvable by slug as well as by id (same read contract)', async () => {
+    const app = await buildApp(repo, () => DAY_MS);
+    const archived = await createArchived(repo);
+    expect(archived.slug).toBeTruthy();
+    const body = (await get(app, archived.slug!)).json();
+    expect(body.id).toBe(archived.id);
+    expect(body.retention.retentionMs).toBe(DAY_MS);
+    expect(body.retention.archivedAt).toBe(archivedAtOf(archived));
+  });
+});
+
+describe('retention on the other archived-asset reads (issue #1034)', () => {
+  let repo: InMemoryAssetRepository;
+  let app: FastifyInstance;
+
+  beforeEach(async () => {
+    repo = new InMemoryAssetRepository();
+    app = await buildApp(repo, () => 30 * DAY_MS);
+  });
+
+  it('GET /?status=archived carries the same window per row; live rows carry none', async () => {
+    const archived = await createArchived(repo, 'archived-row');
+    await createReady(repo, 'ready-row');
+
+    const archivedPage = (
+      await app.inject({ method: 'GET', url: '/api/v1/assets/?status=archived', headers: A })
+    ).json();
+    const row = archivedPage.items.find((i: { id: string }) => i.id === archived.id);
+    expect(row).toBeDefined();
+    expect(row.retention.archivedAt).toBe(archivedAtOf(archived));
+    expect(row.retention.retentionMs).toBe(30 * DAY_MS);
+    expect(row.retention.purgeAfter).toBe(
+      new Date(Date.parse(archivedAtOf(archived)) + 30 * DAY_MS).toISOString()
+    );
+
+    const readyPage = (
+      await app.inject({ method: 'GET', url: '/api/v1/assets/?status=ready', headers: A })
+    ).json();
+    expect(readyPage.items.length).toBeGreaterThan(0);
+    for (const item of readyPage.items) {
+      expect('retention' in item).toBe(false);
+    }
+  });
+
+  it('a mutation body that echoes an archived asset carries the same window', async () => {
+    // The window is attached by ONE helper at every response serializing an
+    // existing asset, so a client that reads the asset back from a mutation
+    // echo sees the same value GET /:id reports — not a body that silently
+    // drops the field depending on which route answered.
+    const archived = await createArchived(repo);
+    const expected = (await get(app, archived.id)).json().retention;
+
+    const locked = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/assets/${archived.id}/lock`,
+      headers: A,
+      payload: {}
+    });
+    expect(locked.statusCode).toBe(200);
+    const body = locked.json();
+    expect(body.status).toBe('archived');
+    expect(body.retention).toEqual(expected);
+  });
+
+  it('a successful restore returns NO retention — the asset has left archived', async () => {
+    const archived = await createArchived(repo);
+    // Pre-restore the window is readable...
+    expect((await get(app, archived.id)).json().retention).toBeDefined();
+
+    const restored = await app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${archived.id}/restore`,
+      headers: A
+    });
+    expect(restored.statusCode).toBe(200);
+    const body = restored.json();
+    expect(body.status).toBe('ready');
+    // ...and afterwards there is no purge window to report, so the member is
+    // absent rather than stale.
+    expect('retention' in body).toBe(false);
+    expect((await get(app, archived.id)).json().retention).toBeUndefined();
+  });
+});
+
+// -------------------------------------------------------------------------
+// The published contract
+// -------------------------------------------------------------------------
+
+describe('openapi.json advertises the retention member (issue #1034)', () => {
+  const spec = JSON.parse(readFileSync(new URL('../openapi.json', import.meta.url), 'utf8')) as {
+    paths: Record<string, Record<string, { responses: Record<string, Record<string, never>> }>>;
+  };
+
+  // The asset 200 schema for GET /api/v1/assets/{id}.
+  const assetSchemaJson = () => {
+    const path = spec.paths['/api/v1/assets/{id}'] as unknown as Record<
+      string,
+      {
+        responses: Record<
+          string,
+          { content: Record<string, { schema: Record<string, unknown> }> }
+        >;
+      }
+    >;
+    return path['get'].responses['200'].content['application/json'].schema;
+  };
+
+  it('declares retention inside the additionalProperties:false asset schema', () => {
+    const schema = assetSchemaJson();
+    // Without being declared here the member could never reach a client: the
+    // serializer strips anything the schema does not list.
+    expect(schema['additionalProperties']).toBe(false);
+    const properties = schema['properties'] as Record<string, Record<string, unknown>>;
+    expect(properties['retention']).toBeDefined();
+    expect(properties['retention']['type']).toBe('object');
+  });
+
+  it('keeps retention OPTIONAL — no existing client is newly non-conformant', () => {
+    const schema = assetSchemaJson();
+    const required = (schema['required'] ?? []) as string[];
+    expect(required).not.toContain('retention');
+  });
+
+  it('documents the three members, with purgeAfter nullable', () => {
+    const properties = assetSchemaJson()['properties'] as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const retention = properties['retention'];
+    const members = retention['properties'] as Record<string, Record<string, unknown>>;
+    expect(Object.keys(members).sort()).toEqual(['archivedAt', 'purgeAfter', 'retentionMs']);
+    expect(retention['required']).toEqual(['archivedAt', 'purgeAfter', 'retentionMs']);
+    expect(members['purgeAfter']['nullable']).toBe(true);
+    expect(members['retentionMs']['type']).toBe('integer');
+    // The earliest-possible-purge caveat must be published, not just commented:
+    // a client that renders purgeAfter as a hard deadline would be lying.
+    expect(String(members['purgeAfter']['description'])).toMatch(/EARLIEST POSSIBLE/);
   });
 });

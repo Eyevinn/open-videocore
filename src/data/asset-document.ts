@@ -333,7 +333,15 @@ export const AssetDocumentSchema = z.object({
     // Explicit delete-lock (ADR-020 decision 3, issue #568). Optional so
     // documents written before #568 (field absent) still deserialize as
     // unlocked — no schemaVersion bump required, all v1 documents remain valid.
-    deleteLock: DeleteLockSchema.optional()
+    deleteLock: DeleteLockSchema.optional(),
+    // The provisioned stack this asset was created against (issue #1097).
+    // System-owned provenance of WHERE the asset lives — not editorial — so it
+    // belongs here under `administrative`, beside `source` and `storage`, and
+    // NOT under user-writable `descriptive`. Optional so documents written
+    // before #1097 (field absent) still deserialize; no schemaVersion bump is
+    // required, all v1 documents remain valid, and an absent value keeps the
+    // previous first-listed-stack resolution.
+    stackName: z.string().optional()
   }),
 
   structural: z
@@ -528,6 +536,12 @@ export function toAssetDocument(
   // absent (back-compat), mirroring the TAMS/packagedOutput pattern.
   if (asset.externalIdentifiers && asset.externalIdentifiers.length > 0) {
     doc.administrative.externalIdentifiers = asset.externalIdentifiers;
+  }
+  // Durable stack identity (issue #1097). Only persisted when the asset actually
+  // carries one, so pre-#1097 assets (and assets created outside a request)
+  // round-trip with the field absent — the documented legacy case.
+  if (asset.stackName) {
+    doc.administrative.stackName = asset.stackName;
   }
   if (asset.objectKey) {
     doc.administrative.storage = {
@@ -754,6 +768,9 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
         ? doc.administrative.externalIdentifiers
         : undefined,
     collections: collections && collections.length > 0 ? collections : undefined,
+    // Durable stack identity (issue #1097). Absent on pre-#1097 documents, which
+    // read back as undefined and keep the first-listed-stack behaviour.
+    stackName: doc.administrative.stackName,
     createdAt: doc.administrative.createdAt,
     updatedAt: doc.administrative.updatedAt
   };

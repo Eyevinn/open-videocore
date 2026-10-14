@@ -48,6 +48,27 @@ const EMPTY = '—';
 // query for the button without restating the string.
 export const COPY_ID_BTN_CLASS = 'copy-id-btn';
 
+// The button's text label (issue #990). Still the real words "Copy" / "Copied" /
+// "Copy failed" — it is both the live-region payload and the value the resting
+// restore writes back — but visually hidden, with an icon carrying the meaning
+// for sighted users. Exported so the wiring, the CSS and tests all name one
+// string.
+export const COPY_ID_LABEL_CLASS = 'copy-id-btn-label';
+
+// The icon box. Empty by construction: the glyph is drawn in CSS from
+// `::before`/`::after` on this span (see `.copy-id-btn-icon` in
+// public/style.css), so it inherits `currentColor` from `.copy-id-btn` and its
+// `:hover`/state rules.
+export const COPY_ID_ICON_CLASS = 'copy-id-btn-icon';
+
+// Outcome classes toggled on the BUTTON for the sighted half of the feedback.
+// Once the word is hidden the visible text can no longer carry the result, so
+// the icon swaps shape — tick for copied, cross for not-copied — and takes a
+// success/danger colour with it. Shape, not hue alone, is what distinguishes the
+// two outcomes (WCAG 1.4.1 Use of Colour).
+export const COPY_ID_OK_CLASS = 'is-copied';
+export const COPY_ID_FAIL_CLASS = 'is-copy-failed';
+
 // How long the transient "Copied" / "Copy failed" feedback stays on the button
 // before it returns to its resting label. Exported so tests assert the real
 // window instead of a duplicated magic number.
@@ -61,12 +82,34 @@ export const FEEDBACK_MS = 1500;
  * ACCESSIBILITY: the button carries `aria-live="polite"` so the transient
  * "Copied" / "Copy failed" feedback written into it by wireCopyIdButtons() is a
  * programmatically determinable status message (WCAG 2.1 SC 4.1.3, level AA)
- * rather than a visual-only flash. The visible word "Copy" is the start of the
- * accessible name, so the name still contains the label (SC 2.5.3).
+ * rather than a visual-only flash.
  *
- * The accessible name also ends with the value itself, so a table of N rows
- * gives N distinguishable controls in a screen reader's control list rather
- * than N identical "Copy asset id" entries with no row context.
+ * The accessible name ends with the value itself, so a table of N rows gives N
+ * distinguishable controls in a screen reader's control list rather than N
+ * identical "Copy asset id" entries with no row context.
+ *
+ * ICON BUTTON (issue #990). The control is a square icon button, not the word
+ * "Copy". What did NOT change: the words are still in the DOM, inside
+ * `.copy-id-btn-label`, because that text is three things at once — the
+ * live-region payload wireCopyIdButtons() writes the outcome into, the string the
+ * resting-text restore puts back, and a non-visual label. Hiding it with the
+ * existing `.visually-hidden` utility (public/style.css:194) keeps all three and
+ * removes only the pixels. SC 2.5.3 (label in name) stops applying because there
+ * is no longer any visible text label to match against.
+ *
+ * Two children, in this order and with NO whitespace between them, so
+ * `button.textContent` is exactly the label and nothing else:
+ *   1. the icon box — `aria-hidden`, so the glyph is never announced and never
+ *      lands in the live-region payload;
+ *   2. the visually-hidden label.
+ *
+ * The glyph is drawn in CSS, not as an inline `<svg>`: `public/` carries no icon
+ * set, no icon font and no SVG (the magnifier at `.ops-search-icon`,
+ * public/style.css:2081, is drawn the same way), and
+ * test/asset-list-lock-indicator.test.ts:413 asserts that no SVG appears
+ * anywhere in an assets-table row — this button included. CSS geometry gets the
+ * same properties an inline SVG was wanted for: `currentColor` theming off
+ * `.copy-id-btn`, no new dependency, nothing for a CSP to allow.
  *
  * @param {string} value  the identifier to display and copy (e.g. an asset ULID)
  * @param {string} [label] accessible label prefix ("Copy asset id")
@@ -83,7 +126,10 @@ export function copyableIdCellHtml(value, label) {
     '<button type="button" class="' + COPY_ID_BTN_CLASS + '" ' +
     'data-copy-id="' + escHtml(v) + '" ' +
     'aria-live="polite" ' +
-    'aria-label="' + escHtml(aria) + '">Copy</button>'
+    'aria-label="' + escHtml(aria) + '">' +
+    '<span class="' + COPY_ID_ICON_CLASS + '" aria-hidden="true"></span>' +
+    '<span class="visually-hidden ' + COPY_ID_LABEL_CLASS + '">Copy</span>' +
+    '</button>'
   );
 }
 
@@ -112,6 +158,12 @@ export function slugCellHtml(slug) {
  * "Copy URL" button): navigator.clipboard when available, transient button-label
  * feedback either way, never a thrown error into the render path.
  *
+ * The outcome goes to BOTH halves of the audience on every click (issue #990):
+ * the words go into the visually-hidden `.copy-id-btn-label` inside the
+ * aria-live button, and an outcome class on the button swaps the CSS-drawn icon
+ * so a sighted operator — who can no longer read the result, the word being
+ * hidden — sees a tick or a cross instead.
+ *
  * @param {ParentNode} root
  * @param {object} [opts]
  * @param {Navigator} [opts.nav] injectable navigator (tests)
@@ -125,12 +177,18 @@ export function wireCopyIdButtons(root, opts) {
   root.querySelectorAll('.' + COPY_ID_BTN_CLASS).forEach(function (btn) {
     if (btn.dataset.copyIdWired === '1') return;
     btn.dataset.copyIdWired = '1';
+    // Where the words live. Since #990 that is the visually-hidden span inside
+    // the icon button, not the button itself — the button's own text would now be
+    // the icon's neighbour rather than a label. Falls back to the button for any
+    // caller-authored markup that has no label span, which keeps the pre-#990
+    // behaviour exactly.
+    const textNode = btn.querySelector('.' + COPY_ID_LABEL_CLASS) || btn;
     // Capture the resting label ONCE, at wire time — NOT per click. Reading it
     // inside the handler meant a second click inside the feedback window
     // captured the transient "Copied" as the text to restore, so the button (and
     // its accessible name, since it is an aria-live region) stayed stranded on
     // "Copied" for good: no Copy affordance and a permanently stale name.
-    const restingText = btn.textContent;
+    const restingText = textNode.textContent;
     const restingLabel = btn.getAttribute('aria-label');
     // One pending restore per button. Tracked so a rapid second click cancels
     // the first timer instead of queueing a second one that fires later.
@@ -143,29 +201,39 @@ export function wireCopyIdButtons(root, opts) {
       // while the button says "Copied". The button is an aria-live region
       // (markup above), which is what makes this feedback a status message
       // instead of a sighted-only flash.
-      const restore = function (text) {
-        btn.textContent = text;
+      // `state` is the sighted half: the icon swaps to a tick or a cross and the
+      // button takes the matching colour for the same window the words are up
+      // for. Both halves are cleared by the one restore timer, so the visible
+      // icon and the announced text can never disagree.
+      const restore = function (text, state) {
+        textNode.textContent = text;
         if (restingLabel !== null) btn.setAttribute('aria-label', text);
+        btn.classList.remove(COPY_ID_OK_CLASS, COPY_ID_FAIL_CLASS);
+        if (state) btn.classList.add(state);
         if (restoreTimer !== null) clearTimeout(restoreTimer);
         restoreTimer = setTimeout(function () {
           restoreTimer = null;
-          btn.textContent = restingText;
+          textNode.textContent = restingText;
           if (restingLabel !== null) btn.setAttribute('aria-label', restingLabel);
+          btn.classList.remove(COPY_ID_OK_CLASS, COPY_ID_FAIL_CLASS);
         }, FEEDBACK_MS);
       };
       if (value && nav && nav.clipboard && nav.clipboard.writeText) {
         nav.clipboard.writeText(value).then(
           function () {
-            restore('Copied');
+            restore('Copied', COPY_ID_OK_CLASS);
           },
           function () {
-            restore('Copy failed');
+            restore('Copy failed', COPY_ID_FAIL_CLASS);
           }
         );
       } else {
         // No clipboard API (insecure origin / old browser): the value is still
-        // plain selectable text in the cell, so nothing is lost.
-        restore('Select to copy');
+        // plain selectable text in the cell, so nothing is lost. Visually this is
+        // the not-copied icon, because that is the truth — the clipboard never
+        // received the value — and the instruction in the words ("Select to
+        // copy") is what the screen-reader half gets.
+        restore('Select to copy', COPY_ID_FAIL_CLASS);
       }
     });
   });

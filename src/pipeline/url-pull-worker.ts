@@ -46,6 +46,11 @@ import {
   type PipelineLogErrorLog,
   type PipelineLogSink
 } from '../services/pipeline-log.js';
+import {
+  PERSISTED_STACK_FALLBACK_MESSAGE,
+  runWithPersistedStack,
+  type StackContextLogger
+} from '../services/request-stack-context.js';
 
 // Default 50 GB cap; configurable via INGEST_MAX_SOURCE_BYTES.
 export const DEFAULT_MAX_SOURCE_BYTES = 50 * 1024 * 1024 * 1024;
@@ -90,6 +95,14 @@ export type PullParams = {
   assetId: string;
   objectKey: string;
   sourceUrl: string;
+  // The stack the job was created against, read off the Job record
+  // (`Job.stackName`, src/data/job-repo.ts — issue #1097). The pull runs
+  // DETACHED from the request that started it and can be re-driven after a
+  // process restart, so the worker re-enters this stack itself instead of
+  // relying on the ambient AsyncLocalStorage context surviving. Undefined on
+  // jobs created before #1097 (and on jobs created outside a request), which
+  // keeps the caller's own resolution — see runPull.
+  stackName?: string;
 };
 
 // Clear any multipart upload left open for this object key (issue #1088), so a
@@ -129,35 +142,57 @@ async function discardOrphanedUpload(
 // Run one pull job to a terminal state. Resolves when the job is done/failed;
 // it never throws (failures are recorded on the job), so it is safe to invoke
 // detached with `void runPull(...)`.
-export async function runPull(
-  params: PullParams,
-  deps: {
-    jobs: JobRepository;
-    assets: AssetRepository;
-    storage: WorkspaceStorage;
-    // Operator-configured total storage cap (issue #579, ADR-020). When
-    // provided, the worker reserves quota headroom once the remote source's
-    // Content-Length is known (openSource().totalBytes) and commits the TRUE
-    // transferred size on success / releases it on failure. An over-cap pull is
-    // a PERMANENT failure (QuotaExceededError), recorded on the job without
-    // retry. Absent => no cap, behaviour unchanged (opt-in).
-    quota?: StorageQuotaGuard;
-    // Best-effort operational log emission for the `ingest` stage (issue #995).
-    // Optional: when absent no log record is appended and behaviour is unchanged.
-    // Wired to the log store that backs GET /api/v1/logs (src/main.ts,
-    // `logStore`). `logPipelineEvent` never throws, so this cannot make the
-    // never-throws contract of runPull (see the doc comment above) any weaker.
-    pipelineLog?: PipelineLogSink;
-    pipelineLogErrors?: PipelineLogErrorLog;
-    // Best-effort audit emission (issue #1000), mirroring the transcode and
-    // packaging pipelines (src/pipeline/transcode.ts:281,332;
-    // src/pipeline/packaging.ts:589,616). Optional so existing callers / tests
-    // that do not assert audit are unaffected; when absent, emission is a no-op.
-    // A failed audit write is logged, never propagated (src/data/audit-emit.ts).
-    audit?: AuditEmitter;
-    auditLog?: AuditErrorLog;
-  } & PullDeps
-): Promise<void> {
+//
+// The whole run executes inside the job's PERSISTED stack context (issue #1097,
+// `params.stackName`): every `deps.jobs` / `deps.assets` write resolves the
+// stack the job was created against, even when the ambient request context is
+// gone (a pull re-driven after a process restart). A job with no persisted
+// stackName keeps today's behaviour — the caller's ambient context if there is
+// one, the first-listed stack otherwise — and the fallback is reported at debug
+// level through `deps.stackLog`.
+export type RunPullDeps = {
+  jobs: JobRepository;
+  assets: AssetRepository;
+  storage: WorkspaceStorage;
+  // Operator-configured total storage cap (issue #579, ADR-020). When
+  // provided, the worker reserves quota headroom once the remote source's
+  // Content-Length is known (openSource().totalBytes) and commits the TRUE
+  // transferred size on success / releases it on failure. An over-cap pull is
+  // a PERMANENT failure (QuotaExceededError), recorded on the job without
+  // retry. Absent => no cap, behaviour unchanged (opt-in).
+  quota?: StorageQuotaGuard;
+  // Best-effort operational log emission for the `ingest` stage (issue #995).
+  // Optional: when absent no log record is appended and behaviour is unchanged.
+  // Wired to the log store that backs GET /api/v1/logs (src/main.ts,
+  // `logStore`). `logPipelineEvent` never throws, so this cannot make the
+  // never-throws contract of runPull (see the doc comment above) any weaker.
+  pipelineLog?: PipelineLogSink;
+  pipelineLogErrors?: PipelineLogErrorLog;
+  // Best-effort audit emission (issue #1000), mirroring the transcode and
+  // packaging pipelines (src/pipeline/transcode.ts:281,332;
+  // src/pipeline/packaging.ts:589,616). Optional so existing callers / tests
+  // that do not assert audit are unaffected; when absent, emission is a no-op.
+  // A failed audit write is logged, never propagated (src/data/audit-emit.ts).
+  audit?: AuditEmitter;
+  auditLog?: AuditErrorLog;
+  // Debug sink for the issue #1097 legacy-document fallback notice. Optional:
+  // absent => the fallback is silent and behaviour is unchanged.
+  stackLog?: StackContextLogger;
+} & PullDeps;
+
+export async function runPull(params: PullParams, deps: RunPullDeps): Promise<void> {
+  return runWithPersistedStack(
+    params.stackName,
+    () => runPullInStack(params, deps),
+    () =>
+      deps.stackLog?.debug(
+        { jobId: params.jobId, assetId: params.assetId },
+        `url-pull worker: ${PERSISTED_STACK_FALLBACK_MESSAGE}`
+      )
+  );
+}
+
+async function runPullInStack(params: PullParams, deps: RunPullDeps): Promise<void> {
   const { jobId, assetId, objectKey, sourceUrl } = params;
   const sleep = deps.sleep ?? defaultSleep;
   const baseBackoff = deps.baseBackoffMs ?? BASE_BACKOFF_MS;

@@ -15,8 +15,10 @@
 // symbol below is verified against its source rather than assumed:
 //   - the `cols` URL param and its null-means-unspecified rule:
 //     PARAM_KEYS / BASE_DEFAULTS in public/table-url-state.js.
-//   - the declared column keys and the legality group:
-//     ASSETS_COLUMN_KEYS / ASSETS_REQUIRED_COLUMN_GROUPS in public/assets-table.js.
+//   - the declared column keys, the off-by-default subset and the legality group:
+//     ASSETS_COLUMN_KEYS / ASSETS_OPTIONAL_COLUMN_KEYS /
+//     ASSETS_DEFAULT_COLUMN_KEYS / ASSETS_REQUIRED_COLUMN_GROUPS in
+//     public/assets-table.js.
 //   - the storage key: columnPrefKey(ns) in public/table-columns.js.
 //   - the chooser's mount point and the cascade it has to survive: renderFilters()
 //     in public/ops-ui-table.js appends `.ops-columns-slot` into the bar whose
@@ -39,6 +41,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createAssetsTable,
   ASSETS_COLUMN_KEYS,
+  ASSETS_DEFAULT_COLUMN_KEYS,
+  ASSETS_OPTIONAL_COLUMN_KEYS,
   ASSETS_REQUIRED_COLUMN_GROUPS,
   ASSETS_NS,
   ASSETS_PAGE_SIZE,
@@ -46,6 +50,7 @@ import {
 import {
   columnPrefKey,
   normalizeVisibleColumns,
+  defaultVisibleColumns,
   lockedColumnKeys,
   readStoredColumns,
   writeStoredColumns,
@@ -319,19 +324,22 @@ describe('createColumnChooser', () => {
 // ─── Assets table: the chooser in place ──────────────────────────────────────
 
 describe('assets table column chooser', () => {
-  it('renders every declared column and a Columns control by default', async () => {
+  it('renders the default column set and a Columns control by default', async () => {
     const { apiFetch } = fakeApi();
     const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
     document.body.appendChild(t.el);
     await tick();
 
-    expect(t.getVisibleColumns()).toEqual([...ASSETS_COLUMN_KEYS]);
-    expect(t.el.querySelectorAll('thead th').length).toBe(ASSETS_COLUMN_KEYS.length);
+    expect(t.getVisibleColumns()).toEqual([...ASSETS_DEFAULT_COLUMN_KEYS]);
+    expect(t.el.querySelectorAll('thead th').length).toBe(ASSETS_DEFAULT_COLUMN_KEYS.length);
     const btn = chooserButton(t.el);
     // The count is part of the button's accessible name so "am I hiding
-    // anything?" is answerable without opening the panel.
+    // anything?" is answerable without opening the panel — and with off-by-
+    // default columns declared (issue #961) the two numbers now differ.
     expect(btn.textContent).toContain('Columns');
-    expect(btn.textContent).toContain('8 of 8');
+    expect(btn.textContent).toContain(
+      ASSETS_DEFAULT_COLUMN_KEYS.length + ' of ' + ASSETS_COLUMN_KEYS.length
+    );
     // It is a view control, not a filter — it must not be mounted as a filter slot.
     const slot = t.el.querySelector('.ops-columns-slot') as HTMLElement;
     expect(slot.dataset.control).toBe('columns');
@@ -408,6 +416,433 @@ describe('assets table column chooser', () => {
       (t.el.querySelector('.ops-columns-item[data-column="created"]') as HTMLElement)
         .querySelector('.ops-columns-note')
     ).toBeNull();
+  });
+});
+
+// ─── Off-by-default columns (issue #961) ─────────────────────────────────────
+//
+// CONTRACT GROUNDING for the two new cells — verified against openapi.json in
+// this repo, not assumed:
+//   `renditions`  openapi.json .paths["/api/v1/assets/"].get.responses["200"]
+//                 .content["application/json"].schema.properties.items.items
+//                 .properties.renditions — an ARRAY of
+//                 { id, label, width, height, objectKey, codec?, bitrateBps? },
+//                 optional (absent from that schema's `required`, which is
+//                 ['id','name','status','statusHistory','createdAt','updatedAt']).
+//                 Also present on the tier-2 projection
+//                 (.paths["/api/v1/search/"].get...assets.items.properties).
+//                 There is NO `renditionCount` scalar in the spec.
+//   `reviewState` the same items schema — a string enum
+//                 ['draft','in-review','approved','rejected'], optional, camelCase
+//                 (there is no `review_state`). ABSENT from the tier-2 search
+//                 projection, whose asset properties are id, name, description,
+//                 status, parentId, objectKey, statusHistory, technicalMetadata,
+//                 technicalMetadataError, manifestUrls, packagingError,
+//                 renditions, metadata, createdAt, updatedAt, type.
+//   The "absent reads as draft" rule the tier-1 cell applies is the API's own:
+//   `const current = asset.reviewState ?? 'draft'` (src/routes/assets.ts:5938).
+//
+// `slug`, `id` and `tags` are the issue's other three names. They were already
+// declared and already toggleable (#959) AND already in the default view, so
+// they are asserted here as still-selectable and still-default rather than moved.
+
+function cellFor(el: HTMLElement, rowKey: string, columnKey: string): HTMLElement {
+  const tr = el.querySelector('tbody tr[data-row-key="' + rowKey + '"]') as HTMLElement | null;
+  if (!tr) throw new Error('no row ' + rowKey);
+  const keys = ASSETS_COLUMN_KEYS.filter((k) => visibleNow(el).includes(k));
+  const idx = keys.indexOf(columnKey);
+  if (idx < 0) throw new Error('column ' + columnKey + ' is not visible');
+  return tr.children[idx] as HTMLElement;
+}
+
+// Read the painted column order off the DOM rather than off the table handle, so
+// the cell lookup above cannot drift from what is actually on screen.
+function visibleNow(el: HTMLElement): string[] {
+  // A sorted header carries a direction glyph after its caption; strip it so the
+  // caption still maps to a key.
+  const labels = headerLabels(el).map((l) => l.replace(/\s*[▲▼]$/, ''));
+  const byLabel: Record<string, string> = {
+    '': 'thumb',
+    ID: 'id',
+    Slug: 'slug',
+    'Name / Title': 'title',
+    Status: 'status',
+    Review: 'reviewState',
+    Renditions: 'renditions',
+    Tags: 'tags',
+    Created: 'created',
+    Actions: 'actions',
+  };
+  return labels.map((l) => byLabel[l]);
+}
+
+describe('the default set is derived from one declaration', () => {
+  it('defaults = declared minus optional', () => {
+    expect(ASSETS_DEFAULT_COLUMN_KEYS).toEqual(
+      ASSETS_COLUMN_KEYS.filter((k) => !ASSETS_OPTIONAL_COLUMN_KEYS.includes(k))
+    );
+    // The pre-#961 view, stated literally so a future reordering has to say so.
+    expect([...ASSETS_DEFAULT_COLUMN_KEYS]).toEqual([
+      'thumb',
+      'id',
+      'slug',
+      'title',
+      'status',
+      'tags',
+      'created',
+      'actions',
+    ]);
+    expect([...ASSETS_OPTIONAL_COLUMN_KEYS]).toEqual(['reviewState', 'renditions']);
+  });
+
+  it('defaultVisibleColumns drops opted-out columns but keeps pinned ones', () => {
+    const columns = [
+      { key: 'id', label: 'ID' },
+      { key: 'extra', label: 'Extra', defaultVisible: false },
+      { key: 'pinned', label: 'Pinned', defaultVisible: false, hideable: false },
+    ];
+    expect(defaultVisibleColumns(columns)).toEqual(['id', 'pinned']);
+    // A table whose every column opted out is a declaration bug; paint it rather
+    // than render a headerless grid.
+    expect(
+      defaultVisibleColumns([{ key: 'a', label: 'A', defaultVisible: false }])
+    ).toEqual(['a']);
+  });
+
+  it('no request means the DEFAULT set, an explicit request can still ask for more', () => {
+    const columns = [
+      { key: 'id', label: 'ID' },
+      { key: 'extra', label: 'Extra', defaultVisible: false },
+    ];
+    expect(normalizeVisibleColumns(null, columns, {})).toEqual(['id']);
+    expect(normalizeVisibleColumns([], columns, {})).toEqual(['id']);
+    // defaultVisible describes the no-choice case ONLY — asking for the column is
+    // exactly how it gets painted.
+    expect(normalizeVisibleColumns(['id', 'extra'], columns, {})).toEqual(['id', 'extra']);
+    expect(normalizeVisibleColumns(['extra'], columns, {})).toEqual(['extra']);
+  });
+});
+
+describe('slug, id, rendition count, review state and tags are all selectable', () => {
+  it('offers every one of them in the chooser', async () => {
+    const { apiFetch } = fakeApi();
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    for (const key of ['slug', 'id', 'renditions', 'reviewState', 'tags']) {
+      expect(() => toggleFor(t.el, key)).not.toThrow();
+    }
+    // The chooser names the two new ones in words, not in wire keys.
+    const labels = Array.from(t.el.querySelectorAll('.ops-columns-item-label')).map(
+      (s) => s.textContent
+    );
+    expect(labels).toContain('Rendition count');
+    expect(labels).toContain('Review state');
+  });
+
+  it('leaves the default view untouched: the new pair is off, the old three are on', async () => {
+    const { apiFetch } = fakeApi();
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    expect(headerLabels(t.el)).toEqual([
+      '',
+      'ID',
+      'Slug',
+      'Name / Title',
+      'Status',
+      'Tags',
+      // The default sort is created DESC, so this header carries its direction
+      // glyph — unchanged by #961.
+      'Created \u25bc',
+      'Actions',
+    ]);
+    expect(toggleFor(t.el, 'reviewState').checked).toBe(false);
+    expect(toggleFor(t.el, 'renditions').checked).toBe(false);
+    expect(toggleFor(t.el, 'slug').checked).toBe(true);
+    expect(toggleFor(t.el, 'id').checked).toBe(true);
+    expect(toggleFor(t.el, 'tags').checked).toBe(true);
+    // …and nothing was written anywhere, because nothing was chosen.
+    expect(readStoredColumns(ASSETS_NS, window)).toBeNull();
+  });
+
+  it('turning one on adds its header in declared position and a cell per row', async () => {
+    const { apiFetch } = fakeApi();
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+    const widthBefore = t.el.querySelectorAll('tbody tr[data-row-key]')[0].children.length;
+
+    setColumn(t.el, 'renditions', true);
+
+    expect(t.getVisibleColumns()).toContain('renditions');
+    // Declared order, not click order: it lands between Review and Tags.
+    expect(headerLabels(t.el)).toEqual([
+      '',
+      'ID',
+      'Slug',
+      'Name / Title',
+      'Status',
+      'Renditions',
+      'Tags',
+      'Created \u25bc',
+      'Actions',
+    ]);
+    const rows = t.el.querySelectorAll('tbody tr[data-row-key]');
+    expect(rows[0].children.length).toBe(widthBefore + 1);
+
+    setColumn(t.el, 'renditions', false);
+    expect(headerLabels(t.el)).not.toContain('Renditions');
+  });
+
+  it('can be turned off again, and off is what persists', async () => {
+    const { apiFetch } = fakeApi();
+    const win = stubWin();
+    const t = createAssetsTable({ ...deps(), apiFetch, win });
+    document.body.appendChild(t.el);
+    await tick();
+
+    setColumn(t.el, 'reviewState', true);
+    expect(readStoredColumns(ASSETS_NS, window)).toContain('reviewState');
+    setColumn(t.el, 'reviewState', false);
+    expect(readStoredColumns(ASSETS_NS, window)).not.toContain('reviewState');
+    expect(t.getVisibleColumns()).toEqual([...ASSETS_DEFAULT_COLUMN_KEYS]);
+  });
+
+  it('restores an off-by-default column from the URL and from storage', async () => {
+    const { apiFetch } = fakeApi();
+    const fromUrl = createAssetsTable({
+      ...deps(),
+      apiFetch,
+      win: stubWin('?assets.cols=id,reviewState,renditions'),
+    });
+    document.body.appendChild(fromUrl.el);
+    await tick();
+    expect(fromUrl.getVisibleColumns()).toEqual(['id', 'reviewState', 'renditions']);
+    fromUrl.destroy();
+
+    localStorage.setItem(PREF_KEY, JSON.stringify(['id', 'renditions', 'created']));
+    const fromStore = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(fromStore.el);
+    await tick();
+    expect(fromStore.getVisibleColumns()).toEqual(['id', 'renditions', 'created']);
+  });
+
+  it('"Show all" reaches the optional columns too', async () => {
+    const { apiFetch } = fakeApi();
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    const showAll = t.el.querySelector('.ops-columns-showall') as HTMLButtonElement;
+    // Not "everything is already shown": two declared columns are off.
+    expect(showAll.disabled).toBe(false);
+    showAll.click();
+    expect(t.getVisibleColumns()).toEqual([...ASSETS_COLUMN_KEYS]);
+    expect(showAll.disabled).toBe(true);
+  });
+});
+
+describe('the new cells render the verified fields', () => {
+  const richRows = [
+    {
+      id: 'a0',
+      slug: 'slug-0',
+      name: 'Asset 0',
+      status: 'ready',
+      reviewState: 'approved',
+      renditions: [
+        { id: 'r1', label: '1080p', width: 1920, height: 1080, objectKey: 'k1' },
+        { id: 'r2', label: '720p', width: 1280, height: 720, objectKey: 'k2' },
+        { id: 'r3', label: '480p', width: 854, height: 480, objectKey: 'k3' },
+      ],
+      tags: [],
+      thumbnails: [],
+      createdAt: '2026-01-01T00:00:00Z',
+    },
+    {
+      // No `renditions`, no `reviewState` — both are optional on the verified
+      // item schema, and a document written before either field existed is the
+      // normal case this has to survive.
+      id: 'a1',
+      slug: 'slug-1',
+      name: 'Asset 1',
+      status: 'uploading',
+      tags: [],
+      thumbnails: [],
+      createdAt: '2026-01-02T00:00:00Z',
+    },
+  ];
+
+  it('counts the renditions ARRAY, and reads an absent array as zero', async () => {
+    const { apiFetch } = fakeApi(2, richRows);
+    const t = createAssetsTable({
+      ...deps(),
+      apiFetch,
+      win: stubWin('?assets.cols=id,renditions'),
+    });
+    document.body.appendChild(t.el);
+    await tick();
+
+    expect(cellFor(t.el, 'a0', 'renditions').textContent).toBe('3');
+    // The PROPERTY is in the tier-1 projection, so absent is a real answer (no
+    // renditions on the document), not a projection gap.
+    expect(cellFor(t.el, 'a1', 'renditions').textContent).toBe('0');
+    // Right-aligned so a column of numbers scans down.
+    expect(cellFor(t.el, 'a0', 'renditions').style.textAlign).toBe('right');
+  });
+
+  it('renders the review state as its own badge family, not the lifecycle badge', async () => {
+    const { apiFetch } = fakeApi(2, richRows);
+    const t = createAssetsTable({
+      ...deps(),
+      apiFetch,
+      win: stubWin('?assets.cols=id,reviewState'),
+    });
+    document.body.appendChild(t.el);
+    await tick();
+
+    const badge = cellFor(t.el, 'a0', 'reviewState').querySelector(
+      '.review-badge'
+    ) as HTMLElement;
+    expect(badge.textContent).toBe('Approved');
+    expect(badge.dataset.reviewState).toBe('approved');
+    expect(badge.classList.contains('review-badge--approved')).toBe(true);
+    // Deliberately NOT the `.badge` family the lifecycle status uses — the two
+    // axes must not be mistakable for one another (WCAG 1.4.1).
+    expect(badge.classList.contains('badge')).toBe(false);
+  });
+
+  it('applies the API\'s own "absent reads as draft" rule on the tier that projects the field', async () => {
+    const { apiFetch } = fakeApi(2, richRows);
+    const t = createAssetsTable({
+      ...deps(),
+      apiFetch,
+      win: stubWin('?assets.cols=id,reviewState'),
+    });
+    document.body.appendChild(t.el);
+    await tick();
+
+    // src/routes/assets.ts:5938 — `asset.reviewState ?? 'draft'`. The list and
+    // the detail panel must not disagree about the same asset.
+    const badge = cellFor(t.el, 'a1', 'reviewState').querySelector(
+      '.review-badge'
+    ) as HTMLElement;
+    expect(badge.textContent).toBe('Draft');
+    expect(badge.dataset.reviewState).toBe('draft');
+  });
+
+  it('renders an unrecognised state verbatim rather than guessing', async () => {
+    const { apiFetch } = fakeApi(1, [{ ...richRows[0], reviewState: 'embargoed' }]);
+    const t = createAssetsTable({
+      ...deps(),
+      apiFetch,
+      win: stubWin('?assets.cols=id,reviewState'),
+    });
+    document.body.appendChild(t.el);
+    await tick();
+
+    const badge = cellFor(t.el, 'a0', 'reviewState').querySelector(
+      '.review-badge'
+    ) as HTMLElement;
+    expect(badge.textContent).toBe('embargoed');
+    expect(badge.classList.contains('review-badge--unknown')).toBe(true);
+  });
+
+  it('shows UNKNOWN, not Draft, on the free-text tier whose projection omits the field', async () => {
+    const { apiFetch, calls } = fakeApi(2, richRows);
+    const t = createAssetsTable({
+      ...deps(),
+      apiFetch,
+      win: stubWin('?assets.q=promo&assets.cols=id,reviewState,renditions'),
+    });
+    document.body.appendChild(t.el);
+    await tick();
+
+    expect(calls.some((c) => c.startsWith('/search'))).toBe(true);
+    // `assetSchema` (src/routes/search.ts) has no `reviewState`, so claiming
+    // "Draft" here would be a promise the payload does not support.
+    expect(cellFor(t.el, 'a0', 'reviewState').querySelector('.review-badge')).toBeNull();
+    expect(cellFor(t.el, 'a0', 'reviewState').textContent).toBe('—');
+    // `renditions` IS in that projection, so the count stays exact on both tiers.
+    expect(cellFor(t.el, 'a0', 'renditions').textContent).toBe('3');
+  });
+});
+
+describe('the new columns do not disturb sort, filter or paging', () => {
+  it('adds no query param and no refetch when switched on', async () => {
+    const { apiFetch, calls } = fakeApi(60, rowsFixture(2));
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+    const before = calls.length;
+    const paramsBefore = calls[calls.length - 1];
+
+    setColumn(t.el, 'reviewState', true);
+    setColumn(t.el, 'renditions', true);
+    await tick();
+
+    expect(calls.length).toBe(before);
+    expect(calls[calls.length - 1]).toBe(paramsBefore);
+    expect(t.state.getState().offset).toBe(0);
+  });
+
+  it('leaves the existing sortable columns sorting exactly as before', async () => {
+    const { apiFetch } = fakeApi(2, [
+      { id: 'a1', slug: 's1', name: 'Zed', status: 'ready', tags: [], thumbnails: [], createdAt: '2026-01-01T00:00:00Z' },
+      { id: 'a2', slug: 's2', name: 'Alpha', status: 'ready', tags: [], thumbnails: [], createdAt: '2026-01-02T00:00:00Z' },
+    ]);
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    setColumn(t.el, 'reviewState', true);
+    setColumn(t.el, 'renditions', true);
+    t.state.toggleSort('title');
+    await tick();
+
+    expect(
+      Array.from(t.el.querySelectorAll('tbody tr[data-row-key]')).map((tr) =>
+        tr.getAttribute('data-row-key')
+      )
+    ).toEqual(['a2', 'a1']);
+  });
+
+  it('offers no sort control on either new column', async () => {
+    const { apiFetch } = fakeApi();
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+    setColumn(t.el, 'reviewState', true);
+    setColumn(t.el, 'renditions', true);
+
+    // Neither endpoint takes a `sort` param and applyClientSort knows no axis for
+    // these, so a header button here would be a control that does nothing.
+    const ths = Array.from(t.el.querySelectorAll('thead th'));
+    const labels = ths.map((th) => (th.textContent || '').trim());
+    for (const label of ['Review', 'Renditions']) {
+      const th = ths[labels.indexOf(label)];
+      expect(th.querySelector('button')).toBeNull();
+    }
+  });
+
+  it('can be the only identifying-adjacent extras without breaking the legality rule', async () => {
+    const { apiFetch } = fakeApi();
+    const t = createAssetsTable({
+      ...deps(),
+      apiFetch,
+      win: stubWin('?assets.cols=reviewState,renditions'),
+    });
+    document.body.appendChild(t.el);
+    await tick();
+
+    // Neither new column is identifying or actionable, so the group repair must
+    // still restore one — the table can never become a grid of anonymous rows.
+    const visible = t.getVisibleColumns();
+    expect(ASSETS_REQUIRED_COLUMN_GROUPS[0].some((k) => visible.includes(k))).toBe(true);
+    expect(visible).toEqual(['id', 'reviewState', 'renditions']);
   });
 });
 
@@ -640,14 +1075,15 @@ describe('persistence across a reload', () => {
     const first = win._applied[win._applied.length - 1];
     expect(new URL('http://x' + first).searchParams.get(ASSETS_NS + '.cols')).toBeNull();
 
-    // "Show all" IS a choice, even though it happens to select everything —
-    // absent means "fall back to storage", which is a different instruction.
+    // Toggling a column off and straight back on IS a choice, even though it
+    // lands on exactly the default set — absent means "fall back to storage",
+    // which is a different instruction.
     (t.el.querySelector('.ops-columns-showall') as HTMLButtonElement).disabled = false;
     setColumn(t.el, 'tags', false);
     setColumn(t.el, 'tags', true);
     const last = win._applied[win._applied.length - 1];
     expect(new URL('http://x' + last).searchParams.get(ASSETS_NS + '.cols')).toBe(
-      ASSETS_COLUMN_KEYS.join(',')
+      ASSETS_DEFAULT_COLUMN_KEYS.join(',')
     );
   });
 

@@ -67,6 +67,7 @@ import {
   toTombstoneDocument
 } from './asset-tombstone.js';
 import { updateWithRetry, type StoredDoc, type StackCouch } from './couchdb.js';
+import { currentDocumentStackName } from '../services/request-stack-context.js';
 
 const RESOURCE_TYPE = 'asset';
 
@@ -112,6 +113,11 @@ export class CouchAssetRepository implements AssetRepository {
       sourceMethod: method,
       originUri: input.originUri,
       provenance: initialProvenance(now, method),
+      // Durable stack identity (issue #1097): the stack this asset is being
+      // created against, so post-upload work (metadata extraction, thumbnails)
+      // can re-enter it even with no ambient context. Undefined outside a
+      // request, which preserves the previous default-stack behaviour.
+      stackName: input.stackName ?? currentDocumentStackName(),
       createdAt: now,
       updatedAt: now
     };

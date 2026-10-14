@@ -589,6 +589,7 @@ Response 201 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/by-external-id/{namespace}/{id}
 
@@ -642,6 +643,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/by-tams-address
 
@@ -821,6 +823,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   PATCH /api/v1/assets/{id}
 
@@ -884,6 +887,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   DELETE /api/v1/assets/{id}
 
@@ -999,6 +1003,7 @@ Response 201 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/comments
 
@@ -1110,24 +1115,12 @@ Request body (application/json)
 {
   "pipeline": "transcode",
   "profile": "string",
-  "customProfile": {
-    "name": "string",
-    "outputs": [
-      {
-        "label": "string",
-        "width": 0,
-        "height": 0,
-        "videoBitrateBps": 0,
-        "audioBitrateBps": 0,
-        "format": "string"
-      }
-    ]
-  },
   "profileParams": {},
   "destinationBucket": "string",
   "destination": "string",
   "externalBackend": "string"
 }
+Field notes- customProfile — REMOVED (issue #1022). Supplying this field is rejected with a 400. An encoding ladder cannot be submitted inline: the transcoding service resolves a profile by NAME against its own profile index, so an inline outputs array could never reach the encoder — it used to be validated and then discarded. Register the ladder as a profile (POST /api/v1/profiles) and pass its name as profile.
 
   Response
 Response 202 (application/json)
@@ -1143,6 +1136,19 @@ Response 202 (application/json)
       "jobId": "string",
       "encoreJobId": "string",
       "error": "string",
+      "errorDetail": {
+        "code": "source_read_failed",
+        "message": "string",
+        "storageError": "string",
+        "httpStatus": 0,
+        "source": {
+          "url": null,
+          "bucket": null,
+          "key": null
+        },
+        "encoreJobId": "string",
+        "assetId": "string"
+      },
       "skipReason": "string",
       "startedAt": "string",
       "completedAt": "string",
@@ -1176,6 +1182,15 @@ Response 200 (application/json)
         "jobId": "string",
         "encoreJobId": "string",
         "error": "string",
+        "errorDetail": {
+          "code": null,
+          "message": null,
+          "storageError": null,
+          "httpStatus": null,
+          "source": null,
+          "encoreJobId": null,
+          "assetId": null
+        },
         "skipReason": "string",
         "startedAt": "string",
         "completedAt": "string",
@@ -1210,6 +1225,19 @@ Response 200 (application/json)
       "jobId": "string",
       "encoreJobId": "string",
       "error": "string",
+      "errorDetail": {
+        "code": "source_read_failed",
+        "message": "string",
+        "storageError": "string",
+        "httpStatus": 0,
+        "source": {
+          "url": null,
+          "bucket": null,
+          "key": null
+        },
+        "encoreJobId": "string",
+        "assetId": "string"
+      },
       "skipReason": "string",
       "startedAt": "string",
       "completedAt": "string",
@@ -1278,6 +1306,7 @@ Response 201 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/external-ids
 
@@ -1358,6 +1387,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   DELETE /api/v1/assets/{id}/external-ids/{namespace}/{externalId}
 
@@ -1480,6 +1510,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   DELETE /api/v1/assets/{id}/lock
 
@@ -1528,6 +1559,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   PUT /api/v1/assets/{id}/metadata
 
@@ -1582,6 +1614,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   POST /api/v1/assets/{id}/multipart/initiate
 
@@ -1698,6 +1731,15 @@ Response 200 (application/json)
         "jobId": "string",
         "encoreJobId": "string",
         "error": "string",
+        "errorDetail": {
+          "code": null,
+          "message": null,
+          "storageError": null,
+          "httpStatus": null,
+          "source": null,
+          "encoreJobId": null,
+          "assetId": null
+        },
         "skipReason": "string",
         "startedAt": "string",
         "completedAt": "string",
@@ -1759,6 +1801,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/review-state
 
@@ -1833,6 +1876,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/stream/{*}
 
@@ -1945,6 +1989,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   DELETE /api/v1/assets/{id}/tags/{tag}
 
@@ -1996,6 +2041,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/thumbnails
 
@@ -2119,25 +2165,14 @@ id | path | string | required
 Request body (application/json)
 {
   "profile": "string",
-  "customProfile": {
-    "name": "string",
-    "outputs": [
-      {
-        "label": "string",
-        "width": 0,
-        "height": 0,
-        "videoBitrateBps": 0,
-        "audioBitrateBps": 0,
-        "format": "string"
-      }
-    ]
-  },
   "profileParams": {},
   "burnIn": {
     "source": null,
     "forceStyle": "string"
   }
 }
+Field notes- profile — Name of a profile registered on this deployment (list them with GET /api/v1/profiles). The encoding ladder lives in the profile; the transcoding service resolves this name against the profile index it loads. A name this deployment does not hold is rejected with a 400 unknown_profile at submit time rather than failing later as a dropped job (issue #1022). Omitted: the deployment default profile is used, and the job record reports whichever profile was actually submitted.
+- customProfile — REMOVED (issue #1022). Supplying this field is rejected with a 400. An encoding ladder cannot be submitted inline: the transcoding service resolves a profile by NAME against its own profile index, so an inline outputs array could never reach the encoder — it used to be validated and then discarded. Register the ladder as a profile (POST /api/v1/profiles) and pass its name as profile.
 
   Response
 Response 202 (application/json)
@@ -2153,7 +2188,7 @@ Response 202 (application/json)
     ]
   }
 }
-Field notes- warning — Present only when profileParams validation could not be performed because the profile YAML was unresolvable (a custom profile not in the store, or the profile store was unreachable). The request was still accepted and the keys were forwarded to Encore unchecked.
+Field notes- warning — Present only when profileParams validation could not be performed because the profile YAML was unresolvable (the profile store was unreachable, or no profile was named and the default profile is not in the store). A caller-named profile that a reachable store does not hold is rejected with a 400 instead. The request was still accepted and the keys were forwarded to Encore unchecked.
 
   PUT /api/v1/assets/{id}/upload
 
@@ -2385,6 +2420,7 @@ Response 200 (application/json)
           "jobId": null,
           "encoreJobId": null,
           "error": null,
+          "errorDetail": null,
           "skipReason": null,
           "startedAt": null,
           "completedAt": null,
@@ -2420,6 +2456,19 @@ Response 200 (application/json)
       "jobId": "string",
       "encoreJobId": "string",
       "error": "string",
+      "errorDetail": {
+        "code": "source_read_failed",
+        "message": "string",
+        "storageError": "string",
+        "httpStatus": 0,
+        "source": {
+          "url": null,
+          "bucket": null,
+          "key": null
+        },
+        "encoreJobId": "string",
+        "assetId": "string"
+      },
       "skipReason": "string",
       "startedAt": "string",
       "completedAt": "string",
@@ -2452,6 +2501,19 @@ Response 200 (application/json)
       "jobId": "string",
       "encoreJobId": "string",
       "error": "string",
+      "errorDetail": {
+        "code": "source_read_failed",
+        "message": "string",
+        "storageError": "string",
+        "httpStatus": 0,
+        "source": {
+          "url": null,
+          "bucket": null,
+          "key": null
+        },
+        "encoreJobId": "string",
+        "assetId": "string"
+      },
       "skipReason": "string",
       "startedAt": "string",
       "completedAt": "string",
@@ -2532,19 +2594,32 @@ Auto-scaler
 
   GET /api/v1/scaler/config
 
-  Get auto-scaler configuration.
+  Get the auto-scaler configuration in force in the serving process: the most recent runtime `PATCH` if one has been accepted since startup, otherwise the boot-time values from `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS`. It reads the live copy, never the parameter store, and does not say which of the two sources a value came from.
+
+  Report the auto-scaler settings this process is using. These are the live values: the most recent PATCH /api/v1/scaler/config if one has been accepted since startup, otherwise the boot values from ENCORE_MAX_INSTANCES and ENCORE_IDLE_TIMEOUT_MS. A PATCHed value is persisted in the parameter store, but that record is not read back at boot yet, so after a restart this reports the environment values again. This endpoint reads the live copy only — it never reads the store, so it cannot be used to check what is persisted, and it does not distinguish the two sources. minInstances is reported from this endpoint's own record and is not the floor the scaler loops enforce (see the field description).
 
   Response
+The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, but nothing re-reads that record at boot yet, so after a restart this reports the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values again until the PATCH is re-sent.
 Response 200 (application/json)
 {
   "maxInstances": 0,
   "minInstances": 0,
   "idleTimeoutMs": 0
 }
+Field notes- maxInstances — Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset).
+- minInstances — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded — persisted and reported back here — and is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart.
+- idleTimeoutMs — Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset).
 
   PATCH /api/v1/scaler/config
 
-  Update auto-scaler configuration at runtime (`maxInstances`, `minInstances`, `idleTimeoutMs`).
+  Update auto-scaler configuration at runtime. `maxInstances` and `idleTimeoutMs` take effect on the next scaler tick with no restart; `minInstances` is persisted and echoed back but not applied to the running scaler (change the warm floor via `ENCORE_MIN_INSTANCES` and a restart). The values are written to the parameter store before they are applied, so a `200` means saved and applied — `501` when no parameter store is configured and `503` when the write fails, with nothing applied in either case. The stored record is not reloaded at boot yet, so a restart reverts to `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS` until the `PATCH` is re-sent. There is no reset endpoint: send the environment values back explicitly.
+
+  Change the auto-scaler settings of the process serving this request. maxInstances and idleTimeoutMs take effect on the next scaler tick, with no restart.
+**Storage.** The values are written to the parameter store first and applied second, as one complete snapshot of all three fields, so a 200 always means "saved AND applied". A deployment with no parameter store configured gets a 501 and nothing is applied; a store that rejects the write or cannot be reached gets a 503 and nothing is applied, so GET /api/v1/scaler/config still reports the previous values. The live copy is per process and is not pushed to other replicas.
+**Precedence.** The most recent PATCH accepted by this process wins. Until one arrives, the values read at boot from ENCORE_MAX_INSTANCES (default 3) and ENCORE_IDLE_TIMEOUT_MS (default 300000) apply. So the order is: runtime PATCH, else environment.
+**Restart.** The stored record survives a restart, but it is not read back at boot yet, so a restarted process serves the environment values again until the PATCH is re-sent. Treat a PATCH as durable but not self-restoring.
+**Reset to the environment default.** There is no reset endpoint and no sentinel value. PATCH the environment values back explicitly, which overwrites the stored snapshot; restarting reverts the live values but leaves the stored record in place. GET /api/v1/scaler/config shows what is in force, but not whether it came from a PATCH or from the environment.
+**Caveats.** minInstances is recorded, persisted and echoed back but is not applied to the running scaler loops (see the field description). A PATCH sent while GET /api/v1/scaler/status reports scalerActive: false is accepted and reported back, but is not carried into the scaler that later activates against a newly provisioned stack — that activation uses the environment values, so re-send the PATCH afterwards.
 
   Request
 Request body (application/json)
@@ -2553,18 +2628,25 @@ Request body (application/json)
   "minInstances": 0,
   "idleTimeoutMs": 0
 }
+Field notes- maxInstances — Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset).
+- minInstances — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded — persisted and reported back here — and is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart.
+- idleTimeoutMs — Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset).
 
   Response
+The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, but nothing re-reads that record at boot yet, so after a restart this reports the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values again until the PATCH is re-sent.
 Response 200 (application/json)
 {
   "maxInstances": 0,
   "minInstances": 0,
   "idleTimeoutMs": 0
 }
+Field notes- maxInstances — Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset).
+- minInstances — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded — persisted and reported back here — and is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart.
+- idleTimeoutMs — Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset).
 
   GET /api/v1/scaler/status
 
-  Current transcoder instance pool status (effective `maxInstances`, `jobsPerInstance`, `idleTimeoutMs`).
+  Current transcoder instance pool status. `maxInstances` and `idleTimeoutMs` are the values in force in the serving process — a runtime `PATCH` if one has been sent since startup, otherwise the boot-time environment values.
 
   Response
 Response 200 (application/json)
@@ -2610,6 +2692,8 @@ Response 200 (application/json)
   "idleTimeoutMs": 0,
   "scalerActive": true
 }
+Field notes- maxInstances — Instance cap per workspace pool in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been accepted since startup, otherwise ENCORE_MAX_INSTANCES from boot. A PATCHed value is persisted but is not reloaded at boot, so this reverts to the environment value on restart. Reported even when scalerActive is false.
+- idleTimeoutMs — Idle teardown timeout (ms) in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been accepted since startup, otherwise ENCORE_IDLE_TIMEOUT_MS from boot. A PATCHed value is persisted but is not reloaded at boot, so this reverts to the environment value on restart.
 
 ---
 
@@ -2629,7 +2713,8 @@ Retention
 Response 200 (application/json)
 {
   "retentionMs": 0,
-  "auditRetentionMs": 0
+  "auditRetentionMs": 0,
+  "logRetentionMs": 0
 }
 
   PATCH /api/v1/retention/config
@@ -2640,14 +2725,16 @@ Response 200 (application/json)
 Request body (application/json)
 {
   "retentionMs": 0,
-  "auditRetentionMs": 0
+  "auditRetentionMs": 0,
+  "logRetentionMs": 0
 }
 
   Response
 Response 200 (application/json)
 {
   "retentionMs": 0,
-  "auditRetentionMs": 0
+  "auditRetentionMs": 0,
+  "logRetentionMs": 0
 }
 
 ---
@@ -2703,7 +2790,7 @@ Search
 
   Full-text and metadata search across assets (canonical). Combines exact filters (`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with free-text `q`, all ANDed, paginated.
 
-  The single canonical search endpoint. Combines an exact-filter tier (tags, mimeType, metadata.<key>, tamsFlowId, tamsTimerange) with a free-text tier (q, matched case-insensitively over name and description). All filters are ANDed; omit them all to list every asset and collection in the workspace. Both assets AND collections are searched (issue #561): a collection matches on its name/description/tags and its open custom bag (via metadata.<key>). Asset-only filters (mimeType, tamsFlowId, tamsTimerange) never match a collection. Asset hits and collection hits are returned in separate arrays and each carries a type discriminator ('asset' | 'collection') so they are unambiguously distinguishable. mimeType filters on the extracted container format and accepts either a container token (mp4) or a common media MIME type (video/mp4), which is resolved onto the container family it names (issue #822). Results are paginated via page/pageSize and returned as { assets, collections, total, collectionTotal, page }. The exact-filter tier also carries status (exact lifecycle match, asset-only) and an inclusive created-at range from/to (issue #833); both are applied to the whole matched set before pagination, so they narrow total and every page rather than the page in hand. Results are ALWAYS CURRENT and there is no reindex step (issue #929): this endpoint reads the stored assets and collections per request rather than consulting a separately maintained index, so an edit made through PATCH /api/v1/assets/{id} or PATCH /api/v1/collections/{id} — a rename included — is reflected by the next search with nothing called in between.
+  The single canonical search endpoint. Combines an exact-filter tier (tags, mimeType, metadata.<key>, tamsFlowId, tamsTimerange) with a free-text tier (q, matched case-insensitively over name and description). All filters are ANDed; omit them all to list every asset and collection in the workspace. Both assets AND collections are searched (issue #561): a collection matches on its name/description/tags and its open custom bag (via metadata.<key>). Asset-only filters (mimeType, tamsFlowId, tamsTimerange) never match a collection. Asset hits and collection hits are returned in separate arrays and each carries a type discriminator ('asset' | 'collection') so they are unambiguously distinguishable. mimeType filters on the extracted container format and accepts either a container token (mp4) or a common media MIME type (video/mp4), which is resolved onto the container family it names (issue #822). Results are paginated via page/pageSize and returned as { assets, collections, total, collectionTotal, page }. The exact-filter tier also carries status (exact lifecycle match, asset-only) and an inclusive created-at range from/to (issue #833); both are applied to the whole matched set before pagination, so they narrow total and every page rather than the page in hand. Results are ALWAYS CURRENT and there is no reindex step (issue #929): this endpoint reads the stored assets and collections per request rather than consulting a separately maintained index, so an edit made through PATCH /api/v1/assets/{id} or PATCH /api/v1/collections/{id} — a rename included — is reflected by the next search with nothing called in between. An asset hit that is archived additionally carries the derived read-only retention window (issue #1034) — archivedAt/purgeAfter/retentionMs, identical in shape and meaning to the member on GET /api/v1/assets/{id} — so ?status=archived answers "when may this be purged?" without a second call. The member is absent on every non-archived hit.
 
   Parameters
 Name | In | Type | Required | Description
@@ -4015,9 +4102,13 @@ The auto-scaler keeps a per-workspace pool of transcoder instances and scales it
 Request
 curl -X PATCH https://<your-instance>/api/v1/scaler/config \
   -H "Content-Type: application/json" \
-  -d '{"minInstances": 1, "maxInstances": 3, "idleTimeoutMs": 300000}'
+  -d '{"maxInstances": 3, "idleTimeoutMs": 300000}'
 
-Set minInstances to 1 or more for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. See GET /api/v1/scaler/status for the pool's live state and the Auto-scaler reference for every field.
+This changes maxInstances and idleTimeoutMs from the next scaler tick, with no restart.
+
+Runtime config is saved, but not reloaded at boot. The values are written to the parameter store first and applied to the serving process second, so a 200 means both: you get a 501 if no parameter store is configured and a 503 if the write fails, and in both cases nothing is applied. Precedence at runtime is two layers: the most recent accepted PATCH wins, otherwise the boot-time environment value. Nothing reads the stored record at boot yet, so a restart or redeploy goes back to ENCORE_MAX_INSTANCES and ENCORE_IDLE_TIMEOUT_MS until the PATCH is re-sent, and the applied value only ever reaches the replica that answered the request. There is no reset endpoint — send the environment values back explicitly, which overwrites the stored snapshot. For a change that must take effect everywhere after a restart, set the environment variable and redeploy.
+
+The warm floor is the exception: set ENCORE_MIN_INSTANCES to 1 or more (and restart) for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. A minInstances sent to the config endpoint is validated, persisted and echoed back, but the running scaler keeps enforcing the floor it read at boot. See GET /api/v1/scaler/status for the pool's live state and the Auto-scaler reference for every field.
 
 Optional services
 
@@ -4368,12 +4459,12 @@ On Open Source Cloud only the settings exposed by the service's deploy form are 
     OSC_ACCESS_TOKEN | Yes | Injected | Personal Access Token. Injected automatically at deploy time on OSC.
     PARAMETER_STORE_API_KEY | Yes | Yes | Config API key of the connected parameter store.
     PARAMETER_STORE_INSTANCE_NAME | Yes | Yes | Name of the parameter store (default ovcconfig). On OSC this is the ParameterStore deploy-form field.
-    MINIO_ROOT_PASSWORD | Yes | Yes | Admin password used when provisioning object storage instances.
+    MINIO_ROOT_PASSWORD | Yes | Yes | Deployment-level object-store credential material. Each provisioned stack gets its own object-store access key id and secret derived from this value, so a credential issued for one stack cannot read or write another stack's buckets. Use a high-entropy value (at least 32 characters, which is what reliably reaches the ~112-bit floor the API enforces — generated, not chosen, e.g. openssl rand -base64 32): the per-stack isolation holds only while this value is expensive to guess, and below that strength newly provisioned stacks keep the deployment-wide credential instead (logged as an error at startup and per affected stack; set ALLOW_SHARED_OBJECT_STORE_CREDENTIAL=true to acknowledge that deliberately and downgrade the startup line to a warning). A stack provisioned by an older build also keeps its original deployment-wide credential until it is migrated. Treat it as a root secret; rotating it invalidates the derived credentials of already-provisioned stacks.
     COUCHDB_ADMIN_PASSWORD | Yes | Yes | Admin password used when provisioning the metadata store.
     PORT | No | No | HTTP port (default 3000). Fixed by the platform on OSC; self-hosted only.
-    ENCORE_MAX_INSTANCES | No | Yes | Max transcoder instances the auto-scaler may run per workspace (default 3).
-    ENCORE_MIN_INSTANCES | No | Yes | Warm floor of transcoder instances kept running even when idle (default 0 — scale to zero). See Operating a workspace.
-    ENCORE_IDLE_TIMEOUT_MS | No | Yes | Idle time before a transcoder instance is torn down (default 300000).
+    ENCORE_MAX_INSTANCES | No | Yes | Max transcoder instances the auto-scaler may run per workspace (default 3). Can be changed at runtime with PATCH /api/v1/scaler/config; that change is persisted but is not reloaded at boot, so a restart reverts to this value until the PATCH is re-sent. See Operating a workspace.
+    ENCORE_MIN_INSTANCES | No | Yes | Warm floor of transcoder instances kept running even when idle (default 0 — scale to zero). The only way to change the floor the scaler enforces: a minInstances sent to the runtime config endpoint is persisted and echoed back but not applied. See Operating a workspace.
+    ENCORE_IDLE_TIMEOUT_MS | No | Yes | Idle time before a transcoder instance is torn down (default 300000). Can be changed at runtime with PATCH /api/v1/scaler/config, with the same persisted-but-not-reloaded-at-boot caveat.
     PUBLIC_BASE_URL | No | No | Publicly-reachable base URL of this instance, used to build the profile index URL handed to each transcoder. Self-hosted only — not configurable on Open Source Cloud (the OSC deploy form exposes no field for it, and OSC injects no self-URL). Left unset on OSC, transcoders fall back to the remote default profiles index.
 
 ---
