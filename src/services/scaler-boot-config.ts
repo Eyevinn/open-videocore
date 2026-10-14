@@ -28,6 +28,24 @@
 //     and throws on a non-2xx other than 404.
 //   - src/routes/scaler.ts `ScalerRouterOptions` ({ maxInstances, minInstances?,
 //     idleTimeoutMs, configSource?, configStore? }) — where the resolved values go.
+//   - src/services/param-store.ts `SCALER_CONFIG_BOUNDS` — the authoritative
+//     per-field range, which routes/scaler.ts `scalerConfigSchema` applies to the
+//     PATCH body AND (through `scalerConfigResponseSchema`) to the 200 response
+//     of GET/PATCH /api/v1/scaler/config. The clamp below applies the same
+//     constant, see IN BOUNDS.
+//
+// IN BOUNDS. `parseScalerRuntimeConfig` enforces only a sanity floor (usable
+// integers), by design: the full range check lives with the write path so
+// tightening a bound later cannot silently discard an operator's stored value.
+// That was harmless while nothing read the record, but this resolver makes the
+// read authoritative, so the loaded values are CLAMPED into SCALER_CONFIG_BOUNDS
+// here and a clamp is warn-logged with the stored and applied numbers. Without
+// it a record written under looser bounds (e.g. idleTimeoutMs 5000, maxInstances
+// 50) would run the loops below the documented minimum idle timeout or above the
+// documented instance ceiling AND fail the 200 response schema of
+// GET /api/v1/scaler/config, turning every call into a 500. Clamping rather than
+// rejecting keeps the operator's intent ("as high as allowed", "as short as
+// allowed") instead of silently reverting to an unrelated env value.
 //
 // ALL-OR-NOTHING. The resolved config is either entirely persisted or entirely
 // env-sourced. Field-by-field merging is deliberately NOT done: the stored blob
@@ -35,6 +53,7 @@
 // would produce a combination no operator ever asked for (e.g. a persisted
 // maxInstances of 1 against an env idle timeout chosen for a cap of 10).
 
+import { SCALER_CONFIG_BOUNDS } from './param-store.js';
 import type { ScalerConfigStore, ScalerRuntimeConfig } from './param-store.js';
 
 // The env-sourced (or built-in default) values boot falls back to. main.ts
@@ -44,20 +63,29 @@ export type ScalerEnvConfig = ScalerRuntimeConfig;
 
 // Why boot ended up on the environment values. Logged, and worth keeping
 // distinct: 'no-store' and 'no-record' are NORMAL (an unconfigured deployment,
-// or one never configured through the API), while 'unusable-record',
-// 'load-failed' and 'load-timeout' mean a persisted value may exist and is NOT
-// being honoured — an operator-visible degradation that has to be warn-logged
-// with its reason rather than passed over in silence.
+// or one never configured through the API), while 'load-failed' and
+// 'load-timeout' mean a persisted value may exist and is NOT being honoured —
+// an operator-visible degradation that has to be warn-logged with its reason
+// rather than passed over in silence.
+//
+// There is deliberately NO 'unusable-record' member. The store seam does not
+// expose that case: `ScalerConfigStore.load()` collapses "key absent" and
+// "stored blob unusable" into `undefined` (param-store.ts `makeScalerConfigStore`
+// -> `parseScalerRuntimeConfig`), so boot genuinely cannot tell them apart and a
+// member for it would be unreachable dead code claiming a precision this
+// resolver does not have. Both arrive as 'no-record'. An unusable blob is also
+// the narrower of the two risks after the clamp below: a record that parses but
+// sits outside the route's bounds is now repaired and warn-logged rather than
+// adopted or dropped.
 export type ScalerBootFallbackReason =
   // No parameter store is configured for this deployment (PARAMETER_STORE_API_KEY
   // unset, or the config-service instance URL unresolvable). PATCH also responds
   // 501 in this state, so there can be no persisted record to miss.
   | 'no-store'
-  // Store reachable, key absent: a deployment never configured through the API.
+  // Store reachable, nothing usable under the key: either a deployment never
+  // configured through the API, or a stored blob parseScalerRuntimeConfig
+  // rejected — indistinguishable through `load()`, see the note above.
   | 'no-record'
-  // Store reachable, record present but not a usable config
-  // (parseScalerRuntimeConfig returned undefined).
-  | 'unusable-record'
   // The read threw (HTTP error, auth failure, DNS, connection refused).
   | 'load-failed'
   // The read did not answer within the boot budget below.
@@ -96,6 +124,43 @@ export type ResolveScalerBootConfigOptions = {
   log?: ScalerBootConfigLogger | undefined;
   timeoutMs?: number;
 };
+
+// One field clamped into [min, max?] from SCALER_CONFIG_BOUNDS. Returns the
+// applied value plus the stored one when they differ, so the caller can report
+// exactly what it repaired.
+function clampField(
+  value: number,
+  bounds: { min: number; max?: number }
+): { value: number; clampedFrom?: number } {
+  let applied = value;
+  if (applied < bounds.min) applied = bounds.min;
+  if (bounds.max !== undefined && applied > bounds.max) applied = bounds.max;
+  return applied === value ? { value } : { value: applied, clampedFrom: value };
+}
+
+// Apply the route's bounds to a loaded record (see IN BOUNDS in the file header).
+// Reports which fields moved so the caller warn-logs a repair instead of
+// adopting a config the API itself would reject.
+export function clampPersistedScalerConfig(loaded: ScalerRuntimeConfig): {
+  config: ScalerRuntimeConfig;
+  clamped: Partial<Record<keyof ScalerRuntimeConfig, number>>;
+} {
+  const maxInstances = clampField(loaded.maxInstances, SCALER_CONFIG_BOUNDS.maxInstances);
+  const minInstances = clampField(loaded.minInstances, SCALER_CONFIG_BOUNDS.minInstances);
+  const idleTimeoutMs = clampField(loaded.idleTimeoutMs, SCALER_CONFIG_BOUNDS.idleTimeoutMs);
+  const clamped: Partial<Record<keyof ScalerRuntimeConfig, number>> = {};
+  if (maxInstances.clampedFrom !== undefined) clamped.maxInstances = maxInstances.clampedFrom;
+  if (minInstances.clampedFrom !== undefined) clamped.minInstances = minInstances.clampedFrom;
+  if (idleTimeoutMs.clampedFrom !== undefined) clamped.idleTimeoutMs = idleTimeoutMs.clampedFrom;
+  return {
+    config: {
+      maxInstances: maxInstances.value,
+      minInstances: minInstances.value,
+      idleTimeoutMs: idleTimeoutMs.value
+    },
+    clamped
+  };
+}
 
 function withTimeout<T>(
   promise: Promise<T>,
@@ -162,20 +227,41 @@ export async function resolveScalerBootConfig(
   }
 
   // `undefined` covers BOTH "key absent" and "stored blob unusable" — the
-  // ScalerConfigStore.load contract collapses the two (param-store.ts:849-851),
-  // so boot cannot tell them apart and reports the conservative reason.
+  // ScalerConfigStore.load contract collapses the two (param-store.ts
+  // `makeScalerConfigStore.load` -> `parseScalerRuntimeConfig`), so boot cannot
+  // tell them apart and reports the conservative reason (see the note on
+  // ScalerBootFallbackReason).
   if (!loaded) return fallback('no-record');
+
+  // A parseable record can still be out of the route's range (the parser only
+  // enforces a sanity floor). Repair it rather than adopt it: an unclamped value
+  // would be rejected by the very endpoint that has to report it.
+  const { config, clamped } = clampPersistedScalerConfig(loaded);
+  if (Object.keys(clamped).length > 0) {
+    log?.warn(
+      {
+        reason: 'out-of-bounds-record',
+        clampedFrom: clamped,
+        maxInstances: config.maxInstances,
+        minInstances: config.minInstances,
+        idleTimeoutMs: config.idleTimeoutMs,
+        bounds: SCALER_CONFIG_BOUNDS
+      },
+      'scaler config: the persisted record is outside the permitted range; ' +
+        'clamped to the nearest allowed values at boot'
+    );
+  }
 
   log?.info(
     {
-      maxInstances: loaded.maxInstances,
-      minInstances: loaded.minInstances,
-      idleTimeoutMs: loaded.idleTimeoutMs,
+      maxInstances: config.maxInstances,
+      minInstances: config.minInstances,
+      idleTimeoutMs: config.idleTimeoutMs,
       envMaxInstances: env.maxInstances,
       envMinInstances: env.minInstances,
       envIdleTimeoutMs: env.idleTimeoutMs
     },
     'scaler config: loaded persisted values at boot, overriding environment values'
   );
-  return { ...loaded, source: 'persisted' };
+  return { ...config, source: 'persisted' };
 }

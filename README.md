@@ -395,8 +395,11 @@ restart. It is worth being precise about what that does and does not mean:
   report the live copy only.
 - **Resetting to the environment default.** There is no reset endpoint and no
   sentinel value. `PATCH` the environment values back explicitly, which
-  overwrites the stored snapshot. Restarting the process reverts the live values
-  to the environment but leaves the stored record in place.
+  overwrites the stored snapshot. Since #1078 that is the only way back:
+  restarting the process no longer undoes a `PATCH`, because boot reads the
+  stored snapshot and serves it again (`source: "runtime"`). A field reports
+  `source: "env"` again only on a process that booted with no usable stored
+  record.
 - **Restarts and replicas.** The stored snapshot survives a restart **and is read
   back at boot** (#1078): a restarted or redeployed process serves the persisted
   values, for the config endpoint and for the scaler loops it creates, with no

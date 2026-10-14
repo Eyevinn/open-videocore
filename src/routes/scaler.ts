@@ -59,6 +59,7 @@ import { JOBS_PER_INSTANCE, keys } from '../encore-scaler/types.js';
 import { listInstances } from '../encore-scaler/instance-pool.js';
 import { readSpawnFailure } from '../encore-scaler/spawn-failure.js';
 import type { ScalerStackConnection } from '../encore-scaler/workspace-registry.js';
+import { SCALER_CONFIG_BOUNDS } from '../services/param-store.js';
 import type { ScalerConfigStore } from '../services/param-store.js';
 
 type ScalerRouterOptions = {
@@ -113,7 +114,11 @@ type ScalerRouterOptions = {
 // Lower bound on the runtime idle timeout. A near-zero timeout would let the
 // scaler destroy an instance almost as soon as it goes idle, thrashing the
 // spawn/destroy cycle (spawns take 60-120s). 10s is a defensible floor.
-const MIN_IDLE_TIMEOUT_MS = 10_000;
+//
+// Sourced from services/param-store.ts `SCALER_CONFIG_BOUNDS` (the same constant
+// the boot-time clamp in services/scaler-boot-config.ts applies), so the value
+// the API rejects and the value boot refuses to adopt cannot drift apart.
+const MIN_IDLE_TIMEOUT_MS = SCALER_CONFIG_BOUNDS.idleTimeoutMs.min;
 
 // Error body for the PATCH /config failure paths (#1077). Same { error, message }
 // shape the rest of the API uses (errorSchema, src/routes/storage.ts:65).
@@ -671,8 +676,8 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
     maxInstances: z
       .number()
       .int()
-      .min(1)
-      .max(20)
+      .min(SCALER_CONFIG_BOUNDS.maxInstances.min)
+      .max(SCALER_CONFIG_BOUNDS.maxInstances.max)
       .describe(
         'Upper bound on transcoder instances in one workspace pool. Applied to ' +
           'every running scaler loop as soon as it is set. Boot default: ' +
@@ -681,8 +686,8 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
     minInstances: z
       .number()
       .int()
-      .min(0)
-      .max(10)
+      .min(SCALER_CONFIG_BOUNDS.minInstances.min)
+      .max(SCALER_CONFIG_BOUNDS.minInstances.max)
       .describe(
         'Warm floor of instances kept running while a pool is idle. NOTE: unlike ' +
           'the other two fields a PATCH to this one is only recorded — persisted ' +
@@ -891,10 +896,13 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
           'write or cannot be reached gets a 503 and nothing is applied, so ' +
           '`GET /api/v1/scaler/config` still reports the previous values. The live ' +
           'copy is per process and is not pushed to other replicas.\n\n' +
-          '**Precedence.** The most recent PATCH accepted by this process wins. ' +
-          'Until one arrives, the values read at boot from `ENCORE_MAX_INSTANCES` ' +
-          '(default 3) and `ENCORE_IDLE_TIMEOUT_MS` (default 300000) apply. So the ' +
-          'order is: runtime PATCH, else environment.\n\n' +
+          '**Precedence.** Three layers, in order: the most recent PATCH accepted ' +
+          'by this process, else the persisted snapshot this process read from the ' +
+          'parameter store at boot (#1078), else the environment values read at ' +
+          'boot — `ENCORE_MAX_INSTANCES` (default 3) and `ENCORE_IDLE_TIMEOUT_MS` ' +
+          '(default 300000). So the environment applies to a deployment never ' +
+          'configured through this endpoint, or to a boot where the stored record ' +
+          'was absent or unreadable.\n\n' +
           '**Restart.** The stored record survives a restart AND is read back at ' +
           'boot (#1078), so a restarted process serves the persisted values — for ' +
           'the config endpoint and for the scaler loops — without the PATCH being ' +
@@ -904,21 +912,24 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
           '`sources`.\n\n' +
           '**Reset to the environment default.** There is no reset endpoint and no ' +
           'sentinel value. PATCH the environment values back explicitly, which ' +
-          'overwrites the stored snapshot; restarting reverts the live values but ' +
-          'leaves the stored record in place. `GET /api/v1/scaler/config` shows ' +
-          'what is in force, and `sources` says per field whether the value came ' +
-          'from a PATCH on this process or from the environment (#1079) — note ' +
-          'that PATCHing an environment value back still reports ' +
-          '`source: "runtime"`, because `sources` reports who set the value, not ' +
-          'whether the number changed; only a restart puts a field back to ' +
-          '`source: "env"`.\n\n' +
+          'overwrites the stored snapshot — and now that boot restores that ' +
+          'snapshot (#1078), that is the only way back to the environment values: ' +
+          'restarting no longer undoes a PATCH. `GET /api/v1/scaler/config` shows ' +
+          'what is in force, and `sources` says per field whether the value was ' +
+          'set through PATCH — on this process, or on an earlier one and restored ' +
+          'at boot — or came from the environment (#1079). Note that PATCHing an ' +
+          'environment value back still reports `source: "runtime"`, because ' +
+          '`sources` reports who set the value, not whether the number changed; a ' +
+          'field reports `source: "env"` again only on a process that booted with ' +
+          'no usable stored record.\n\n' +
           '**Caveats.** `minInstances` is recorded, persisted and echoed back but ' +
           'is not applied to the running scaler loops (see the field description). ' +
           'A PATCH sent while `GET /api/v1/scaler/status` reports ' +
           '`scalerActive: false` is accepted and reported back, but is not carried ' +
           'into the scaler that later activates against a newly provisioned stack ' +
-          '— that activation uses the environment values, so re-send the PATCH ' +
-          'afterwards.',
+          '— that activation uses the values this process resolved at boot (the ' +
+          'persisted snapshot when one was loaded, else the environment values), ' +
+          'so re-send the PATCH afterwards.',
         body: scalerConfigSchema.partial(),
         response: { 200: scalerConfigResponseSchema, 501: errorSchema, 503: errorSchema }
       }
