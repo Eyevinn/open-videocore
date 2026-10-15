@@ -328,3 +328,76 @@ export async function publishProfileIndex(deps: {
     return { ok: false, reason: 'write-failed', bucket, err };
   }
 }
+
+/**
+ * Everything one publish needs, all of it belonging to ONE stack.
+ *
+ * This type is the fix for issue #1207 review BLOCKING 1: the write target
+ * (`storageClient` + `objectStoreEndpoint`) and the read source
+ * (`listProfiles`) are produced together, from a single resolution of a single
+ * stack name, so a publish cannot mix two stack scopes.
+ */
+export type ProfileIndexPublishTarget = {
+  /** The stack's object-store client (`WorkspaceConnections.storageClient`). */
+  storageClient: ProfilesBucketClient | undefined;
+  /** The stack's stored PUBLIC object-store endpoint (`StackConfig.minioEndpoint`). */
+  objectStoreEndpoint: string | undefined;
+  /** The SAME stack's profile store (`WorkspaceConnections.profiles.list()`). */
+  listProfiles: () => Promise<PublishableProfile[]>;
+  /** Optional in-cluster endpoint seam for this stack (ADR-026 D2 step 1, C7). */
+  resolveEndpoint?: (publicEndpoint: string) => Promise<string>;
+};
+
+/**
+ * Build the stack-scoped republish entry point used by the app
+ * (`publishProfileIndexToObjectStore` in src/main.ts) and by the republish hook
+ * the profiles router fires after every mutation.
+ *
+ * The returned function takes the ONE stack name to publish for and threads it
+ * through `resolveTarget`, which must resolve BOTH sides of the publish from
+ * that single name. `undefined` means the workspace default stack, exactly as
+ * `WorkspaceStackResolver.resolve(stackName?)` defines it (cache key
+ * `stackName ?? ''`, src/services/workspace-stack.ts).
+ *
+ * Why a factory rather than a closure in main.ts (issue #1207 review, BLOCKING
+ * 1): the previous closure resolved its WRITE target with no stack name while
+ * reading profiles through the request-scoped repository, which the
+ * `void`-detached hook inherits via AsyncLocalStorage. A
+ * `PUT /api/v1/profiles/:name` with `X-Stack-Name: stack-b` therefore wrote
+ * stack-b's profiles into the DEFAULT stack's bucket — clobbering the index
+ * Encore fetches and exposing another workspace's profile YAML under D3's
+ * anonymous-read policy. With one name feeding both sides that is no longer
+ * representable, and it is covered by
+ * src/routes/profiles.republish-stack-scope.test.ts.
+ *
+ * Fail-soft like {@link publishProfileIndex}: a `resolveTarget` rejection
+ * (unresolvable stack, broken parameter store) is logged and reported as
+ * `no-object-store`, never thrown, so a publish failure can never change the
+ * profiles HTTP contract (ADR-026 §6).
+ */
+export function makeStackScopedProfileIndexPublisher(deps: {
+  resolveTarget: (stackName: string | undefined) => Promise<ProfileIndexPublishTarget>;
+  bucket?: string;
+  log?: PublisherLogger;
+}): (stackName: string | undefined) => Promise<PublishOutcome> {
+  return async (stackName: string | undefined): Promise<PublishOutcome> => {
+    let target: ProfileIndexPublishTarget;
+    try {
+      target = await deps.resolveTarget(stackName);
+    } catch (err) {
+      deps.log?.warn(
+        { err, stackName },
+        'profile index publish skipped: could not resolve the stack object store; Encore keeps the pre-ADR-026 profilesUrl tiers'
+      );
+      return { ok: false, reason: 'no-object-store' };
+    }
+    return publishProfileIndex({
+      storageClient: target.storageClient,
+      objectStoreEndpoint: target.objectStoreEndpoint,
+      ...(target.resolveEndpoint ? { resolveEndpoint: target.resolveEndpoint } : {}),
+      listProfiles: target.listProfiles,
+      ...(deps.bucket ? { bucket: deps.bucket } : {}),
+      ...(deps.log ? { log: deps.log } : {})
+    });
+  };
+}

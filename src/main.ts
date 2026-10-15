@@ -187,10 +187,7 @@ import {
   resolveEncoreProfilesUrlFromParamStore,
   stackScopedProfilesIndexUrl
 } from './services/public-base-url.js';
-import {
-  publishProfileIndex,
-  type PublishOutcome
-} from './services/profile-index-publisher.js';
+import { makeStackScopedProfileIndexPublisher } from './services/profile-index-publisher.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
 import { Client as MinioClient } from 'minio';
@@ -1106,10 +1103,38 @@ const resolveProfilesObjectStoreEndpoint = makeInternalEndpointResolver({
   probeTimeoutMs: profilesObjectStoreSettings.probeTimeoutMs,
   log: app.log
 });
-const publishProfileIndexToObjectStore = async (): Promise<PublishOutcome> => {
-  try {
-    const connections = await stackResolver.resolve();
-    return await publishProfileIndex({
+// SINGLE-SCOPED by construction (issue #1207 review, BLOCKING 1). `stackName` is
+// the ONE stack this publish reads from and writes to: it keys BOTH
+// `stackResolver.resolve()` (which selects the object store the bytes land in,
+// services/workspace-stack.ts `resolve(stackName?)`, cache key `stackName ?? ''`)
+// AND the profile list that is rendered into the index
+// (`connections.profiles.list()`).
+//
+// It deliberately does NOT read profiles through the ambient
+// `profileRepository`: `PerWorkspaceProfileRepository` resolves per call via
+// `currentRequestStackName()` (src/data/per-workspace-repos.ts), and because
+// `onProfilesChanged` fires synchronously inside a mutation handler the
+// `void`-detached publish INHERITS that request's AsyncLocalStorage store
+// (services/request-stack-context.ts). Mixing the two scopes meant a
+// `PUT /api/v1/profiles/:name` with `X-Stack-Name: stack-b` rendered stack-b's
+// profiles and wrote them into the DEFAULT stack's `openvideocore-profiles`
+// bucket — clobbering the index Encore fetches and exposing another workspace's
+// profile YAML under D3's anonymous-read policy. Passing one name through both
+// sides makes that unrepresentable.
+//
+// Scope chosen: PER-STACK (the mutated stack publishes into its OWN stack's
+// bucket). ADR-026 §4 costs the design as "one more provisioning step and one
+// more bucket PER STACK", the bucket is provisioned and torn down with the stack
+// (#1208), and the scaler already points each stack's Encore at that stack's own
+// index (`resolveProfilesUrl` / `stackScopedProfilesIndexUrl`, issue #1164). So
+// a mutation on stack-b must refresh stack-b's bucket, not the default's.
+const publishProfileIndexToObjectStore = makeStackScopedProfileIndexPublisher({
+  log: app.log,
+  // ONE `stackResolver.resolve(stackName)` produces the write target AND the
+  // read source, so the two can never name different stacks.
+  resolveTarget: async (stackName) => {
+    const connections = await stackResolver.resolve(stackName);
+    return {
       storageClient: connections.storageClient,
       // The stack's stored PUBLIC object-store endpoint (StackConfig.minioEndpoint).
       // `stackResolvedMinioEndpoint` deliberately returns undefined for the
@@ -1117,20 +1142,18 @@ const publishProfileIndexToObjectStore = async (): Promise<PublishOutcome> => {
       // "no provisioned object store" case ADR-026 D2 reason 1 keeps on the
       // fallback tiers.
       objectStoreEndpoint: stackResolvedMinioEndpoint(connections),
-      resolveEndpoint: (publicEndpoint) =>
+      resolveEndpoint: (publicEndpoint: string) =>
         resolveProfilesObjectStoreEndpoint(publicEndpoint, connections.s3Config?.stackName),
-      listProfiles: () => profileRepository.list(),
-      log: app.log
-    });
-  } catch (err) {
-    app.log.warn(
-      { err },
-      'profile index publish skipped: could not resolve the stack object store; Encore keeps the pre-ADR-026 profilesUrl tiers'
-    );
-    return { ok: false, reason: 'no-object-store' };
+      // Same resolution as the write target above — the profile store that
+      // belongs to `stackName`, never the ambient request-scoped repository.
+      listProfiles: () => connections.profiles.list()
+    };
   }
-};
-const publishedProfilesIndex = await publishProfileIndexToObjectStore();
+});
+// Boot-time publish: explicitly the DEFAULT stack (no ambient request exists
+// here), because the URL it returns seeds the process-global `profilesUrl` the
+// resolver below computes.
+const publishedProfilesIndex = await publishProfileIndexToObjectStore(undefined);
 const publishedProfilesIndexUrl = publishedProfilesIndex.ok
   ? publishedProfilesIndex.indexUrl
   : undefined;
@@ -2341,8 +2364,18 @@ await app.register(profilesRouter, {
   // and Encore instances read `profilesUrl` at startup, so the requirement is
   // only that a publish completes before the next spawn — not that it is
   // synchronous with the edit.
+  //
+  // The stack the mutation actually landed on is captured SYNCHRONOUSLY here,
+  // while the handler's AsyncLocalStorage store is still the current one, and
+  // passed explicitly into the detached publish (issue #1207 review, BLOCKING
+  // 1). `currentRequestStackName()` is exactly the key
+  // `PerWorkspaceProfileRepository` just resolved the mutation on
+  // (src/data/per-workspace-repos.ts), so the republish reads and writes the
+  // SAME stack the edit changed — never a mix of stack-b's profiles into the
+  // default stack's bucket.
   onProfilesChanged: () => {
-    void publishProfileIndexToObjectStore();
+    const mutatedStackName = currentRequestStackName();
+    void publishProfileIndexToObjectStore(mutatedStackName);
   }
 });
 
@@ -2379,8 +2412,10 @@ await bootstrapProfiles({
 // the same ordering reason bootstrapProfiles is: it must complete before
 // reconcileScaler() can spawn an Encore instance that fetches the published
 // index. Fail-soft — `publishProfileIndex` never throws, and a failure leaves
-// Encore on whichever tier the resolver already chose.
-await publishProfileIndexToObjectStore();
+// Encore on whichever tier the resolver already chose. Explicitly the DEFAULT
+// scope, like the boot publish above: `bootstrapProfiles` seeded the default
+// stack's store (there is no request in flight at boot).
+await publishProfileIndexToObjectStore(undefined);
 
 // Assets router also owns POST /ingest-url (issue #5) and POST /:id/transcode
 // (issue #8). It shares the same job repository so a job created here is
