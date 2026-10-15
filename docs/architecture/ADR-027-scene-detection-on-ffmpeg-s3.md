@@ -3,7 +3,7 @@
 **Status:** PROPOSED 2026-10-15 — decision record only; no product code changes in this PR
 **Date:** 2026-10-15
 **Author agent:** architect
-**Issue:** #1190 — *ADR-027: scene detection runs on `eyevinn-ffmpeg-s3`, not `eyevinn-function-scenes`*. Records the decision the maintainer took on **2026-10-14 in #883** (*re-scope `sceneMetadata` — `eyevinn-function-scenes` cannot return cut timecodes*, now closed). Grounded in #797 / `docs/investigations/797-function-scenes-runtime-contract.md` and in the partial fix #881. Supersedes ADR-001's silence on the scene-detect slot ([D4](#d4--supersedes-adr-001s-silence-on-the-scene-detect-slot)) and amends ADR-023 §4 ([D5](#d5--adr-023-4-is-superseded-in-principle-now-and-retired-with-1193)). Blocking spike: **#1191** (open, unmerged — see [§2 C5](#c5--the-ffmpeg-s3-runtime-job-contract-is-not-in-the-catalog-schema-and-is-not-yet-pinned-1191)). Follow-ups: #1192 (detector rewrite), #1193 (retire the old path). Related: #115 (the step), #798 (the fix this unblocks), #799 (the pinned request contract).
+**Issue:** #1190 — *ADR-027: scene detection runs on `eyevinn-ffmpeg-s3`, not `eyevinn-function-scenes`*. Records the decision the maintainer took on **2026-10-14 in #883** (*re-scope `sceneMetadata` — `eyevinn-function-scenes` cannot return cut timecodes*, now closed). Grounded in #797 / `docs/investigations/797-function-scenes-runtime-contract.md` and in the partial fix #881. Supersedes ADR-001's silence on the scene-detect slot ([D4](#d4--supersedes-adr-001s-silence-on-the-scene-detect-slot)) and amends ADR-023 §4 ([D5](#d5--adr-023-4-is-superseded-in-principle-now-and-retired-with-1193)). Blocking spike: **#1191** (open, unmerged — see [§2 C5](#c5--the-ffmpeg-s3-runtime-job-contract-is-not-in-the-catalog-schema-and-is-not-yet-pinned-1191)). Follow-ups: #1192 (detector rewrite), #1193 (retire the old path). Related: #115 (the step), #798 (closed 2026-10-14 as *not planned* — superseded, see [§5](#5-follow-up-implementation-issues)), #799 (the pinned request contract).
 
 **Citation style.** Code is cited as **file path + symbol name**, without line
 numbers, for the reason ADR-026 gives: this branch will drift behind `main`
@@ -203,8 +203,13 @@ read as a spike result. No `docs/contracts/` snapshot for
 producing one is #1191's deliverable and a precondition for #1192.
 
 Logged as OSC friction (the catalog cannot describe an ephemeral job runner's job
-body or result surface) in the agents repo at
-`docs/osc-feedback/incoming-ffmpeg-s3-job-contract-not-in-catalog-schema.md`.
+body or result surface) in the agents repo (`Eyevinn/eng-open-videocore-agents`) at
+`docs/osc-feedback/incoming-ffmpeg-s3-job-contract-not-in-catalog-schema.md`,
+written 2026-10-15 and committed there on `main`; it is not yet pushed, so the
+file is local to that working copy until the agents repo is published. The log
+records the limitation from the prior first-hand records cited above (797,
+ADR-023 §2.2, ADR-026 §2 C1) plus this repo's four runners. It does **not** claim
+a fresh `get-service-schema` probe — no catalog tooling was reachable.
 
 ---
 
@@ -424,8 +429,9 @@ If it does not, in order:
 - The detector joins the pattern the team already debugs daily: same service id,
   same token, same poll, same `/logs/:name`, same cleanup, same external-backend
   credential mapping.
-- #798's acceptance criterion 1 ("a run completes and writes `sceneMetadata`")
-  becomes reachable for the first time.
+- The outcome #798 was opened for — its acceptance criterion 1, "a run completes
+  and writes `sceneMetadata`" — becomes reachable for the first time. #798 itself
+  is closed (2026-10-14, *not planned*); #1192 carries that criterion now.
 
 **Negative / risks**
 
@@ -466,7 +472,7 @@ If it does not, in order:
 | **#1191** | open — **blocks everything below** | Spike: confirm the cuts are readable from a successful ffmpeg-s3 job; pin a `docs/contracts/` snapshot + a `docs/investigations/` finding; confirm the F1 fallback if the log route fails. |
 | **#1192** | open, blocked by #1191 | Detector rewrite: new `SceneDetector` on ffmpeg-s3 per D1/D2, D3's failure table, the endpoint decision from §4's last risk, and a contract test. |
 | **#1193** | open, blocked by #1192 | Retire `eyevinn-function-scenes`: `src/pipeline/osc-scene-detect.ts`, `src/pipeline/function-scenes-contract.ts`, `test/scene-detect-contract.test.ts`, `docs/contracts/eyevinn-function-scenes-api.json`, the `SCENE_DETECT_SERVICE_ID` lazy-provisioning wiring in `src/services/stack.ts`, existing provisioned instances, **and the full ADR-023 §4 amendment (D5.2)**. |
-| #798 | open | Closed by #1192, not by this ADR. |
+| #798 | **closed 2026-10-14 — _not planned_** | Not a live follow-up. Its premise — a `GET` against `eyevinn-function-scenes` with a source-URL query parameter — does not exist (797), so it was closed alongside the #883 decision rather than carried forward. The outcome it wanted (`sceneMetadata` populated) is delivered by #1192; this ADR does not plan to reopen it. |
 
 No new issue is filed by this ADR; #1191/#1192/#1193 already cover its scope.
 
