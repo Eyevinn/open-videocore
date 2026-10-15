@@ -47,6 +47,12 @@
 // rejecting keeps the operator's intent ("as high as allowed", "as short as
 // allowed") instead of silently reverting to an unrelated env value.
 //
+// The ENV BRANCH is clamped by the same function for the same reason: since this
+// resolver's output seeds the config endpoint, an out-of-range or non-numeric
+// ENCORE_MIN_INSTANCES / ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS would
+// fail that same 200 response schema. Before #1078 it could not: minInstances
+// was a hardcoded 0 at the endpoint and the env values never reached it.
+//
 // ALL-OR-NOTHING. The resolved config is either entirely persisted or entirely
 // env-sourced. Field-by-field merging is deliberately NOT done: the stored blob
 // is one snapshot written by one PATCH, so mixing half of it with env values
@@ -126,21 +132,34 @@ export type ResolveScalerBootConfigOptions = {
 };
 
 // One field clamped into [min, max?] from SCALER_CONFIG_BOUNDS. Returns the
-// applied value plus the stored one when they differ, so the caller can report
-// exactly what it repaired.
+// applied value plus the original one when they differ, so the caller can
+// report exactly what it repaired.
+//
+// NOT-A-NUMBER. A non-finite value (NaN from `parseInt('')`/`parseInt('abc')`
+// on an ENCORE_* environment variable, or an Infinity) is treated as out of
+// range and clamped to `bounds.min`, because the two comparisons below are both
+// false for NaN and would otherwise let it through — and NaN fails
+// `z.number().int()` in the route's response schema just as surely as 12 fails
+// `.max(10)`. `bounds.min` is the conservative choice: the smallest value the
+// API documents, reported in the caller's warn log next to the unusable input.
+// Fractional values are not handled because neither producer can emit one:
+// `parseScalerRuntimeConfig` admits only integers, and main.ts reads the
+// environment with `parseInt`.
 function clampField(
   value: number,
   bounds: { min: number; max?: number }
 ): { value: number; clampedFrom?: number } {
+  if (!Number.isFinite(value)) return { value: bounds.min, clampedFrom: value };
   let applied = value;
   if (applied < bounds.min) applied = bounds.min;
   if (bounds.max !== undefined && applied > bounds.max) applied = bounds.max;
   return applied === value ? { value } : { value: applied, clampedFrom: value };
 }
 
-// Apply the route's bounds to a loaded record (see IN BOUNDS in the file header).
-// Reports which fields moved so the caller warn-logs a repair instead of
-// adopting a config the API itself would reject.
+// Apply the route's bounds to a config, whether it was loaded from the store or
+// read from the environment (see IN BOUNDS in the file header). Reports which
+// fields moved so the caller warn-logs a repair instead of adopting a config the
+// API itself would reject.
 export function clampPersistedScalerConfig(loaded: ScalerRuntimeConfig): {
   config: ScalerRuntimeConfig;
   clamped: Partial<Record<keyof ScalerRuntimeConfig, number>>;
@@ -188,19 +207,45 @@ export async function resolveScalerBootConfig(
   const { env, store, log } = opts;
   const timeoutMs = opts.timeoutMs ?? SCALER_BOOT_LOAD_TIMEOUT_MS;
 
+  // The environment values need the SAME clamp as a loaded record, for the same
+  // reason: ENCORE_MIN_INSTANCES=12, ENCORE_MAX_INSTANCES=50,
+  // ENCORE_IDLE_TIMEOUT_MS=5000 or a non-numeric value (parseInt -> NaN) are
+  // outside `scalerConfigResponseSchema` just as much as a stale stored record
+  // is, and since #1078 these values are what seeds the config endpoint — an
+  // unclamped one would fail the 200 response schema and turn every GET/PATCH
+  // /api/v1/scaler/config into a 500 for the life of the process. Deliberately
+  // the same `clampPersistedScalerConfig` / SCALER_CONFIG_BOUNDS as the
+  // persisted branch, so the two cannot drift, and warn-logged in the same shape
+  // (reason + clampedFrom + applied values + bounds) — only the reason differs,
+  // naming the environment as the source of the out-of-range input.
   const fallback = (
     reason: ScalerBootFallbackReason,
     detail?: Record<string, unknown>
   ): ScalerBootConfig => {
+    const { config, clamped } = clampPersistedScalerConfig(env);
+    if (Object.keys(clamped).length > 0) {
+      log?.warn(
+        {
+          reason: 'out-of-bounds-env',
+          clampedFrom: clamped,
+          maxInstances: config.maxInstances,
+          minInstances: config.minInstances,
+          idleTimeoutMs: config.idleTimeoutMs,
+          bounds: SCALER_CONFIG_BOUNDS
+        },
+        "scaler config: the deployment's environment values are outside the permitted " +
+          'range; clamped to the nearest allowed values at boot'
+      );
+    }
     const payload = {
       reason,
-      maxInstances: env.maxInstances,
-      minInstances: env.minInstances,
-      idleTimeoutMs: env.idleTimeoutMs,
+      maxInstances: config.maxInstances,
+      minInstances: config.minInstances,
+      idleTimeoutMs: config.idleTimeoutMs,
       ...detail
     };
     // 'no-store'/'no-record' are expected states, not problems: info. The other
-    // three mean a persisted value might be being ignored: warn, with the reason.
+    // two mean a persisted value might be being ignored: warn, with the reason.
     if (reason === 'no-store' || reason === 'no-record') {
       log?.info(payload, 'scaler config: using environment values at boot');
     } else {
@@ -209,7 +254,7 @@ export async function resolveScalerBootConfig(
         'scaler config: could not load the persisted record at boot, falling back to environment values'
       );
     }
-    return { ...env, source: 'env', fallbackReason: reason };
+    return { ...config, source: 'env', fallbackReason: reason };
   };
 
   if (!store) return fallback('no-store');

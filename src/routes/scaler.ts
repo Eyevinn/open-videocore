@@ -721,10 +721,13 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
       sources: z
         .object({
           maxInstances: configValueSourceSchema,
-          // Field-specific, because the generic `source` wording is not true of
-          // this field: "env" here is the built-in 0 this endpoint is seeded
-          // with, NEVER the deployment's ENCORE_MIN_INSTANCES, which is read
-          // elsewhere and never reaches this endpoint (see the comment on
+          // Field-specific, because the generic `source` wording needs one
+          // qualification for this field: since #1078 "env" here IS the
+          // deployment's ENCORE_MIN_INSTANCES (0 when unset), forwarded by
+          // main.ts through resolveScalerBootConfig — it is no longer the
+          // hardcoded 0 this endpoint used to be seeded with. What stays
+          // field-specific is the fan-out: a PATCH to this field is recorded and
+          // persisted but not applied to the running loops (see the comment on
           // runtimeSetAt).
           minInstances: configValueSourceSchema.describe(
             'Provenance of `minInstances`, with one caveat specific to this ' +

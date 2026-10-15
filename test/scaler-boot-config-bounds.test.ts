@@ -191,6 +191,88 @@ describe('GET /scaler/config survives a boot from an out-of-bounds persisted rec
   });
 });
 
+// The env branch needs the same clamp as the persisted one (issue #1078, review
+// finding A). Before #1078 the config endpoint was seeded with a hardcoded
+// minInstances: 0 and never saw ENCORE_MIN_INSTANCES; now main.ts forwards
+// `scalerBootConfig.minInstances`, so an out-of-range or non-numeric ENCORE_*
+// value reaches `scalerConfigResponseSchema` — which applies
+// SCALER_CONFIG_BOUNDS to the 200 body — and would 500 GET and PATCH
+// /api/v1/scaler/config for the life of the process.
+describe('boot clamps out-of-range environment values too (issue #1078)', () => {
+  // Mirrors the wiring main.ts does: resolved boot values seed the router, with
+  // no parameter store (the 'no-store' fallback), which is exactly the state a
+  // deployment configured only through ENCORE_* env vars boots in.
+  async function getConfig(env: {
+    maxInstances: number;
+    minInstances: number;
+    idleTimeoutMs: number;
+  }) {
+    const log = recordingLog();
+    const boot = await resolveScalerBootConfig({ env, log });
+
+    const app = Fastify();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    await app.register(scalerRouter, {
+      maxInstances: boot.maxInstances,
+      minInstances: boot.minInstances,
+      idleTimeoutMs: boot.idleTimeoutMs,
+      configSource: boot.source
+    });
+    await app.ready();
+    const res = await app.inject({ method: 'GET', url: '/config' });
+    await app.close();
+    return { res, boot, log };
+  }
+
+  it('answers 200 when ENCORE_MIN_INSTANCES is above the permitted ceiling', async () => {
+    // 12 > SCALER_CONFIG_BOUNDS.minInstances.max (10): parseable, settable as an
+    // env var, and rejected by the response schema if adopted verbatim.
+    const { res, boot, log } = await getConfig({ ...ENV, minInstances: 12 });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().minInstances).toBe(SCALER_CONFIG_BOUNDS.minInstances.max);
+    expect(boot.minInstances).toBe(SCALER_CONFIG_BOUNDS.minInstances.max);
+    expect(boot.source).toBe('env');
+    // The operator has to be able to see that their env value was repaired, and
+    // the line has to name both numbers to be actionable.
+    const clampWarn = log.warns.find((w) => w.obj['clampedFrom'] !== undefined);
+    expect(clampWarn).toBeDefined();
+    expect(clampWarn!.obj['clampedFrom']).toEqual({ minInstances: 12 });
+    expect(clampWarn!.msg).toMatch(/clamp/i);
+  });
+
+  it('answers 200 when an ENCORE_* value is non-numeric (parseInt -> NaN)', async () => {
+    // main.ts reads these with parseInt, so `ENCORE_MIN_INSTANCES=none` arrives
+    // as NaN — which fails z.number().int() in the response schema exactly like
+    // an out-of-range number does, and is NOT caught by a plain min/max compare.
+    const { res, boot } = await getConfig({
+      maxInstances: Number.parseInt('none', 10),
+      minInstances: Number.parseInt('none', 10),
+      idleTimeoutMs: Number.parseInt('', 10)
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.maxInstances).toBe(SCALER_CONFIG_BOUNDS.maxInstances.min);
+    expect(body.minInstances).toBe(SCALER_CONFIG_BOUNDS.minInstances.min);
+    expect(body.idleTimeoutMs).toBe(SCALER_CONFIG_BOUNDS.idleTimeoutMs.min);
+    expect(Number.isInteger(boot.maxInstances)).toBe(true);
+    expect(Number.isInteger(boot.minInstances)).toBe(true);
+    expect(Number.isInteger(boot.idleTimeoutMs)).toBe(true);
+  });
+
+  it('leaves in-range environment values untouched and unwarned', async () => {
+    const { res, boot, log } = await getConfig(ENV);
+
+    expect(res.statusCode).toBe(200);
+    expect(boot).toEqual({ ...ENV, source: 'env', fallbackReason: 'no-store' });
+    expect(log.warns).toHaveLength(0);
+    // An unconfigured deployment still reports its values as env-sourced.
+    expect(res.json().sources.minInstances).toEqual({ source: 'env' });
+  });
+});
+
 describe('the boot fallback reasons are all reachable (issue #1078)', () => {
   // Source-level, in the idiom of the main.ts wiring assertions in
   // test/scaler-boot-persisted-config.test.ts: a reason an operator can never
