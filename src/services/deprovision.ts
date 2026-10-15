@@ -5,6 +5,10 @@ import {
   removeInstance
 } from '@osaas/client-core';
 import {
+  isRouteNotFoundError,
+  oscHttpCode
+} from '../encore-scaler/osc-error.js';
+import {
   AUTO_SUBTITLES_SERVICE_ID,
   SCENE_DETECT_SERVICE_ID,
   STACK_SERVICES,
@@ -123,6 +127,53 @@ export async function confirmInstanceAbsentVia(
   );
 }
 
+// Run the absence confirmation, distinguishing "the probe says it is still
+// there / could not be checked" from "this service API has no probe to run".
+//
+// CONTRACT NOTE (issue #1211). `listInstances` reads the service's OWN instance
+// API at the `apiUrl` the catalog publishes for that serviceId — for the object
+// store (`OBJECT_STORE_SERVICE_ID = 'minio-minio'`, stack.ts) that is
+// `https://api-minio-minio.auto.prod-se.osaas.io/minioinstance`
+// (service OpenAPI `…/docs/json`, recorded in ADR-026 C5: the document defines
+// `POST /minioinstance` for create, and NO collection GET). So the path is
+// right and the serviceId is right — the collection READ simply is not part of
+// that service's contract, and the call comes back
+// `Route GET:/minioinstance not found` (404).
+//
+// Treating that as a probe failure made the storage teardown unconditionally
+// `failed`: the instance was never even asked to go away, so a stack delete
+// reported failures while its object store stayed up (#1166). A missing route
+// is NOT evidence about the instance, so it must not resolve `true` (that would
+// claim a confirmed absence and skip the removal — exactly the #1039 defect in
+// the other direction). We resolve `false`: nothing was confirmed, so fall
+// through to the removal and let the DELETE — the authoritative read — decide.
+// Every other failure still propagates and reports `failed`.
+async function absenceConfirmed(
+  osc: Context,
+  serviceId: string,
+  name: string,
+  sat: string
+): Promise<boolean> {
+  try {
+    return await confirmInstanceAbsent(osc, serviceId, name, sat);
+  } catch (err) {
+    if (!isRouteNotFoundError(err)) throw err;
+    return false;
+  }
+}
+
+// Did the removal 404 because the instance is ALREADY GONE?
+//
+// A DELETE answered 404 by the instance route is the control plane stating
+// directly that there is nothing at that name — stronger evidence than either
+// probe above, so it converges to `not_found` rather than failing a retry
+// forever. A 404 that reports a missing ROUTE is excluded: that says the API
+// cannot perform the removal at all, which stays a failure so the stored config
+// is kept and the instance is surfaced as a leftover.
+function removedAlready(err: unknown): boolean {
+  return oscHttpCode(err) === 404 && !isRouteNotFoundError(err);
+}
+
 // Tear down a single OSC service instance, tolerating the already-removed case.
 // We probe with getInstance first; because that probe reports EVERY error as
 // `undefined` (see confirmInstanceAbsent), an empty probe result is re-checked
@@ -140,14 +191,23 @@ async function teardownService(
     const sat = await osc.getServiceAccessToken(serviceId);
 
     const existing = await getInstance(osc, serviceId, name, sat);
-    if (!existing && (await confirmInstanceAbsent(osc, serviceId, name, sat))) {
+    if (!existing && (await absenceConfirmed(osc, serviceId, name, sat))) {
       return { serviceId, role, status: 'not_found' };
     }
 
     // Either the probe returned the instance, or the probe came back empty but
     // the list says the instance is still there (the empty probe was a swallowed
-    // error). Both mean there is something to remove.
-    await removeInstance(osc, serviceId, name, sat);
+    // error), or the service publishes no collection read to confirm with
+    // (#1211). All three mean there is something to remove — or, when the
+    // DELETE itself answers 404, nothing left to remove.
+    try {
+      await removeInstance(osc, serviceId, name, sat);
+    } catch (err) {
+      if (removedAlready(err)) {
+        return { serviceId, role, status: 'not_found' };
+      }
+      throw err;
+    }
     return { serviceId, role, status: 'removed' };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
