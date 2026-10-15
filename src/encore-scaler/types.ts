@@ -459,6 +459,26 @@ export const keys = {
   // chance to GET that instance's /encoreJobs/{uuid} endpoint. See
   // src/encore-scaler/packaging-pin.ts.
   pendingPackaging: (instanceId: string) => `encore:pending-packaging:${instanceId}`,
+  // #1219: epoch ms (decimal string) at which an OPERATOR cancelled this job,
+  // written by the scaler client's cancel path for a job that had already been
+  // dispatched. Keyed by our externalId (encoreJobId, globally unique like
+  // jobUuid) with the same 24h TTL as the other dispatch-time keys, so it stays
+  // resolvable for exactly as long as the job URL it refers to.
+  //
+  // Why the timestamp is recorded at all: a delivered cancel does not guarantee
+  // the job STOPS. A frozen transcode answers the cancel endpoint 200 and keeps
+  // running (#1219), so the job stays QUEUED/IN_PROGRESS in Encore's own active
+  // set forever. Scale-down reads "real in-flight work" from that set and so
+  // drains — never tears down — the instance holding it, which is why the only
+  // way to stop such a job used to be destroying the Encore instance by hand.
+  //
+  // This key is what lets the scaler tell the two apart: an active Encore job
+  // the operator explicitly cancelled MORE than the grace window ago is work
+  // nobody wants, so it stops protecting its instance from teardown. The
+  // timestamp (not a bare flag) is what provides the grace window — a cancel
+  // Encore is about to honour normally must not trigger a teardown.
+  // See src/encore-scaler/cancelled-job-reclaim.ts.
+  jobCancelRequested: (encoreJobId: string) => `encore:job-cancel-requested:${encoreJobId}`,
   // #778: hash of orphan-candidate instanceId -> epoch ms (string) of the FIRST
   // sweep that saw a scaler-owned Encore instance running on OSC with no pool
   // record. The orphan reaper only destroys an instance that is still orphaned

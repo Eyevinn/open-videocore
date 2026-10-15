@@ -14,7 +14,8 @@ import {
   withDependencyTimeout
 } from './dependency-timeout.js';
 import { assertUnderJobThroughputCap } from './job-throughput-cap.js';
-import { resolveEncoreCancelUrl } from './cancel-target.js';
+import { resolveEncoreCancelUrl, resolveJobInstanceId } from './cancel-target.js';
+import { recordOperatorCancel } from './cancelled-job-reclaim.js';
 
 // Per-request bound (ms) on the outbound Encore cancel POST. The cancel is
 // issued inside the operator's synchronous DELETE /jobs/:id request and the peer
@@ -167,6 +168,23 @@ export function makeScalingEncoreClient(config: EncoreScalerConfig): EncoreClien
 
       // (3) Record the terminal CANCELLED status so getJobStatus reports 'failed'.
       await redis.hset(keys.jobStatus(workspaceId), encoreJobId, 'CANCELLED');
+
+      // (4) #1219, the half that delivering the cancel does not fix: a FROZEN
+      // encode answers the cancel endpoint 200 "Ok" and keeps running, so the
+      // job never leaves Encore's active set and the scaler — which treats that
+      // set as real in-flight work — drains its instance forever instead of
+      // tearing it down. Record the cancel (with its timestamp, for the grace
+      // window) and stop routing new jobs to the instance, so scale-down can
+      // reclaim it once the job has demonstrably ignored the cancel. Destroying
+      // that instance is the only thing that stops a frozen ffmpeg, and doing it
+      // by hand is the workaround the issue reports. Best-effort by contract:
+      // never fails the cancel. See src/encore-scaler/cancelled-job-reclaim.ts.
+      if (encoreJobUrl) {
+        const instanceId = await resolveJobInstanceId(redis, workspaceId, encoreJobId).catch(
+          () => undefined
+        );
+        await recordOperatorCancel(redis, workspaceId, encoreJobId, instanceId);
+      }
 
       if (deliveryError) throw deliveryError;
     }

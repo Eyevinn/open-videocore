@@ -68,9 +68,7 @@ export async function resolveEncoreCancelUrl(
   const encoreUuid = await redis.get(keys.jobUuid(encoreJobId));
   if (!encoreUuid) return undefined;
 
-  const instanceId =
-    (await redis.get(keys.jobTerminalInstance(encoreJobId))) ??
-    (await redis.hget(keys.jobInstance(workspaceId), encoreJobId));
+  const instanceId = await resolveJobInstanceId(redis, workspaceId, encoreJobId);
   if (!instanceId) return undefined;
 
   const poolRaw = await redis.hget(keys.pool(workspaceId), instanceId);
@@ -83,4 +81,20 @@ export async function resolveEncoreCancelUrl(
   }
   if (!record.url) return undefined;
   return `${record.url.replace(/\/+$/, '')}/encoreJobs/${encoreUuid}`;
+}
+
+// Which Encore instance is running (or ran) this job, as far as the scaler
+// knows. Same preference order as above: the terminal-surviving mapping first
+// (keys.jobTerminalInstance, #739, written before the live mapping is hdel'd),
+// then the live one (keys.jobInstance), which is already gone for exactly the
+// jobs #1219 is about. Undefined when neither records an instance.
+export async function resolveJobInstanceId(
+  redis: ReadRedis,
+  workspaceId: string,
+  encoreJobId: string
+): Promise<string | undefined> {
+  const terminal = await redis.get(keys.jobTerminalInstance(encoreJobId));
+  if (terminal) return terminal;
+  const live = await redis.hget(keys.jobInstance(workspaceId), encoreJobId);
+  return live ?? undefined;
 }
