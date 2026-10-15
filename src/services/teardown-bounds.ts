@@ -47,7 +47,7 @@
 //     ORCHESTRATOR_UNAVAILABLE / ECONNRESET / ETIMEDOUT / ... message markers).
 //     Reused here rather than re-deriving a second, drifting copy.
 
-import { isTransientOscError } from '../encore-scaler/osc-error.js';
+import { isTransientOscError, oscHttpCode } from '../encore-scaler/osc-error.js';
 
 // How a teardown step failed, as reported to the caller.
 //   timeout    — the per-service budget ran out while an OSC call was in flight
@@ -147,10 +147,20 @@ export function describeTeardownFailure(detail: {
 // failing spawn is retried. #1212 is a teardown fix, so the widening is scoped
 // to teardown; the shared structural rules (httpCode 5xx/408/429, the
 // orchestrator and socket markers) are reused unchanged.
+//
+// It is also gated the same way the shared list is gated: the marker is only
+// consulted when the error carries NO httpCode (`oscHttpCode`,
+// src/encore-scaler/osc-error.ts:48). A response WITH a status is classified on
+// that status alone — otherwise a 400 or 404 whose body happens to quote
+// "fetch failed" (an upstream error relayed verbatim through
+// lib/fetch.js `defaultErrorFactory`) would be retried three times against a
+// call that will reject identically every time, spending a service's whole
+// teardown budget to learn nothing.
 const TEARDOWN_TRANSIENT_MESSAGE_MARKERS = ['fetch failed'];
 
 export function isTransientTeardownError(err: unknown): boolean {
   if (isTransientOscError(err)) return true;
+  if (oscHttpCode(err) !== undefined) return false;
   const message = errorMessage(err).toLowerCase();
   return TEARDOWN_TRANSIENT_MESSAGE_MARKERS.some((marker) =>
     message.includes(marker)

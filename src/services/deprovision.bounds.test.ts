@@ -243,6 +243,35 @@ describe('bounded retry with backoff for transient OSC failures (issue #1212)', 
       )
     ).toBe(false);
   });
+
+  // The message marker is only consulted when the error carries no httpCode
+  // (the invariant stated at src/encore-scaler/osc-error.ts:56-58). A 4xx that
+  // relays an upstream "fetch failed" in its body — which reaches us verbatim
+  // via @osaas/client-core@0.24.0 lib/fetch.js `defaultErrorFactory`, which
+  // puts the response body in `message` and the status in `httpCode` — is a
+  // definite answer from the control plane and must not be retried.
+  it('does not retry a 4xx whose body quotes "fetch failed"', () => {
+    expect(
+      isTransientTeardownError(
+        Object.assign(new Error('upstream fetch failed'), { httpCode: 400 })
+      )
+    ).toBe(false);
+    expect(
+      isTransientTeardownError(
+        Object.assign(new Error('instance gone: fetch failed'), {
+          httpCode: 404
+        })
+      )
+    ).toBe(false);
+    // A 5xx is still transient on its status, body text notwithstanding.
+    expect(
+      isTransientTeardownError(
+        Object.assign(new Error('fetch failed'), { httpCode: 502 })
+      )
+    ).toBe(true);
+    // And a true transport fault still carries no status, so it is retried.
+    expect(isTransientTeardownError(new TypeError('fetch failed'))).toBe(true);
+  });
 });
 
 describe('a retry of a partial teardown skips what is already gone (issue #1212)', () => {
