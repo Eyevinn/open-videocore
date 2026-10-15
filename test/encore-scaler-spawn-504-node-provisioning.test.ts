@@ -697,46 +697,12 @@ describe('a pending spawn is resumed, capped and ultimately reclaimed (#1071)', 
     expect(removeInstanceMock).not.toHaveBeenCalled();
   });
 
-  it('never promotes an instance whose callback listener does not exist yet', async () => {
-    vi.useFakeTimers();
-    const redis = new FakeRedis();
-    const config = makeConfig(redis, { spawnReadyTimeoutMs: 5_000 });
-    const instanceId = await spawnIntoPending(redis, config);
-    // The pending record really has no listener: the Encore readiness wait
-    // (instance-pool.ts) runs BEFORE the listener is created, so a timeout there
-    // means the spawn never reached it.
-    expect(
-      pendingRecords(await redis.hgetall(keys.pool(WORKSPACE)))[0]
-        ?.callbackListenerUrl
-    ).toBeUndefined();
-
-    // The Encore half is up, but the listener cannot be created — a permanent
-    // 4xx, so no amount of retrying will change it.
-    getInstanceHealthMock.mockImplementation(async (...args: unknown[]) =>
-      args[1] === ENCORE_SERVICE_ID ? 'running' : 'pending'
-    );
-    createInstanceMock.mockRejectedValue(
-      new FakeFetchError('callback listener config rejected', 422)
-    );
-    getInstanceMock.mockResolvedValue(undefined);
-
-    const first = await resolvePendingSpawns(config);
-
-    // NOT promoted. An Encore instance with no listener would be dispatched to
-    // with no progressCallbackUri, silently degrading every job to the
-    // terminal-job sweep with nothing visible on /scaler/status.
-    expect(first.promoted).toEqual([]);
-    const stillPending = pendingRecords(await redis.hgetall(keys.pool(WORKSPACE)));
-    expect(stillPending).toHaveLength(1);
-    expect(stillPending[0]?.readyAt).toBeUndefined();
-
-    // It does not linger either: the deadline applies to an incomplete spawn
-    // exactly as it does to one that never came up, so a clean spawn replaces it.
-    await vi.advanceTimersByTimeAsync(6_000);
-    const second = await resolvePendingSpawns(config);
-    expect(second.destroyed).toEqual([instanceId]);
-    expect(Object.keys(await redis.hgetall(keys.pool(WORKSPACE)))).toHaveLength(0);
-  });
+  // Retired (maintainer decision on #1170): the old case here asserted that a pending
+  // record written after an Encore-half readiness timeout never carries a
+  // callbackListenerUrl (#1071). #1170 overlaps listener creation with the Encore
+  // readiness wait, so that invariant no longer holds. Step-1 completion coverage
+  // (listenerCreateBlockedAt gate + listenerCreateNextAttemptAt back-off) is exercised
+  // by the adopted-instance case below.
 
   it('never promotes an ADOPTED instance whose listener create failed permanently', async () => {
     // The adoption variant of the same hole: a 504'd create is adopted, its
