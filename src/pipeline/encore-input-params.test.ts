@@ -117,6 +117,36 @@ describe('encoreInputParamsFor (issue #1222)', () => {
     ).toEqual(EXPECTED_PARAMS);
   });
 
+  it('falls back to the defaults on a fractional sub-1 override instead of emitting "0"', () => {
+    // Regression, PR #1230 review: the env helper used to validate the parsed
+    // number and floor it afterwards, so "0.5" passed the `> 0` guard and then
+    // truncated to 0 — emitting reconnect_delay_max: "0" and rw_timeout: "0",
+    // which is the bound REMOVED rather than retuned (ffmpeg reads rw_timeout=0
+    // as no read deadline at all). The value that is emitted is the value that
+    // has to satisfy `> 0`, so flooring now happens before validation.
+    const params = encoreInputParamsFor('s3://src-bucket/in.mp4', {
+      ENCORE_INPUT_RECONNECT_DELAY_MAX_SECONDS: '0.5',
+      ENCORE_INPUT_RW_TIMEOUT_MICROSECONDS: '0.9'
+    });
+    expect(params).toEqual(EXPECTED_PARAMS);
+    expect(params?.['rw_timeout']).not.toBe('0');
+    expect(params?.['reconnect_delay_max']).not.toBe('0');
+
+    // A fraction that floors to a positive integer is still honoured — it is
+    // truncated to whole units, not rejected.
+    expect(
+      encoreInputParamsFor('s3://src-bucket/in.mp4', {
+        ENCORE_INPUT_RECONNECT_DELAY_MAX_SECONDS: '45.7',
+        ENCORE_INPUT_RW_TIMEOUT_MICROSECONDS: '2500000.5'
+      })
+    ).toEqual({
+      reconnect: '1',
+      reconnect_on_network_error: '1',
+      reconnect_delay_max: '45',
+      rw_timeout: '2500000'
+    });
+  });
+
   it('can be switched off entirely for diagnosis, but only explicitly', () => {
     expect(
       encoreInputParamsFor('s3://src-bucket/in.mp4', { ENCORE_INPUT_RECONNECT_ENABLED: 'false' })

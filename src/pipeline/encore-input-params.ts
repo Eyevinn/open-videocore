@@ -63,8 +63,22 @@
 //      `input.params.filterKeys { ffprobeValidParams.contains(it) }`
 //      (encore-common/.../service/mediaanalyzer/MediaAnalyzerService.kt:58-69,
 //      with `getValidFfprobeParams()` at :90 parsing `ffprobe -h`). The first
-//      analyze step (`mediainfo`) receives no input params at all — that one is
-//      service-side and outside our reach; logged as OSC friction.
+//      analyze step (`mediainfo`) receives no input params at all: the only
+//      params channel out of `analyzeInput` is the one named
+//      `ffprobeInputParams`, and the bundled analyzer
+//      (`se.svt.oss:media-analyzer:2.0.7`, encore-common/build.gradle.kts:8)
+//      threads it to ffprobe only — `MediaAnalyzer.analyze` calls
+//      `mediaInfoAnalyzer.analyze(file, disableImageSequenceDetection)` with no
+//      params argument to pass anything to (media-analyzer @ tag
+//      `release-2.0.7`, src/main/kotlin/se/svt/oss/mediaanalyzer/
+//      MediaAnalyzer.kt:33-68), and `MediaInfoAnalyzer.analyze` builds a fixed
+//      `mediainfo --Output=JSON <file>` command line (.../mediainfo/
+//      MediaInfoAnalyzer.kt:13-30). So the pre-encode analysis window is
+//      service-side and outside our reach — logged as OSC friction in
+//      `docs/osc-feedback/incoming-issue1222-mediainfo-no-input-params.md`
+//      (authoritative copy: same filename under `docs/osc-feedback/` in the
+//      agents repo), which also records what we would need from the service to
+//      close it.
 //
 // A NOTE ON WHY LOCAL PATHS ARE EXCLUDED
 // --------------------------------------
@@ -118,12 +132,21 @@ export function isNetworkInputUri(uri: string): boolean {
 // (`deliveryTimeoutMs`, src/pipeline/asset-delivery.ts:139-146;
 // `rewrapUrlTtlSeconds`, src/pipeline/rewrap.ts:52-58): unset, unparseable or
 // non-positive falls back to the default rather than disabling the bound.
+//
+// FLOOR BEFORE VALIDATING, not after. These values are emitted verbatim as
+// ffmpeg option strings, and ffmpeg reads them as integers, so a fractional
+// override has to be truncated. Validating first and truncating second let a
+// sub-1 fraction through the guard and then floored it to 0 — `rw_timeout: "0"`
+// and `reconnect_delay_max: "0"` — i.e. the exact "bound disabled" outcome the
+// guard exists to prevent (ffmpeg treats rw_timeout 0 as no timeout). So the
+// value that is actually emitted is the value that must satisfy `> 0`: floor
+// first, then validate, and a floored 0 falls back to the default.
 function positiveIntEnv(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
   const raw = env[name];
   if (!raw) return fallback;
-  const parsed = Number(raw);
+  const parsed = Math.floor(Number(raw));
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
-  return Math.floor(parsed);
+  return parsed;
 }
 
 // Escape hatch: `ENCORE_INPUT_RECONNECT_ENABLED=false` submits inputs with no
