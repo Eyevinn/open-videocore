@@ -71,12 +71,30 @@ export type StackConfig = {
   // whenever a stack was added. Ordering by this field makes the listing
   // creation-ordered and the default stable.
   //
-  // Optional for back-compat, mirroring `status?`: a stack provisioned BEFORE
-  // #1165 carries no value here. Absence is meaningful, not unknown — such a
-  // stack necessarily predates every stack stamped by a post-#1165 build, so
-  // compareStackCreationOrder sorts unstamped stacks FIRST. That is what keeps
-  // an existing deployment's original default stack the default when a new stack
-  // is added.
+  // Optional for back-compat, mirroring `status?`: a stack provisioned before
+  // #1165 carries no value here. Absence means "created before this deployment
+  // recorded creation times" — it is not an unknown instant, but it is also not
+  // a position: such a stack necessarily predates every stack stamped by a
+  // later build, so compareStackCreationOrder sorts unstamped stacks first and
+  // separates them from each other by name.
+  //
+  // What that does and does not guarantee, precisely (see
+  // compareStackCreationOrder):
+  //   - A deployment with ONE pre-existing stack keeps that stack as its
+  //     default: it is the only unstamped entry, so it stays at index 0.
+  //   - A deployment with SEVERAL pre-existing stacks does NOT necessarily keep
+  //     its previous default. Those stacks have no recorded instant to order
+  //     them by, so they sort by name, and the no-X-Stack-Name default becomes
+  //     the name-first one. If the store happened to list a different stack
+  //     first before the upgrade, the default moves once, at upgrade.
+  //
+  // Two mechanisms close that gap; neither invents a creation time:
+  //   - DEFAULT_STACK_NAME (see resolvePinnedStackName) lets an operator pin
+  //     the default explicitly, which overrides ordering entirely.
+  //   - backfillCreatedAt() stamps a legacy stack with LEGACY_STACK_CREATED_AT
+  //     — an explicit "created before creation times were recorded" marker that
+  //     orders exactly as absence does, so the key becomes persisted and stable
+  //     instead of being re-derived from absence on every listing.
   createdAt?: string;
   minioEndpoint: string;
   // CouchDB host/URL only — no embedded password.
@@ -195,22 +213,32 @@ function createdAtEpoch(createdAt?: string): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-// TOTAL, DETERMINISTIC order over a stack listing (issue #1165).
+// Total, deterministic order over a stack listing (issue #1165).
 //
 // The order, in precedence:
-//   1. UNSTAMPED BEFORE STAMPED. A config with no usable `createdAt` was written
-//      by a pre-#1165 build, so it predates every stack a post-#1165 build
-//      stamped. This is the rule that keeps an existing deployment's original
-//      default stack at index 0 when a new stack is provisioned — the bug in
-//      #1165, where adding `foyervod1007` to an instance whose only stack was
-//      `signage1007` moved the default to the new stack.
-//   2. `createdAt` ASCENDING among stamped stacks, so a newly provisioned stack
-//      sorts LAST and is appended to the listing instead of landing in the
-//      middle.
-//   3. NAME ascending as the final tiebreak. Needed for two unstamped legacy
-//      stacks (no timestamp to separate them) and for two stacks stamped inside
-//      the same millisecond. Without it the order would fall back to the store's
+//   1. Unstamped before stamped. A config with no usable `createdAt` was
+//      written by an earlier build, so it predates every stack a later build
+//      stamped. This is the rule that keeps a deployment's original default
+//      stack at index 0 when a new stack is provisioned — the reported bug,
+//      where adding a second stack to a deployment that had one moved the
+//      default to the new stack.
+//   2. `createdAt` ascending among stamped stacks, so a newly provisioned stack
+//      sorts last and is appended to the listing instead of landing in the
+//      middle. LEGACY_STACK_CREATED_AT is the lowest representable stamp, so a
+//      backfilled legacy stack sorts with the unstamped ones.
+//   3. Name ascending as the final tiebreak. Needed for two legacy stacks (no
+//      distinct instant to separate them) and for two stacks stamped inside the
+//      same millisecond. Without it the order would fall back to the store's
 //      unspecified iteration order and the default could still move.
+//
+// Scope, stated honestly: this makes the order a FUNCTION OF THE RECORDS, so it
+// is stable against adding, removing and re-listing stacks. It does NOT
+// reconstruct the pre-upgrade order of several stacks that were never stamped —
+// rule 3 orders those by name, so a deployment with more than one pre-existing
+// stack can see its no-header default change once, at upgrade. An operator who
+// needs a specific stack to stay the default sets DEFAULT_STACK_NAME, which
+// takes precedence over all three rules (resolvePinnedStackName /
+// orderStackNamesByCreation).
 //
 // Pure and side-effect free so both the HTTP client and any other ParamStore
 // implementation can share one ordering rule and cannot drift apart.
@@ -226,12 +254,69 @@ export function compareStackCreationOrder(
   return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
 }
 
+// Explicit "created before this deployment recorded creation times" marker
+// (issue #1165 review, blocking finding 1).
+//
+// Used to BACKFILL a legacy stack that carries no `createdAt`. It is the epoch
+// instant, so it compares lower than any real provision stamp and a backfilled
+// stack keeps exactly the position absence gave it (rule 1 above), with the name
+// tiebreak still separating legacy stacks from each other. Backfilling does not
+// claim to know when the stack was created — it records that the creation time
+// is unknown-and-early, which is the only true statement available: the config
+// service stores no creation metadata of its own (ConfigObject = { key, value,
+// secret? }, see the contract cited on makeHttpParamStore), so there is no
+// source to recover a real instant from.
+export const LEGACY_STACK_CREATED_AT = '1970-01-01T00:00:00.000Z';
+
+// True when a stamp is the legacy backfill marker rather than a real creation
+// instant. Callers that want to distinguish "created early" from "creation time
+// unknown" (diagnostics, operator tooling) use this instead of string equality.
+export function isLegacyCreatedAt(createdAt?: string): boolean {
+  return createdAtEpoch(createdAt) === 0;
+}
+
+// The operator-pinned default stack (issue #1165 review, blocking finding 1).
+//
+// DEFAULT_STACK_NAME names the stack that must be element 0 of the listing, and
+// therefore the stack a request with no X-Stack-Name header is routed to. It
+// exists because ordering alone cannot preserve the default for a deployment
+// that already had SEVERAL unstamped stacks before creation times were recorded
+// — there is no stored instant to reconstruct their original order from. Pinning
+// is an explicit operator statement, so it needs no inference.
+//
+// Config via env var, 12-factor; unset/blank means "no pin, use creation order".
+// Trimmed because a trailing newline in a deployment's env block is a common and
+// otherwise silent way for the pin to stop matching a stack name.
+export function resolvePinnedStackName(
+  env: Record<string, string | undefined> = process.env
+): string | undefined {
+  const raw = env['DEFAULT_STACK_NAME'];
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
 // Order a listing with compareStackCreationOrder and project it to names.
 // Does not mutate the input.
+//
+// `pinnedStackName` (DEFAULT_STACK_NAME) hoists one stack to index 0 and leaves
+// every other stack in creation order behind it. A pin naming a stack that is
+// NOT in the listing is ignored rather than fabricating an entry: the stack may
+// be deprovisioned or not yet provisioned, and dropping the pin silently is
+// wrong in the other direction only if it changes the order, which it cannot.
 export function orderStackNamesByCreation(
-  entries: StackListingEntry[]
+  entries: StackListingEntry[],
+  pinnedStackName?: string
 ): string[] {
-  return [...entries].sort(compareStackCreationOrder).map((e) => e.name);
+  const ordered = [...entries].sort(compareStackCreationOrder).map((e) => e.name);
+  if (pinnedStackName === undefined) return ordered;
+  const pinnedIndex = ordered.indexOf(pinnedStackName);
+  if (pinnedIndex <= 0) return ordered;
+  return [
+    pinnedStackName,
+    ...ordered.slice(0, pinnedIndex),
+    ...ordered.slice(pinnedIndex + 1)
+  ];
 }
 
 // Read the `createdAt` off a raw stored config value, for ordering purposes
@@ -745,14 +830,17 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
         // #1165: taking its order through meant the first-listed stack — the
         // no-X-Stack-Name default — changed whenever a stack was added, and a
         // new stack could land in the middle. Impose the creation order
-        // explicitly instead.
+        // explicitly instead, with DEFAULT_STACK_NAME overriding it when an
+        // operator has pinned the default (read per call, not captured at
+        // construction, so the pin applies to an already-built store).
         return orderStackNamesByCreation(
           (body.items ?? [])
             .filter((item) => item.key.startsWith(prefix))
             .map((item) => ({
               name: item.key.slice(prefix.length),
               createdAt: createdAtFromStoredValue(item.value)
-            }))
+            })),
+          resolvePinnedStackName()
         );
       });
     }
