@@ -57,6 +57,27 @@ export type StackConfig = {
   // this field existed have no `status` and MUST be read as 'ready' so already
   // provisioned live stacks keep working (see isReadyStack).
   status?: 'provisioning' | 'ready' | 'failed';
+  // When this stack was first recorded, as an ISO-8601 instant (issue #1165).
+  // Stamped ONCE, by the first write that creates the stack's key (the
+  // 'provisioning' marker, or the final 'ready' write when the marker could not
+  // be written), and PRESERVED verbatim by every later write to the same stack —
+  // status transitions, the packager-inventory update (main.ts), and the partial
+  // 'failed' write all carry the original value forward.
+  //
+  // This is the ONLY ordering key for the stack listing. The config service's
+  // list endpoint does not specify an order (param-store.ts:359-361
+  // ConfigObjectList), so before #1165 the listing order — and therefore the
+  // no-X-Stack-Name default stack, which is the FIRST listed stack — changed
+  // whenever a stack was added. Ordering by this field makes the listing
+  // creation-ordered and the default stable.
+  //
+  // Optional for back-compat, mirroring `status?`: a stack provisioned BEFORE
+  // #1165 carries no value here. Absence is meaningful, not unknown — such a
+  // stack necessarily predates every stack stamped by a post-#1165 build, so
+  // compareStackCreationOrder sorts unstamped stacks FIRST. That is what keeps
+  // an existing deployment's original default stack the default when a new stack
+  // is added.
+  createdAt?: string;
   minioEndpoint: string;
   // CouchDB host/URL only — no embedded password.
   couchdbUrl: string;
@@ -145,7 +166,91 @@ export interface ParamStore {
   // idempotent: deleting an already-absent entry resolves without error.
   deleteStackConfig(workspaceId: string, name: string): Promise<void>;
   // List all stack names persisted for a workspace.
+  //
+  // ORDERING IS PART OF THIS CONTRACT (issue #1165). The returned array MUST be
+  // in CREATION ORDER: oldest stack first, newly created stacks appended last.
+  // Three resolution paths in WorkspaceStackResolver take element [0] as the
+  // workspace default stack for a request with no X-Stack-Name header
+  // (resolve(), resolveStackName(), resolveStackConfig()), so an unstable order
+  // silently reassigns the default — and the Encore profile index that follows
+  // it — every time a stack is provisioned.
+  //
+  // Implementations MUST order with compareStackCreationOrder (below) rather
+  // than returning the store's own iteration order: the config service's list
+  // endpoint specifies no order (see CONFIG_LIST_PAGE_LIMIT's contract note).
   listStackNames(workspaceId: string): Promise<string[]>;
+}
+
+// One entry in a stack listing, before ordering: the stack name plus the
+// `createdAt` read off its stored config (absent for a pre-#1165 stack).
+export type StackListingEntry = { name: string; createdAt?: string };
+
+// Parse a `createdAt` into a comparable epoch, or undefined when it is absent or
+// not a usable instant. A malformed value is treated exactly like an absent one
+// (pre-#1165 / legacy) rather than throwing — a corrupt timestamp must not make
+// the whole listing unorderable.
+function createdAtEpoch(createdAt?: string): number | undefined {
+  if (typeof createdAt !== 'string' || createdAt.length === 0) return undefined;
+  const parsed = Date.parse(createdAt);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+// TOTAL, DETERMINISTIC order over a stack listing (issue #1165).
+//
+// The order, in precedence:
+//   1. UNSTAMPED BEFORE STAMPED. A config with no usable `createdAt` was written
+//      by a pre-#1165 build, so it predates every stack a post-#1165 build
+//      stamped. This is the rule that keeps an existing deployment's original
+//      default stack at index 0 when a new stack is provisioned — the bug in
+//      #1165, where adding `foyervod1007` to an instance whose only stack was
+//      `signage1007` moved the default to the new stack.
+//   2. `createdAt` ASCENDING among stamped stacks, so a newly provisioned stack
+//      sorts LAST and is appended to the listing instead of landing in the
+//      middle.
+//   3. NAME ascending as the final tiebreak. Needed for two unstamped legacy
+//      stacks (no timestamp to separate them) and for two stacks stamped inside
+//      the same millisecond. Without it the order would fall back to the store's
+//      unspecified iteration order and the default could still move.
+//
+// Pure and side-effect free so both the HTTP client and any other ParamStore
+// implementation can share one ordering rule and cannot drift apart.
+export function compareStackCreationOrder(
+  a: StackListingEntry,
+  b: StackListingEntry
+): number {
+  const ae = createdAtEpoch(a.createdAt);
+  const be = createdAtEpoch(b.createdAt);
+  if (ae === undefined && be !== undefined) return -1;
+  if (ae !== undefined && be === undefined) return 1;
+  if (ae !== undefined && be !== undefined && ae !== be) return ae - be;
+  return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+}
+
+// Order a listing with compareStackCreationOrder and project it to names.
+// Does not mutate the input.
+export function orderStackNamesByCreation(
+  entries: StackListingEntry[]
+): string[] {
+  return [...entries].sort(compareStackCreationOrder).map((e) => e.name);
+}
+
+// Read the `createdAt` off a raw stored config value, for ordering purposes
+// only. Returns undefined for anything that is not JSON carrying a string
+// `createdAt` — an unparseable value simply orders as a legacy (unstamped)
+// stack, which is the safe direction: it never promotes an unknown record ahead
+// of an established default by accident, because the name tiebreak still
+// applies.
+export function createdAtFromStoredValue(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return undefined;
+  const createdAt = (parsed as Record<string, unknown>)['createdAt'];
+  return typeof createdAt === 'string' ? createdAt : undefined;
 }
 
 // Key under which a stack's config blob is stored. Namespaced by workspace so
@@ -627,11 +732,28 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
           }
           throw new Error(msg);
         }
-        const body = (await res.json()) as { items?: { key: string }[] };
-        return (body.items ?? [])
-          .map((item) => item.key)
-          .filter((key) => key.startsWith(prefix))
-          .map((key) => key.slice(prefix.length));
+        // `items` carries the VALUE alongside the key — ConfigObject =
+        // { key: string; value: string; secret?: boolean } (contract cited on
+        // CONFIG_LIST_PAGE_LIMIT, verified against Eyevinn/app-config-svc
+        // src/api_config.ts @ c1538c0e88). So the `createdAt` that orders the
+        // listing (issue #1165) comes out of THIS SAME page: ordering costs no
+        // extra round-trip and adds no per-stack GET.
+        const body = (await res.json()) as {
+          items?: { key: string; value?: string }[];
+        };
+        // The service specifies NO order on `items`, which is the whole of
+        // #1165: taking its order through meant the first-listed stack — the
+        // no-X-Stack-Name default — changed whenever a stack was added, and a
+        // new stack could land in the middle. Impose the creation order
+        // explicitly instead.
+        return orderStackNamesByCreation(
+          (body.items ?? [])
+            .filter((item) => item.key.startsWith(prefix))
+            .map((item) => ({
+              name: item.key.slice(prefix.length),
+              createdAt: createdAtFromStoredValue(item.value)
+            }))
+        );
       });
     }
   };

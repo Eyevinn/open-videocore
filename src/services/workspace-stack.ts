@@ -975,6 +975,16 @@ export class WorkspaceStackResolver {
   // invisible to the resolver's "first listed stack" path. The subsequent
   // per-name load goes through loadStackConfigWithMigration, which is what
   // performs the rewrite.
+  //
+  // ORDER (issue #1165): the returned array is in CREATION ORDER — oldest
+  // first, newest appended last — because that is ParamStore.listStackNames'
+  // documented contract (param-store.ts, `listStackNames` on the ParamStore
+  // interface) and the HTTP client imposes it with
+  // compareStackCreationOrder instead of passing the config service's
+  // unspecified `items` order through. Every default-stack resolution in this
+  // class takes element [0], so that ordering IS the default-stack rule: the
+  // default is the FIRST-CREATED stack and provisioning another stack cannot
+  // change it. Do not re-sort, reverse, or de-duplicate the result here.
   private async listStackNamesWithMigration(ps: ParamStore): Promise<string[]> {
     const direct = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
     if (direct.length > 0) return direct;
@@ -1070,6 +1080,11 @@ export class WorkspaceStackResolver {
         // resolver uses the FIRST listed stack as the default. If the list is
         // empty here but the provision route logged a successful write, the
         // write key and the list prefix disagree — a read-side namespace/key bug.
+        //
+        // "First listed" is now "first CREATED" (issue #1165): the listing is
+        // creation-ordered, so this default is STABLE across later provisions.
+        // The `listed` field below is therefore also the ordering evidence — if
+        // the default ever appears to move, compare consecutive log lines.
         const names = await this.listStackNamesWithMigration(ps);
         this.log?.info?.(
           { source: 'default', namespace, listed: names },

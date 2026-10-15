@@ -843,6 +843,25 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         };
         let objectStorePlan: ObjectStoreCredentialPlan = legacyObjectStorePlan;
 
+        // The stack's creation instant (issue #1165), decided ONCE for this
+        // provision run and reused by every write below — the 'provisioning'
+        // marker, the final 'ready' config and the partial 'failed' config — so
+        // all three agree and a retried provision does not re-stamp the stack to
+        // "now" and shuffle it to the end of the listing.
+        //
+        // Seeded from the EXISTING stored config when there is one (a retry, or
+        // a 'provisioning'/'failed' record from an earlier attempt), so the
+        // original instant survives. `undefined` here means "no stored stack
+        // yet", and the writes below stamp it with stackCreatedAtFor().
+        let existingCreatedAt: string | undefined;
+        const provisionStartedAt = new Date().toISOString();
+        // The value to persist on this write: the original instant when one was
+        // already recorded, otherwise this run's. Keeping it a function (rather
+        // than a precomputed constant) means a write that happens AFTER the
+        // marker read still picks up whatever the read found.
+        const stackCreatedAtFor = (): string =>
+          existingCreatedAt ?? provisionStartedAt;
+
         // Reset the plan to the legacy credential when the per-stack access key
         // id could NOT be persisted (issue #1094 review, blocking finding 3).
         //
@@ -881,6 +900,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             try {
               const wsId = STACK_CONFIG_NAMESPACE;
               const existing = await paramStore.loadStackConfig(wsId, name);
+              // Carry a previously recorded creation instant forward (issue
+              // #1165) so a retried provision keeps this stack's position in the
+              // listing instead of being re-stamped to "now" and jumping to the
+              // end. Read before the converge-and-return below so it is set on
+              // every path that reaches a write.
+              existingCreatedAt = existing?.createdAt;
               // A completed stack: converge, return its coordinates, create
               // nothing. isReadyStack treats a legacy status-less config as
               // ready (param-store.ts:102).
@@ -979,6 +1004,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               try {
                 await paramStore.storeStackConfig(wsId, name, {
                   status: 'provisioning',
+                  // Creation instant (issue #1165). The marker is normally the
+                  // FIRST write that creates this stack's key, so this is where
+                  // the stack's position in the listing is fixed.
+                  createdAt: stackCreatedAtFor(),
                   minioEndpoint: '',
                   couchdbUrl: '',
                   redisUrl: '',
@@ -1495,6 +1524,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         if (paramStore) {
           const stackConfig: StackConfig = {
             status: 'ready',
+            // Creation instant (issue #1165) — the SAME value the
+            // 'provisioning' marker carried, preserved across the status
+            // transition so the stack keeps its place in the listing. If the
+            // marker write failed, this write creates the key and stamps it.
+            createdAt: stackCreatedAtFor(),
             minioEndpoint,
             couchdbUrl: stripCredentials(couchdbUrl),
             redisUrl,
@@ -1697,6 +1731,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               const workspaceId = STACK_CONFIG_NAMESPACE;
               await paramStore.storeStackConfig(workspaceId, name, {
                 status: 'failed',
+                // Preserve the creation instant on the partial write (issue
+                // #1165), for the same reason the per-stack access key id is
+                // preserved below: a retry must read back the original value
+                // rather than re-stamping and reordering the listing.
+                createdAt: stackCreatedAtFor(),
                 minioEndpoint: '',
                 couchdbUrl: '',
                 redisUrl: '',
@@ -1786,14 +1825,41 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   );
 
   // GET /api/v1/provision — list all stack names provisioned for this workspace.
-  //   200  array of stack name strings
+  //   200  array of stack name strings, in CREATION ORDER (issue #1165):
+  //        oldest stack first, newly provisioned stacks appended LAST. Element
+  //        [0] is the workspace DEFAULT stack — the stack a request with no
+  //        X-Stack-Name header resolves to (WorkspaceStackResolver.resolve /
+  //        resolveStackName / resolveStackConfig all take names[0]) and the one
+  //        whose profile index the transcoder reads. Provisioning another stack
+  //        therefore does NOT change the default. The order comes from
+  //        ParamStore.listStackNames' contract (param-store.ts), not from this
+  //        route, so this listing and the resolver can never disagree.
   //   501  parameter store not configured
   app.get(
     '/',
     {
       schema: {
+        description:
+          'List the stacks provisioned on this deployment. ORDER IS PART OF ' +
+          'THE CONTRACT (issue #1165): stacks are returned in CREATION ORDER — ' +
+          'the oldest stack first, each newly provisioned stack APPENDED LAST. ' +
+          'The first element is the DEFAULT stack: a request that sends no ' +
+          'X-Stack-Name header is routed to it, and it is the stack whose ' +
+          'transcode profile index is served as the deployment default. That ' +
+          'default is STABLE — provisioning or deprovisioning another stack ' +
+          'never changes which stack is first, and a new stack never appears ' +
+          'in the middle of this list. Stacks provisioned before this ordering ' +
+          'contract existed carry no recorded creation time; they sort before ' +
+          'every stack created after it, in name order, so an existing ' +
+          "deployment's default is preserved.",
         response: {
-          200: z.array(z.string()),
+          200: z
+            .array(z.string())
+            .describe(
+              'Provisioned stack names in creation order, oldest first. ' +
+                'Element 0 is the default stack for requests without an ' +
+                'X-Stack-Name header.'
+            ),
           501: notConfiguredSchema
         }
       }
@@ -1804,6 +1870,8 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       }
       try {
         const workspaceId = STACK_CONFIG_NAMESPACE;
+        // Creation-ordered by contract (ParamStore.listStackNames,
+        // param-store.ts) — passed through verbatim, never re-sorted here.
         const names = await opts.paramStore.listStackNames(workspaceId);
         return reply.send(names);
       } catch (err) {

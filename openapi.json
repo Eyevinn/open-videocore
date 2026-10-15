@@ -380,16 +380,18 @@
         }
       },
       "get": {
+        "description": "List the stacks provisioned on this deployment. ORDER IS PART OF THE CONTRACT (issue #1165): stacks are returned in CREATION ORDER \u2014 the oldest stack first, each newly provisioned stack APPENDED LAST. The first element is the DEFAULT stack: a request that sends no X-Stack-Name header is routed to it, and it is the stack whose transcode profile index is served as the deployment default. That default is STABLE \u2014 provisioning or deprovisioning another stack never changes which stack is first, and a new stack never appears in the middle of this list. Stacks provisioned before this ordering contract existed carry no recorded creation time; they sort before every stack created after it, in name order, so an existing deployment's default is preserved.",
         "responses": {
           "200": {
-            "description": "Default Response",
+            "description": "Provisioned stack names in creation order, oldest first. Element 0 is the default stack for requests without an X-Stack-Name header.",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "array",
                   "items": {
                     "type": "string"
-                  }
+                  },
+                  "description": "Provisioned stack names in creation order, oldest first. Element 0 is the default stack for requests without an X-Stack-Name header."
                 }
               }
             }
