@@ -77,6 +77,11 @@ import {
   ffmpegS3CredentialMapping
 } from '../services/external-storage-credentials.js';
 import type { OperationStore } from '../services/operation-store.js';
+import {
+  resolveTeardownBounds,
+  withTeardownTimeout,
+  type TeardownBoundsOverrides
+} from '../services/teardown-bounds.js';
 import type { WorkspaceEncoreScalerRegistry } from '../encore-scaler/workspace-registry.js';
 
 // Buckets created on the freshly provisioned MinIO instance. These names are
@@ -316,6 +321,12 @@ type ProvisionRouterOptions = {
   // Cadence (ms) between health probes inside that wait. Unset uses
   // DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS (1s, the SDK's own cadence).
   readyPollIntervalMs?: number;
+  // Bounds applied to stack teardown (issue #1212): the per-service deadline,
+  // the whole-operation deadline, and the bounded retry/backoff for transient
+  // OSC failures. Unset resolves from the environment
+  // (STACK_TEARDOWN_* in services/teardown-bounds.ts) and falls back to the
+  // defaults there; tests inject millisecond budgets and a fake sleep.
+  teardownBounds?: TeardownBoundsOverrides;
 };
 
 // Async operation view returned by GET /operations and GET /operations/:id.
@@ -571,6 +582,13 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
     readyTimeoutMs,
     readyPollIntervalMs
   } = opts;
+
+  // Teardown bounds (issue #1212), resolved ONCE at registration so the DELETE
+  // route, the on-demand packager teardown, the scaler teardown and the
+  // provision-rollback teardown all run under one policy. Environment-driven by
+  // default (12-factor); explicit overrides win, which is how tests collapse the
+  // budgets to milliseconds.
+  const teardownBounds = resolveTeardownBounds(opts.teardownBounds);
 
   // Readiness-wait budget shared by every backing instance this route creates
   // (issue #1038). Resolved once here so all five waits use one bound, and so
@@ -1635,7 +1653,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 created.map((c) => ({
                   serviceId: c.serviceId,
                   instanceName: c.name
-                }))
+                })),
+                // No optional opt-in instances exist on a failed provision.
+                undefined,
+                // Same bounds as the DELETE route (issue #1212): a rollback must
+                // not hang the provision operation on a stuck teardown call.
+                teardownBounds
               );
               if (rollback.status === 'failed') {
                 app.log.error(
@@ -2020,10 +2043,54 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       const op = ops.create('deprovision', name);
       reply.code(202).send({ operationId: op.id, name, status: 'pending' });
 
-      setImmediate(async () => {
-        try {
-          ops.update(op.id, { status: 'running' });
+      // Exactly one TERMINAL update per operation (issue #1212). The closure
+      // below runs under a deadline; when that fires the operation is reported
+      // `failed` immediately, and the abandoned background work — which cannot
+      // be cancelled, @osaas/client-core takes no AbortSignal — must not later
+      // overwrite that with a stale `done`.
+      let settled = false;
+      const settle = (patch: Parameters<typeof ops.update>[1]): void => {
+        if (settled) return;
+        settled = true;
+        ops.update(op.id, patch);
+      };
 
+      // Tear down a hung-prone OSC step under the per-service budget so one
+      // unanswered call cannot consume the whole operation deadline. Used for
+      // the steps that do NOT already carry their own budget (the scaler
+      // registry teardown and the on-demand packager reconciliation); the
+      // stored-service teardown bounds itself (services/deprovision.ts).
+      const bounded = <T>(label: string, run: () => Promise<T>): Promise<T> =>
+        withTeardownTimeout(run, {
+          label,
+          timeoutMs: teardownBounds.serviceTimeoutMs
+        });
+
+      // The packager reconciliation, bounded. teardownOnDemandPackager reports
+      // its own failures as a `failed` result rather than throwing, so the only
+      // thing that can escape here is the deadline — converted to the same
+      // `failed` shape so a hung packager probe is folded into the reported
+      // result (issue #1056) instead of stranding the operation.
+      const boundedPackagerTeardown =
+        async (): Promise<PackagerTeardownResult> => {
+          try {
+            return await bounded(`packager teardown "${name}"`, () =>
+              teardownOnDemandPackager(packagerOscApiFromContext(osc), name)
+            );
+          } catch (err) {
+            return {
+              serviceId: PACKAGER_SERVICE_ID,
+              status: 'failed',
+              error: err instanceof Error ? err.message : String(err)
+            };
+          }
+        };
+
+      // The teardown itself. Extracted from the setImmediate closure so the
+      // WHOLE flow — scaler teardown, packager reconciliation, stored-service
+      // teardown and the parameter-store cleanup — sits under one operation
+      // deadline below and always reaches a terminal state (issue #1212).
+      const runTeardown = async (): Promise<void> => {
           // Without a parameter store there is no per-workspace ownership record
           // to consult, so fall back to the legacy hardcoded-list teardown. This
           // keeps store-less deployments working; ownership scoping (#29)
@@ -2033,10 +2100,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             // it consumes), reconciling via introspection (issue #246). Safe
             // whether or not packaging ever ran: not_found when no packager
             // exists. A failure is logged but does not abort the static teardown.
-            const packagerTeardown = await teardownOnDemandPackager(
-              packagerOscApiFromContext(osc),
-              name
-            );
+            const packagerTeardown = await boundedPackagerTeardown();
             if (packagerTeardown.status === 'failed') {
               app.log.error(
                 { packagerTeardown, name },
@@ -2049,13 +2113,13 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             // static TEARDOWN_ORDER also covers PACKAGER_SERVICE_ID, so the
             // fold MERGES onto that entry instead of reporting two packagers.
             const result = foldTeardownResults(
-              await deprovisionStack(osc, name),
+              await deprovisionStack(osc, name, teardownBounds),
               packagerTeardownAsServiceResults(packagerTeardown)
             );
             if (result.status === 'failed') {
               app.log.error({ result }, 'stack teardown reported failures');
             }
-            ops.update(op.id, { status: 'done', completedAt: Date.now(), result });
+            settle({ status: 'done', completedAt: Date.now(), result });
             return;
           }
 
@@ -2080,7 +2144,9 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             const staleRegistry = getScalerRegistry?.();
             if (staleRegistry) {
               try {
-                await staleRegistry.teardown(name);
+                await bounded(`scaler teardown "${name}"`, () =>
+                  staleRegistry.teardown(name)
+                );
               } catch (err) {
                 app.log.warn(
                   { err, name },
@@ -2088,7 +2154,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 );
               }
             }
-            ops.update(op.id, {
+            settle({
               status: 'done',
               completedAt: Date.now(),
               result: { name, status: 'not_found', services: [] }
@@ -2114,7 +2180,9 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           const scalerRegistry = getScalerRegistry?.();
           if (scalerRegistry) {
             try {
-              await scalerRegistry.teardown(name);
+              await bounded(`scaler teardown "${name}"`, () =>
+                scalerRegistry.teardown(name)
+              );
             } catch (err) {
               app.log.error(
                 { err, name },
@@ -2151,10 +2219,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // double-count it (see packagerTeardownAsServiceResults).
           let packagerTeardown: PackagerTeardownResult | undefined;
           if (!packagerInStoredServices) {
-            packagerTeardown = await teardownOnDemandPackager(
-              packagerOscApiFromContext(osc),
-              name
-            );
+            packagerTeardown = await boundedPackagerTeardown();
             if (packagerTeardown.status === 'failed') {
               app.log.error(
                 { packagerTeardown, name, workspaceId },
@@ -2191,7 +2256,8 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 ...(config.sceneDetectInstanceName
                   ? { sceneDetectInstanceName: config.sceneDetectInstanceName }
                   : {})
-              }
+              },
+              teardownBounds
             ),
             packagerTeardownAsServiceResults(packagerTeardown)
           );
@@ -2199,8 +2265,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           if (result.status === 'failed') {
             app.log.error({ result }, 'stack teardown reported failures');
             // The parameter-store entry is intentionally NOT removed so a retry
-            // can re-read the services[] and finish the teardown.
-            ops.update(op.id, { status: 'done', completedAt: Date.now(), result });
+            // can re-read the services[] and finish the teardown. That retry is
+            // cheap and converges (issue #1212): the services this run already
+            // removed are confirmed absent and reported not_found without a
+            // second removal, so the next DELETE spends its budget only on what
+            // is still there.
+            settle({ status: 'done', completedAt: Date.now(), result });
             return;
           }
 
@@ -2237,11 +2307,34 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // not served from cache after teardown.
           onStackChange?.(workspaceId);
 
-          ops.update(op.id, { status: 'done', completedAt: Date.now(), result });
+          settle({ status: 'done', completedAt: Date.now(), result });
+      };
+
+      setImmediate(async () => {
+        try {
+          ops.update(op.id, { status: 'running' });
+
+          // ONE deadline over the whole teardown (issue #1212). Every OSC call
+          // inside is individually bounded, but this is the backstop that makes
+          // the terminal state unconditional: whatever stalls — a registry
+          // teardown, a parameter-store read, an SDK call that ignores every
+          // other bound — the operation stops being `running` and says why.
+          await withTeardownTimeout(runTeardown, {
+            label: `stack teardown "${name}"`,
+            timeoutMs: teardownBounds.operationTimeoutMs
+          });
+
+          // Defensive: a teardown path that returned without reporting must
+          // still leave a terminal operation rather than a permanent `running`.
+          settle({
+            status: 'failed',
+            completedAt: Date.now(),
+            error: `deprovisioning "${name}" finished without reporting a result`
+          });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           app.log.error({ err, name }, 'deprovisioning failed');
-          ops.update(op.id, {
+          settle({
             status: 'failed',
             completedAt: Date.now(),
             error: `deprovisioning failed: ${message}`
