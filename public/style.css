@@ -500,6 +500,44 @@ tr.row-locked td:first-child {
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
+/* Pre-flight block flag next to a destructive control (issue #921). The reason a
+   delete is already known to be refused, stated in words beside the button so
+   the operator reads it BEFORE activating anything — colour carries nothing here
+   (WCAG 1.4.1) and the text is wired to the button with aria-describedby, so it
+   is announced with the control rather than only on hover.
+
+   The control itself is deliberately NOT disabled: `.action-blocked` keeps it
+   enabled and focusable so its explanation stays reachable (the trade
+   docs/ux/asset-lock-state-spec.md §5.1 settled for the asset archive). */
+.action-blocked-note {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
+/* Blocked variant of a danger button. Deliberately NO `opacity`: compositing
+   the whole control dragged its 13px label (`button, .btn` sets font-size 13px)
+   down to ~2.95:1, under the 4.5:1 WCAG 1.4.3 floor for normal text and under
+   the 3:1 of 1.4.11 — and dimming is the wrong signal anyway for a control that
+   stays enabled on purpose. The state is already carried in words by
+   `.action-blocked-note` (--text-muted on --bg, 7.36:1) and wired to the button
+   with aria-describedby, so the visual treatment only has to be
+   non-destructive. Two cues, neither of them load-bearing (colour alone never
+   says "blocked" — WCAG 1.4.1):
+     - a left accent strip, the same device as tr.row-locked and .lock-block;
+     - a brighter label, measured against the button's composited fill
+       (rgba(239, 68, 68, 0.15) over --bg => #31191e, over --surface => #3a232b):
+       #f87171 gives 5.92:1 on --bg and 5.22:1 on --surface. The unblocked
+       var(--danger) label measures 4.35:1 / 3.83:1 on the same fills, so the
+       blocked state is the HIGHER-contrast one — it is never the dimmer of the
+       two. */
+.btn-danger.action-blocked {
+  box-shadow: inset 3px 0 0 var(--danger);
+  color: #f87171;
+}
+
 /* "Delete protection" block on the asset detail view (issue #895). Text only —
    the lock is never carried by colour or shape alone (WCAG 1.4.1). The left
    accent is the same indigo as the list flag so the two surfaces read as one
@@ -545,6 +583,48 @@ tr.row-locked td:first-child {
   font-size: 11px;
 }
 
+/* ── The Editorial panel (issue #937) ───────────────────────────────────────
+   One container on asset detail holding the three things a HUMAN decides about
+   an asset: its approval state, its classification and the notes left on it
+   (docs/design/editorial-panel-layout.md §1). The left rail is the boundary
+   between the two independent axes — everything inside it is editorial, the
+   lifecycle `status` badge in the summary grid is outside it (§4, separation 5).
+   The panel itself never collapses: hiding the review axis behind a click is
+   the failure #134 asks this layout to prevent. */
+.editorial-panel {
+  border-left: 3px solid var(--review-accent, #2dd4bf);
+  padding-left: 10px;
+}
+
+/* The axis sentence (§4.2). Sits directly under the panel heading and covers
+   all three sub-sections, so neither the review block nor the tags block has to
+   repeat it. */
+.editorial-intro {
+  font-size: 12px;
+  margin-bottom: 12px;
+}
+
+/* A sub-section wrapper. The panel supplies it; the three modules keep their
+   own ids and render into it untouched, so each can still ship on its own. */
+.editorial-group + .editorial-group {
+  margin-top: 4px;
+}
+
+/* Visual hierarchy inside the panel (§8): the panel owns the one loud heading,
+   and the three sub-section headings drop a step below it — the same step
+   `.tracks-group-title` already encodes for sub-groups of the Audio section.
+   Without this the panel would read as four peer sections rather than one
+   surface with three parts. Scoped to `.editorial-group` so the modules' own
+   `.section-title` markup needs no change, and so the same block mounted
+   standalone anywhere else keeps the house heading. */
+.editorial-group .section-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: normal;
+  margin-bottom: 6px;
+}
+
 /* ── Editorial review state (issue #901) ────────────────────────────────────
    The review axis is INDEPENDENT of the lifecycle `status`
    (src/data/asset-repo.ts) and must never read as the same control. So the
@@ -552,8 +632,13 @@ tr.row-locked td:first-child {
    a pill, its own teal accent, and it is always preceded by the words "Review
    state". Shape + wording carry the distinction, so it survives monochrome and
    colour-blind rendering (WCAG 1.4.1). */
+/* The teal rail moved from this block to `.editorial-panel` with issue #937:
+   the review block is now nested INSIDE that panel, and a rail on both would
+   draw a rail inside a rail — two nesting levels where there is one, diluting
+   the very signal that made the rail worth having. The rail now means exactly
+   one thing: everything inside this boundary is the human/editorial axis, and
+   the lifecycle axis is outside it. */
 .review-block {
-  border-left: 3px solid var(--review-accent, #2dd4bf);
   padding-left: 10px;
 }
 

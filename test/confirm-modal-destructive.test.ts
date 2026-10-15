@@ -211,10 +211,15 @@ describe('nameOrFallback (issue #919)', () => {
 // ─── Integration: the Collections tab delete flow ──────────────────────────────
 
 describe('Collections tab delete confirmation (issue #919)', () => {
+  // EMPTY, so the delete is actually offered. Issue #921 short-circuits a
+  // collection the list already shows as blocked (locked, or still holding
+  // members) BEFORE the confirmation, so the confirm path below is the
+  // empty-collection path; the blocked path has its own suite in
+  // test/preflight-destructive-validation.test.ts.
   const COLLECTION = {
     id: '01J8ZQF7TESTCOLLECTIONID',
     name: 'Summer campaign rushes',
-    assetIds: ['01J8A', '01J8B'],
+    assetIds: [] as string[],
     createdAt: '2026-03-01T00:00:00.000Z',
     updatedAt: '2026-03-01T00:00:00.000Z',
   };
@@ -269,18 +274,24 @@ describe('Collections tab delete confirmation (issue #919)', () => {
     expect(calls.filter((c) => c.method === 'DELETE')).toEqual([]);
   });
 
-  it('warns that a non-empty collection will be refused, using the real assetIds count', async () => {
-    const { container } = await renderTab(COLLECTION);
+  it('does not ask for confirmation at all once the API is known to refuse (issue #921)', async () => {
+    // The #919 behaviour was a confirmation that WARNED about the refusal; #921
+    // replaced it with an explanation and no confirm control. assetIds.length
+    // === 2 (collectionSchema, src/routes/collections.ts:95).
+    const { container, calls } = await renderTab({
+      ...COLLECTION,
+      assetIds: ['01J8A', '01J8B'],
+    });
     (container.querySelector('.coll-delete-btn') as HTMLButtonElement).click();
     await flush();
-    const affected = dialog()!.querySelector('.confirm-affected')!.textContent || '';
-    // assetIds.length === 2 (collectionSchema, src/routes/collections.ts:83).
-    expect(affected).toContain('2 assets');
-    expect(affected).toContain('refuse the delete');
+    const el = dialog()!;
+    expect(el.querySelector('.confirm-accept')).toBeNull();
+    expect(el.textContent).toContain('still holds 2 assets');
+    expect(calls.filter((c) => c.method === 'DELETE')).toEqual([]);
   });
 
   it('says the delete will go through when the collection is empty', async () => {
-    const { container } = await renderTab({ ...COLLECTION, assetIds: [] });
+    const { container } = await renderTab(COLLECTION);
     (container.querySelector('.coll-delete-btn') as HTMLButtonElement).click();
     await flush();
     const affected = dialog()!.querySelector('.confirm-affected')!.textContent || '';
@@ -289,29 +300,32 @@ describe('Collections tab delete confirmation (issue #919)', () => {
   });
 
   // A delete-locked collection is refused whatever its member count: the lock
-  // guard (src/routes/collections.ts:404-406, CollectionDeleteProtectedError ->
+  // guard (src/routes/collections.ts:453-455, CollectionDeleteProtectedError ->
   // 409 delete_blocked / reason delete_protected) runs BEFORE the emptiness
-  // check (:407-414) and `?force=true` never applies to it. An EMPTY locked
-  // collection is the trap case, so that is what this pins.
-  it('says an empty but delete-locked collection will still be refused', async () => {
-    const { container } = await renderTab({
+  // check (:490-492) and `?force=true` never applies to it. An EMPTY locked
+  // collection is the trap case, so that is what this pins — and since #921 it
+  // is explained instead of confirmed.
+  it('explains an empty but delete-locked collection instead of confirming it', async () => {
+    const { container, calls } = await renderTab({
       ...COLLECTION,
       assetIds: [],
       deleteLock: { locked: true, lockedAt: '2026-01-01T00:00:00.000Z' },
     });
     (container.querySelector('.coll-delete-btn') as HTMLButtonElement).click();
     await flush();
-    const affected = dialog()!.querySelector('.confirm-affected')!.textContent || '';
-    expect(affected).toContain('delete-locked');
-    expect(affected).toContain('refuse the delete');
+    const el = dialog()!;
+    const text = el.textContent || '';
+    expect(el.querySelector('.confirm-accept')).toBeNull();
+    expect(text).toContain('delete lock');
     // Must NOT promise an outcome the lock guard will veto.
-    expect(affected).not.toContain('will go through');
-    // Names the only route that lifts the lock (collections.ts:478-491).
-    expect(affected).toContain('/collections/{id}/lock');
+    expect(text).not.toContain('will go through');
+    // Names the only route that lifts the lock (collections.ts:572-584).
+    expect(text).toContain('/collections/{id}/lock');
+    expect(calls.filter((c) => c.method === 'DELETE')).toEqual([]);
   });
 
   it('DELETEs the collection once the operator confirms', async () => {
-    const { container, calls } = await renderTab({ ...COLLECTION, assetIds: [] });
+    const { container, calls } = await renderTab(COLLECTION);
     (container.querySelector('.coll-delete-btn') as HTMLButtonElement).click();
     await flush();
     (dialog()!.querySelector('.confirm-accept') as HTMLButtonElement).click();

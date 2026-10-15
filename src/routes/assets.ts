@@ -900,7 +900,25 @@ const technicalMetadataSchema = z.object({
   bitrateBps: z.number(),
   containerFormat: z.string(),
   audioTracks: z.array(audioTrackSchema),
-  extractedAt: z.string()
+  extractedAt: z.string(),
+  // Frames per second of the primary video stream (issue #1066). Clients doing
+  // frame-by-frame stepping need it to convert between frames and seconds.
+  // OPTIONAL: omitted for a source with no video stream, and for assets probed
+  // before the extractor read the rate.
+  frameRate: z
+    .number()
+    .optional()
+    .describe(
+      'Frames per second of the primary video stream, as reported by the probe. ' +
+        'Omitted when the source carries no video stream or was probed before ' +
+        'the frame rate was extracted.'
+    ),
+  // Start timecode of the source, e.g. "01:00:00:00" (issue #1066). OPTIONAL:
+  // most sources carry none.
+  startTimecode: z
+    .string()
+    .optional()
+    .describe('Start timecode of the source (e.g. "01:00:00:00"), when it carries one.')
 });
 
 const manifestUrlsSchema = z.object({
@@ -986,7 +1004,17 @@ const videoTrackOutSchema = z.object({
   width: z.number(),
   height: z.number(),
   bitrateBps: z.number().optional(),
-  frameRate: z.number().optional()
+  frameRate: z
+    .number()
+    .optional()
+    .describe(
+      'Frames per second of this video track, as reported by the probe. Omitted ' +
+        'when the asset was probed before the frame rate was extracted.'
+    ),
+  startTimecode: z
+    .string()
+    .optional()
+    .describe('Start timecode of the source (e.g. "01:00:00:00"), when it carries one.')
 });
 
 // Project an asset's video tracks for the read API (issue #978). The canonical
@@ -998,14 +1026,29 @@ const videoTrackOutSchema = z.object({
 // off `technicalMetadata`) — the same bytes either tier would store, so both
 // backends answer identically. Unprobed asset: empty array, never undefined.
 function videoTracksOf(asset: Asset): VideoTrack[] {
+  // An audio-only source is recorded by the probe as `codec: 'unknown'` with zero
+  // dimensions (pipeline/metadata-extractor.ts parseFfprobe). That placeholder is
+  // not a video track, so drop it here for either storage tier rather than report
+  // a 0x0 "unknown" stream (issue #1066, AC2).
+  const isProbePlaceholder = (t: VideoTrack): boolean =>
+    t.codec === 'unknown' && !t.width && !t.height;
   if (asset.videoTracks) {
-    return asset.videoTracks;
+    return asset.videoTracks.filter((t) => !isProbePlaceholder(t));
   }
   const tm = asset.technicalMetadata;
   if (!tm) {
     return [];
   }
-  return [{ codec: tm.codec, width: tm.width, height: tm.height, bitrateBps: tm.bitrateBps }];
+  return [
+    {
+      codec: tm.codec,
+      width: tm.width,
+      height: tm.height,
+      bitrateBps: tm.bitrateBps,
+      ...(tm.frameRate !== undefined ? { frameRate: tm.frameRate } : {}),
+      ...(tm.startTimecode !== undefined ? { startTimecode: tm.startTimecode } : {})
+    }
+  ].filter((t) => !isProbePlaceholder(t));
 }
 
 const tracksSchema = z.object({
@@ -1103,6 +1146,32 @@ const assetSchema = z.object({
   versionOfAssetId: z.string().optional(),
   versionGroupId: z.string().optional(),
   objectKey: z.string().optional(),
+  // Byte length of the stored source object (issue #1173), the read side of the
+  // length recorded at ingest completion (`Asset.sourceSizeBytes`,
+  // src/data/asset-repo.ts, persisted at `administrative.storage.sizeBytes`).
+  // It pairs with `objectKey` above: the recorded length always describes the
+  // recorded key, because any patch that changes `objectKey` without supplying a
+  // new length clears it (asset-repo.ts `update()`, couch-asset-repo.ts
+  // `applyPatch()`).
+  //
+  // OPTIONAL, and absence is MEANINGFUL: it means "no length was ever recorded",
+  // not "zero bytes". Absent on assets ingested before the length was recorded
+  // and on the finalize paths that cannot learn it (a presigned-PUT completion
+  // whose stat does not report a size), so it must never be coerced to `0` —
+  // a `0` on the wire would read as a legitimately empty source. The repositories
+  // already normalise the stored "nothing recorded" sentinel `0` back to
+  // undefined (asset-document.ts `fromAssetDocument`), so this field is either a
+  // positive byte count or missing.
+  sourceSizeBytes: z
+    .number()
+    .optional()
+    .describe(
+      'Byte length of the stored source object, as recorded when ingest ' +
+        'completed. Omitted — never 0 — when no length was ever recorded for ' +
+        'the current object key, e.g. an asset ingested through a finalize path ' +
+        'that could not learn the size. A present value always describes the ' +
+        'current `objectKey`.'
+    ),
   statusHistory: z.array(transitionSchema),
   // Technical metadata (issue #6). `null` until the first successful extraction
   // (or after a failed one); `technicalMetadataError` carries the last failure.
