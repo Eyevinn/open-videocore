@@ -444,3 +444,151 @@ describe('#1219: cancelled-job reclaim helpers', () => {
     expect(await redis.hget(keys.pool(WS), 'inst-vanished')).toBeNull();
   });
 });
+
+// #1219 review finding 1: the other side of the reclaim — a cancel Encore
+// HONOURS, which is the overwhelmingly common case.
+//
+// Recording a cancel marks the host instance draining so no further transcode
+// is routed to an instance whose job might be stuck. That mark must not double
+// as evidence for teardown: a drain scale-down writes itself means "already a
+// teardown candidate, held only until its real work clears", but a cancel-set
+// drain says nothing about the instance's age or health. Treating the two the
+// same destroyed a warm instance on the very next tick of any routine cancel —
+// `real.count === 0`, no abandoned job, so no protected work — bypassing
+// idleTimeoutMs and making every cancel cost a cold spawn. That is exactly the
+// churn cancelled-job-reclaim.ts's grace-window note promises not to cause.
+//
+// Contract sources verified before writing (CLAUDE.md rule 7):
+//   - teardown candidacy (`activeJobs === 0 && idlePastTimeout`, `draining`,
+//     stuck-cancel hosts) and the destroy/drain boundary — scaler-loop.ts
+//     tick() step 4, around the `isTeardownCandidate` / `protectedCount`
+//     computation.
+//   - `EncoreInstanceRecord.draining` / `.cancelDrainingSince` / `.lastIdleAt`
+//     and the keys.pool / keys.jobInstance / keys.jobEncoreUrl schema —
+//     src/encore-scaler/types.ts.
+//   - idle age basis `lastIdleAt ?? readyAt` — resolveIdleSince /
+//     isIdlePastTimeout, src/encore-scaler/scaler-loop.ts.
+//   - Encore cancel endpoint POST {instanceUrl}/encoreJobs/{uuid}/cancel and
+//     the findByStatus HATEOAS page shape, as cited at the top of this file.
+describe('#1219: a cancel Encore honours must not cost the instance its idle lifetime', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    destroyInstanceMock.mockReset();
+  });
+
+  const HONOURED_UUID = '7f1e0000-0000-0000-0000-00000000abcd';
+
+  // Answers the Encore cancel POST 200 "Ok" AND the findByStatus probes, so one
+  // test can run a real cancel() followed by a real tick().
+  function cancelThenActiveFetchMock(active: string[]): ReturnType<typeof vi.fn> {
+    return vi.fn(async (input: unknown, _init?: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/cancel')) {
+        return { ok: true, status: 200, text: async () => 'Ok' } as unknown as Response;
+      }
+      if (url.includes('status=QUEUED')) return encorePage([]);
+      if (url.includes('status=IN_PROGRESS')) return encorePage(active);
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+  }
+
+  async function seedHonouredCancelHost(redis: FakeRedis): Promise<void> {
+    await seedPool(redis, {
+      instanceId: INSTANCE_ID,
+      url: INSTANCE_URL,
+      // Warm and busy with the job about to be cancelled, idle clock just
+      // stamped: nothing about this instance is near its idle timeout.
+      activeJobs: 1,
+      lastIdleAt: Date.now()
+    });
+    await redis.set(
+      keys.jobEncoreUrl('job-honoured'),
+      `${INSTANCE_URL}/encoreJobs/${HONOURED_UUID}`
+    );
+    await redis.hset(keys.jobInstance(WS), 'job-honoured', INSTANCE_ID);
+  }
+
+  it('keeps the warm instance alive and back in service when Encore stops the cancelled job', async () => {
+    const redis = new FakeRedis();
+    await seedHonouredCancelHost(redis);
+    // Encore honours the cancel: the job is gone from the active set by the
+    // time the next tick asks.
+    vi.stubGlobal('fetch', cancelThenActiveFetchMock([]));
+    destroyInstanceMock.mockResolvedValue(undefined);
+
+    // Idle timeout far longer than this test: any teardown here can only come
+    // from the cancel, never from the instance having aged out.
+    const config = makeConfig(redis, { idleTimeoutMs: 600_000 });
+    await makeScalingEncoreClient(config).cancel('job-honoured');
+
+    await new EncoreScalerLoop(config).tick();
+
+    // The instance survives — a routine cancel is not an instance teardown.
+    expect(destroyInstanceMock).not.toHaveBeenCalled();
+    const raw = await redis.hget(keys.pool(WS), INSTANCE_ID);
+    expect(raw).not.toBeNull();
+    const record = JSON.parse(raw as string) as EncoreInstanceRecord;
+    // And with the cancel confirmed honoured, the drain it set is released, so
+    // the warm instance can take the operator's next transcode instead of
+    // sitting unroutable until it ages out.
+    expect(record.draining).toBeUndefined();
+    expect(record.cancelDrainingSince).toBeUndefined();
+    // Tracked count reconciled down to the real zero Encore reported, with the
+    // idle clock stamped from that confirmation.
+    expect(record.activeJobs).toBe(0);
+    expect(typeof record.lastIdleAt).toBe('number');
+  });
+
+  it('still tears that instance down once it has aged out, so nothing leaks', async () => {
+    const redis = new FakeRedis();
+    await seedHonouredCancelHost(redis);
+    vi.stubGlobal('fetch', cancelThenActiveFetchMock([]));
+    destroyInstanceMock.mockResolvedValue(undefined);
+
+    const warmConfig = makeConfig(redis, { idleTimeoutMs: 600_000 });
+    await makeScalingEncoreClient(warmConfig).cancel('job-honoured');
+    await new EncoreScalerLoop(warmConfig).tick();
+    expect(destroyInstanceMock).not.toHaveBeenCalled();
+
+    // Age the released record past the idle timeout: the ordinary idle path —
+    // the one the cancel must neither short-circuit nor disable — now applies.
+    const released = JSON.parse(
+      (await redis.hget(keys.pool(WS), INSTANCE_ID)) as string
+    ) as EncoreInstanceRecord;
+    await seedPool(redis, { ...released, lastIdleAt: Date.now() - 60_000 });
+
+    await new EncoreScalerLoop(makeConfig(redis, { idleTimeoutMs: 1_000 })).tick();
+
+    expect(destroyInstanceMock).toHaveBeenCalledTimes(1);
+    expect(destroyInstanceMock.mock.calls[0][0]).toBe(INSTANCE_ID);
+  });
+
+  it('still reclaims the instance when the cancel-set drain is the only route in', async () => {
+    const redis = new FakeRedis();
+    // The #1219 frozen case with its LIVE job->instance mapping already gone
+    // (success/scale-down/dropped-job handling all clear it), so the
+    // stuck-cancel host lookup finds nothing and the cancel-set drain is the
+    // only thing that can make this instance a teardown candidate at all.
+    await seedPool(redis, {
+      instanceId: INSTANCE_ID,
+      url: INSTANCE_URL,
+      activeJobs: 1,
+      lastIdleAt: Date.now(),
+      draining: true,
+      cancelDrainingSince: Date.now() - CANCEL_RECLAIM_GRACE_MS * 2
+    });
+    await redis.hset(keys.jobStatus(WS), 'job-frozen', 'CANCELLED');
+    await redis.set(
+      keys.jobCancelRequested('job-frozen'),
+      String(Date.now() - CANCEL_RECLAIM_GRACE_MS * 2)
+    );
+    // Encore still reports the cancelled job IN_PROGRESS: it ignored its cancel.
+    vi.stubGlobal('fetch', fetchMock([], ['job-frozen']));
+    destroyInstanceMock.mockResolvedValue(undefined);
+
+    await new EncoreScalerLoop(makeConfig(redis)).tick();
+
+    expect(destroyInstanceMock).toHaveBeenCalledTimes(1);
+    expect(destroyInstanceMock.mock.calls[0][0]).toBe(INSTANCE_ID);
+  });
+});

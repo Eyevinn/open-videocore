@@ -15,7 +15,8 @@
 // blocked in a read that never returns. The cancel is accepted and recorded,
 // but nothing interrupts that process, so the job stays in Encore's
 // QUEUED+IN_PROGRESS set indefinitely. That is upstream behaviour we cannot fix
-// from this side, and it is logged as OSC friction.
+// from this side; it is logged as OSC friction in
+// docs/osc-feedback/incoming-issue1219-encore-cancel-not-honoured-by-frozen-job.md.
 //
 // What it costs us is NOT just a stale status. The scaler reads the same active
 // set as the authoritative "real in-flight work" signal before it tears an
@@ -53,6 +54,15 @@
 // instance churn). Only a job still active CANCEL_RECLAIM_GRACE_MS after the
 // cancel was requested — i.e. one that has demonstrably ignored it — stops
 // protecting its instance.
+//
+// That window is what the TEARDOWN is gated on, not merely what the reclaim
+// path consults. Recording a cancel marks the host instance `draining` (keeping
+// new work off an instance whose job may be stuck), but a drain with a
+// `cancelDrainingSince` stamp is explicitly NOT evidence for teardown: with no
+// abandoned job past the window and no idle-and-aged condition, scale-down
+// keeps the instance and releases the stamp, so a cancel Encore honours leaves
+// its host exactly as long-lived as any other instance that just finished a
+// job. See recordOperatorCancel below and scaler-loop.ts tick() step 4.
 import type { Redis } from 'ioredis';
 import { keys, type EncoreInstanceRecord } from './types.js';
 
@@ -80,6 +90,24 @@ const CANCEL_MARKER_TTL_SECONDS = 86_400;
 // without this it would never become a teardown candidate at all. Draining is
 // also the correct state on its own terms — an instance whose only job is a
 // cancelled one that will not die must not be handed anybody's next transcode.
+//
+// The drain is stamped `cancelDrainingSince` so scale-down can tell it apart
+// from a drain IT wrote. That distinction is load-bearing, and the reason this
+// write is not a teardown on its own: scale-down's own drain means "already a
+// teardown candidate, held only until its real work clears", so a cleared
+// instance is destroyed at once. A cancel means no such thing — the host is
+// usually a warm, healthy instance whose cancel Encore honours in seconds, and
+// destroying it would bypass idleTimeoutMs and turn every routine cancel into
+// instance churn (the failure the GRACE WINDOW note below promises to avoid).
+// So scale-down requires positive evidence — an abandoned job past its grace
+// window, or the ordinary idle-and-aged condition — before destroying an
+// instance whose only candidacy reason is this stamp, and RELEASES the stamp
+// (returning the instance to service) once Encore confirms no work is left.
+// See scaler-loop.ts tick() step 4.
+//
+// Never overwrites an existing drain: a record already `draining` is left
+// exactly as it is (an operator drain via DELETE /scaler/instances/:id, or a
+// scale-down drain, keeps its own meaning and must not be released by a cancel).
 //
 // Best-effort by contract: every failure is swallowed. This runs inside the
 // operator's cancel request, and a missing marker must never turn a cancel into
@@ -111,7 +139,11 @@ export async function recordOperatorCancel(
     await redis.hset(
       keys.pool(workspaceId),
       instanceId,
-      JSON.stringify({ ...record, draining: true } satisfies EncoreInstanceRecord)
+      JSON.stringify({
+        ...record,
+        draining: true,
+        cancelDrainingSince: now
+      } satisfies EncoreInstanceRecord)
     );
   } catch {
     // Unparseable/unwritable pool record: leave the pool exactly as it was.

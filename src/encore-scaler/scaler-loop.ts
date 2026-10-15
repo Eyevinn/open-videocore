@@ -532,10 +532,25 @@ export class EncoreScalerLoop {
       // A candidate for teardown is either an instance the tracked count already
       // considers idle-and-aged, or one already marked draining (which is being
       // held only until its real work clears — see below).
+      const idleAndAged = inst.activeJobs === 0 && idlePastTimeout;
       const isTeardownCandidate =
-        (inst.activeJobs === 0 && idlePastTimeout) ||
-        inst.draining === true ||
-        stuckCancelledHosts.has(inst.instanceId);
+        idleAndAged || inst.draining === true || stuckCancelledHosts.has(inst.instanceId);
+      // #1219 review: candidacy alone does not justify a teardown when the ONLY
+      // reason for it is a drain an operator CANCEL wrote (cancelDrainingSince,
+      // cancelled-job-reclaim.ts recordOperatorCancel). Unlike a drain written
+      // below — which always means "already a teardown candidate, held only
+      // until its real work clears" — a cancel-set drain says nothing about the
+      // instance's own health or age: the host is typically warm, nowhere near
+      // idleTimeoutMs, and its cancel is honoured in seconds. Destroying it on
+      // that basis would bypass the idle timeout entirely and make every
+      // routine cancel churn an instance. So such an instance is destroyed only
+      // on positive evidence, checked after the authoritative real-state read
+      // below: a job that has demonstrably ignored its cancel, or the ordinary
+      // idle-and-aged condition that applies to every other instance.
+      const cancelDrainOnlyCandidate =
+        inst.cancelDrainingSince !== undefined &&
+        !idleAndAged &&
+        !stuckCancelledHosts.has(inst.instanceId);
 
       if (!isTeardownCandidate || activeCount <= minInstances) {
         survivors.push(inst);
@@ -612,6 +627,41 @@ export class EncoreScalerLoop {
         }
         await updateInstance(redis, workspaceId, drainingRecord);
         survivors.push(drainingRecord);
+        continue;
+      }
+
+      // #1219 review: the honoured-cancel case. This instance is a candidate
+      // ONLY because an operator cancel marked it draining, and Encore has just
+      // confirmed it holds no work at all (protectedCount === 0 with
+      // abandoned.size === 0 means real.count === 0) — i.e. the cancel WAS
+      // honoured, in the normal way, within the grace window. Nothing here is
+      // evidence that the instance should go away: it is a healthy warm
+      // instance that has simply finished its job, and tearing it down would
+      // bypass idleTimeoutMs and make the cancel cost a fresh spawn.
+      //
+      // So keep it, and release the cancel-set drain: the reason for it (its
+      // job MIGHT be stuck) has been positively disproved, so the instance goes
+      // back into routing rather than lingering as warm-but-unroutable
+      // capacity. The tracked count is reconciled down to the confirmed real 0
+      // and the idle clock stamped from this confirmation, so from here on this
+      // instance ages out through exactly the same idle path as any other — it
+      // can neither be destroyed early nor pinned for ever.
+      if (cancelDrainOnlyCandidate && abandoned.size === 0) {
+        const releasedRecord: EncoreInstanceRecord = {
+          ...inst,
+          activeJobs: 0,
+          lastIdleAt: inst.activeJobs > 0 ? now : (resolveIdleSince(inst) ?? now),
+          draining: undefined,
+          cancelDrainingSince: undefined
+        };
+        console.warn(
+          `[encore-scaler] scale-down: instance ${inst.instanceId} was draining only because ` +
+            'an operator cancel may have left a stuck job on it; Encore reports no active ' +
+            'work, so the cancel was honoured — keeping the instance and returning it to ' +
+            'service, to age out on the normal idle timeout'
+        );
+        await updateInstance(redis, workspaceId, releasedRecord);
+        survivors.push(releasedRecord);
         continue;
       }
 

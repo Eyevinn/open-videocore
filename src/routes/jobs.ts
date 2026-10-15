@@ -246,6 +246,14 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
       // (src/pipeline/transcode.ts:172,194). Without the fallback, a job whose
       // post-submit write did not land is cancellable in Videocore while the
       // scaler keeps its queue entry and later dispatches it to Encore.
+      //
+      // The fallback is only MEANINGFUL under the scaler, for that reason. On a
+      // stack wired to a direct EncoreClient, `cancel` takes the internal Encore
+      // UUID (src/pipeline/encore-client.ts:52-58,142-155), so passing our
+      // externalId POSTs a path no job matches and Encore answers 404 — which
+      // that client treats as the documented idempotent no-op. No worse than the
+      // behaviour without a fallback (nothing attempted), but it is not a cancel:
+      // such a job is only cancellable once `encoreInternalJobId` is recorded.
       const encoreHandle = job.encoreInternalJobId ?? job.encoreJobId;
       if (encoreHandle) {
         const encore = request.connections?.encore;
