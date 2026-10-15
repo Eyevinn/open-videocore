@@ -41,6 +41,16 @@ import {
 } from './retry-store.js';
 import { probeCallbackTrust, buildCallbackUri } from './callback-trust-probe.js';
 import { logScalerEvent, ScalerLogThrottle, type ScalerLogPhase } from './scaler-log.js';
+import {
+  assignmentTrailFingerprint,
+  describeProbeResult,
+  formatAssignmentTrail,
+  recordedProbeOutcome,
+  shouldLogAssignmentTrail,
+  type AssignmentDecision,
+  type AssignmentOutcome,
+  type ProbeOutcome
+} from './assignment-log.js';
 import { spawnFailureSecrets } from './spawn-failure.js';
 import { hasPendingPackaging } from './packaging-pin.js';
 import {
@@ -176,6 +186,12 @@ export class EncoreScalerLoop {
   // loop — one loop per workspace, created once (workspace-registry.ts) — so the
   // state lives exactly as long as the loop whose appends it is limiting.
   private readonly logThrottle = new ScalerLogThrottle();
+  // #1172 assignment-trail suppression state (see logAssignmentTrail). Owned by
+  // the loop, like logThrottle: one loop per workspace, so the state lives
+  // exactly as long as the trail it is limiting.
+  private lastAssignmentFingerprint: string | undefined;
+  private lastAssignmentLoggedAt = 0;
+  private unchangedAssignmentTicks = 0;
 
   constructor(private config: EncoreScalerConfig) {}
 
@@ -516,11 +532,38 @@ export class EncoreScalerLoop {
     await this.reapOrphansIfDue();
 
     // 5. Dispatch pending jobs to instances with spare capacity.
+    //
+    // #1172: every `continue`/`break` below is a decision an operator needs to
+    // be able to read back ("why did this ready instance get no job?"), so each
+    // one now records WHY on `decisions` before taking its existing branch. The
+    // control flow is untouched — the records are written, never consulted — and
+    // the whole set is emitted as ONE trail entry after the loop
+    // (logAssignmentTrail).
+    const decisions: AssignmentDecision[] = [];
+    const decide = (
+      inst: EncoreInstanceRecord,
+      outcome: AssignmentOutcome,
+      probe: ProbeOutcome,
+      assignedJobIds: string[] = []
+    ): void => {
+      decisions.push({
+        instanceId: inst.instanceId,
+        // Ready = the trust gate cleared it and it was not withheld for
+        // draining/pending-spawn. `at-capacity` is ready-but-full.
+        ready: outcome !== 'draining' && outcome !== 'pending-spawn' && outcome !== 'trust-probe-pending',
+        outcome,
+        probe,
+        assignedJobIds,
+        activeJobs: inst.activeJobs,
+        capacity: JOBS_PER_INSTANCE
+      });
+    };
     for (const inst of instances) {
       // A draining instance (issue #513) is being torn down: it must receive no
       // new job dispatches. Skip it so its real active-job count can reach zero
       // and a later tick can safely remove it.
       if (inst.draining === true) {
+        decide(inst, 'draining', recordedProbeOutcome(inst));
         continue;
       }
       // #1071: a PENDING spawn is in the pool so it counts against maxInstances
@@ -529,6 +572,7 @@ export class EncoreScalerLoop {
       // node. It becomes eligible the tick after resolvePendingSpawns promotes
       // it, which is also when its callback-trust probe starts.
       if (inst.pendingReadySince !== undefined) {
+        decide(inst, 'pending-spawn', recordedProbeOutcome(inst));
         continue;
       }
       // Gate first-job dispatch on confirmed outbound TLS trust to the paired
@@ -538,15 +582,29 @@ export class EncoreScalerLoop {
       // entirely, so warm instances incur no added latency. A quarantined
       // instance is never dispatched to. This never throws into the tick: a
       // probe failure keeps the job in the queue for a later tick.
-      if (!(await this.ensureCallbackTrust(inst))) {
+      const trust = await this.ensureCallbackTrust(inst);
+      if (!trust.eligible) {
+        // #1172: the trail now names the probe outcome that withheld the job,
+        // so "ready instance, no work" is explained on the tick it happens.
+        decide(inst, 'trust-probe-pending', trust.probe);
         continue; // not eligible this tick — leave its capacity unused
       }
+      // #1172: an instance that is full before the queue is consulted never
+      // enters the loop below, which is a legitimate (and previously invisible)
+      // reason for a queued job to sit still.
+      if (inst.activeJobs >= JOBS_PER_INSTANCE) {
+        decide(inst, 'at-capacity', trust.probe);
+        continue;
+      }
+      // Recorded per instance and reported once after the loop.
+      const assignedJobIds: string[] = [];
+      let outcome: AssignmentOutcome = 'queue-empty';
       while (inst.activeJobs < JOBS_PER_INSTANCE) {
         const claimed = await redis.rpoplpush(
           keys.queue(workspaceId),
           keys.inflight(workspaceId)
         );
-        if (!claimed) break; // queue empty
+        if (!claimed) break; // queue empty (outcome stays 'queue-empty')
 
         let job: QueuedJob;
         try {
@@ -565,6 +623,9 @@ export class EncoreScalerLoop {
         if (job.notBefore && job.notBefore > Date.now()) {
           await redis.lrem(keys.inflight(workspaceId), 1, claimed);
           await redis.rpush(keys.queue(workspaceId), claimed);
+          // #1172: a queue that is NOT empty while an instance sits idle looks
+          // identical to a broken dispatcher unless the backoff is stated.
+          if (assignedJobIds.length === 0) outcome = 'retry-backoff';
           break;
         }
 
@@ -576,13 +637,73 @@ export class EncoreScalerLoop {
         if (!dispatched) {
           // Re-queue at the head so it is retried on the next tick.
           await redis.rpush(keys.queue(workspaceId), claimed);
+          // #1172: the CAUSE is already reported by the #1136 dispatch-phase
+          // error entry, which this must not duplicate — the trail only records
+          // that this instance stopped taking work for that reason.
+          if (assignedJobIds.length === 0) outcome = 'dispatch-failed';
           break; // instance likely unhealthy; stop feeding it this tick
         }
 
         inst.activeJobs += 1;
+        assignedJobIds.push(job.jobId);
+        outcome = 'assigned';
         await updateInstance(redis, workspaceId, inst);
       }
+      decide(inst, outcome, trust.probe, assignedJobIds);
     }
+
+    // 5b. #1172: ONE entry that explains this tick's assignment decisions —
+    //     queue depth, every instance considered, its probe outcome, and the
+    //     jobs it was given. Emitted after dispatch so it reports what actually
+    //     happened, and never before: a trail written mid-loop could not say
+    //     whether a later instance took the work.
+    this.logAssignmentTrail(pending, decisions);
+  }
+
+  // Append the per-tick readiness/assignment trail (issue #1172).
+  //
+  // Gated by shouldLogAssignmentTrail (src/encore-scaler/assignment-log.ts): a
+  // CHANGED decision picture is logged on the tick it changes, an unchanged one
+  // is re-stated at most once per ASSIGNMENT_TRAIL_REPEAT_MS with the count of
+  // the ticks it stood in for. Without that gate a 10s loop would write ~8,600
+  // info records a day per workspace into a bounded, oldest-first retained
+  // window (LOG_STORE_MAX_RECORDS, src/services/log-store.ts) and evict the
+  // history the trail exists to provide — the same reasoning, and the same
+  // window, as the #1136 error throttle.
+  //
+  // Skipped entirely when the tick considered NO instance: with an empty pool
+  // there is no per-instance decision to explain, and why the pool is empty is
+  // the scale-up path's story, already told by the spawn-failure record
+  // (keys.spawnFailure / GET /scaler/status, #1071) and the #1136 spawn-phase
+  // entry. Never throws and never awaits (logScalerEvent).
+  private logAssignmentTrail(queueDepth: number, decisions: AssignmentDecision[]): void {
+    if (!this.config.logSink) return;
+    if (decisions.length === 0) return;
+    const trail = { queueDepth, decisions };
+    const fingerprint = assignmentTrailFingerprint(trail);
+    const now = Date.now();
+    const unchangedTicks = shouldLogAssignmentTrail({
+      fingerprint,
+      lastFingerprint: this.lastAssignmentFingerprint,
+      lastLoggedAt: this.lastAssignmentLoggedAt,
+      unchangedTicks: this.unchangedAssignmentTicks,
+      now
+    });
+    if (unchangedTicks === undefined) {
+      this.unchangedAssignmentTicks += 1;
+      return;
+    }
+    this.lastAssignmentFingerprint = fingerprint;
+    this.lastAssignmentLoggedAt = now;
+    this.unchangedAssignmentTicks = 0;
+    logScalerEvent(this.config.logSink, {
+      phase: 'assign',
+      // A normal outcome, not a failure: the trail must never raise the level
+      // badge (public/logs-table.js) on a healthy pool.
+      level: 'info',
+      workspaceId: this.config.workspaceId,
+      message: formatAssignmentTrail({ ...trail, unchangedTicks })
+    });
   }
 
   // Report an instance whose record carries no usable idle timestamp — at most
@@ -1703,16 +1824,40 @@ export class EncoreScalerLoop {
   //      probe. A PKIX/handshake failure fast-fails (~1s) and does NOT consume
   //      the AbortSignal window, so the deadline is what actually bounds the
   //      wait across re-probes.
-  private async ensureCallbackTrust(inst: EncoreInstanceRecord): Promise<boolean> {
-    if (inst.callbackTrustReady) return true;
-    if (inst.callbackTrustQuarantinedAt) return false;
+  //
+  // #1172: the gate now also REPORTS what it decided and why, alongside the
+  // eligibility it has always returned. Every branch below already knew its
+  // probe outcome and threw it away unless it was one of the two terminal
+  // failures (quarantine / sweep-only fallback) — which is exactly why "ready
+  // instance, no work" was unexplainable from the logs. The return shape carries
+  // the outcome out to the dispatch step, which folds it into the per-tick
+  // assignment trail (src/encore-scaler/assignment-log.ts). `eligible` keeps the
+  // old boolean's meaning EXACTLY, so no gate behaviour changes.
+  private async ensureCallbackTrust(
+    inst: EncoreInstanceRecord
+  ): Promise<{ eligible: boolean; probe: ProbeOutcome }> {
+    if (inst.callbackTrustReady) return { eligible: true, probe: { kind: 'confirmed-earlier' } };
+    if (inst.callbackTrustQuarantinedAt) {
+      return { eligible: false, probe: { kind: 'quarantined' } };
+    }
     // Already resolved to the degraded sweep-only fallback (issue #813): the
     // listener ingress rejected the probe for the whole bounded wait. The state
     // was persisted and logged once; do not re-probe every tick and do not
     // withhold jobs (completion falls back to the terminal-job sweep).
-    if (inst.callbackPathUnusableAt) return true;
+    if (inst.callbackPathUnusableAt) {
+      return {
+        eligible: true,
+        probe: {
+          kind: 'sweep-only-fallback',
+          detail:
+            inst.callbackPathUnusableStatus === undefined
+              ? undefined
+              : String(inst.callbackPathUnusableStatus)
+        }
+      };
+    }
     // No listener URL to probe (reconciled-from-OSC instance): fail open.
-    if (!inst.callbackListenerUrl) return true;
+    if (!inst.callbackListenerUrl) return { eligible: true, probe: { kind: 'none-to-probe' } };
 
     const timeoutMs =
       this.config.callbackTrustTimeoutMs ?? DEFAULT_CALLBACK_TRUST_TIMEOUT_MS;
@@ -1736,7 +1881,7 @@ export class EncoreScalerLoop {
       inst.callbackTrustReady = true;
       inst.callbackTrustConfirmedAt = Date.now();
       await updateInstance(this.config.redis, this.config.workspaceId, inst);
-      return true;
+      return { eligible: true, probe: { kind: 'trusted-now' } };
     }
 
     // Probe did NOT confirm the callback path. If we are still inside the
@@ -1747,7 +1892,11 @@ export class EncoreScalerLoop {
     // the deadline has not been exceeded.
     const elapsedMs = Date.now() - inst.callbackTrustFirstProbeAt;
     if (elapsedMs <= timeoutMs) {
-      return false;
+      // #1172: previously a SILENT `false` — the single most common reason a
+      // freshly ready instance has no work. The live probe outcome travels out
+      // so the trail can say which of tls-trust / timeout / connection /
+      // auth-walled ingress is holding the instance back on this tick.
+      return { eligible: false, probe: describeProbeResult(result) };
     }
 
     // Bounded wait EXCEEDED with the listener ingress still REJECTING the probe
@@ -1782,7 +1931,7 @@ export class EncoreScalerLoop {
           `(ingress ${hostname} answered ${result.status} for the whole ${timeoutMs}ms ` +
           'bounded wait); dispatching anyway with sweep-only completion'
       );
-      return true;
+      return { eligible: true, probe: { kind: 'sweep-only-fallback', detail: String(result.status) } };
     }
 
     // Bounded wait EXCEEDED: quarantine the instance from job assignment and
@@ -1808,7 +1957,7 @@ export class EncoreScalerLoop {
         `(ingress ${hostname}, errorClass=${String(result.errorClass)}); ` +
         'instance quarantined from job assignment'
     );
-    return false;
+    return { eligible: false, probe: { kind: 'quarantined', detail: result.errorClass } };
   }
 
   // POST a queued job's raw Encore payload to a chosen instance and record the
