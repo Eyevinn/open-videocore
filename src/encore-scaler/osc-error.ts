@@ -106,6 +106,35 @@ export function isTransientOscError(err: unknown): boolean {
   return TRANSIENT_MESSAGE_MARKERS.some((marker) => message.includes(marker));
 }
 
+// Fastify's default not-found body, as served by an OSC service's own instance
+// API. The framework answers an unregistered route with
+// `{"message":"Route <METHOD>:<path> not found","error":"Not Found","statusCode":404}`,
+// which @osaas/client-core's defaultErrorFactory (lib/fetch.js, JSON branch)
+// turns into `FetchError { message: 'Route GET:/minioinstance not found',
+// httpCode: 404 }`.
+const ROUTE_NOT_FOUND_MESSAGE = /^Route\s+[A-Z]+:\/\S*\s+not found$/;
+
+// Did the call 404 because the ROUTE does not exist on that service's API, as
+// opposed to the addressed RESOURCE not existing?
+//
+// The distinction matters wherever a 404 is read as "the thing is gone": a
+// missing route says nothing at all about the resource, so believing it would
+// invent an answer the control plane never gave. Observed on `minio-minio`,
+// whose instance API serves no collection read — `listInstances` GETs the
+// service's `apiUrl` (lib/core.js:160-170) and is answered
+// `Route GET:/minioinstance not found` (issue #1211, reported from the stable
+// channel on 2026-10-07 in #1166).
+//
+// Matched on the message because the status alone cannot separate the two
+// cases, and gated on the 404 so a resource-level body that happens to quote a
+// route is not misread. A transport failure carries no httpCode and is never
+// classified here.
+export function isRouteNotFoundError(err: unknown): boolean {
+  if (oscHttpCode(err) !== 404) return false;
+  const message = err instanceof Error ? err.message : String(err ?? '');
+  return ROUTE_NOT_FOUND_MESSAGE.test(message.trim());
+}
+
 // Did createInstance fail because an instance of that name ALREADY EXISTS?
 //
 // This is the signal that a previous attempt landed even though it reported a
