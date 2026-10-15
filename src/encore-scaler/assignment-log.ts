@@ -46,8 +46,14 @@
 //   - Probe outcome vocabulary: `CallbackTrustProbeResult` — the union
 //     `{ ok: true; state: 'trusted'; status }` |
 //     `{ ok: false; state: 'callback-unusable'; status; detail }` |
+//     `{ ok: false; state: 'ingress-auth-window'; status; authenticatedStatus;
+//     detail }` |
 //     `{ ok: false; state: 'probe-failed'; errorClass: 'tls-trust' | 'timeout'
 //     | 'connection'; detail }` — src/encore-scaler/callback-trust-probe.ts.
+//     Re-verified against that union on 2026-10-15 when #1171 added the
+//     'ingress-auth-window' member: it is the one failure state with an HTTP
+//     status and NO `errorClass`, which is why it gets its own probe outcome
+//     below rather than falling through to 'probe-failed'.
 //   - Queue depth semantics: `keys.queue(workspaceId)` =
 //     `encore:queue:${workspaceId}` (src/encore-scaler/types.ts `keys`), read as
 //     `redis.llen` in `EncoreScalerLoop.tick` step 1 and reported as
@@ -110,6 +116,16 @@ export const PROBE_OUTCOMES = [
   // distinguishes a PKIX race from a timeout from an auth-walled ingress.
   'probe-failed',
   'callback-unusable',
+  // A probe ran THIS tick, the ingress rejected the UNAUTHENTICATED request
+  // 401/403, but the same request carrying this service's callback-listener
+  // service access token got through (#1171). Kept distinct from
+  // 'callback-unusable' precisely because the two are the same HTTP status with
+  // opposite meanings: here the hostname, certificate, routing and listener are
+  // proven live and only the platform's inbound auth wall answered, so the gate
+  // keeps re-probing instead of latching a verdict. Collapsing it into
+  // 'callback-unusable' would make the trail say "callback path rejecting" about
+  // an instance that just answered an authenticated probe.
+  'ingress-auth-window',
   // The gate was never reached on this tick (the instance was skipped earlier,
   // for draining or an unresolved spawn), so nothing was probed and nothing is
   // yet resolved on the record — see recordedProbeOutcome.
@@ -134,6 +150,12 @@ export function describeProbeResult(result: CallbackTrustProbeResult): ProbeOutc
   if (result.ok) return { kind: 'trusted-now' };
   if (result.state === 'callback-unusable') {
     return { kind: 'callback-unusable', detail: String(result.status) };
+  }
+  // #1171's state carries no `errorClass` — there WAS an HTTP response — so it
+  // is reported with the unauthenticated status the ingress answered, the same
+  // qualifier shape 'callback-unusable' uses.
+  if (result.state === 'ingress-auth-window') {
+    return { kind: 'ingress-auth-window', detail: String(result.status) };
   }
   return { kind: 'probe-failed', detail: result.errorClass };
 }

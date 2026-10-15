@@ -962,7 +962,25 @@ const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] || St
 // becoming ready/trusted and the instance beginning to process (and fail) its
 // first job. On timeout the instance is quarantined from job assignment rather
 // than dispatched to. Defaults to 60s; override via ENCORE_CALLBACK_TRUST_TIMEOUT_MS.
-const encoreCallbackTrustTimeoutMs = parseInt(process.env['ENCORE_CALLBACK_TRUST_TIMEOUT_MS'] || String(60 * 1000), 10);
+//
+// VALIDATED, not just parsed (#1171 review finding C). Both of these timeouts
+// end up inside `AbortSignal.timeout(...)` via probeCallbackTrust's
+// `Math.min(timeoutMs, requestTimeoutMs)`, and `AbortSignal.timeout(NaN)`
+// throws a RangeError on node 22 (verified by the reviewer) — which would make
+// every probe throw out of the tick and halt the pool. `parseInt` happily
+// returns NaN for a malformed value and NaN survives a `?? default` check, so
+// these go through parsePositiveMsEnv (defined above), which rejects
+// NaN/zero/negative values, warns at boot, and falls back to the default here.
+const encoreCallbackTrustTimeoutMs =
+  parsePositiveMsEnv('ENCORE_CALLBACK_TRUST_TIMEOUT_MS') ?? 60 * 1000;
+// Per-REQUEST bound (issue #1171) for ONE callback-trust probe request, as
+// opposed to the cross-tick bounded wait above. The wait value used to double as
+// the request timeout, so a hung probe held a tick — and instance readiness and
+// job assignment with it — for a full minute. A handshake plus a HEAD against a
+// live per-instance ingress completes in well under a second.
+// Defaults to 5s; override via ENCORE_CALLBACK_PROBE_TIMEOUT_MS.
+const encoreCallbackProbeTimeoutMs =
+  parsePositiveMsEnv('ENCORE_CALLBACK_PROBE_TIMEOUT_MS') ?? 5 * 1000;
 // Grace window (issue #708) for the reconcile loop's dropped-job diff. reconcile
 // can diff Encore's active set AFTER Encore drops a finished job but BEFORE the
 // callback poller has decremented the tracked activeJobs count (observed ~4.4s
@@ -1335,6 +1353,8 @@ function activateScaler(redisUrl: string): void {
     // Gate first-job dispatch on confirmed outbound callback-listener TLS trust
     // (issue #463): bounded wait before a freshly spawned instance is eligible.
     callbackTrustTimeoutMs: encoreCallbackTrustTimeoutMs,
+    // Per-request bound for a single probe request (issue #1171).
+    callbackProbeRequestTimeoutMs: encoreCallbackProbeTimeoutMs,
     // Grace window for reconcile's dropped-job diff (issue #708): skip jobs the
     // callback poller recorded completing (keys.jobCompletionSeen) within this
     // window rather than re-raising them as silently dropped.
