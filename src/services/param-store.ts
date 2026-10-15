@@ -56,7 +56,24 @@ export type StackConfig = {
   // connections for 'ready'. Optional for back-compat: configs written before
   // this field existed have no `status` and MUST be read as 'ready' so already
   // provisioned live stacks keep working (see isReadyStack).
-  status?: 'provisioning' | 'ready' | 'failed';
+  //
+  // TEARDOWN states (issue #1210). A stack whose DELETE is running or left
+  // services behind MUST stay in the listing — its stored config is the only
+  // record of what is still to remove — but it must not read as a live stack:
+  //   'deleting'      — a teardown is in flight for this stack.
+  //   'delete_failed' — a teardown finished with at least one service NOT
+  //                     removed (StackTeardownResult.status === 'failed'); the
+  //                     entry is deliberately retained so a retried DELETE can
+  //                     re-read services[] and finish the job.
+  // Both are non-ready, so isReadyStack (and therefore the resolver) skips
+  // them exactly like 'provisioning'/'failed'. The entry is only deleted once
+  // every service is confirmed gone.
+  status?:
+    | 'provisioning'
+    | 'ready'
+    | 'failed'
+    | 'deleting'
+    | 'delete_failed';
   minioEndpoint: string;
   // CouchDB host/URL only — no embedded password.
   couchdbUrl: string;
@@ -122,7 +139,10 @@ export type StackConfig = {
 // Back-compat: a missing `status` (config written before issue #106) is treated
 // as 'ready' so existing live stacks keep resolving. Only 'ready' (or absent)
 // stacks are connected; 'provisioning'/'failed' are skipped by the resolver but
-// remain readable for deprovision cleanup (they still carry services[]).
+// remain readable for deprovision cleanup (they still carry services[]). The
+// teardown states 'deleting'/'delete_failed' (issue #1210) are skipped for the
+// same reason and for the same purpose: the entry survives so a retried DELETE
+// still knows which services are left.
 export function isReadyStack(config: StackConfig): boolean {
   return config.status === undefined || config.status === 'ready';
 }
