@@ -64,7 +64,7 @@ import {
   PerStackQuotaSumIncomplete
 } from './data/storage-quota-stack-sum.js';
 import { makeS3Reader } from './pipeline/source.js';
-import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE, type WorkspaceConnections } from './services/workspace-stack.js';
+import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE, stackResolvedMinioEndpoint, type WorkspaceConnections } from './services/workspace-stack.js';
 import {
   makeRequestScopedStorageFactory,
   requestStackNameFromHeaders,
@@ -183,10 +183,14 @@ import {
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
 import {
   resolvePublicBaseUrl,
-  resolveEncoreProfilesUrl,
+  resolveEncoreProfilesUrlWithOrigin,
   resolveEncoreProfilesUrlFromParamStore,
   stackScopedProfilesIndexUrl
 } from './services/public-base-url.js';
+import {
+  publishProfileIndex,
+  type PublishOutcome
+} from './services/profile-index-publisher.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
 import { Client as MinioClient } from 'minio';
@@ -1073,14 +1077,72 @@ const encoreProfilesUrl =
 // Encore at the local profile store; #283 confirmed OSC exposes no runtime self-URL,
 // so an explicit value is the only lever.
 const publicBaseUrl = resolvePublicBaseUrl();
-// Tier 3 (issue #315): resolve an operator-supplied full profiles-index URL from
+
+// ADR-026 D1/D2 (issue #1207): publish the profile index into the DEDICATED
+// `openvideocore-profiles` bucket and make that bucket's index.yml the PRIMARY
+// profilesUrl. The object store's reachability is a property this app configures
+// itself (the anonymous-read GetObject policy, ADR-026 D3/C6) and can read back,
+// whereas the derived app path depends on an orchestrator-level auth-gate
+// exemption no OSC contract can set, read, or assert (ADR-026 C3) — the standing
+// wager behind the customer-observed 401 on /api/v1/profiles/index.yml.
+//
+// Reuses the hardened in-cluster seam (ADR-026 C7): the resolver is opt-out
+// (ENCORE_S3_INTERNAL_ENDPOINT=off), PROBED before use and fail-soft back to the
+// stack's stored public endpoint, so the preferred
+// http://<service>.minio-minio.svc.cluster.local:8080 form (which matches the
+// `routing: INTERNAL` OSC itself models for Encore -> object store, C2) is used
+// only when it is actually reachable.
+//
+// Fail-soft end to end: `publishProfileIndex` never throws, and tier 2 is only
+// offered to the resolver on `ok: true`. A deployment with no provisioned object
+// store (env-override/in-memory), or a stack provisioned before this change and
+// therefore without the bucket (which stack provisioning creates — issue #1208),
+// resolves exactly as it did before ADR-026.
+const profilesObjectStoreSettings = resolveInternalEndpointSettings(process.env);
+const resolveProfilesObjectStoreEndpoint = makeInternalEndpointResolver({
+  enabled: profilesObjectStoreSettings.enabled,
+  lookup: makeOscInternalEndpointLookup({ oscContext, log: app.log }),
+  port: profilesObjectStoreSettings.port,
+  probeTimeoutMs: profilesObjectStoreSettings.probeTimeoutMs,
+  log: app.log
+});
+const publishProfileIndexToObjectStore = async (): Promise<PublishOutcome> => {
+  try {
+    const connections = await stackResolver.resolve();
+    return await publishProfileIndex({
+      storageClient: connections.storageClient,
+      // The stack's stored PUBLIC object-store endpoint (StackConfig.minioEndpoint).
+      // `stackResolvedMinioEndpoint` deliberately returns undefined for the
+      // env-override and in-memory paths, which is precisely the
+      // "no provisioned object store" case ADR-026 D2 reason 1 keeps on the
+      // fallback tiers.
+      objectStoreEndpoint: stackResolvedMinioEndpoint(connections),
+      resolveEndpoint: (publicEndpoint) =>
+        resolveProfilesObjectStoreEndpoint(publicEndpoint, connections.s3Config?.stackName),
+      listProfiles: () => profileRepository.list(),
+      log: app.log
+    });
+  } catch (err) {
+    app.log.warn(
+      { err },
+      'profile index publish skipped: could not resolve the stack object store; Encore keeps the pre-ADR-026 profilesUrl tiers'
+    );
+    return { ok: false, reason: 'no-object-store' };
+  }
+};
+const publishedProfilesIndex = await publishProfileIndexToObjectStore();
+const publishedProfilesIndexUrl = publishedProfilesIndex.ok
+  ? publishedProfilesIndex.indexUrl
+  : undefined;
+
+// Tier 4 (issue #315): resolve an operator-supplied full profiles-index URL from
 // the provisioned stack record at boot, where the parameter store is already
 // awaited (see paramStore above). Undefined when there is no store, no stack, or
 // the field is unset — in which case resolveEncoreProfilesUrl falls through to
 // the remote default, byte-identical to pre-#315 behaviour.
 const paramStoreProfilesUrl =
-  publicBaseUrl || process.env['ENCORE_PROFILES_URL_OVERRIDE']
-    ? undefined // env-var seams (tier 1/2) win; skip the param-store read entirely
+  publishedProfilesIndexUrl || publicBaseUrl || process.env['ENCORE_PROFILES_URL_OVERRIDE']
+    ? undefined // a higher tier (override / published object-store index / app path) wins; skip the param-store read entirely
     : await resolveEncoreProfilesUrlFromParamStore({
         paramStore,
         namespace: STACK_CONFIG_NAMESPACE,
@@ -1090,15 +1152,24 @@ const paramStoreProfilesUrl =
             'profiles URL: failed to resolve from parameter store; falling back to remote default index'
           )
       });
-const encoreScalerProfilesUrl = resolveEncoreProfilesUrl(
+const resolvedProfilesUrl = resolveEncoreProfilesUrlWithOrigin(
   encoreProfilesUrl,
-  paramStoreProfilesUrl
+  paramStoreProfilesUrl,
+  publishedProfilesIndexUrl
 );
-if (
-  !publicBaseUrl &&
-  !process.env['ENCORE_PROFILES_URL_OVERRIDE'] &&
-  !paramStoreProfilesUrl
-) {
+const encoreScalerProfilesUrl = resolvedProfilesUrl.url;
+// Log the RESOLVED TIER and URL (ADR-026 §4, the five-tier-resolver trade-off):
+// with a fifth tier an operator must be able to read, from one line, which
+// origin Encore will actually fetch.
+app.log.info(
+  {
+    profilesUrl: encoreScalerProfilesUrl,
+    origin: resolvedProfilesUrl.origin,
+    publishOutcome: publishedProfilesIndex.ok ? 'published' : publishedProfilesIndex.reason
+  },
+  'Encore profilesUrl resolved (ADR-026 tier order: override -> published object-store index -> app path -> parameter store -> remote default)'
+);
+if (resolvedProfilesUrl.origin === 'remote-default') {
   app.log.warn('profiles URL unresolved to local store (neither PUBLIC_BASE_URL nor ENCORE_PROFILES_URL_OVERRIDE set, no parameter-store value / no OSC-derived app URL) — Encore instances will fetch profiles from the remote default index instead of the local profile store');
 }
 
@@ -2262,7 +2333,17 @@ async function reconcileScaler(): Promise<void> {
 await app.register(profilesRouter, {
   prefix: '/api/v1/profiles',
   repository: profileRepository,
-  bootstrapIndexUrl: encoreProfilesUrl
+  bootstrapIndexUrl: encoreProfilesUrl,
+  // ADR-026 §4 mitigation: with the index published as objects, a profile edit
+  // is no longer instantaneously visible to Encore, so EVERY mutation
+  // (create/update/delete/bootstrap) republishes. Fire-and-forget and fail-soft:
+  // a publish failure must never change the profiles HTTP contract (ADR-026 §6),
+  // and Encore instances read `profilesUrl` at startup, so the requirement is
+  // only that a publish completes before the next spawn — not that it is
+  // synchronous with the edit.
+  onProfilesChanged: () => {
+    void publishProfileIndexToObjectStore();
+  }
 });
 
 // Seed profiles from the default Encore index on first startup. Skipped when
@@ -2291,6 +2372,15 @@ await bootstrapProfiles({
   indexUrl: encoreProfilesUrl,
   log: app.log
 }).catch((err) => app.log.warn({ err }, 'profile bootstrap on startup failed'));
+
+// Republish the object-store index now that the store is seeded (ADR-026 D1).
+// The first publish above ran before bootstrap (it has to: its URL is the input
+// to the resolver), so on a first boot it published an empty index. AWAITED for
+// the same ordering reason bootstrapProfiles is: it must complete before
+// reconcileScaler() can spawn an Encore instance that fetches the published
+// index. Fail-soft — `publishProfileIndex` never throws, and a failure leaves
+// Encore on whichever tier the resolver already chose.
+await publishProfileIndexToObjectStore();
 
 // Assets router also owns POST /ingest-url (issue #5) and POST /:id/transcode
 // (issue #8). It shares the same job repository so a job created here is
@@ -3143,9 +3233,21 @@ if (routeDumpPath) {
 // confirms, at boot, whether OSC's 2026-07-08 promise to make /api/v1/profiles
 // publicly accessible for the app actually took effect (this environment cannot
 // reach live OSC to confirm it ahead of time).
+// ADR-026 D2/D4 (issue #1207): the probe now follows the RESOLVED TIER instead
+// of inferring it from `Boolean(publicBaseUrl)`. With the published
+// object-store index as the new primary, `publicBaseUrl` being set no longer
+// means the resolved URL is this app's own index — so the login-wall/#284
+// wording this probe emits would be plainly wrong for an object-store origin.
+// Gating on `origin === 'app-path'` keeps the probe doing exactly what it did
+// before for the app-served index and makes it a no-op for the other origins.
+// EXTENDING the boot check to verify the published object-store index (and
+// scoping its message per origin) is issue #1209 / ADR-026 D4, which ships
+// alongside this change; nothing about this probe's lifecycle, cost,
+// non-fatality, scoped TLS relaxation (#337) or `ReachabilityOutcome` shape is
+// altered here.
 void checkProfilesIndexReachable({
   profilesIndexUrl: encoreScalerProfilesUrl,
-  usingLocalIndex: Boolean(publicBaseUrl),
+  usingLocalIndex: resolvedProfilesUrl.origin === 'app-path',
   log: app.log
 }).catch((err) => app.log.error({ err }, 'profiles-index reachability check errored unexpectedly'));
 
