@@ -2239,6 +2239,10 @@
                     "objectKey": {
                       "type": "string"
                     },
+                    "sourceSizeBytes": {
+                      "type": "number",
+                      "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
+                    },
                     "statusHistory": {
                       "type": "array",
                       "items": {
@@ -2821,6 +2825,10 @@
                           },
                           "objectKey": {
                             "type": "string"
+                          },
+                          "sourceSizeBytes": {
+                            "type": "number",
+                            "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
                           },
                           "statusHistory": {
                             "type": "array",
@@ -3548,6 +3556,10 @@
                           "objectKey": {
                             "type": "string"
                           },
+                          "sourceSizeBytes": {
+                            "type": "number",
+                            "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
+                          },
                           "statusHistory": {
                             "type": "array",
                             "items": {
@@ -4096,6 +4108,10 @@
                           },
                           "objectKey": {
                             "type": "string"
+                          },
+                          "sourceSizeBytes": {
+                            "type": "number",
+                            "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
                           },
                           "statusHistory": {
                             "type": "array",
@@ -4721,6 +4737,10 @@
                     "objectKey": {
                       "type": "string"
                     },
+                    "sourceSizeBytes": {
+                      "type": "number",
+                      "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
+                    },
                     "statusHistory": {
                       "type": "array",
                       "items": {
@@ -5320,6 +5340,10 @@
                     },
                     "objectKey": {
                       "type": "string"
+                    },
+                    "sourceSizeBytes": {
+                      "type": "number",
+                      "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
                     },
                     "statusHistory": {
                       "type": "array",
@@ -6097,6 +6121,10 @@
                     "objectKey": {
                       "type": "string"
                     },
+                    "sourceSizeBytes": {
+                      "type": "number",
+                      "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
+                    },
                     "statusHistory": {
                       "type": "array",
                       "items": {
@@ -6713,6 +6741,10 @@
                     },
                     "objectKey": {
                       "type": "string"
+                    },
+                    "sourceSizeBytes": {
+                      "type": "number",
+                      "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
                     },
                     "statusHistory": {
                       "type": "array",
@@ -7429,6 +7461,10 @@
                           },
                           "objectKey": {
                             "type": "string"
+                          },
+                          "sourceSizeBytes": {
+                            "type": "number",
+                            "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
                           },
                           "statusHistory": {
                             "type": "array",
@@ -10382,6 +10418,10 @@
                     "objectKey": {
                       "type": "string"
                     },
+                    "sourceSizeBytes": {
+                      "type": "number",
+                      "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
+                    },
                     "statusHistory": {
                       "type": "array",
                       "items": {
@@ -11313,6 +11353,10 @@
                     "objectKey": {
                       "type": "string"
                     },
+                    "sourceSizeBytes": {
+                      "type": "number",
+                      "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
+                    },
                     "statusHistory": {
                       "type": "array",
                       "items": {
@@ -12114,6 +12158,10 @@
                     },
                     "objectKey": {
                       "type": "string"
+                    },
+                    "sourceSizeBytes": {
+                      "type": "number",
+                      "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
                     },
                     "statusHistory": {
                       "type": "array",
@@ -13220,6 +13268,10 @@
                     "objectKey": {
                       "type": "string"
                     },
+                    "sourceSizeBytes": {
+                      "type": "number",
+                      "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
+                    },
                     "statusHistory": {
                       "type": "array",
                       "items": {
@@ -13775,6 +13827,10 @@
                     },
                     "objectKey": {
                       "type": "string"
+                    },
+                    "sourceSizeBytes": {
+                      "type": "number",
+                      "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
                     },
                     "statusHistory": {
                       "type": "array",
@@ -14424,6 +14480,10 @@
                     "objectKey": {
                       "type": "string"
                     },
+                    "sourceSizeBytes": {
+                      "type": "number",
+                      "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
+                    },
                     "statusHistory": {
                       "type": "array",
                       "items": {
@@ -15015,6 +15075,10 @@
                     "objectKey": {
                       "type": "string"
                     },
+                    "sourceSizeBytes": {
+                      "type": "number",
+                      "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
+                    },
                     "statusHistory": {
                       "type": "array",
                       "items": {
@@ -15559,6 +15623,10 @@
                     },
                     "objectKey": {
                       "type": "string"
+                    },
+                    "sourceSizeBytes": {
+                      "type": "number",
+                      "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
                     },
                     "statusHistory": {
                       "type": "array",
@@ -16106,6 +16174,10 @@
                     },
                     "objectKey": {
                       "type": "string"
+                    },
+                    "sourceSizeBytes": {
+                      "type": "number",
+                      "description": "Byte length of the stored source object, as recorded when ingest completed. Omitted \u2014 never 0 \u2014 when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current `objectKey`."
                     },
                     "statusHistory": {
                       "type": "array",

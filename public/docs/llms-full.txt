@@ -614,6 +614,7 @@ Response 201 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/by-external-id/{namespace}/{id}
@@ -669,6 +670,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/by-tams-address
@@ -852,6 +854,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   PATCH /api/v1/assets/{id}
@@ -917,6 +920,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   DELETE /api/v1/assets/{id}
@@ -1034,6 +1038,7 @@ Response 201 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/comments
@@ -1338,6 +1343,7 @@ Response 201 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/external-ids
@@ -1420,6 +1426,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   DELETE /api/v1/assets/{id}/external-ids/{namespace}/{externalId}
@@ -1544,6 +1551,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   DELETE /api/v1/assets/{id}/lock
@@ -1594,6 +1602,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   PUT /api/v1/assets/{id}/metadata
@@ -1650,6 +1659,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   POST /api/v1/assets/{id}/multipart/initiate
@@ -1838,6 +1848,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/review-state
@@ -1914,6 +1925,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/stream/{*}
@@ -2028,6 +2040,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   DELETE /api/v1/assets/{id}/tags/{tag}
@@ -2081,6 +2094,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/thumbnails
