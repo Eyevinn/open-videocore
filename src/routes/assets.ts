@@ -1146,6 +1146,32 @@ const assetSchema = z.object({
   versionOfAssetId: z.string().optional(),
   versionGroupId: z.string().optional(),
   objectKey: z.string().optional(),
+  // Byte length of the stored source object (issue #1173), the read side of the
+  // length recorded at ingest completion (`Asset.sourceSizeBytes`,
+  // src/data/asset-repo.ts, persisted at `administrative.storage.sizeBytes`).
+  // It pairs with `objectKey` above: the recorded length always describes the
+  // recorded key, because any patch that changes `objectKey` without supplying a
+  // new length clears it (asset-repo.ts `update()`, couch-asset-repo.ts
+  // `applyPatch()`).
+  //
+  // OPTIONAL, and absence is MEANINGFUL: it means "no length was ever recorded",
+  // not "zero bytes". Absent on assets ingested before the length was recorded
+  // and on the finalize paths that cannot learn it (a presigned-PUT completion
+  // whose stat does not report a size), so it must never be coerced to `0` —
+  // a `0` on the wire would read as a legitimately empty source. The repositories
+  // already normalise the stored "nothing recorded" sentinel `0` back to
+  // undefined (asset-document.ts `fromAssetDocument`), so this field is either a
+  // positive byte count or missing.
+  sourceSizeBytes: z
+    .number()
+    .optional()
+    .describe(
+      'Byte length of the stored source object, as recorded when ingest ' +
+        'completed. Omitted — never 0 — when no length was ever recorded for ' +
+        'the current object key, e.g. an asset ingested through a finalize path ' +
+        'that could not learn the size. A present value always describes the ' +
+        'current `objectKey`.'
+    ),
   statusHistory: z.array(transitionSchema),
   // Technical metadata (issue #6). `null` until the first successful extraction
   // (or after a failed one); `technicalMetadataError` carries the last failure.
