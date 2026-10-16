@@ -61,8 +61,12 @@
 //     module cannot drift from the submit path).
 
 import type { AssetRepository } from '../data/asset-repo.js';
-import { isValidTransition, type AssetStatus } from '../data/asset-repo.js';
+import { type AssetStatus } from '../data/asset-repo.js';
 import type { Job, JobRepository } from '../data/job-repo.js';
+// #1227: the ONE rule for recomputing an asset's state from a job's final
+// state. A late completion is one of the terminal edges it serves; the others
+// are the cancel route and the pipeline-execution cancel.
+import { recomputeAssetStateAfterTerminalJob } from './asset-state-after-terminal-job.js';
 
 // The minimal object-storage surface the reclaim needs: a subset of
 // WorkspaceStorage (src/data/storage.ts), declared structurally so the rule is
@@ -170,17 +174,22 @@ export async function reclaimCancelledTranscodeCompletion(
   //    running. Only when no OTHER job is still active on it, and only through a
   //    transition the asset state machine allows — a cancelled transcode leaves
   //    the source object intact, so `ready` (reusable/retryable), never `failed`.
-  let assetStatus: AssetStatus | undefined;
-  const asset = await deps.assets.get(sourceAssetId);
-  if (asset && asset.status === 'processing' && isValidTransition(asset.status, 'ready')) {
-    const stillActive = (await deps.jobs.findActiveByAssetId(sourceAssetId)).filter(
-      (j) => j.id !== job.id
-    );
-    if (stillActive.length === 0) {
-      const updated = await deps.assets.update(sourceAssetId, { status: 'ready' });
-      assetStatus = updated?.status ?? 'ready';
-    }
-  }
+  //
+  //    #1227: that recompute is no longer written here. It is the SAME rule the
+  //    cancel route and the pipeline-execution cancel need (an asset must leave
+  //    `processing` whenever its last active job ends, however it ended), so it
+  //    lives in one place — `recomputeAssetStateAfterTerminalJob` — and this
+  //    path calls it with the cancelled job. The outcome for a cancelled
+  //    transcode is unchanged: no renditions and a job that did not fail, so the
+  //    asset returns to its prior state, falling back to `ready` because a
+  //    transcode only READ the source (asset-state-after-terminal-job.ts).
+  const recompute = await recomputeAssetStateAfterTerminalJob(
+    job,
+    { assets: deps.assets, jobs: deps.jobs, logWarn: deps.logWarn },
+    sourceAssetId
+  );
+  const assetStatus: AssetStatus | undefined =
+    recompute.outcome === 'applied' ? recompute.status : undefined;
 
   return {
     outputPrefix,
