@@ -288,6 +288,21 @@ type ProvisionRouterOptions = {
   // derived identifier. Optional: when omitted no cache invalidation is
   // signalled.
   onStackChange?: (workspaceId: string) => void;
+  // Invoked with the STACK NAME at the very start of DELETE /:name's teardown —
+  // before the scaler teardown and before any instance is removed (#1213).
+  //
+  // This is where a caller releases everything it is running AGAINST that
+  // stack's backing services, while they still exist. main.ts stops the Encore
+  // callback poller(s) bound to the stack's Valkey here: the poller's dedicated
+  // blocking connection otherwise retried the removed Valkey about once a
+  // second with ECONNREFUSED, and the reconcile that used to be the only thing
+  // that stopped it runs at the END of a successful teardown only, so a
+  // teardown reporting failures left it retrying for the process's lifetime.
+  //
+  // Best-effort and bounded by the caller's per-service teardown budget: a hook
+  // that throws or hangs is logged and the teardown continues, because leaving
+  // a stack provisioned is worse than leaving a poller running.
+  onStackTeardownStart?: (name: string) => void | Promise<void>;
   // Late-bound accessor for the scaler registry. The registry is created lazily
   // in main.ts *after* this router registers (only once a stack exists), so it
   // cannot be passed by value at registration time. This getter reads the
@@ -590,6 +605,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
     osc,
     paramStore,
     onStackChange,
+    onStackTeardownStart,
     getScalerRegistry,
     operationStore: ops,
     publicBaseUrl,
@@ -2218,6 +2234,28 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       // teardown and the parameter-store cleanup — sits under one operation
       // deadline below and always reaches a terminal state (issue #1212).
       const runTeardown = async (): Promise<void> => {
+          // Release everything this process is running AGAINST the stack's
+          // backing services while those services still exist (#1213) — the
+          // Encore callback poller(s) bound to the stack's Valkey above all.
+          // FIRST, ahead of the scaler teardown and of every instance removal,
+          // and on every branch below (including the already-gone stack), so no
+          // path can leave a poller retrying a removed Valkey once a second.
+          //
+          // Bounded like the other hung-prone steps and never fatal: a hook that
+          // throws or outruns its budget is logged, and the teardown proceeds.
+          if (onStackTeardownStart) {
+            try {
+              await bounded(`stack teardown prepare "${name}"`, async () =>
+                onStackTeardownStart(name)
+              );
+            } catch (err) {
+              app.log.warn(
+                { err, name },
+                'releasing stack-bound pollers before teardown failed; continuing teardown'
+              );
+            }
+          }
+
           // Without a parameter store there is no per-workspace ownership record
           // to consult, so fall back to the legacy hardcoded-list teardown. This
           // keeps store-less deployments working; ownership scoping (#29)
@@ -2281,6 +2319,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 );
               }
             }
+            // Converge the stack-bound background work for this name too
+            // (#1213): the pollers released above are re-armed by the reconcile
+            // this triggers if, and only if, their Valkey is still there.
+            onStackChange?.(workspaceId);
             settle({
               status: 'done',
               completedAt: Date.now(),
@@ -2397,6 +2439,13 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             // removed are confirmed absent and reported not_found without a
             // second removal, so the next DELETE spends its budget only on what
             // is still there.
+            //
+            // #1213: signal the change on this path as well. The stack-bound
+            // pollers were released before the teardown started, and this is
+            // what lets the reconcile decide what to re-arm: a stack whose
+            // Valkey survived a failed teardown gets its poller back, one whose
+            // Valkey is gone does not.
+            onStackChange?.(workspaceId);
             settle({ status: 'done', completedAt: Date.now(), result });
             return;
           }

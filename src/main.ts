@@ -167,6 +167,7 @@ import {
 import { healthRouter } from './routes/health.js';
 import { resolveBuildInfo } from './build-info.js';
 import { startEncoreCallbackPoller, type PollerDeps } from './pipeline/encore-callback-poller.js';
+import { StackCallbackPollerRegistry } from './pipeline/stack-callback-poller-registry.js';
 import {
   reconcileFailedTranscodes,
   settleFailedTranscode
@@ -647,6 +648,10 @@ await app.register(provisionRouter, {
       indexUrl: encoreProfilesUrl,
       log: app.log
     }).then(() => undefined),
+  // Release the background work bound to a stack's Valkey before that Valkey is
+  // removed (#1213). Declared below (stopCallbackPollersForStack); the route
+  // only calls this at teardown time, long after the binding initialises.
+  onStackTeardownStart: (name) => stopCallbackPollersForStack(name),
   // Late-bound accessor for the scaler registry. scalerRegistry is a
   // module-level binding created lazily by reconcileScaler() only once a stack
   // exists (and reset to undefined on the last deprovision), which is *after*
@@ -1219,8 +1224,15 @@ let stopEncoreCallbackPoller: (() => void) | undefined;
 let callbackPollerOptions: Omit<PollerDeps, 'redis'> | undefined;
 let activationConnectionId: string | undefined;
 // Callback pollers for every stack Valkey other than the activation one, keyed
-// by connectionId. See syncStackCallbackPollers.
-const stackCallbackPollers = new Map<string, () => void>();
+// by connectionId and tracking which stacks each one serves (#1213). See
+// syncStackCallbackPollers and stopCallbackPollersForStack.
+const stackCallbackPollers = new StackCallbackPollerRegistry();
+// The stack whose Valkey the activation poller (stopEncoreCallbackPoller) is
+// bound to, when that connection is a stack's OWN store (#1213). Set by
+// syncStackCallbackPollers, which is the only place a stack is matched to the
+// activation connectionId; undefined on a single-Valkey env-override
+// deployment, where no stack owns the connection.
+let activationPollerStackKey: string | undefined;
 
 // The Valkey a stack's scaler state lives on. Since #615 each provisioned stack
 // has its own Valkey and its scaler loop, the callback listeners paired with its
@@ -2233,8 +2245,8 @@ async function deactivateScaler(): Promise<void> {
 
   stopEncoreCallbackPoller?.();
   stopEncoreCallbackPoller = undefined;
-  for (const stop of stackCallbackPollers.values()) stop();
-  stackCallbackPollers.clear();
+  activationPollerStackKey = undefined;
+  stackCallbackPollers.stopAll();
   callbackPollerOptions = undefined;
   activationConnectionId = undefined;
 
@@ -2330,23 +2342,96 @@ function inScalerStack<T>(stackKey: string | undefined, fn: () => Promise<T>): P
 // stack that was just provisioned is not missed for its lifetime.
 async function syncStackCallbackPollers(): Promise<void> {
   if (!scalerRegistry || !sharedRedis || !callbackPollerOptions) return;
-  const live = new Set<string>();
+  const options = callbackPollerOptions;
+  const connections: Array<{ stackKey: string; connectionId: string }> = [];
+  // The connection object each poller must drain, by connectionId. Always the
+  // identical client the stack's scaler loop uses (resolveStackRedis), never a
+  // second socket to the same store.
+  const redisByConnection = new Map<string, IORedis>();
+  // Which stack OWNS the activation Valkey, if any (#1213). Recomputed on every
+  // sync from the same enumeration, so a stack whose own store is the
+  // activation connection can have its poller stopped at teardown time instead
+  // of polling a removed Valkey until the next reconcile.
+  activationPollerStackKey = undefined;
   for (const connection of await scalerRegistry.listStackConnections({ fresh: true })) {
     const { connectionId, redis, stackKey } = connection;
-    if (!connectionId || !redis || connectionId === activationConnectionId) continue;
-    live.add(connectionId);
-    if (stackCallbackPollers.has(connectionId)) continue;
-    stackCallbackPollers.set(
-      connectionId,
-      startEncoreCallbackPoller({ ...callbackPollerOptions, redis })
-    );
-    app.log.info({ stackKey, connectionId }, 'encore-callback-poller: started for stack Valkey');
+    if (!connectionId || !redis) continue;
+    if (connectionId === activationConnectionId) {
+      // Only a real stack can OWN this connection. The fixed DEPLOYMENT_CONTEXT
+      // ('default', src/auth/workspace.ts) also resolves to it — it is the
+      // fallback identity of a single-Valkey env-override deployment, not a
+      // provisioned stack — and must never claim it, or a DELETE of the stack
+      // that genuinely owns the store would not stop this poller. First real
+      // stack wins; a second stack on the same store is the shared-Valkey case,
+      // where the owner is whichever one was enumerated first.
+      if (stackKey !== DEPLOYMENT_CONTEXT && activationPollerStackKey === undefined) {
+        activationPollerStackKey = stackKey;
+      }
+      // #1213: re-arm the activation poller when it was stopped for a teardown
+      // that then left this Valkey in place (a teardown reporting failures, or
+      // one whose Valkey removal itself failed). Without this the deployment
+      // would stay active with nothing draining its completions until a
+      // restart.
+      if (!stopEncoreCallbackPoller) {
+        stopEncoreCallbackPoller = startEncoreCallbackPoller({ ...options, redis });
+        app.log.info(
+          { stackKey, connectionId },
+          'encore-callback-poller: re-started for the activation stack Valkey'
+        );
+      }
+      continue;
+    }
+    connections.push({ stackKey, connectionId });
+    redisByConnection.set(connectionId, redis);
   }
-  for (const [connectionId, stop] of stackCallbackPollers) {
-    if (live.has(connectionId)) continue;
-    stop();
-    stackCallbackPollers.delete(connectionId);
+  const { started, stopped } = stackCallbackPollers.sync(connections, (connection) =>
+    startEncoreCallbackPoller({
+      ...options,
+      redis: redisByConnection.get(connection.connectionId)!
+    })
+  );
+  for (const connectionId of started) {
+    app.log.info({ connectionId }, 'encore-callback-poller: started for stack Valkey');
+  }
+  for (const connectionId of stopped) {
     app.log.info({ connectionId }, 'encore-callback-poller: stopped for stack Valkey');
+  }
+}
+
+// Stop the callback pollers bound to a stack's Valkey BEFORE that Valkey is
+// removed (#1213).
+//
+// Wired to the provision router's onStackTeardownStart hook, so it runs at the
+// start of DELETE /api/v1/provision/:name — ahead of the scaler teardown and
+// of every instance removal. Previously the only thing that stopped a stack's
+// poller was the reconcile at the END of a SUCCESSFUL teardown, so from the
+// moment the stack's Valkey instance was removed the poller's dedicated
+// blocking connection retried it about once a second with ECONNREFUSED, and a
+// teardown that reported failures (which never reaches that reconcile) left it
+// retrying for the lifetime of the process.
+//
+// Stops are exact: a per-stack poller is released only when this stack was the
+// last one using its connection (StackCallbackPollerRegistry.stopForStack), and
+// the activation poller only when this stack is the one whose own store that
+// connection is. Both stop functions are idempotent, and the reconcile that
+// follows the teardown re-arms whatever is still needed.
+function stopCallbackPollersForStack(stackName: string): void {
+  for (const connectionId of stackCallbackPollers.stopForStack(stackName)) {
+    app.log.info(
+      { stackKey: stackName, connectionId },
+      'encore-callback-poller: stopped for a stack being torn down'
+    );
+  }
+  if (stopEncoreCallbackPoller && activationPollerStackKey === stackName) {
+    stopEncoreCallbackPoller();
+    stopEncoreCallbackPoller = undefined;
+    // Drop the ownership claim with the poller: the next sync re-establishes it
+    // (and re-arms the poller) only if this Valkey is still there.
+    activationPollerStackKey = undefined;
+    app.log.info(
+      { stackKey: stackName, connectionId: activationConnectionId },
+      'encore-callback-poller: stopped for the activation stack being torn down'
+    );
   }
 }
 
