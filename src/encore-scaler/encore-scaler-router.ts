@@ -173,11 +173,14 @@ export const encoreScalerRouter: FastifyPluginAsync<EncoreScalerRouterOptions> =
       const { url } = JSON.parse(record) as { url: string };
 
       // The remote cancel leg (#1232). Contract source (CLAUDE.md rule 7):
-      // `EncoreClient.cancel` in src/pipeline/encore-client.ts — the transcoder
-      // cancels with `POST {baseUrl}/encoreJobs/{jobId}/cancel`, no body, cited
-      // to the upstream transcoder's controller source and hand-verified
-      // 2026-07-09; only NEW/QUEUED/IN_PROGRESS are cancellable and cancelling
-      // an already-gone/terminal job is a no-op. `{jobId}` there is the id the
+      // upstream transcoder controller `EncoreController.kt`
+      // (github.com/svt/encore, encore-web/src/main/kotlin/se/svt/oss/encore/
+      // controller/EncoreController.kt) —
+      // `@PostMapping("/{jobId}/cancel") fun cancel(@PathVariable jobId: UUID, ...)`:
+      // POST, no request body, 404 when the job does not exist, and 409 only
+      // when the job's status is not cancellable (NEW/QUEUED/IN_PROGRESS are
+      // the cancellable states). This repo's client speaks the same shape —
+      // `EncoreClient.cancel`, src/pipeline/encore-client.ts. `{jobId}` is the id the
       // TRANSCODER assigned, not our externalId: the scaler records it at
       // dispatch time under keys.jobUuid (scaler-loop.ts, `set` with a 24h TTL)
       // and the same resolution is done by makeScalingEncoreClient().cancel
@@ -192,7 +195,18 @@ export const encoreScalerRouter: FastifyPluginAsync<EncoreScalerRouterOptions> =
         // instead of reporting a cancellation that did not happen — the job is
         // still running on the instance. Local state is left untouched so the
         // caller (or the reconciler) can retry once the id is resolvable.
-        return reply.code(409).send({
+        //
+        // 503, deliberately NOT 404/409: in the upstream contract both of those
+        // mean "nothing left to cancel" (404 unknown job, 409 already in a
+        // non-cancellable/terminal status), and clients written against it —
+        // including `EncoreClient.cancel` in src/pipeline/encore-client.ts,
+        // `if (res.status === 404 || res.status === 409) return;` — treat them
+        // as an idempotent success. Answering 409 here would let a client
+        // pointed at this facade swallow "the cancel was never forwarded and
+        // the job is still transcoding" as a completed cancellation. 503 is
+        // outside that no-op window, so such a client throws and the caller can
+        // retry.
+        return reply.code(503).send({
           id,
           status: 'CANCEL_NOT_HONOURED',
           error:

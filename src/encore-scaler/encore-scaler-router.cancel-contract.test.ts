@@ -8,13 +8,17 @@
 // transcoding.
 //
 // Contract sources verified before writing (CLAUDE.md rule 7):
-//   - Cancel shape: `EncoreClient.cancel` doc comment + HTTP implementation,
-//     src/pipeline/encore-client.ts — `POST {baseUrl}/encoreJobs/{jobId}/cancel`,
-//     no body, cited to the upstream transcoder's controller source and
-//     hand-verified 2026-07-09; only NEW/QUEUED/IN_PROGRESS are cancellable and
-//     cancelling an already-gone/terminal job is a no-op (hence 404/409 are
-//     idempotent). The live instance contract is still unfetchable — see
-//     docs/osc-feedback/incoming-encore-api-docs-unreachable-cancel-contract.md.
+//   - Cancel shape: upstream transcoder controller `EncoreController.kt`
+//     (github.com/svt/encore,
+//     encore-web/src/main/kotlin/se/svt/oss/encore/controller/EncoreController.kt) —
+//     `@PostMapping("/{jobId}/cancel") fun cancel(@PathVariable jobId: UUID, ...)`:
+//     POST, no request body, 404 when the job does not exist, and 409 only when
+//     the job's status is not cancellable (the handler cancels NEW/QUEUED/
+//     IN_PROGRESS and throws CONFLICT for every other status). Hence 404/409
+//     both mean "nothing left to cancel" and are idempotent no-ops. The same
+//     shape is implemented by `EncoreClient.cancel`, src/pipeline/encore-client.ts,
+//     which returns early on 404/409 — so a refusal this facade raises itself
+//     must use a status outside that window (see the unknown-id test below).
 //   - Transcoder-assigned id lookup: `keys.jobUuid(encoreJobId)` (a plain string
 //     key, `redis.get`), src/encore-scaler/types.ts, written at dispatch time in
 //     src/encore-scaler/scaler-loop.ts and read the same way by
@@ -213,7 +217,14 @@ describe('#1232 scaler facade cancel speaks the verified transcoder contract', (
     try {
       const res = await app.inject({ method: 'DELETE', url: `/encoreJobs/${EXTERNAL_ID}` });
 
-      expect(res.statusCode).toBe(409);
+      // The refusal must NOT reuse 404/409: those are the contract's
+      // "already terminal / nothing to cancel" no-op statuses, and
+      // `EncoreClient.cancel` (src/pipeline/encore-client.ts) returns early on
+      // them — so a client pointed at this facade would read an unforwarded
+      // cancel as a successful one while the job is still transcoding.
+      expect(res.statusCode).not.toBe(404);
+      expect(res.statusCode).not.toBe(409);
+      expect(res.statusCode).toBe(503);
       const body = res.json() as { id: string; status: string; error: string };
       expect(body.status).toBe('CANCEL_NOT_HONOURED');
       expect(body.error).toMatch(/transcoder-assigned job id/i);
