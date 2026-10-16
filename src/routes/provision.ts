@@ -45,6 +45,7 @@ import {
   AUTO_SUBTITLES_SERVICE_ID,
   OBJECT_STORE_SERVICE_ID,
   PACKAGER_SERVICE_ID,
+  QUEUE_SERVICE_ID,
   SCENE_DETECT_SERVICE_ID,
   STACK_SERVICES
 } from '../services/stack.js';
@@ -288,6 +289,43 @@ type ProvisionRouterOptions = {
   // derived identifier. Optional: when omitted no cache invalidation is
   // signalled.
   onStackChange?: (workspaceId: string) => void;
+  // Invoked with the STACK NAME at the very start of DELETE /:name's teardown —
+  // before the scaler teardown and before any instance is removed (#1213).
+  //
+  // This is where a caller releases everything it is running AGAINST that
+  // stack's backing services, while they still exist. main.ts stops the Encore
+  // callback poller(s) bound to the stack's Valkey here: the poller's dedicated
+  // blocking connection otherwise retried the removed Valkey about once a
+  // second with ECONNREFUSED, and the reconcile that used to be the only thing
+  // that stopped it runs at the END of a successful teardown only, so a
+  // teardown reporting failures left it retrying for the process's lifetime.
+  //
+  // Best-effort and bounded by the caller's per-service teardown budget: a hook
+  // that throws or hangs is logged and the teardown continues, because leaving
+  // a stack provisioned is worse than leaving a poller running.
+  onStackTeardownStart?: (name: string) => void | Promise<void>;
+  // Report whether the stack's QUEUE (Valkey) instance is still there, for the
+  // paths that leave the stored StackConfig in place (#1213).
+  //
+  // A caller that binds background work to a stack's Valkey cannot read that
+  // from the stored config: the config is the stack's COORDINATES, and a
+  // teardown that reported failures deliberately keeps it (so the DELETE can be
+  // retried) even though the services it points at are being removed one by
+  // one. TEARDOWN_ORDER (services/stack.ts) removes the queue SECOND, so a run
+  // that removed the Valkey and then failed on the database or the storage ends
+  // as `failed` with a stored config whose `redisUrl` now points at nothing.
+  // Anything re-derived from that config — a poller re-armed by a post-teardown
+  // reconcile, say — would bind straight back to the removed store.
+  //
+  // Called with `present: false` when a run that is KEEPING the config
+  // established the queue instance is gone (removed by this run, or confirmed
+  // already absent), and with `present: true` when the queue is known to be
+  // there: its removal failed, or the stack has just been provisioned. Not
+  // called on a fully successful teardown — the config is deleted there, so the
+  // stack stops being enumerable at all.
+  //
+  // Synchronous and best-effort: it only updates the caller's own bookkeeping.
+  onStackQueuePresence?: (name: string, present: boolean) => void;
   // Late-bound accessor for the scaler registry. The registry is created lazily
   // in main.ts *after* this router registers (only once a stack exists), so it
   // cannot be passed by value at registration time. This getter reads the
@@ -581,6 +619,30 @@ export async function persistStackConfig(opts: {
   );
 }
 
+// What a teardown run established about the stack's QUEUE (Valkey) instance
+// (#1213), read off the per-service results the run reports.
+//
+// `false` — the queue instance is gone: this run removed it, or confirmed it
+//           was already absent. `not_found` counts, because it is the
+//           CONFIRMED-absent status (deprovision.ts TeardownStatus), not a
+//           "could not check" — an unconfirmable absence is reported `failed`.
+// `true`  — the queue instance is still there: its own removal failed, so the
+//           store is (as far as this run could tell) alive.
+// `undefined` — this run says nothing about the queue: it never reached it
+//           (the stored services[] did not include it, or the run was
+//           store-less). The caller must not change its mind on no evidence.
+//
+// Matching is by serviceId identity (QUEUE_SERVICE_ID, services/stack.ts), not
+// by role string or by position, so it holds for both the stored-config
+// teardown and the static TEARDOWN_ORDER one.
+export function queueInstancePresentAfterTeardown(
+  result: StackTeardownResult
+): boolean | undefined {
+  const queue = result.services.find((s) => s.serviceId === QUEUE_SERVICE_ID);
+  if (!queue) return undefined;
+  return queue.status === 'failed';
+}
+
 export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async (
   fastify,
   opts
@@ -590,6 +652,8 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
     osc,
     paramStore,
     onStackChange,
+    onStackTeardownStart,
+    onStackQueuePresence,
     getScalerRegistry,
     operationStore: ops,
     publicBaseUrl,
@@ -1698,6 +1762,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           }
           // The new stack is now discoverable: drop any cached connections so
           // the next request resolves it immediately.
+          //
+          // Its queue instance is live by construction — the provision above
+          // created it and waited for it to be ready — so say so before the
+          // reconcile runs (#1213). A stack name can carry a "queue is gone"
+          // report from an earlier failed teardown that kept the stored config;
+          // re-provisioning under the same name is exactly the case where that
+          // report stops being true, and without this the new stack's callback
+          // poller would never be armed.
+          onStackQueuePresence?.(name, true);
           onStackChange?.(workspaceId);
 
           // Seed the newly-provisioned stack's profile store (issue #701). This
@@ -2218,6 +2291,28 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       // teardown and the parameter-store cleanup — sits under one operation
       // deadline below and always reaches a terminal state (issue #1212).
       const runTeardown = async (): Promise<void> => {
+          // Release everything this process is running AGAINST the stack's
+          // backing services while those services still exist (#1213) — the
+          // Encore callback poller(s) bound to the stack's Valkey above all.
+          // FIRST, ahead of the scaler teardown and of every instance removal,
+          // and on every branch below (including the already-gone stack), so no
+          // path can leave a poller retrying a removed Valkey once a second.
+          //
+          // Bounded like the other hung-prone steps and never fatal: a hook that
+          // throws or outruns its budget is logged, and the teardown proceeds.
+          if (onStackTeardownStart) {
+            try {
+              await bounded(`stack teardown prepare "${name}"`, async () =>
+                onStackTeardownStart(name)
+              );
+            } catch (err) {
+              app.log.warn(
+                { err, name },
+                'releasing stack-bound pollers before teardown failed; continuing teardown'
+              );
+            }
+          }
+
           // Without a parameter store there is no per-workspace ownership record
           // to consult, so fall back to the legacy hardcoded-list teardown. This
           // keeps store-less deployments working; ownership scoping (#29)
@@ -2281,6 +2376,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 );
               }
             }
+            // Converge the stack-bound background work for this name too
+            // (#1213): the pollers released above are re-armed by the reconcile
+            // this triggers if, and only if, their Valkey is still there.
+            onStackChange?.(workspaceId);
             settle({
               status: 'done',
               completedAt: Date.now(),
@@ -2397,6 +2496,25 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             // removed are confirmed absent and reported not_found without a
             // second removal, so the next DELETE spends its budget only on what
             // is still there.
+            //
+            // #1213: this is the one terminal path that KEEPS the stored config
+            // while the stack's services are (partly) gone, so it is also the
+            // one path where the config stops describing reality. Report what
+            // this run established about the queue instance BEFORE signalling
+            // the change: the reconcile the signal triggers re-derives the
+            // stack's Valkey from the config that is being kept, and
+            // TEARDOWN_ORDER (services/stack.ts) removes the queue second — so
+            // a run that removed the Valkey and then failed on the database or
+            // the storage would otherwise re-arm a poller against the store it
+            // had just removed. With the report in hand the reconcile re-arms
+            // only for a stack whose Valkey survived (its removal failed), and
+            // leaves one whose Valkey is gone released until the retry finishes
+            // the teardown and the config is deleted.
+            const queuePresent = queueInstancePresentAfterTeardown(result);
+            if (queuePresent !== undefined) {
+              onStackQueuePresence?.(name, queuePresent);
+            }
+            onStackChange?.(workspaceId);
             settle({ status: 'done', completedAt: Date.now(), result });
             return;
           }
