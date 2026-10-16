@@ -36,6 +36,7 @@ import {
   type JobRepository
 } from '../data/job-repo.js';
 import type { EncoreClient } from './encore-client.js';
+import { encoreInputParamsFor } from './encore-input-params.js';
 import { BURN_IN_PROFILE_PARAM_KEY } from './burn-in.js';
 import { emitAudit, originActor, type AuditEmitter, type AuditErrorLog } from '../data/audit-emit.js';
 import { logPipelineEvent, type PipelineLogSink } from '../services/pipeline-log.js';
@@ -188,7 +189,17 @@ export async function submitTranscode(
     // (issue #1022), so `Job.profile` always names the profile Encore was asked
     // for. EncoreSubmitInput.profile is a name string resolved server-side
     // (src/pipeline/encore-client.ts:29-30).
-    const result = await deps.encore.submit({ externalId: encoreJobId, inputUri, outputUri, profile: submittedProfile, profileParams, progressCallbackUri: undefined });
+    // Source-dropout recovery (issue #1222): set ffmpeg's reconnect + read
+    // timeout options on the job input, so a source connection that dies
+    // mid-read is retried from the same byte offset (or fails fast) instead of
+    // hanging or failing the job with zero output. Defaults ON for network
+    // inputs — which is every input this path builds, `s3://…` above — and
+    // resolved per URI (and overridable via env) by encoreInputParamsFor. The
+    // params ride through to the transcoder as `inputs[].params`
+    // (src/pipeline/encore-client.ts), including via the scaler queue, which
+    // stores the payload toEncorePayload produced here (src/encore-scaler/index.ts:40).
+    const inputParams = encoreInputParamsFor(inputUri);
+    const result = await deps.encore.submit({ externalId: encoreJobId, inputUri, outputUri, profile: submittedProfile, profileParams, inputParams, progressCallbackUri: undefined });
     encoreInternalJobId = result.encoreInternalId || undefined;
     if (encoreInternalJobId) {
       await deps.jobs.update(job.id, { encoreInternalJobId });
