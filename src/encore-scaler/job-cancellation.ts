@@ -48,8 +48,20 @@ export async function markJobCancelled(
 }
 
 // Every cancelled externalId in the workspace, as a set — one HGETALL, the same
-// read shape the re-enqueue paths already use for jobInstance/jobStatus, so a
-// whole pass costs one extra round trip regardless of candidate count.
+// read shape the re-enqueue paths already use for jobInstance/jobStatus.
+//
+// COST / CALL DISCIPLINE: read this once per PASS, never once per candidate. All
+// three call sites do (scaler-loop.ts requeueScaleDownInterruptions, reconcile()'s
+// drop diff, and the dispatch loop, which reads it once per instance before
+// feeding that instance), so a tick costs O(instances) HGETALLs, not
+// O(instances x jobs). That discipline matters because the hash is pruned only
+// when the workspace is deprovisioned — workspace-registry.ts deletes
+// keys.cancelledJobs beside keys.jobStatus; there is no per-job hdel and no TTL —
+// so it grows for the lifetime of the workspace and must not be re-read per job.
+//
+// A cancel that lands AFTER a pass's read is not lost, it is merely late: both
+// re-enqueue paths consult the tombstone on every pass, so the next pass (next
+// tick) sees it, and nothing clears it in the meantime.
 //
 // Read errors are NOT swallowed: every caller runs inside a best-effort
 // try/catch that logs and abandons the pass, so unreadable tombstones withhold

@@ -677,6 +677,14 @@ export class EncoreScalerLoop {
       // Recorded per instance and reported once after the loop.
       const assignedJobIds: string[] = [];
       let outcome: AssignmentOutcome = 'queue-empty';
+      // #1225: cancellation tombstones, read ONCE for this instance's whole
+      // dispatch pass — the same per-instance read shape the two re-enqueue call
+      // sites use, rather than one read per claimed entry (which would re-read
+      // the whole hash O(jobs) times per instance per tick, and the hash is only
+      // pruned at workspace deprovision). A cancel that lands after this read is
+      // still safe: it cannot be re-enqueued (both recovery paths consult the
+      // tombstone) and the next tick's read sees it.
+      const cancelledJobs = await loadCancelledJobs(redis, workspaceId);
       while (inst.activeJobs < JOBS_PER_INSTANCE) {
         const claimed = await redis.rpoplpush(
           keys.queue(workspaceId),
@@ -714,7 +722,7 @@ export class EncoreScalerLoop {
         // life and then kept being re-enqueued. Drop the claimed entry WITHOUT
         // re-queueing it: cancellation is terminal, so there is nothing to
         // retry, and the status stays CANCELLED.
-        if ((await loadCancelledJobs(redis, workspaceId)).has(job.jobId)) {
+        if (cancelledJobs.has(job.jobId)) {
           await redis.lrem(keys.inflight(workspaceId), 1, claimed);
           console.warn(
             '[encore-scaler] dispatch: job %s has been CANCELLED; dropping the ' +
@@ -1118,7 +1126,7 @@ export class EncoreScalerLoop {
       // back to running, so a cancel that raced a claimed dispatch leaves a job
       // that reads RUNNING here; re-enqueuing it resurrects cancelled work on a
       // fresh instance after the original was deleted. The cancellation
-      // tombstone (keys.jobCancelled, written by every cancel path before it
+      // tombstone (keys.cancelledJobs, written by every cancel path before it
       // touches Encore — job-cancellation.ts markJobCancelled) is monotonic and
       // nothing on this path writes it, so it is the authoritative answer.
       const cancelled = await loadCancelledJobs(redis, workspaceId);
