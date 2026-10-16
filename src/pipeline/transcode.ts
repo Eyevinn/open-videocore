@@ -40,8 +40,23 @@ import { encoreInputParamsFor } from './encore-input-params.js';
 import { BURN_IN_PROFILE_PARAM_KEY } from './burn-in.js';
 import { emitAudit, originActor, type AuditEmitter, type AuditErrorLog } from '../data/audit-emit.js';
 import { logPipelineEvent, type PipelineLogSink } from '../services/pipeline-log.js';
+// #1226: the defined rule for a completion that arrives after a cancel.
+import {
+  reclaimCancelledTranscodeCompletion,
+  type CancelledCompletionReclaim,
+  type CancelledJobOutputStorage
+} from './cancelled-transcode-completion.js';
 
 export const PACKAGED_OUTPUT_PREFIX = 'transcode';
+
+// THE deterministic object prefix one transcode job writes its output under, in
+// the output bucket. Single spelling, used by submitTranscode to build the
+// `outputUri` it submits to Encore AND by completeTranscode to reclaim the
+// output of a run that was cancelled (#1226) — so the reclaim can never target a
+// prefix other than the one Encore was told to write to.
+export function transcodeOutputPrefix(sourceAssetId: string, jobId: string): string {
+  return `${PACKAGED_OUTPUT_PREFIX}/${sourceAssetId}/${jobId}`;
+}
 
 // Profile submitted when a caller names none. 'program' is the conventional
 // entry of the default Encore profile index this API bootstraps from
@@ -161,7 +176,7 @@ export async function submitTranscode(
   // single bucket namespace, so the s3:// URIs use the object key directly with
   // no workspace prefix.
   const inputUri = `s3://${params.sourceBucket}/${params.sourceObjectKey}`;
-  const outputUri = `s3://${params.outputBucket}/${PACKAGED_OUTPUT_PREFIX}/${params.sourceAssetId}/${job.id}`;
+  const outputUri = `s3://${params.outputBucket}/${transcodeOutputPrefix(params.sourceAssetId, job.id)}`;
 
   // Record the encore job id and mark the job `queued`: submitTranscode only
   // enqueues the job onto the Encore auto-scaler's Redis queue (ADR-006); the
@@ -299,6 +314,22 @@ export async function completeTranscode(
     // Best-effort operational log emission (issue #995). Optional; when absent,
     // no-op. See submitTranscode's identical dep.
     pipelineLog?: PipelineLogSink;
+    // #1226: resolves object storage for the transcode OUTPUT bucket of the
+    // stack this job belongs to, so a completion that arrives for a CANCELLED
+    // job can reclaim the output of the run the user stopped. Lazy and optional:
+    // it is only ever invoked on that path (a normal completion builds no
+    // storage handle), and when absent the discard is still recorded on the job
+    // record — the objects are simply left for an operator/later sweep.
+    resolveOutputStorage?: () => Promise<CancelledJobOutputStorage | undefined>;
+    // #1226: called with what the reclaim did, and ONLY on that path, so the
+    // caller can log one explicit line instead of the bare `applied false
+    // renditionCount 0` the issue was reported from. Reported through a callback
+    // rather than on CompleteTranscodeResult so the result shape every other
+    // consumer (and every existing caller/test) depends on is untouched.
+    onCancelledCompletionDiscarded?: (reclaim: CancelledCompletionReclaim) => void;
+    // Best-effort warn sink for a reclaim that could not remove the objects.
+    // Optional; absent => the failure is reported only through the callback above.
+    logWarn?: (detail: Record<string, unknown>) => void;
   }
 ): Promise<CompleteTranscodeResult> {
   const job = await deps.jobs.get(params.jobId);
@@ -318,12 +349,44 @@ export async function completeTranscode(
   // FAILED callback for a dropped job still no-ops.
   const isConditionalDropFailed =
     job.status === 'failed' && job.droppedByScaler === true;
-  if (job.status === 'done' || job.status === 'cancelled') {
-    // Duplicate / late callback, or the job was cancelled by an operator: nothing
-    // to do. `cancelled` is terminal (src/data/job-repo.ts:103), so short-circuit
-    // here to keep a late Encore callback idempotent — attempting an update would
-    // otherwise throw InvalidJobTransitionError (issue #126). No audit entry: a
-    // no-op / already-terminal callback is not a fresh terminal transition.
+  if (job.status === 'cancelled') {
+    // #1226 — a completion for a job the user already cancelled. THE RULE:
+    // cancel wins, and the output of the stopped run is reclaimed, so the job
+    // record (`cancelled`), its renditionCount (0) and the output files (none)
+    // agree. The rationale for choosing this over accepting the output lives in
+    // src/pipeline/cancelled-transcode-completion.ts; the short version is that
+    // `cancelled` is the only status with no outgoing transition
+    // (ALLOWED_JOB_TRANSITIONS, src/data/job-repo.ts) because it records a user
+    // decision rather than an inference about Encore, and #1220/#1225 depend on
+    // that. Still `applied: false` — no transcode terminal state was applied —
+    // but no longer SILENT: before this, the handler returned here and left a
+    // cancelled job reporting 0 renditions while a complete output sat in the
+    // bucket. `cancelled` remains terminal, so no status is written and no
+    // InvalidJobTransitionError can arise (issue #126). No audit entry: nothing
+    // transitioned.
+    const reclaim = await reclaimCancelledTranscodeCompletion(
+      {
+        job,
+        sourceAssetId: params.sourceAssetId,
+        outputPrefix: transcodeOutputPrefix(params.sourceAssetId, job.id),
+        reportedRenditionCount: params.renditions.length
+      },
+      {
+        jobs: deps.jobs,
+        assets: deps.assets,
+        resolveOutputStorage: deps.resolveOutputStorage,
+        logWarn: deps.logWarn
+      }
+    );
+    deps.onCancelledCompletionDiscarded?.(reclaim);
+    return { applied: false, renditionCount: 0, renditions: [] };
+  }
+  if (job.status === 'done') {
+    // Duplicate / late callback for an already-completed job: nothing to do.
+    // `done` is terminal (src/data/job-repo.ts), so short-circuit here to keep a
+    // late Encore callback idempotent — attempting an update would otherwise
+    // throw InvalidJobTransitionError (issue #126). No audit entry: a no-op /
+    // already-terminal callback is not a fresh terminal transition.
     return { applied: false, renditionCount: 0, renditions: [] };
   }
   if (job.status === 'failed' && !(isConditionalDropFailed && params.success)) {

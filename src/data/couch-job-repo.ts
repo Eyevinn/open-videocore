@@ -224,6 +224,13 @@ function toDoc(job: Job): Record<string, unknown> {
     // completions with no audit emitter wired.
     droppedThenRecovered: job.droppedThenRecovered,
     correctedDropError: job.correctedDropError,
+    // #1226: the durable trace that a completion arrived for this job after it
+    // was cancelled and was discarded, with the output prefix that was
+    // reclaimed. Persisted here (not only logged) so a cancelled job reporting
+    // 0 renditions explains itself from the record alone.
+    lateCompletionDiscarded: job.lateCompletionDiscarded,
+    discardedRenditionCount: job.discardedRenditionCount,
+    discardedOutputPrefix: job.discardedOutputPrefix,
     // Durable stack identity (#1097). Written on every put so an update()
     // round-trip never drops the value; absent (undefined) on jobs created
     // outside a request and on documents written before #1097.
@@ -258,6 +265,11 @@ function fromDoc(doc: StoredDoc): Job {
     droppedByScaler: doc['droppedByScaler'] as boolean | undefined,
     droppedThenRecovered: doc['droppedThenRecovered'] as boolean | undefined,
     correctedDropError: doc['correctedDropError'] as string | undefined,
+    // #1226: absent on every job that never had a completion discarded after a
+    // cancel, which reads back as undefined exactly like the #1023 pair above.
+    lateCompletionDiscarded: doc['lateCompletionDiscarded'] as boolean | undefined,
+    discardedRenditionCount: doc['discardedRenditionCount'] as number | undefined,
+    discardedOutputPrefix: doc['discardedOutputPrefix'] as string | undefined,
     // Durable stack identity (#1097). A document written before #1097 has no
     // such field and reads back as undefined — the documented legacy case,
     // which keeps the first-listed-stack behaviour.

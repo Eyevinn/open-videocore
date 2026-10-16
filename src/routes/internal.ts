@@ -63,6 +63,8 @@ import type { AssetRepository } from '../data/asset-repo.js';
 import { isStepComplete } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { completeTranscode, type CallbackRendition } from '../pipeline/transcode.js';
+// #1226: object-storage surface for reclaiming a cancelled job's late output.
+import type { CancelledJobOutputStorage } from '../pipeline/cancelled-transcode-completion.js';
 // #1060: structured source-read failure detail for a failed `transcode` step.
 import { buildSourceReadErrorDetail } from '../pipeline/encore-source-read-failure.js';
 import type { PipelineLogSink } from '../services/pipeline-log.js';
@@ -195,6 +197,16 @@ type InternalRouterOptions = {
   // record to the log store GET /api/v1/logs reads (src/main.ts,
   // `logStore`; read path src/routes/logs.ts:94). Absent => no log record.
   pipelineLog?: PipelineLogSink;
+  // #1226: resolves object storage for the transcode OUTPUT bucket of the stack
+  // a completion belongs to. Passed to completeTranscode, which calls it ONLY
+  // when the completion arrives for a job the user already CANCELLED — the
+  // output of the stopped run is then reclaimed so the job record (`cancelled`),
+  // its renditionCount (0) and the files in the bucket agree. This route is one
+  // of the paths that applies a transcode completion (the callback poller is the
+  // other), so it is wired here too and the SAME rule applies whichever path
+  // observed the completion. Absent => the discard is still recorded durably on
+  // the job record and the objects are left for an operator.
+  resolveTranscodeOutputStorage?: () => Promise<CancelledJobOutputStorage | undefined>;
 };
 
 // The provisioned stack names, never throwing (issue #1058). These callbacks are
@@ -668,7 +680,32 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
             // here leaves the Logs tab showing a stage that started and never
             // finished. Emitted INSIDE the issue #1058 stack re-entry above, so
             // the record is written for the stack the job actually belongs to.
-            pipelineLog: opts.pipelineLog
+            pipelineLog: opts.pipelineLog,
+            // #1226: reclaim the output of a run that was CANCELLED before this
+            // completion arrived (cancel wins; see
+            // src/pipeline/cancelled-transcode-completion.ts). Resolved lazily
+            // inside the rule, so a normal completion builds no storage handle.
+            resolveOutputStorage: opts.resolveTranscodeOutputStorage,
+            // #1226: a completion for a job the user had cancelled. Log the
+            // reclaim explicitly — a cancelled job reporting 0 renditions over a
+            // complete output in the bucket is exactly the state this issue was
+            // reported from, and it must be visible on whichever path observed
+            // the completion.
+            onCancelledCompletionDiscarded: (reclaim) =>
+              fastify.log.info(
+                {
+                  jobId: found.job.id,
+                  externalId,
+                  status,
+                  outputPrefix: reclaim.outputPrefix,
+                  discardedRenditionCount: reclaim.discardedRenditionCount,
+                  outputRemoved: reclaim.outputRemoved,
+                  ...(reclaim.removalError ? { removalError: reclaim.removalError } : {}),
+                  ...(reclaim.assetStatus ? { assetStatus: reclaim.assetStatus } : {})
+                },
+                'discarded a completion for a cancelled job and reclaimed its output'
+              ),
+            logWarn: (detail) => fastify.log.warn(detail)
           }
         );
 
