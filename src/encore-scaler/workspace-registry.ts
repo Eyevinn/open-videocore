@@ -715,6 +715,9 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
           keys.inflight(workspaceId),
           keys.jobInstance(workspaceId),
           keys.jobStatus(workspaceId),
+          // #1225: the workspace's cancellation tombstones live beside
+          // jobStatus and are purged with it.
+          keys.cancelledJobs(workspaceId),
           keys.orphanSeen(workspaceId),
           keys.spawnFailure(workspaceId)
         );

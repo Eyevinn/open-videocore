@@ -40,6 +40,7 @@ import {
   recordDispatch,
   requeueInterruptedByScaleDown
 } from './retry-store.js';
+import { loadCancelledJobs } from './job-cancellation.js';
 import {
   probeCallbackTrust,
   buildCallbackUri,
@@ -706,6 +707,23 @@ export class EncoreScalerLoop {
           break;
         }
 
+        // #1225: never dispatch a job that has been cancelled. A cancel drains
+        // the queue (index.ts cancel / the router's DELETE) but cannot drain an
+        // entry already claimed into keys.inflight, and dispatch() pins the
+        // status back to 'running' — which is how a cancelled job came back to
+        // life and then kept being re-enqueued. Drop the claimed entry WITHOUT
+        // re-queueing it: cancellation is terminal, so there is nothing to
+        // retry, and the status stays CANCELLED.
+        if ((await loadCancelledJobs(redis, workspaceId)).has(job.jobId)) {
+          await redis.lrem(keys.inflight(workspaceId), 1, claimed);
+          console.warn(
+            '[encore-scaler] dispatch: job %s has been CANCELLED; dropping the ' +
+              'claimed queue entry instead of dispatching it (#1225)',
+            job.jobId
+          );
+          continue;
+        }
+
         const dispatched = await this.dispatch(inst, job);
         // Whether or not dispatch succeeded, the job is no longer "inflight"
         // under this attempt: success recorded the mapping, failure re-queued.
@@ -1081,6 +1099,7 @@ export class EncoreScalerLoop {
     try {
       const trackedInstances = await redis.hgetall(keys.jobInstance(workspaceId));
       const trackedStatuses = await redis.hgetall(keys.jobStatus(workspaceId));
+      const candidates: string[] = [];
       for (const [jobId, mappedInstanceId] of Object.entries(trackedInstances)) {
         if (mappedInstanceId !== instanceId) continue;
         // Still running on Encore: it is being drained, not lost — leave it.
@@ -1090,6 +1109,28 @@ export class EncoreScalerLoop {
         // status (DONE/SUCCESSFUL/FAILED/CANCELLED) and must NOT be reclassified.
         const st = (trackedStatuses[jobId] ?? '').toUpperCase();
         if (st !== 'RUNNING' && st !== 'QUEUED') continue;
+        candidates.push(jobId);
+      }
+
+      // #1225: a CANCELLED job is terminal and must never be re-enqueued, not
+      // even when the status hash says otherwise. The status gate above is
+      // last-writer-wins and dispatch()/requeueInterruptedByScaleDown pin a job
+      // back to running, so a cancel that raced a claimed dispatch leaves a job
+      // that reads RUNNING here; re-enqueuing it resurrects cancelled work on a
+      // fresh instance after the original was deleted. The cancellation
+      // tombstone (keys.jobCancelled, written by every cancel path before it
+      // touches Encore — job-cancellation.ts markJobCancelled) is monotonic and
+      // nothing on this path writes it, so it is the authoritative answer.
+      const cancelled = await loadCancelledJobs(redis, workspaceId);
+      for (const jobId of candidates) {
+        if (cancelled.has(jobId)) {
+          console.warn(
+            `[encore-scaler] scale-down: job ${jobId} was mapped to scaled-away ` +
+              `instance ${instanceId} but has been CANCELLED; cancellation is ` +
+              `terminal — NOT re-enqueued (#1225)`
+          );
+          continue;
+        }
 
         // #745: cancel any still-active prior Encore attempt for this externalId
         // before the scale-down re-enqueue lands a fresh dispatch, so the same
@@ -1487,6 +1528,10 @@ export class EncoreScalerLoop {
             const now = Date.now();
             const trackedInstances = await redis.hgetall(keys.jobInstance(workspaceId));
             const trackedStatuses = await redis.hgetall(keys.jobStatus(workspaceId));
+            // #1225: cancelled jobs are terminal and are excluded from the drop
+            // diff below. Read once per instance, same shape as the two reads
+            // above (job-cancellation.ts loadCancelledJobs).
+            const cancelledJobs = await loadCancelledJobs(redis, workspaceId);
             // externalIds dropped from THIS instance, so we can recover each
             // one's Encore failure text from THIS instance's FAILED set below.
             const droppedForInstance: string[] = [];
@@ -1496,6 +1541,25 @@ export class EncoreScalerLoop {
               // callback poller / cancel already settled has a terminal status.
               const st = (trackedStatuses[jobId] ?? '').toUpperCase();
               if (st !== 'RUNNING' && st !== 'QUEUED') continue;
+              // #1225: a cancelled job is terminal — keep it out of the drop set
+              // entirely. Raising it as dropped sends it through the retry gate
+              // (main.ts onJobsDropped -> decideRetry), which re-queues a
+              // transport-class signature, and would also overwrite the
+              // caller-facing `cancelled` with a generic failure. The status gate
+              // above cannot be trusted alone: dispatch()/
+              // requeueInterruptedByScaleDown pin a job back to running, so the
+              // monotonic cancellation tombstone is consulted instead (#1225,
+              // job-cancellation.ts).
+              if (cancelledJobs.has(jobId)) {
+                console.warn(
+                  '[encore-scaler] reconcile: job %s is gone from instance %s but ' +
+                    'has been CANCELLED; cancellation is terminal — not classified ' +
+                    'as a dropped job and never re-enqueued (#1225)',
+                  jobId,
+                  instanceId
+                );
+                continue;
+              }
               if (activeExternalIds.has(jobId)) {
                 // Still live on Encore, right here on its mapped instance. Any
                 // partial-visibility drop counter this job accumulated on an

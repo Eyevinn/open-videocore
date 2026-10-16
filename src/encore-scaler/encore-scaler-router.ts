@@ -23,6 +23,7 @@ import {
   assertUnderJobThroughputCap,
   isJobThroughputCapExceededError
 } from './job-throughput-cap.js';
+import { markJobCancelled } from './job-cancellation.js';
 
 export type EncoreScalerRouterOptions = {
   redis: Redis;
@@ -158,11 +159,19 @@ export const encoreScalerRouter: FastifyPluginAsync<EncoreScalerRouterOptions> =
         // Not dispatched. If we drained one or more buffered entries the job is
         // cancelled; otherwise there was nothing to cancel.
         if (drained) {
-          await redis.hset(keys.jobStatus(workspaceId), id, 'CANCELLED');
+          await markJobCancelled(redis, workspaceId, id);
           return reply.code(200).send({ id, status: 'CANCELLED' });
         }
         return reply.code(404).send({ id, status: 'NOT_FOUND' });
       }
+
+      // #1225: the job IS dispatched, so record the cancellation (monotonic
+      // tombstone + terminal status) BEFORE the remote leg. Every exit below —
+      // the missing-pool-record 404, the unreachable-instance 502, the 200 — then
+      // leaves a cancel that the scaler's scale-down recovery and dropped-job
+      // reconciliation can no longer undo by re-enqueueing the job. Response
+      // codes are unchanged. See src/encore-scaler/job-cancellation.ts.
+      await markJobCancelled(redis, workspaceId, id);
 
       const record = await redis.hget(keys.pool(workspaceId), instanceId);
       if (!record) {
