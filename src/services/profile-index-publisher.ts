@@ -104,6 +104,28 @@ export function renderPublishedProfileIndex(profiles: PublishableProfile[]): str
 }
 
 /**
+ * Count the profile entries in a PUBLISHED index body.
+ *
+ * The inverse of {@link renderPublishedProfileIndex}, kept next to it so the
+ * writer and the reader cannot drift. Used by the boot-time publish
+ * verification (ADR-026 D4, issue #1209): the probe GETs the published
+ * `index.yml` and compares the number of entries it actually serves against the
+ * number the publisher reported writing (`PublishOutcome.profileCount`), so a
+ * stale or partially-written bucket is surfaced loudly instead of silently
+ * handing Encore an index that is missing profiles.
+ *
+ * Mirrors the renderer exactly: `{}` is the empty-store body (#459) and counts
+ * as zero, blank lines are ignored, and every other non-blank line is one
+ * `name: <name>.yml` entry.
+ */
+export function countPublishedProfileIndexEntries(indexBody: string): number {
+  return indexBody
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && line !== '{}').length;
+}
+
+/**
  * The anonymous (public) read-only bucket policy for the profiles bucket
  * (ADR-026 D3).
  *

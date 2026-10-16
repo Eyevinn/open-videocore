@@ -3295,22 +3295,35 @@ if (routeDumpPath) {
 // confirms, at boot, whether OSC's 2026-07-08 promise to make /api/v1/profiles
 // publicly accessible for the app actually took effect (this environment cannot
 // reach live OSC to confirm it ahead of time).
-// ADR-026 D2/D4 (issue #1207): the probe now follows the RESOLVED TIER instead
-// of inferring it from `Boolean(publicBaseUrl)`. With the published
+// ADR-026 D2/D4 (issues #1207, #1209): the probe follows the RESOLVED TIER
+// instead of inferring it from `Boolean(publicBaseUrl)`. With the published
 // object-store index as the new primary, `publicBaseUrl` being set no longer
 // means the resolved URL is this app's own index — so the login-wall/#284
-// wording this probe emits would be plainly wrong for an object-store origin.
-// Gating on `origin === 'app-path'` keeps the probe doing exactly what it did
-// before for the app-served index and makes it a no-op for the other origins.
-// EXTENDING the boot check to verify the published object-store index (and
-// scoping its message per origin) is issue #1209 / ADR-026 D4, which ships
-// alongside this change; nothing about this probe's lifecycle, cost,
-// non-fatality, scoped TLS relaxation (#337) or `ReachabilityOutcome` shape is
-// altered here.
+// wording would be plainly wrong for an object-store origin — and on a catalog
+// deploy, where `PUBLIC_BASE_URL` is unsettable (ADR-026 C9), the old boolean
+// skipped the check entirely and left the new primary unverified. The resolved
+// `origin` is therefore passed straight through: the probe keeps its exact
+// pre-ADR-026 behaviour and wording for `app-path`, additionally verifies the
+// `object-store` primary (fetchable unauthenticated AND serving the profile
+// count the publisher wrote — ADR-026 D4 publish verification, fed by the
+// `PublishOutcome` fields below), and stays a no-op for the operator-typed /
+// third-party tiers. Lifecycle is untouched: still one-shot (no periodic probe
+// — #1103's interval scope is rejected by D4), still non-fatal, still the
+// scoped TLS relaxation (#337) and the same `ReachabilityOutcome` shape.
 void checkProfilesIndexReachable({
   profilesIndexUrl: encoreScalerProfilesUrl,
-  usingLocalIndex: resolvedProfilesUrl.origin === 'app-path',
-  log: app.log
+  origin: resolvedProfilesUrl.origin,
+  log: app.log,
+  // Only present when the boot publish succeeded — i.e. exactly when the
+  // resolved origin can be 'object-store'. `profileCount` is what makes the
+  // check a publish VERIFICATION rather than a bare fetchability probe.
+  ...(publishedProfilesIndex.ok
+    ? {
+        expectedProfileCount: publishedProfilesIndex.profileCount,
+        bucket: publishedProfilesIndex.bucket,
+        endpointKind: publishedProfilesIndex.endpointKind
+      }
+    : {})
 }).catch((err) => app.log.error({ err }, 'profiles-index reachability check errored unexpectedly'));
 
 // Start watch-folder ingest only after the server is listening and every router
