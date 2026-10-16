@@ -144,3 +144,70 @@ export class StackCallbackPollerRegistry {
     this.pollers.clear();
   }
 }
+
+// The stacks whose backing Valkey is known to be GONE while their stored
+// StackConfig is still there (#1213).
+//
+// A stack teardown that reports failures deliberately keeps the parameter-store
+// entry so the DELETE can be retried — but TEARDOWN_ORDER (services/stack.ts)
+// removes the queue (Valkey) SECOND, so a run that removed the Valkey and then
+// failed on the database or the storage leaves a stored config whose `redisUrl`
+// points at a store that no longer exists. Everything that re-derives a stack's
+// Valkey from the enumeration — the scaler reconcile and the callback-poller
+// sync above — would happily bind to it again, which is how a poller that was
+// correctly stopped at teardown time came straight back as a new poller
+// retrying a removed Valkey about once a second.
+//
+// So the DELETE route reports what each run established about the queue
+// instance (routes/provision.ts queueInstancePresentAfterTeardown) and the sync
+// consults this set: a stack recorded here is skipped — no poller started, no
+// claim on the activation connection — until the stack stops being enumerable
+// (the retry finished the teardown and the config was deleted, which is what
+// `forgetUnlisted` detects) or its queue is reported present again (its removal
+// failed, or the name was re-provisioned).
+//
+// Deliberately NOT a liveness probe: it records only what a teardown run
+// actually observed. A stack nobody reported on is treated as live, exactly as
+// before.
+export class RemovedStackQueues {
+  private readonly stackKeys = new Set<string>();
+
+  get size(): number {
+    return this.stackKeys.size;
+  }
+
+  // True once a teardown reported this stack's queue instance gone, until
+  // something reports otherwise.
+  isRemoved(stackKey: string): boolean {
+    return this.stackKeys.has(stackKey);
+  }
+
+  // Record what a run established. `present: true` clears the record — the
+  // queue survived (its removal failed) or the stack was re-provisioned.
+  // Returns true when the recorded state actually changed, so the caller can
+  // log the transition and nothing else.
+  record(stackKey: string, present: boolean): boolean {
+    if (present) return this.stackKeys.delete(stackKey);
+    if (this.stackKeys.has(stackKey)) return false;
+    this.stackKeys.add(stackKey);
+    return true;
+  }
+
+  // Drop records for stacks that are no longer enumerated at all: their stored
+  // config is gone, so the name carries no state worth remembering (and a stack
+  // provisioned under it later must start clean). Returns the forgotten keys.
+  forgetUnlisted(listedStackKeys: Iterable<string>): string[] {
+    const listed = new Set(listedStackKeys);
+    const forgotten: string[] = [];
+    for (const stackKey of [...this.stackKeys]) {
+      if (listed.has(stackKey)) continue;
+      this.stackKeys.delete(stackKey);
+      forgotten.push(stackKey);
+    }
+    return forgotten;
+  }
+
+  clear(): void {
+    this.stackKeys.clear();
+  }
+}

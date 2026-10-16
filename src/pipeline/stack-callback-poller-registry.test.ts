@@ -18,7 +18,10 @@
 //     main.ts narrows into PollerStackConnection.
 
 import { describe, expect, it } from 'vitest';
-import { StackCallbackPollerRegistry } from './stack-callback-poller-registry.js';
+import {
+  RemovedStackQueues,
+  StackCallbackPollerRegistry
+} from './stack-callback-poller-registry.js';
 
 type Started = { connectionId: string; running: boolean; stops: number };
 
@@ -131,5 +134,52 @@ describe('StackCallbackPollerRegistry (#1213)', () => {
     registry.stopAll();
     expect(started.every((s) => !s.running)).toBe(true);
     expect(registry.size).toBe(0);
+  });
+});
+
+// The other half of the bookkeeping: WHICH stacks must not be polled at all,
+// because a teardown that kept their stored config has already removed the
+// Valkey that config points at.
+describe('RemovedStackQueues', () => {
+  it('treats a stack nobody reported on as pollable', () => {
+    const removed = new RemovedStackQueues();
+    expect(removed.isRemoved('mystack')).toBe(false);
+    expect(removed.size).toBe(0);
+  });
+
+  it('records a removed queue once and clears it when the queue is present again', () => {
+    const removed = new RemovedStackQueues();
+
+    expect(removed.record('mystack', false)).toBe(true);
+    expect(removed.isRemoved('mystack')).toBe(true);
+    // Re-reporting the same state is not a transition.
+    expect(removed.record('mystack', false)).toBe(false);
+    expect(removed.size).toBe(1);
+
+    // A later run finds the Valkey still there (or the name is re-provisioned).
+    expect(removed.record('mystack', true)).toBe(true);
+    expect(removed.isRemoved('mystack')).toBe(false);
+    expect(removed.record('mystack', true)).toBe(false);
+  });
+
+  it('forgets records for stacks that are no longer enumerated', () => {
+    const removed = new RemovedStackQueues();
+    removed.record('gone', false);
+    removed.record('still-there', false);
+
+    expect(removed.forgetUnlisted(['still-there', 'untouched'])).toEqual([
+      'gone'
+    ]);
+    expect(removed.isRemoved('gone')).toBe(false);
+    expect(removed.isRemoved('still-there')).toBe(true);
+  });
+
+  it('clear drops every record', () => {
+    const removed = new RemovedStackQueues();
+    removed.record('a', false);
+    removed.record('b', false);
+
+    removed.clear();
+    expect(removed.size).toBe(0);
   });
 });

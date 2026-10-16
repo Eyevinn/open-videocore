@@ -14,6 +14,13 @@
 //   2. The same holds when the teardown reports failures.
 //   3. The same holds for a stack whose stored config is already gone (the
 //      retry-after-teardown path), which removes nothing at all.
+//   4. With the post-teardown reconcile wired, a failed teardown that DID
+//      remove the Valkey (and then failed on a later service, so the stored
+//      config is kept) leaves no poller running: the reconcile must not re-arm
+//      one against a store this run has already removed.
+//   5. ...and the complementary case still re-arms: a failed teardown whose
+//      Valkey removal itself failed leaves the store alive, so the reconcile
+//      brings its poller back rather than leaving completions undrained.
 //
 // CONTRACT SOURCES (verified before writing, CLAUDE.md rule 7):
 //   - @osaas/client-core@0.24.0 lib/core.d.ts:46/56/65 — removeInstance(context,
@@ -24,8 +31,20 @@
 //     `(name: string) => void | Promise<void>`, invoked with the STACK NAME at
 //     the start of the DELETE teardown.
 //   - src/pipeline/stack-callback-poller-registry.ts
-//     StackCallbackPollerRegistry.sync / .stopForStack / .size — the real
-//     registry main.ts uses is exercised here, not a stand-in.
+//     StackCallbackPollerRegistry.sync / .stopForStack / .size and
+//     RemovedStackQueues.record / .isRemoved / .forgetUnlisted — the real
+//     registry and the real removed-queue bookkeeping main.ts uses are
+//     exercised here, not stand-ins.
+//   - src/routes/provision.ts ProvisionRouterOptions.onStackQueuePresence —
+//     `(name: string, present: boolean) => void`, reported before
+//     onStackChange on the terminal paths that KEEP the stored config.
+//   - src/services/stack.ts TEARDOWN_ORDER — packager -> queue (Valkey) ->
+//     database -> storage, so a database/storage failure happens AFTER the
+//     Valkey has already been removed. That ordering is what makes case 4
+//     reachable at all.
+//   - src/services/deprovision.ts TeardownStatus — 'removed' | 'not_found' |
+//     'failed'; 'not_found' is CONFIRMED absence, 'failed' is the only status
+//     that leaves an instance possibly still there.
 //   - src/services/operation-store.ts — Operation.status is
 //     'pending' | 'running' | 'done' | 'failed'; only done/failed are terminal.
 
@@ -59,7 +78,10 @@ process.env['COUCHDB_ADMIN_PASSWORD'] = 'test-couchdb-password';
 import { provisionRouter } from './provision.js';
 import type { ParamStore } from '../services/param-store.js';
 import { OperationStore, type Operation } from '../services/operation-store.js';
-import { StackCallbackPollerRegistry } from '../pipeline/stack-callback-poller-registry.js';
+import {
+  RemovedStackQueues,
+  StackCallbackPollerRegistry
+} from '../pipeline/stack-callback-poller-registry.js';
 
 const osc = { getServiceAccessToken: vi.fn(async () => 'test-sat') } as never;
 
@@ -120,9 +142,51 @@ function makeParamStore(loadResult: unknown) {
   } as unknown as ParamStore;
 }
 
+// main.ts's post-teardown reconcile, reduced to the part that matters here
+// (syncStackCallbackPollers): enumerate the stacks that still have a stored
+// config, SKIP the ones a teardown reported as having lost their Valkey, sync
+// the poller fleet over the rest, then forget the records of stacks that are no
+// longer enumerated at all. The gate and the registry are the real ones.
+function makeReconcile(fleet: {
+  registry: StackCallbackPollerRegistry;
+  pollers: FakePoller[];
+  events: string[];
+  removedQueues: RemovedStackQueues;
+  listedStacks: () => Array<{ stackKey: string; connectionId: string }>;
+}): { reconcile: () => void; runs: () => number } {
+  let runs = 0;
+  return {
+    runs: () => runs,
+    reconcile: () => {
+      runs += 1;
+      const listed = fleet.listedStacks();
+      const pollable = listed.filter(
+        (connection) => !fleet.removedQueues.isRemoved(connection.stackKey)
+      );
+      fleet.registry.sync(pollable, (connection) => {
+        const poller: FakePoller = {
+          connectionId: connection.connectionId,
+          running: true,
+          stops: 0
+        };
+        fleet.pollers.push(poller);
+        fleet.events.push(`start:${poller.connectionId}`);
+        return () => {
+          poller.running = false;
+          poller.stops += 1;
+          fleet.events.push(`stop:${poller.connectionId}`);
+        };
+      });
+      fleet.removedQueues.forgetUnlisted(listed.map((c) => c.stackKey));
+    }
+  };
+}
+
 async function buildApp(options: {
   paramStore?: ParamStore;
   onStackTeardownStart?: (name: string) => void | Promise<void>;
+  onStackQueuePresence?: (name: string, present: boolean) => void;
+  onStackChange?: (workspaceId: string) => void;
 }) {
   const app = Fastify();
   app.setValidatorCompiler(validatorCompiler);
@@ -135,6 +199,10 @@ async function buildApp(options: {
     ...(options.onStackTeardownStart
       ? { onStackTeardownStart: options.onStackTeardownStart }
       : {}),
+    ...(options.onStackQueuePresence
+      ? { onStackQueuePresence: options.onStackQueuePresence }
+      : {}),
+    ...(options.onStackChange ? { onStackChange: options.onStackChange } : {}),
     // Millisecond budgets and a no-op sleep so a failing removal exhausts its
     // bounded retries immediately instead of waiting out the real backoff.
     teardownBounds: {
@@ -267,5 +335,129 @@ describe('DELETE /api/v1/provision/:name releases the stack-bound callback polle
     )!;
     expect(stackPoller.running).toBe(false);
     expect(removeInstance).not.toHaveBeenCalled();
+  });
+
+  // The complementary case to the test above it: there the VALKEY removal was
+  // what failed, so the store survived. Here the Valkey is removed
+  // successfully and a LATER service fails — which TEARDOWN_ORDER (packager ->
+  // queue -> database -> storage) makes the normal shape of a partial failure.
+  // The stored config is kept for the retry, so the stack is still fully
+  // enumerable with a `redisUrl` pointing at a Valkey that no longer exists,
+  // and the reconcile this path triggers would re-arm a poller straight onto
+  // it if nothing said otherwise.
+  it('does not re-arm the poller when a failed teardown already removed the Valkey', async () => {
+    const { registry, pollers, events } = makePollerFleet();
+    const removedQueues = new RemovedStackQueues();
+
+    removeInstance.mockImplementation(async (_ctx, serviceId: string) => {
+      events.push(`removeInstance:${serviceId}`);
+      // The Valkey goes away cleanly; the database removal then fails
+      // permanently, so the run reports `failed` and keeps the stored config.
+      if (serviceId === 'apache-couchdb') {
+        throw Object.assign(new Error('instance is busy'), { httpCode: 409 });
+      }
+    });
+
+    // Both stacks still have a stored config after this run — mystack's is
+    // deliberately KEPT because the teardown failed.
+    const { reconcile, runs } = makeReconcile({
+      registry,
+      pollers,
+      events,
+      removedQueues,
+      listedStacks: () => [
+        { stackKey: 'mystack', connectionId: 'valkey.example.osaas.io:6379' },
+        { stackKey: 'otherstack', connectionId: 'other.example.osaas.io:6379' }
+      ]
+    });
+
+    const app = await buildApp({
+      paramStore: makeParamStore(STORED_CONFIG),
+      onStackTeardownStart: (name) => {
+        registry.stopForStack(name);
+      },
+      onStackQueuePresence: (name, present) => {
+        removedQueues.record(name, present);
+      },
+      onStackChange: () => reconcile()
+    });
+
+    const op = await deleteAndWait(app, 'mystack');
+    expect(op.status).toBe('done');
+    expect((op.result as { status: string }).status).toBe('failed');
+    // The Valkey really was removed by this run, and reported as such.
+    expect(events).toContain(`removeInstance:${VALKEY_SERVICE_ID}`);
+    const queueResult = (
+      op.result as { services: Array<{ serviceId: string; status: string }> }
+    ).services.find((s) => s.serviceId === VALKEY_SERVICE_ID);
+    expect(queueResult?.status).toBe('removed');
+    // The reconcile did run on this path (that is the whole risk).
+    expect(runs()).toBeGreaterThan(0);
+    // And it left NO poller on the removed store: not the original one, and no
+    // replacement started in its place.
+    expect(
+      pollers.filter(
+        (p) => p.connectionId === 'valkey.example.osaas.io:6379' && p.running
+      )
+    ).toEqual([]);
+    expect(events).not.toContain('start:valkey.example.osaas.io:6379');
+    expect(registry.has('valkey.example.osaas.io:6379')).toBe(false);
+    expect(removedQueues.isRemoved('mystack')).toBe(true);
+    // The other stack is untouched: the gate is per stack, not global.
+    const otherPoller = pollers.find(
+      (p) => p.connectionId === 'other.example.osaas.io:6379'
+    )!;
+    expect(otherPoller.running).toBe(true);
+  });
+
+  it('re-arms the poller when a failed teardown left the Valkey in place', async () => {
+    const { registry, pollers, events } = makePollerFleet();
+    const removedQueues = new RemovedStackQueues();
+
+    // This time the Valkey removal itself is what fails, so the store is still
+    // there and its completions still need draining.
+    removeInstance.mockImplementation(async (_ctx, serviceId: string) => {
+      events.push(`removeInstance:${serviceId}`);
+      if (serviceId === VALKEY_SERVICE_ID) {
+        throw Object.assign(new Error('instance is busy'), { httpCode: 409 });
+      }
+    });
+
+    const { reconcile } = makeReconcile({
+      registry,
+      pollers,
+      events,
+      removedQueues,
+      listedStacks: () => [
+        { stackKey: 'mystack', connectionId: 'valkey.example.osaas.io:6379' },
+        { stackKey: 'otherstack', connectionId: 'other.example.osaas.io:6379' }
+      ]
+    });
+
+    const app = await buildApp({
+      paramStore: makeParamStore(STORED_CONFIG),
+      onStackTeardownStart: (name) => {
+        registry.stopForStack(name);
+      },
+      onStackQueuePresence: (name, present) => {
+        removedQueues.record(name, present);
+      },
+      onStackChange: () => reconcile()
+    });
+
+    const op = await deleteAndWait(app, 'mystack');
+    expect(op.status).toBe('done');
+    expect((op.result as { status: string }).status).toBe('failed');
+    expect(removedQueues.isRemoved('mystack')).toBe(false);
+    // Stopped for the teardown, then brought back by the reconcile because the
+    // store survived it.
+    expect(events.indexOf('stop:valkey.example.osaas.io:6379')).toBeLessThan(
+      events.indexOf('start:valkey.example.osaas.io:6379')
+    );
+    expect(registry.has('valkey.example.osaas.io:6379')).toBe(true);
+    const live = pollers.filter(
+      (p) => p.connectionId === 'valkey.example.osaas.io:6379' && p.running
+    );
+    expect(live).toHaveLength(1);
   });
 });

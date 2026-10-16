@@ -167,7 +167,10 @@ import {
 import { healthRouter } from './routes/health.js';
 import { resolveBuildInfo } from './build-info.js';
 import { startEncoreCallbackPoller, type PollerDeps } from './pipeline/encore-callback-poller.js';
-import { StackCallbackPollerRegistry } from './pipeline/stack-callback-poller-registry.js';
+import {
+  RemovedStackQueues,
+  StackCallbackPollerRegistry
+} from './pipeline/stack-callback-poller-registry.js';
 import {
   reconcileFailedTranscodes,
   settleFailedTranscode
@@ -652,6 +655,19 @@ await app.register(provisionRouter, {
   // removed (#1213). Declared below (stopCallbackPollersForStack); the route
   // only calls this at teardown time, long after the binding initialises.
   onStackTeardownStart: (name) => stopCallbackPollersForStack(name),
+  // Remember what a teardown that KEPT the stored config established about the
+  // stack's Valkey (#1213), so the reconcile that follows does not re-arm a
+  // poller against a store that teardown already removed. Declared below
+  // (removedStackQueues); only invoked at request time.
+  onStackQueuePresence: (name, present) => {
+    if (!removedStackQueues.record(name, present)) return;
+    app.log.info(
+      { stackKey: name, queuePresent: present },
+      present
+        ? 'encore-callback-poller: stack Valkey reported present again; it may be polled'
+        : 'encore-callback-poller: stack Valkey reported removed; not polling it until the stack is gone'
+    );
+  },
   // Late-bound accessor for the scaler registry. scalerRegistry is a
   // module-level binding created lazily by reconcileScaler() only once a stack
   // exists (and reset to undefined on the last deprovision), which is *after*
@@ -1227,6 +1243,11 @@ let activationConnectionId: string | undefined;
 // by connectionId and tracking which stacks each one serves (#1213). See
 // syncStackCallbackPollers and stopCallbackPollersForStack.
 const stackCallbackPollers = new StackCallbackPollerRegistry();
+// Stacks a teardown reported as having lost their Valkey while their stored
+// config survives (#1213). Fed by the DELETE route's onStackQueuePresence hook
+// and consulted by syncStackCallbackPollers, which refuses to arm a poller
+// against a store a teardown has already removed.
+const removedStackQueues = new RemovedStackQueues();
 // The stack whose Valkey the activation poller (stopEncoreCallbackPoller) is
 // bound to, when that connection is a stack's OWN store (#1213). Set by
 // syncStackCallbackPollers, which is the only place a stack is matched to the
@@ -2247,6 +2268,10 @@ async function deactivateScaler(): Promise<void> {
   stopEncoreCallbackPoller = undefined;
   activationPollerStackKey = undefined;
   stackCallbackPollers.stopAll();
+  // No stack is being polled any more, so the per-stack "its Valkey is gone"
+  // records have nothing to gate (#1213). A later activation re-enumerates from
+  // the parameter store and starts clean.
+  removedStackQueues.clear();
   callbackPollerOptions = undefined;
   activationConnectionId = undefined;
 
@@ -2353,9 +2378,22 @@ async function syncStackCallbackPollers(): Promise<void> {
   // activation connection can have its poller stopped at teardown time instead
   // of polling a removed Valkey until the next reconcile.
   activationPollerStackKey = undefined;
+  const listedStackKeys: string[] = [];
   for (const connection of await scalerRegistry.listStackConnections({ fresh: true })) {
     const { connectionId, redis, stackKey } = connection;
+    listedStackKeys.push(stackKey);
     if (!connectionId || !redis) continue;
+    // #1213: a stack whose Valkey a teardown already removed is NOT pollable,
+    // however healthy its stored config still looks. The config is kept on the
+    // failed-teardown path precisely so the DELETE can be retried, and
+    // TEARDOWN_ORDER removes the queue second, so `redis` here can be a
+    // connection to a store that is gone — arming a poller on it would re-create
+    // the once-a-second ECONNREFUSED loop this issue is about, against a Valkey
+    // the same process just removed. Skipped entirely: no poller, and no claim
+    // on the activation connection either, so a live stack sharing that store
+    // owns it instead. The record is dropped (below) as soon as the stack stops
+    // being enumerated, or when a later run reports the queue present again.
+    if (removedStackQueues.isRemoved(stackKey)) continue;
     if (connectionId === activationConnectionId) {
       // Only a real stack can OWN this connection. The fixed DEPLOYMENT_CONTEXT
       // ('default', src/auth/workspace.ts) also resolves to it — it is the
@@ -2368,10 +2406,11 @@ async function syncStackCallbackPollers(): Promise<void> {
         activationPollerStackKey = stackKey;
       }
       // #1213: re-arm the activation poller when it was stopped for a teardown
-      // that then left this Valkey in place (a teardown reporting failures, or
-      // one whose Valkey removal itself failed). Without this the deployment
-      // would stay active with nothing draining its completions until a
-      // restart.
+      // that then left this Valkey IN PLACE — a teardown whose Valkey removal
+      // itself failed, or one that failed before reaching it. Without this the
+      // deployment would stay active with nothing draining its completions
+      // until a restart. Reaching this line already means the store survived:
+      // the removedStackQueues gate above skipped the stack otherwise.
       if (!stopEncoreCallbackPoller) {
         stopEncoreCallbackPoller = startEncoreCallbackPoller({ ...options, redis });
         app.log.info(
@@ -2395,6 +2434,15 @@ async function syncStackCallbackPollers(): Promise<void> {
   }
   for (const connectionId of stopped) {
     app.log.info({ connectionId }, 'encore-callback-poller: stopped for stack Valkey');
+  }
+  // A stack that is no longer enumerated has had its stored config deleted —
+  // the retry finished the teardown — so the "its Valkey is gone" record has
+  // nothing left to protect and must not outlive the name (#1213).
+  for (const stackKey of removedStackQueues.forgetUnlisted(listedStackKeys)) {
+    app.log.info(
+      { stackKey },
+      'encore-callback-poller: forgot the removed-Valkey record for a stack that is gone'
+    );
   }
 }
 
