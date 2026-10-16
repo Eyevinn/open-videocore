@@ -1251,6 +1251,24 @@ async function stackRedisForAmbientStack(): Promise<IORedis | undefined> {
 const sourceBucket = process.env['MINIO_SOURCE_BUCKET'] ?? 'openvideocore-source';
 const outputBucket = process.env['MINIO_PACKAGED_BUCKET'] ?? 'openvideocore-packaged';
 
+// #1226: object storage for the transcode OUTPUT bucket of the stack the caller
+// is currently running inside. Both transcode-completion paths (the callback
+// poller and POST /api/v1/internal/encore-callback) hand this to
+// completeTranscode, which invokes it ONLY when a completion arrives for a job
+// the user already CANCELLED — the output of the stopped run is then reclaimed
+// so the job record (`cancelled`), its renditionCount (0) and the files in the
+// bucket agree. `resolve()` (not `resolveCached`) so it also warms the entry on
+// the poller path, which re-enters the job's PERSISTED stack rather than a
+// request-warmed one; `conns.packagedBucket` is the stack's own output bucket,
+// the same value the transcode submit paths resolve for `outputBucket`
+// (src/routes/assets.ts). Returns undefined when the stack has no object
+// storage, in which case the discard is still recorded durably on the job.
+const resolveTranscodeOutputStorage = async (): Promise<WorkspaceStorage | undefined> => {
+  const conns = await stackResolver.resolve(currentRequestStackName());
+  if (!conns.storageClient) return undefined;
+  return new WorkspaceStorage(conns.storageClient, conns.packagedBucket);
+};
+
 // S3 reader for URL-pull ingest of s3:// sources (issue #5). This reads the
 // source object via a MinIO client. With per-workspace stacks the worker runs
 // detached and the global pullDeps cannot carry a per-request workspace, so we
@@ -2163,6 +2181,12 @@ function activateScaler(redisUrl: string): void {
     // store GET /api/v1/logs reads (`logStore` above, durable since #996), so a transcode
     // that settles through this poller shows up in the Logs tab.
     pipelineLog: logStore,
+    // #1226: object storage for the output bucket of the stack a completion
+    // belongs to, used only when the completion arrives for a CANCELLED job so
+    // the stopped run's output is reclaimed instead of left orphaned in the
+    // bucket. Same closure the internal callback route gets, so both
+    // transcode-completion paths apply the identical rule.
+    resolveTranscodeOutputStorage,
     logger: app.log
   };
   stopEncoreCallbackPoller = startEncoreCallbackPoller({ redis, ...callbackPollerOptions });
@@ -2578,7 +2602,10 @@ const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: st
   listStackNames: () => stackResolver.listStackNames(),
   // Operational log record for the transcode terminal-state callback (issue
   // #995). Same store GET /api/v1/logs reads (`logStore` above).
-  pipelineLog: logStore
+  pipelineLog: logStore,
+  // #1226: reclaim the output of a run cancelled before its completion landed,
+  // so this path and the callback poller apply the identical rule.
+  resolveTranscodeOutputStorage
 };
 await app.register(internalRouter, internalRouterOptions);
 
