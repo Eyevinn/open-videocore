@@ -7,7 +7,9 @@
 //
 //   POST   /encoreJobs      enqueue -> { id, status: 'QUEUED' }
 //   GET    /encoreJobs/:id  proxy to the running instance, or QUEUED if unmapped
-//   DELETE /encoreJobs/:id  remove from queue, or cancel on the instance
+//   DELETE /encoreJobs/:id  remove from queue, or cancel on the instance with
+//                           POST {instanceUrl}/encoreJobs/{transcoderJobId}/cancel
+//                           (the verified transcoder cancel contract, #1232)
 //
 // Payload shape mirrors src/pipeline/encore-client.ts toEncorePayload(): the
 // only field we depend on for correlation is `externalId`. Everything else is
@@ -169,14 +171,54 @@ export const encoreScalerRouter: FastifyPluginAsync<EncoreScalerRouterOptions> =
         return reply.code(404).send({ id, status: 'NOT_FOUND' });
       }
       const { url } = JSON.parse(record) as { url: string };
+
+      // The remote cancel leg (#1232). Contract source (CLAUDE.md rule 7):
+      // `EncoreClient.cancel` in src/pipeline/encore-client.ts — the transcoder
+      // cancels with `POST {baseUrl}/encoreJobs/{jobId}/cancel`, no body, cited
+      // to the upstream transcoder's controller source and hand-verified
+      // 2026-07-09; only NEW/QUEUED/IN_PROGRESS are cancellable and cancelling
+      // an already-gone/terminal job is a no-op. `{jobId}` there is the id the
+      // TRANSCODER assigned, not our externalId: the scaler records it at
+      // dispatch time under keys.jobUuid (scaler-loop.ts, `set` with a 24h TTL)
+      // and the same resolution is done by makeScalingEncoreClient().cancel
+      // (src/encore-scaler/index.ts). This facade previously sent
+      // `DELETE {instanceUrl}/encoreJobs/{externalId}` — wrong method, wrong
+      // path and the wrong id — so the remote leg was a silent no-op while the
+      // caller was told CANCELLED.
+      const transcoderJobId = await redis.get(keys.jobUuid(id));
+      if (!transcoderJobId) {
+        // Dispatched, but we never recorded (or have since expired) the id the
+        // transcoder assigned, so there is no cancel we can address. Say so
+        // instead of reporting a cancellation that did not happen — the job is
+        // still running on the instance. Local state is left untouched so the
+        // caller (or the reconciler) can retry once the id is resolvable.
+        return reply.code(409).send({
+          id,
+          status: 'CANCEL_NOT_HONOURED',
+          error:
+            'job is dispatched but its transcoder-assigned job id is unknown, so the cancel could not be forwarded to the instance'
+        });
+      }
+
       try {
         const token = await getToken();
-        const res = await fetch(`${url.replace(/\/$/, '')}/encoreJobs/${encodeURIComponent(id)}`, {
-          method: 'DELETE',
-          headers: { authorization: `Bearer ${token}` }
-        });
+        const res = await fetch(
+          `${url.replace(/\/$/, '')}/encoreJobs/${encodeURIComponent(transcoderJobId)}/cancel`,
+          { method: 'POST', headers: { authorization: `Bearer ${token}` } }
+        );
+        // 404/409 => the job is already gone or already terminal. Per the
+        // verified contract that is an idempotent no-op, so the job is not
+        // running and CANCELLED is the honest answer.
+        if (!res.ok && res.status !== 404 && res.status !== 409) {
+          const text = await res.text().catch(() => '');
+          return reply.code(502).send({
+            id,
+            status: 'CANCEL_FAILED',
+            error: `encore instance rejected the cancel: ${res.status} ${text}`.trim()
+          });
+        }
         await redis.hset(keys.jobStatus(workspaceId), id, 'CANCELLED');
-        return reply.code(res.ok ? 200 : res.status).send({ id, status: 'CANCELLED' });
+        return reply.code(200).send({ id, status: 'CANCELLED' });
       } catch {
         return reply.code(502).send({ id, error: 'failed to reach encore instance' });
       }
