@@ -108,6 +108,12 @@ export type WorkspaceEncoreScalerConfig = {
   // Forwarded to every spawned Encore instance as its `profilesUrl` so it loads
   // operator-managed profiles from this API's public index (issue #84).
   profilesUrl?: string;
+  // Forwarded to every spawned Encore instance as the multipart part size (in
+  // bytes) it uploads its outputs with (issue #1221). Process-global: it is a
+  // property of the upload client inside the transcoder, not of a stack, so
+  // unlike profilesUrl/s3Config it has no per-stack resolver. Unset => the
+  // option is omitted and instances keep the service default.
+  uploadPartSizeBytes?: number;
   // Optional per-stack rewrite of `profilesUrl` (issue #1164). When supplied,
   // called with the loop key (the EFFECTIVE stack identity the transcode request
   // resolved to) and preferred over the process-global `profilesUrl` above.
@@ -425,6 +431,10 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
       s3Config,
       profilesUrl,
+      // #1221: size the output upload's multipart parts on every instance this
+      // loop spawns, so an archive-class single large output does not fail its
+      // upload on the service's default part size.
+      uploadPartSizeBytes: this.config.uploadPartSizeBytes,
       onDispatched: this.config.onDispatched,
       onEncodeDispatched: this.config.onEncodeDispatched,
       reconcileFailedTranscodes: this.config.reconcileFailedTranscodes,
@@ -576,6 +586,9 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
             // getOrCreate, so a re-discovered pool and a freshly created one
             // never disagree about which stack's profiles its instances load.
             profilesUrl: this.resolveLoopProfilesUrl(workspaceId),
+            // #1221: same upload part size as getOrCreate's loop, so a
+            // re-discovered pool spawns replacements configured identically.
+            uploadPartSizeBytes: this.config.uploadPartSizeBytes,
             onDispatched: this.config.onDispatched
           };
           await reconcilePoolFromOsc(scalerConfig).catch(() => {

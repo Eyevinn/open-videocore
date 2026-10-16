@@ -195,6 +195,7 @@ import type { StackReachabilityDeps } from './services/stack-reachability.js';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
 import { valkeyConnectionId } from './encore-scaler/valkey-connection-id.js';
 import { resolveJobThroughputCap } from './encore-scaler/job-throughput-cap.js';
+import { resolveUploadPartSizeBytes } from './encore-scaler/upload-part-size.js';
 import { decideRetry, clearRetryState, makePriorAttemptCanceler } from './encore-scaler/retry-store.js';
 import { decodeEncoreJobId } from './data/job-repo.js';
 import { DEPLOYMENT_CONTEXT } from './auth/workspace.js';
@@ -1008,6 +1009,22 @@ const encoreSpawnReadyTimeoutMs =
   Number.isFinite(encoreSpawnReadyTimeoutMsRaw) && encoreSpawnReadyTimeoutMsRaw > 0
     ? encoreSpawnReadyTimeoutMsRaw
     : undefined;
+// Multipart part size (bytes) every spawned transcoder uploads its OUTPUTS with
+// (issue #1221). The transcoder service's own default of 100 MB makes a single
+// multi-GB output (an archive/mastering profile's one large file) fail its
+// upload deterministically with a connection-pool acquisition timeout after a
+// complete, successful encode, while many-small-output profiles on the same
+// source and object store upload in about a second. Override with
+// ENCORE_S3_MULTIPART_PART_SIZE_BYTES; invalid or out-of-bounds values fall back
+// to the default and say so. See src/encore-scaler/upload-part-size.ts.
+const encoreUploadPartSizeBytes = resolveUploadPartSizeBytes(
+  process.env['ENCORE_S3_MULTIPART_PART_SIZE_BYTES'],
+  (reason) =>
+    app.log.warn(
+      { reason },
+      'ENCORE_S3_MULTIPART_PART_SIZE_BYTES ignored — transcoder output uploads use the built-in part size'
+    )
+);
 // Bounded timeout (issue #273) for the failed-transcode reconciliation sweep: a
 // transcode still non-terminal after this long whose Encore record has been
 // garbage-collected (getJobStatus -> 404/undefined) is declared failed rather
@@ -1477,6 +1494,11 @@ function activateScaler(redisUrl: string): void {
     // Point each spawned Encore instance at our own public profile index so it
     // loads the operator-managed profiles from CouchDB (issue #84).
     profilesUrl: encoreScalerProfilesUrl,
+    // Size each spawned instance's OUTPUT upload (issue #1221) so a single
+    // multi-GB output — an archive/mastering profile's one large file — does not
+    // fail its upload on the service's default multipart part size after a
+    // complete encode.
+    uploadPartSizeBytes: encoreUploadPartSizeBytes,
     // …and point it at THAT STACK's profile index (issue #1164). The scaler's
     // loop key is the EFFECTIVE stack identity the transcode request resolved to
     // (issue #615), and a spawned instance fetches its profilesUrl with a
