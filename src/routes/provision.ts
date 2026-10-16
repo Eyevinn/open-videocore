@@ -63,6 +63,14 @@ import {
   teardownOnDemandPackager,
   type PackagerTeardownResult
 } from '../services/packager-provisioning.js';
+// The profiles bucket name and its anonymous-read policy document are owned by
+// the publisher module (ADR-026 D1/D3, issue #1207) and imported here rather
+// than re-declared, so the bucket provisioning below and the publish path can
+// never drift about which bucket is served or which policy it carries.
+import {
+  PROFILES_BUCKET,
+  profilesBucketAnonymousReadPolicy
+} from '../services/profile-index-publisher.js';
 import { computeStackReadiness } from '../services/stack-readiness.js';
 import {
   checkStackReachability,
@@ -89,6 +97,13 @@ import type { WorkspaceEncoreScalerRegistry } from '../encore-scaler/workspace-r
 // packager (OutputFolder) when packaging is first executed (epic #226).
 const SOURCE_BUCKET = 'openvideocore-source';
 const PACKAGED_BUCKET = 'openvideocore-packaged';
+
+// The two buckets a provisioned stack CANNOT work without: ingest lands in the
+// source bucket and packaged output lands in the packaged bucket, so a failure
+// to create either must fail the provision. The profiles bucket
+// (PROFILES_BUCKET, issue #1208) is deliberately NOT in this list — it has a
+// working fallback (ADR-026 D2) and is therefore created best-effort below.
+const REQUIRED_BUCKETS = [SOURCE_BUCKET, PACKAGED_BUCKET] as const;
 
 // Sensitive credentials are supplied by the operator as environment variables
 // (ADR-002, 12-factor config) — never in the request body. During provisioning
@@ -1185,7 +1200,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         });
         const delay = (ms: number) =>
           new Promise((resolve) => setTimeout(resolve, ms));
-        for (const bucket of [SOURCE_BUCKET, PACKAGED_BUCKET]) {
+        for (const bucket of REQUIRED_BUCKETS) {
           let attempts = 0;
           while (true) {
             try {
@@ -1202,8 +1217,72 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           }
         }
 
+        // 1b-ii. Create the DEDICATED profiles bucket (issue #1208, ADR-026
+        // D1/D3). This is the bucket the profile-index publisher writes
+        // `index.yml` + one `<name>.yml` per runnable profile into, and whose
+        // anonymous-read `index.yml` URL becomes the PRIMARY Encore
+        // `profilesUrl` — so each spawned Encore instance fetches its profiles
+        // with a plain tokenless GET of an origin this app configures itself,
+        // instead of depending on an orchestrator-level auth-gate exemption
+        // that no OSC contract can set, read, or assert (ADR-026 C3).
+        //
+        // Dedicated bucket rather than a prefix on the packaged bucket, so the
+        // profiles policy and the media policy stay independently auditable and
+        // a profile object can never collide with a packaged key. The name and
+        // the policy document both come from the publisher module, so the two
+        // halves of ADR-026 D3 cannot disagree.
+        //
+        // BEST-EFFORT, unlike the required buckets above: the resolver keeps a
+        // working fallback tier (the app's own
+        // `GET /api/v1/profiles/index.yml`, ADR-026 D2), and `publishProfileIndex`
+        // already treats a missing bucket as `bucket-missing` -> "fall through
+        // to the pre-ADR-026 tiers". A profiles-bucket hiccup must therefore
+        // never fail the provision of an otherwise-healthy stack, exactly like
+        // the CORS and packaged-policy steps below.
+        //
+        // TEARDOWN: nothing to add. The bucket lives INSIDE this stack's
+        // `minio-minio` instance, which is a member of STACK_SERVICES and is
+        // removed by the stack teardown path (services/deprovision.ts, via
+        // TEARDOWN_ORDER), so the bucket and its objects are destroyed with the
+        // stack and a re-provision under the same name starts from an empty
+        // bucket with the policy re-applied below.
+        let profilesBucketReady = false;
+        {
+          let attempts = 0;
+          while (true) {
+            try {
+              // bucketExists-then-makeBucket (not makeBucket alone) keeps a
+              // re-provision idempotent: an existing profiles bucket, already
+              // holding a published index, is left exactly as it is.
+              const exists = await minioClient.bucketExists(PROFILES_BUCKET);
+              if (!exists) {
+                await minioClient.makeBucket(PROFILES_BUCKET);
+              }
+              profilesBucketReady = true;
+              break;
+            } catch (err) {
+              attempts++;
+              if (attempts >= 5) {
+                app.log.warn(
+                  { err, bucket: PROFILES_BUCKET, stack: name },
+                  'could not create the profiles bucket; the Encore profilesUrl ' +
+                    'will fall back to this API\'s own /api/v1/profiles/index.yml ' +
+                    '(re-provision to retry)'
+                );
+                break;
+              }
+              await delay(3000);
+            }
+          }
+        }
+
         // 1c. Set CORS on both buckets so browsers can PUT presigned URLs
         // directly from the ops UI without cross-origin errors.
+        // Deliberately NOT applied to the profiles bucket: nothing in a browser
+        // reads it (the ops UI reads profiles through this API's own
+        // /api/v1/profiles routes) and its only consumer is Encore's
+        // server-side, same-process `UrlResource` GET, which is not subject to
+        // the browser's cross-origin rules.
         // MinIO supports the S3 PutBucketCors API; we call it via the MinIO
         // client's makeRequestAsync (which handles AWS Signature V4 signing)
         // because the minio JS SDK does not expose a setBucketCors helper.
@@ -1222,7 +1301,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           '</CORSConfiguration>'
         ].join('');
         const corsPayload = Buffer.from(corsXml, 'utf-8');
-        for (const bucket of [SOURCE_BUCKET, PACKAGED_BUCKET]) {
+        for (const bucket of REQUIRED_BUCKETS) {
           let attempts = 0;
           while (true) {
             try {
@@ -1274,6 +1353,54 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             } catch {
               attempts++;
               if (attempts >= 5) break; // best-effort — don't block provision
+              await delay(3000);
+            }
+          }
+        }
+
+        // 1e. Apply the SAME anonymous read-only policy shape to the PROFILES
+        // bucket (issue #1208, ADR-026 D3), so Encore's tokenless
+        // `UrlResource` GET of `<minio>/openvideocore-profiles/index.yml`
+        // succeeds. The document comes from
+        // `profilesBucketAnonymousReadPolicy()` — the exact JSON the publisher
+        // re-asserts after each publish — so there is one policy definition for
+        // this bucket, not a hand-copied second one: `s3:GetObject` only, for
+        // principal '*', scoped to `arn:aws:s3:::openvideocore-profiles/*`. No
+        // ListBucket and no write, so objects are readable by exact key and the
+        // bucket is not browsable/enumerable.
+        //
+        // The exposure is accepted explicitly in ADR-026 D3: the objects are
+        // encoder configuration (codec, bitrate ladder, container settings),
+        // never customer media and never credentials, and this is a strictly
+        // NARROWER exposure than the anonymous-read packaged bucket above
+        // (#199), which serves actual media. The SOURCE bucket's privacy and
+        // the PACKAGED bucket's existing policy are both untouched — changing
+        // either is out of scope (ADR-026 §6).
+        //
+        // Skipped when the bucket is not there (creation failed above): a
+        // policy on a non-existent bucket cannot succeed, and retrying it would
+        // only add 4 pointless sleeps to the provision. Same best-effort
+        // retry/backoff as the packaged policy; `setBucketPolicy` overwrites,
+        // so a re-provision converges rather than accumulating statements.
+        if (profilesBucketReady) {
+          const profilesPolicy = profilesBucketAnonymousReadPolicy();
+          let attempts = 0;
+          while (true) {
+            try {
+              await minioClient.setBucketPolicy(PROFILES_BUCKET, profilesPolicy);
+              break;
+            } catch (err) {
+              attempts++;
+              if (attempts >= 5) {
+                app.log.warn(
+                  { err, bucket: PROFILES_BUCKET, stack: name },
+                  'could not apply the anonymous-read policy to the profiles ' +
+                    'bucket; the publisher re-asserts it best-effort on the next ' +
+                    'publish, and until it holds the Encore profilesUrl falls ' +
+                    "back to this API's own /api/v1/profiles/index.yml"
+                );
+                break; // best-effort — don't block provision
+              }
               await delay(3000);
             }
           }
