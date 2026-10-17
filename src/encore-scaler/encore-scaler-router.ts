@@ -25,6 +25,7 @@ import {
   assertUnderJobThroughputCap,
   isJobThroughputCapExceededError
 } from './job-throughput-cap.js';
+import { markJobCancelled } from './job-cancellation.js';
 
 export type EncoreScalerRouterOptions = {
   redis: Redis;
@@ -160,11 +161,62 @@ export const encoreScalerRouter: FastifyPluginAsync<EncoreScalerRouterOptions> =
         // Not dispatched. If we drained one or more buffered entries the job is
         // cancelled; otherwise there was nothing to cancel.
         if (drained) {
-          await redis.hset(keys.jobStatus(workspaceId), id, 'CANCELLED');
+          await markJobCancelled(redis, workspaceId, id);
           return reply.code(200).send({ id, status: 'CANCELLED' });
         }
+
+        // #1225: one more place the job can be, between the two reads above — the
+        // scaler loop's `rpoplpush(queue -> inflight)` has CLAIMED the entry but
+        // dispatch() has not yet written keys.jobInstance. There is then nothing
+        // left in the queue to drain and no instance mapping, so this used to
+        // 404 with no tombstone and the job went on to dispatch and run. A
+        // claimed entry is still cancellable: record the tombstone and report
+        // CANCELLED. The loop's own pre-dispatch guard (scaler-loop.ts, same
+        // issue) reads the tombstone and drops the claimed entry instead of
+        // dispatching it, so the inflight entry is left for the loop to lrem
+        // with the exact value it claimed.
+        //
+        // Honest limit: that guard reads the tombstones once per instance per
+        // tick, so a tombstone written after the read can still let THIS claim
+        // dispatch. What the tombstone then guarantees is the actual subject of
+        // #1225 — the job is never re-enqueued by scale-down recovery or by the
+        // dropped-job diff, and its status stays CANCELLED. It does NOT promise
+        // that an already-claimed job never reaches the instance.
+        const inflight = await redis.lrange(keys.inflight(workspaceId), 0, -1);
+        const claimed = inflight.some((entry) => {
+          try {
+            return (JSON.parse(entry) as QueuedJob).jobId === id;
+          } catch {
+            return false;
+          }
+        });
+        if (claimed) {
+          await markJobCancelled(redis, workspaceId, id);
+          return reply.code(200).send({ id, status: 'CANCELLED' });
+        }
+
+        // Genuinely unknown to the scaler: nothing queued, nothing claimed,
+        // nothing dispatched.
         return reply.code(404).send({ id, status: 'NOT_FOUND' });
       }
+
+      // #1225: the job IS dispatched, so record the cancellation (monotonic
+      // tombstone + terminal status) BEFORE the remote leg. Every exit below —
+      // the missing-pool-record 404, the unreachable-instance 502, the 200 — then
+      // leaves a cancel that the scaler's scale-down recovery and dropped-job
+      // reconciliation can no longer undo by re-enqueueing the job. Response
+      // codes are unchanged. See src/encore-scaler/job-cancellation.ts.
+      //
+      // NOTE on how this is proved: this plugin is a library-exported facade. It
+      // is NOT registered by src/main.ts (`grep -rn "encoreScalerRouter" src/` =>
+      // this file, the index.ts re-export, and the tests), and the router main.ts
+      // does mount for the compat surface (src/routes/encore-compat.ts) exposes
+      // only POST /encoreJobs and GET /encoreJobs/:id — no DELETE. So there is no
+      // live HTTP endpoint to curl for this handler; every branch below is proved
+      // instead by injected requests in
+      // encore-scaler-router.cancel-dispatched.test.ts (200 / 404 / 502) and
+      // encore-scaler-router.delete-drain.test.ts (queued 200, unknown 404).
+      await markJobCancelled(redis, workspaceId, id);
 
       const record = await redis.hget(keys.pool(workspaceId), instanceId);
       if (!record) {

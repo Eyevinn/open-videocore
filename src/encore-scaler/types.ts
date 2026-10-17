@@ -416,6 +416,23 @@ export const keys = {
   // 24h TTL as `jobEncoreUrl` so URL and instance stay resolvable for the same
   // window. Keyed by our encoreJobId (externalId, globally unique).
   jobTerminalInstance: (encoreJobId: string) => `encore:job-terminal-instance:${encoreJobId}`,
+  // #1225: cancellation tombstones for this workspace — a hash of our externalId
+  // (encoreJobId) -> epoch ms (string) of the cancel. Lives beside jobStatus, is
+  // written by every cancel path, and is purged with the rest of the workspace's
+  // scaler keys on deprovision (workspace-registry.ts).
+  //
+  // Why a separate key when jobStatus already records 'CANCELLED': the status
+  // hash is a LAST-WRITER-WINS field that the recovery machinery itself
+  // overwrites — dispatch pins it to 'running' (scaler-loop.ts dispatch) and
+  // requeueInterruptedByScaleDown pins it back to 'RUNNING' (retry-store.ts) so
+  // an in-flight job is never observed as settled. A cancel that races a claimed
+  // dispatch therefore had its terminal status erased, and the job looked
+  // non-terminal again to scale-down recovery and to reconcile()'s dropped-job
+  // diff, which re-enqueued it on a fresh instance after the original was
+  // deleted. Cancellation is terminal and MONOTONIC, so it is recorded in a key
+  // nothing on the recovery path writes: once set, every re-enqueue path skips
+  // the job for good.
+  cancelledJobs: (workspaceId: string) => `encore:job-cancelled:${workspaceId}`,
   // Original Encore job payload, stored at dispatch time with a 24h TTL so a
   // transport-class failure can be re-dispatched (#295) without the caller
   // re-submitting. Keyed by our externalId (encoreJobId), which is globally
