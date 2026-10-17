@@ -30,9 +30,11 @@
 //   - Runtime config provenance (#1079): the live config values below are seeded
 //     from this router's options, which main.ts resolves from the environment
 //     (ENCORE_MAX_INSTANCES, ENCORE_IDLE_TIMEOUT_MS, minInstances defaulting to 0),
-//     and are overwritten in-process by PATCH /config. A PATCH is persisted (#1077)
-//     but not yet re-read at boot (#1078), so `sources` reports which of the two
-//     each value currently is — see `configValueSourceSchema`.
+//     and are overwritten in-process by PATCH /config. Since #1078 those boot
+//     values are the PERSISTED snapshot when the parameter store holds a readable
+//     one (main.ts resolveScalerBootConfig -> `configSource: 'persisted'`), so
+//     `sources` reports which of the two each value currently is — see
+//     `configValueSourceSchema` and `bootSource` below.
 //   - ScalerStackConnection + WorkspaceEncoreScalerRegistry.listStackConnections():
 //     src/encore-scaler/workspace-registry.ts — { stackKey, connectionId?, redis?,
 //     unobservedReason? }, resolved through the registry's own
@@ -57,6 +59,7 @@ import { JOBS_PER_INSTANCE, keys } from '../encore-scaler/types.js';
 import { listInstances } from '../encore-scaler/instance-pool.js';
 import { readSpawnFailure } from '../encore-scaler/spawn-failure.js';
 import type { ScalerStackConnection } from '../encore-scaler/workspace-registry.js';
+import { SCALER_CONFIG_BOUNDS } from '../services/param-store.js';
 import type { ScalerConfigStore } from '../services/param-store.js';
 
 type ScalerRouterOptions = {
@@ -99,12 +102,23 @@ type ScalerRouterOptions = {
   // Contract (key, value shape, error semantics): services/param-store.ts
   // SCALER_CONFIG_KEY / ScalerRuntimeConfig / makeScalerConfigStore.
   configStore?: ScalerConfigStore;
+  // Where the boot values above came from (#1078). 'persisted' means main.ts
+  // loaded them from the parameter store at boot (resolveScalerBootConfig in
+  // services/scaler-boot-config.ts), i.e. they are a previous operator's PATCH
+  // restored after a restart; 'env' (the default) means they came from this
+  // deployment's environment. It only affects what `sources` REPORTS — the
+  // values themselves are already resolved by the caller.
+  configSource?: 'env' | 'persisted';
 };
 
 // Lower bound on the runtime idle timeout. A near-zero timeout would let the
 // scaler destroy an instance almost as soon as it goes idle, thrashing the
 // spawn/destroy cycle (spawns take 60-120s). 10s is a defensible floor.
-const MIN_IDLE_TIMEOUT_MS = 10_000;
+//
+// Sourced from services/param-store.ts `SCALER_CONFIG_BOUNDS` (the same constant
+// the boot-time clamp in services/scaler-boot-config.ts applies), so the value
+// the API rejects and the value boot refuses to adopt cannot drift apart.
+const MIN_IDLE_TIMEOUT_MS = SCALER_CONFIG_BOUNDS.idleTimeoutMs.min;
 
 // Error body for the PATCH /config failure paths (#1077). Same { error, message }
 // shape the rest of the API uses (errorSchema, src/routes/storage.ts:65).
@@ -253,11 +267,16 @@ const connectionSchema = z.object({
 // Where one scaler config value came from (#1079).
 //
 // The reported numbers are identical whether they came from the deployment
-// environment at boot or were set at runtime through PATCH /config, so after a
-// process restart — which reverts every value to its environment default, since
-// nothing re-reads the persisted record at boot yet (#1078) — an operator could
-// not tell "my PATCH was reverted" from "that is the value I asked for". This says
-// which of the two the value is.
+// environment or were set by an operator through PATCH /config, so without this
+// an operator could not tell "my PATCH is in force" from "that is just the env
+// default". This says which of the two the value is.
+//
+// #1078 changed what a restart does, not what this field means: a restarted
+// process now RESTORES the persisted snapshot, so a restored field reports
+// 'runtime' (the state it was set in) rather than reverting to 'env'. 'env'
+// therefore means one of two things — never configured through the API, or the
+// parameter store was unreadable at boot, which the process warn-logs with the
+// reason (services/scaler-boot-config.ts).
 const configValueSourceSchema = z
   .object({
     source: z
@@ -316,9 +335,9 @@ const scalerStatusSchema = z.object({
     .describe(
       'Instance cap per workspace pool in force in this process: the most recent ' +
         'PATCH /api/v1/scaler/config value if one has been accepted since startup, ' +
-        'otherwise ENCORE_MAX_INSTANCES from boot. A PATCHed value is persisted but ' +
-        'is not reloaded at boot, so this reverts to the environment value on ' +
-        'restart. Reported even when scalerActive is false.'
+        'otherwise the boot value — the persisted snapshot from an earlier PATCH ' +
+        'when one is stored and readable, else ENCORE_MAX_INSTANCES (#1078). ' +
+        'Reported even when scalerActive is false.'
     ),
   // How many concurrent jobs ONE instance can take before the scaler counts it
   // as busy (#979). A server-owned config constant, reported alongside
@@ -331,9 +350,8 @@ const scalerStatusSchema = z.object({
     .describe(
       'Idle teardown timeout (ms) in force in this process: the most recent PATCH ' +
         '/api/v1/scaler/config value if one has been accepted since startup, ' +
-        'otherwise ENCORE_IDLE_TIMEOUT_MS from boot. A PATCHed value is persisted ' +
-        'but is not reloaded at boot, so this reverts to the environment value on ' +
-        'restart.'
+        'otherwise the boot value — the persisted snapshot from an earlier PATCH ' +
+        'when one is stored and readable, else ENCORE_IDLE_TIMEOUT_MS (#1078).'
     ),
   scalerActive: z.boolean(),
   sources: statusConfigSourcesSchema
@@ -579,17 +597,23 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
   //                 read; they are not a second source of truth.
   //   - precedence: the last PATCH this process accepted wins for this process;
   //                 before any PATCH, the boot values handed in as options
-  //                 (main.ts scalerRouterOptions, sourced from
-  //                 ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS). So: runtime
-  //                 PATCH, else environment.
-  //   - restart:    the stored record SURVIVES, but nothing reads it at boot
-  //                 yet — the boot-time load is issue #1078 — so a restarted
-  //                 process is back on the environment values until a PATCH is
-  //                 re-sent. A PATCH is durable; it is not yet self-restoring.
+  //                 (main.ts scalerRouterOptions), which are the persisted
+  //                 snapshot when one was loadable, else ENCORE_MAX_INSTANCES /
+  //                 ENCORE_IDLE_TIMEOUT_MS. So: runtime PATCH, else persisted,
+  //                 else environment.
+  //   - restart:    the stored record SURVIVES and IS read at boot (#1078,
+  //                 services/scaler-boot-config.ts), so a restarted process
+  //                 comes back on the persisted values — for this endpoint and
+  //                 for the scaler loops main.ts creates from the same resolved
+  //                 numbers. It falls back to the environment only when nothing
+  //                 is stored or the store was unreadable at boot, which is
+  //                 warn-logged with the reason. A PATCH is durable AND
+  //                 self-restoring.
   //   - reset:      no reset endpoint and no sentinel value. PATCH the
-  //                 environment values back explicitly (which overwrites the
-  //                 stored snapshot); restarting reverts the live values but
-  //                 leaves the stored record in place.
+  //                 environment values back explicitly, which overwrites the
+  //                 stored snapshot — and now that boot restores that snapshot,
+  //                 that is the ONLY way back to the environment values:
+  //                 restarting no longer undoes a PATCH.
   //   - fan-out:    `opts.onConfigChange` carries maxInstances/idleTimeoutMs to
   //                 the live scaler objects (main.ts onConfigChange ->
   //                 workspace-registry setMaxInstances/setIdleTimeoutMs ->
@@ -621,25 +645,39 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
   // was READ, not set. So `updatedAt` is omitted for env values rather than
   // filled in with a boot time that would read as "someone changed this at boot".
   //
-  // Lifetime is this process. A PATCH is persisted (#1077) but not yet re-read at
-  // boot (#1078), so a restart returns every field to "env" — the
-  // restart-reverts-silently behaviour this field exists to make visible. When
-  // boot-time restore ships, a restored value must keep reporting source
-  // "runtime" with its original updatedAt.
+  // Lifetime is this process: this map only records PATCHes THIS process served.
+  // A value restored at boot is reported as "runtime" through `bootSource` below
+  // instead, because the persisted snapshot carries no timestamp to put in
+  // `updatedAt` (#1078).
   type ConfigField = 'maxInstances' | 'minInstances' | 'idleTimeoutMs';
   const runtimeSetAt: Partial<Record<ConfigField, string>> = {};
 
+  // #1078 closes the gap the paragraph above describes. When main.ts restored
+  // the boot values from the parameter store, every field starts out as an
+  // OPERATOR-set value, not an environment value, so it reports
+  // `source: "runtime"` from the first request — otherwise a restored PATCH
+  // would be indistinguishable on the wire from the env default it overrode.
+  // `updatedAt` is omitted in that state on purpose: the persisted snapshot
+  // carries only the three numbers (ScalerRuntimeConfig, param-store.ts), so the
+  // process genuinely does not know WHEN the original PATCH happened, and
+  // `updatedAt` is optional precisely so a known-source/unknown-time value can
+  // be reported without inventing a timestamp. A PATCH on this process then
+  // fills the timestamp in as usual.
+  const bootSource: z.infer<typeof configValueSourceSchema>['source'] =
+    opts.configSource === 'persisted' ? 'runtime' : 'env';
+
   function sourceOf(field: ConfigField): z.infer<typeof configValueSourceSchema> {
     const updatedAt = runtimeSetAt[field];
-    return updatedAt === undefined ? { source: 'env' } : { source: 'runtime', updatedAt };
+    if (updatedAt !== undefined) return { source: 'runtime', updatedAt };
+    return { source: bootSource };
   }
 
   const scalerConfigSchema = z.object({
     maxInstances: z
       .number()
       .int()
-      .min(1)
-      .max(20)
+      .min(SCALER_CONFIG_BOUNDS.maxInstances.min)
+      .max(SCALER_CONFIG_BOUNDS.maxInstances.max)
       .describe(
         'Upper bound on transcoder instances in one workspace pool. Applied to ' +
           'every running scaler loop as soon as it is set. Boot default: ' +
@@ -648,15 +686,16 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
     minInstances: z
       .number()
       .int()
-      .min(0)
-      .max(10)
+      .min(SCALER_CONFIG_BOUNDS.minInstances.min)
+      .max(SCALER_CONFIG_BOUNDS.minInstances.max)
       .describe(
         'Warm floor of instances kept running while a pool is idle. NOTE: unlike ' +
-          'the other two fields this one is only recorded — persisted and reported ' +
-          'back here — and is NOT fanned out to the running scaler loops, which ' +
-          'keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It ' +
-          'also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is ' +
-          'set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart.'
+          'the other two fields a PATCH to this one is only recorded — persisted ' +
+          'and reported back here — and is NOT fanned out to the already-running ' +
+          'scaler loops, which keep enforcing the floor they were created with. ' +
+          'The persisted value IS applied at the next boot (#1078), where it takes ' +
+          'precedence over ENCORE_MIN_INSTANCES, so a PATCH here takes effect on ' +
+          'the running loops only after a restart.'
       ),
     idleTimeoutMs: z
       .number()
@@ -682,22 +721,25 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
       sources: z
         .object({
           maxInstances: configValueSourceSchema,
-          // Field-specific, because the generic `source` wording is not true of
-          // this field: "env" here is the built-in 0 this endpoint is seeded
-          // with, NEVER the deployment's ENCORE_MIN_INSTANCES, which is read
-          // elsewhere and never reaches this endpoint (see the comment on
+          // Field-specific, because the generic `source` wording needs one
+          // qualification for this field: since #1078 "env" here IS the
+          // deployment's ENCORE_MIN_INSTANCES (0 when unset), forwarded by
+          // main.ts through resolveScalerBootConfig — it is no longer the
+          // hardcoded 0 this endpoint used to be seeded with. What stays
+          // field-specific is the fan-out: a PATCH to this field is recorded and
+          // persisted but not applied to the running loops (see the comment on
           // runtimeSetAt).
           minInstances: configValueSourceSchema.describe(
             'Provenance of `minInstances`, with one caveat specific to this ' +
-              'field: `source: "env"` means the built-in default 0 this process ' +
-              'started with, NOT the value of ENCORE_MIN_INSTANCES. That ' +
-              'variable is read only by the scaler loops and never reaches this ' +
-              'endpoint, so a deployment running with ENCORE_MIN_INSTANCES=2 ' +
-              'still reports `minInstances: 0` with `source: "env"` here until ' +
-              'a PATCH sets it. `source: "runtime"` has its usual meaning — set ' +
-              'by PATCH /config on this process — but note that even then the ' +
-              'value is only recorded and echoed, not applied to the running ' +
-              'scaler loops (see the `minInstances` field description). ' +
+              'field: `source: "env"` means the warm floor this process booted ' +
+              'with from ENCORE_MIN_INSTANCES (0 when unset). `source: ' +
+              '"runtime"` means the value was set by PATCH /config — on this ' +
+              'process, or on an earlier one and restored from the parameter ' +
+              'store at boot (#1078), in which case `updatedAt` is absent ' +
+              'because the stored record carries no timestamp. Note that a ' +
+              'PATCH on the RUNNING process is only recorded and echoed, not ' +
+              'applied to the live scaler loops, whereas a value restored at ' +
+              'boot is applied (see the `minInstances` field description). ' +
               'Read-only and server-asserted.'
           ),
           idleTimeoutMs: configValueSourceSchema
@@ -707,9 +749,11 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
     .describe(
       'The auto-scaler configuration this process is using right now. A value set ' +
         'by PATCH is written durably to the parameter store before it is applied, ' +
-        'but nothing re-reads that record at boot yet, so after a restart this ' +
-        'reports the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment ' +
-        'values again until the PATCH is re-sent.'
+        'and is read back at boot (#1078), so a restarted process serves the ' +
+        'persisted values and reports them with `source: "runtime"`. The ' +
+        'ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values apply ' +
+        'only to a deployment never configured through this endpoint, or when the ' +
+        'parameter store could not be read at boot (logged with the reason).'
     );
 
   const configResponse = (): z.infer<typeof scalerConfigResponseSchema> => ({
@@ -855,31 +899,40 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
           'write or cannot be reached gets a 503 and nothing is applied, so ' +
           '`GET /api/v1/scaler/config` still reports the previous values. The live ' +
           'copy is per process and is not pushed to other replicas.\n\n' +
-          '**Precedence.** The most recent PATCH accepted by this process wins. ' +
-          'Until one arrives, the values read at boot from `ENCORE_MAX_INSTANCES` ' +
-          '(default 3) and `ENCORE_IDLE_TIMEOUT_MS` (default 300000) apply. So the ' +
-          'order is: runtime PATCH, else environment.\n\n' +
-          '**Restart.** The stored record survives a restart, but it is not read ' +
-          'back at boot yet, so a restarted process serves the environment values ' +
-          'again until the PATCH is re-sent. Treat a PATCH as durable but not ' +
-          'self-restoring.\n\n' +
+          '**Precedence.** Three layers, in order: the most recent PATCH accepted ' +
+          'by this process, else the persisted snapshot this process read from the ' +
+          'parameter store at boot (#1078), else the environment values read at ' +
+          'boot — `ENCORE_MAX_INSTANCES` (default 3) and `ENCORE_IDLE_TIMEOUT_MS` ' +
+          '(default 300000). So the environment applies to a deployment never ' +
+          'configured through this endpoint, or to a boot where the stored record ' +
+          'was absent or unreadable.\n\n' +
+          '**Restart.** The stored record survives a restart AND is read back at ' +
+          'boot (#1078), so a restarted process serves the persisted values — for ' +
+          'the config endpoint and for the scaler loops — without the PATCH being ' +
+          're-sent. If the parameter store cannot be read at boot the process ' +
+          'starts on the environment values instead and logs a warning naming the ' +
+          'reason, so a restored value must never be assumed without checking ' +
+          '`sources`.\n\n' +
           '**Reset to the environment default.** There is no reset endpoint and no ' +
           'sentinel value. PATCH the environment values back explicitly, which ' +
-          'overwrites the stored snapshot; restarting reverts the live values but ' +
-          'leaves the stored record in place. `GET /api/v1/scaler/config` shows ' +
-          'what is in force, and `sources` says per field whether the value came ' +
-          'from a PATCH on this process or from the environment (#1079) — note ' +
-          'that PATCHing an environment value back still reports ' +
-          '`source: "runtime"`, because `sources` reports who set the value, not ' +
-          'whether the number changed; only a restart puts a field back to ' +
-          '`source: "env"`.\n\n' +
+          'overwrites the stored snapshot — and now that boot restores that ' +
+          'snapshot (#1078), that is the only way back to the environment values: ' +
+          'restarting no longer undoes a PATCH. `GET /api/v1/scaler/config` shows ' +
+          'what is in force, and `sources` says per field whether the value was ' +
+          'set through PATCH — on this process, or on an earlier one and restored ' +
+          'at boot — or came from the environment (#1079). Note that PATCHing an ' +
+          'environment value back still reports `source: "runtime"`, because ' +
+          '`sources` reports who set the value, not whether the number changed; a ' +
+          'field reports `source: "env"` again only on a process that booted with ' +
+          'no usable stored record.\n\n' +
           '**Caveats.** `minInstances` is recorded, persisted and echoed back but ' +
           'is not applied to the running scaler loops (see the field description). ' +
           'A PATCH sent while `GET /api/v1/scaler/status` reports ' +
           '`scalerActive: false` is accepted and reported back, but is not carried ' +
           'into the scaler that later activates against a newly provisioned stack ' +
-          '— that activation uses the environment values, so re-send the PATCH ' +
-          'afterwards.',
+          '— that activation uses the values this process resolved at boot (the ' +
+          'persisted snapshot when one was loaded, else the environment values), ' +
+          'so re-send the PATCH afterwards.',
         body: scalerConfigSchema.partial(),
         response: { 200: scalerConfigResponseSchema, 501: errorSchema, 503: errorSchema }
       }
@@ -961,10 +1014,9 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
         description:
           'Report the auto-scaler settings this process is using. These are the ' +
           'live values: the most recent `PATCH /api/v1/scaler/config` if one has ' +
-          'been accepted since startup, otherwise the boot values from ' +
-          '`ENCORE_MAX_INSTANCES` and `ENCORE_IDLE_TIMEOUT_MS`. A PATCHed value is ' +
-          'persisted in the parameter store, but that record is not read back at ' +
-          'boot yet, so after a restart this reports the environment values again. ' +
+          'been accepted since startup, otherwise the boot values — the persisted ' +
+          'snapshot of an earlier PATCH when the parameter store holds a readable ' +
+          'one (#1078), else `ENCORE_MAX_INSTANCES` and `ENCORE_IDLE_TIMEOUT_MS`. ' +
           'This endpoint reads the live copy only — it never reads the store, so it ' +
           'cannot be used to check what is persisted. `sources` says, per field, ' +
           'whether the value is the deployment\'s environment value or was set ' +
