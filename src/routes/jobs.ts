@@ -239,14 +239,45 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
       // Best-effort Encore cancellation. Must never block the synchronous status
       // update: Encore may be unreachable and cancelling a gone/terminal job is a
       // safe no-op per EncoreClient.cancel's contract (src/pipeline/encore-client.ts:44).
-      if (job.encoreInternalJobId) {
+      //
+      // #1219: the handle falls back to `encoreJobId` (our externalId) when the
+      // internal id was never recorded. Under the scaler the two are the SAME
+      // value — makeScalingEncoreClient.submit returns `encoreInternalId:
+      // input.externalId` because the real Encore UUID is unknown until dispatch
+      // (src/encore-scaler/index.ts:73-75) — and submitTranscode writes
+      // `encoreJobId` BEFORE submitting but `encoreInternalJobId` only after
+      // (src/pipeline/transcode.ts:172,194). Without the fallback, a job whose
+      // post-submit write did not land is cancellable in Videocore while the
+      // scaler keeps its queue entry and later dispatches it to Encore.
+      //
+      // The fallback is only MEANINGFUL under the scaler, for that reason. On a
+      // stack wired to a direct EncoreClient, `cancel` takes the internal Encore
+      // UUID (src/pipeline/encore-client.ts:52-58,142-155), so passing our
+      // externalId POSTs a path no job matches and Encore answers 404 — which
+      // that client treats as the documented idempotent no-op. No worse than the
+      // behaviour without a fallback (nothing attempted), but it is not a cancel:
+      // such a job is only cancellable once `encoreInternalJobId` is recorded.
+      const encoreHandle = job.encoreInternalJobId ?? job.encoreJobId;
+      if (encoreHandle) {
         const encore = request.connections?.encore;
         if (encore) {
           try {
-            await encore.cancel(job.encoreInternalJobId);
-          } catch {
+            await encore.cancel(encoreHandle);
+          } catch (err) {
             // Encore unreachable or job already gone — proceed with local cancel.
+            // Logged (not swallowed silently) because an undelivered cancel is
+            // the #1219 failure mode: the job reads CANCELLED here while it may
+            // still be running on Encore, and nothing else records that.
+            request.log.warn(
+              { err, jobId: job.id, encoreHandle },
+              'encore cancel could not be confirmed; job marked cancelled locally'
+            );
           }
+        } else {
+          request.log.warn(
+            { jobId: job.id, encoreHandle },
+            'no encore connection for this stack; job marked cancelled locally without an encore cancel'
+          );
         }
       }
 
