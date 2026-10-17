@@ -57,6 +57,7 @@ import {
   recordSpawnFailure,
   spawnFailureSecrets
 } from './spawn-failure.js';
+import { UPLOAD_PART_SIZE_OPTION } from './upload-part-size.js';
 
 // Encore's OSC service identifier. Not hardcoded at the call sites — sourced
 // from the provisioning contract (STACK_SERVICES / provision route) via this
@@ -606,6 +607,16 @@ async function spawnPooledInstance(
       // Encore service's own config key for the YAML profile index URL.
       if (config.profilesUrl) {
         instanceBody['profilesUrl'] = config.profilesUrl;
+      }
+      // Size the OUTPUT upload's multipart parts (issue #1221). Sent
+      // independently of `s3Config` above: the credentials may come from the
+      // static env pair instead of a resolved stack config, and this is a
+      // transport tunable, not a credential. The option's declared type is
+      // `string` (a decimal byte count, like its "104857600" default), so the
+      // number is stringified rather than sent as JSON number — see
+      // upload-part-size.ts for the instance-API schema this is verified against.
+      if (config.uploadPartSizeBytes !== undefined) {
+        instanceBody[UPLOAD_PART_SIZE_OPTION] = String(config.uploadPartSizeBytes);
       }
       // Say what is being created before the call: a create that hangs or
       // fails at the gateway otherwise leaves no record of having been tried.
