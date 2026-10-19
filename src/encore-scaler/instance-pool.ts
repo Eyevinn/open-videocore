@@ -47,6 +47,7 @@ import { keys, type EncoreInstanceRecord, type EncoreScalerConfig } from './type
 import { fetchEncoreActiveState } from './encore-active-state.js';
 import { hasPendingPackaging } from './packaging-pin.js';
 import {
+  isInstanceAlreadyGoneError,
   isNameAlreadyTakenError,
   isTransientOscError,
   oscHttpCode
@@ -390,17 +391,23 @@ export const DEFAULT_SPAWN_READY_POLL_INTERVAL_MS =
 // deadline path is remapped — a getServiceAccessToken failure before the loop
 // still propagates as itself, which the cleanup path correctly treats as "not a
 // readiness timeout".
+// `signal` (#1170) cancels the wait when the SIBLING readiness wait this one
+// runs concurrently with has already failed — see spawnPooledInstance. Passing
+// it keeps the "no health probe after the spawn has rejected" property (#778
+// review round 2) intact now that two waits overlap.
 async function waitForSpawnedInstanceReady(
   serviceId: string,
   instanceId: string,
-  config: EncoreScalerConfig
+  config: EncoreScalerConfig,
+  signal?: AbortSignal
 ): Promise<void> {
   await waitForInstanceReadyBounded(config.oscContext, serviceId, instanceId, {
     timeoutMs: config.spawnReadyTimeoutMs ?? DEFAULT_SPAWN_READY_TIMEOUT_MS,
     pollIntervalMs:
       config.spawnReadyPollIntervalMs ?? DEFAULT_SPAWN_READY_POLL_INTERVAL_MS,
     makeTimeoutError: (message) =>
-      new SpawnReadyTimeoutError(serviceId, instanceId, message)
+      new SpawnReadyTimeoutError(serviceId, instanceId, message),
+    ...(signal ? { signal } : {})
   });
 }
 
@@ -710,53 +717,125 @@ async function spawnPooledInstance(
   // sit outside, so an instance that never became `running` was left live on OSC
   // with no pool record and no cleanup.
   try {
-    await waitForSpawnedInstanceReady(ENCORE_SERVICE_ID, instanceId, config);
-    // Pair this Encore instance with a dedicated callback listener (same name)
-    // configured with this exact Encore URL, so completion callbacks are routed
-    // to the scaler-managed instance rather than a static one. RedisQueue is set
-    // explicitly to a dedicated queue (`ovc:transcode-done`) that no external
-    // eyevinn-encore-packager consumes, so an external packager can't win the
-    // BZPOPMIN race against our poller and swallow our completion messages
-    // (issue #93). This MUST match DEFAULT_QUEUE_KEY in
-    // src/pipeline/encore-callback-poller.ts.
-    const callbackSat = await config.oscContext.getServiceAccessToken(
-      ENCORE_CALLBACK_LISTENER_SERVICE_ID
-    );
-    progress.secrets.push(callbackSat);
-    // Retry callback listener creation with the same transient-error logic as
-    // the Encore instance above. The OSC ingress webhook sometimes returns
-    // ORCHESTRATOR_UNAVAILABLE under load; a short back-off is enough.
-    let callback: OscInstance | undefined;
-    let lastCallbackErr: unknown;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      progress.attempts += 1;
-      try {
-        const result = await createOrAdoptCallbackListener(
-          config,
-          instanceId,
-          encoreUrl,
-          callbackSat
-        );
-        callback = result.instance;
-        listenerAdopted = result.adopted;
-        break;
-      } catch (err) {
-        lastCallbackErr = err;
-        // The adopt-on-"already taken" step lives in
-        // createOrAdoptCallbackListener above, shared with resolvePendingSpawns.
-        const isTransient = isTransientOscError(err);
-        if (!isTransient || attempt === maxAttempts) throw err;
-        await new Promise((r) => setTimeout(r, attempt * 5_000));
+    // #1170: START the Encore half's readiness wait, do NOT await it yet.
+    //
+    // A pooled instance only becomes eligible for queued work once the pool
+    // record below is written, and that record is written only after BOTH
+    // halves report `running`. These two waits used to be SERIAL — the paired
+    // callback listener was not even created until the Encore half was up — so
+    // a workspace that needed a second instance paid for two full provisioning
+    // waits end to end. That is the delay reported in #1170: the Encore half
+    // (muxs3tn6) was ready at 07:21:59 with jobs queued, but its listener had
+    // only just been created and the instance did not take a job until 07:26,
+    // while the already-warm instance drained the whole queue in sequence. The
+    // tick itself is blocked for that whole time too (EncoreScalerLoop.start
+    // guards against overlapping ticks, scaler-loop.ts), so nothing else in the
+    // control loop runs either.
+    //
+    // The listener's create only needs `encoreUrl`, which `createInstance`
+    // already returned above — it does NOT need the Encore instance to be
+    // `running`. So the create is issued immediately and the two readiness
+    // waits overlap in the Promise.all below. Nothing downstream is weakened:
+    // the record is still written only when both halves report `running`, and
+    // the first job is still gated on the callback-trust probe
+    // (ensureCallbackTrust, scaler-loop.ts) exactly as before.
+    //
+    // The no-op catch keeps a rejection that lands while the listener create is
+    // still running from surfacing as an unhandled rejection; it attaches a
+    // second handler and does not consume the rejection for the await below.
+    const readinessAbort = new AbortController();
+    // #1170 review finding: EVERYTHING from the start of the first wait down to
+    // the Promise.all lives inside ONE try/finally, so the wait is aborted on
+    // every exit from the block that started it — not only on the Promise.all
+    // path. Three paths in between throw straight past that point:
+    //   - the listener's getServiceAccessToken rejects,
+    //   - a listener create that is non-transient or has exhausted maxAttempts,
+    //   - `!callback` (loop fell through without an instance).
+    // Each of those used to leave the Encore wait polling getInstanceHealth
+    // once a second for up to 15 minutes after spawnPooledInstance had already
+    // rejected — against an instance the catch below may have destroyed on its
+    // way out. `encoreReady.catch(() => undefined)` silences that loop's
+    // rejection, it does not stop the loop; only the abort does.
+    try {
+      const encoreReady = waitForSpawnedInstanceReady(
+        ENCORE_SERVICE_ID,
+        instanceId,
+        config,
+        readinessAbort.signal
+      );
+      encoreReady.catch(() => undefined);
+      // Pair this Encore instance with a dedicated callback listener (same name)
+      // configured with this exact Encore URL, so completion callbacks are routed
+      // to the scaler-managed instance rather than a static one. RedisQueue is set
+      // explicitly to a dedicated queue (`ovc:transcode-done`) that no external
+      // eyevinn-encore-packager consumes, so an external packager can't win the
+      // BZPOPMIN race against our poller and swallow our completion messages
+      // (issue #93). This MUST match DEFAULT_QUEUE_KEY in
+      // src/pipeline/encore-callback-poller.ts.
+      const callbackSat = await config.oscContext.getServiceAccessToken(
+        ENCORE_CALLBACK_LISTENER_SERVICE_ID
+      );
+      progress.secrets.push(callbackSat);
+      // Retry callback listener creation with the same transient-error logic as
+      // the Encore instance above. The OSC ingress webhook sometimes returns
+      // ORCHESTRATOR_UNAVAILABLE under load; a short back-off is enough.
+      let callback: OscInstance | undefined;
+      let lastCallbackErr: unknown;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        progress.attempts += 1;
+        try {
+          const result = await createOrAdoptCallbackListener(
+            config,
+            instanceId,
+            encoreUrl,
+            callbackSat
+          );
+          callback = result.instance;
+          listenerAdopted = result.adopted;
+          break;
+        } catch (err) {
+          lastCallbackErr = err;
+          // The adopt-on-"already taken" step lives in
+          // createOrAdoptCallbackListener above, shared with
+          // resolvePendingSpawns.
+          const isTransient = isTransientOscError(err);
+          if (!isTransient || attempt === maxAttempts) throw err;
+          await new Promise((r) => setTimeout(r, attempt * 5_000));
+        }
       }
+      if (!callback) throw lastCallbackErr;
+      listenerCreated = true;
+      listenerUrl = instanceUrl(callback);
+      // #1170: both halves are now provisioning; wait for them CONCURRENTLY
+      // rather than one after the other. Each wait keeps its own deadline and
+      // cadence (waitForSpawnedInstanceReady), and Promise.all rejects with the
+      // first failure — which the cleanup path below classifies exactly as
+      // before: a SpawnReadyTimeoutError keeps the instance and records it as a
+      // PENDING pool entry for resolvePendingSpawns to finish. That pending
+      // record now carries `callbackListenerUrl` even when it is the ENCORE half
+      // that timed out, because the listener already exists by this point — the
+      // "a timed-out spawn never got to the listener" case resolvePendingSpawns
+      // documents is one less thing a resumed spawn has to redo.
+      const listenerReady = waitForSpawnedInstanceReady(
+        ENCORE_CALLBACK_LISTENER_SERVICE_ID,
+        instanceId,
+        config,
+        readinessAbort.signal
+      );
+      listenerReady.catch(() => undefined);
+      await Promise.all([encoreReady, listenerReady]);
+    } finally {
+      // Whichever way the readiness phase ends — both halves running, one half
+      // timing out, or a throw before the second wait was even started — any
+      // wait still in flight has nothing left to wait for. Aborting here, in
+      // the same block the waits are started in, keeps the #778 property that
+      // no health probe is issued once the spawn has settled: the abort checks
+      // in waitForInstanceReadyBounded (src/services/instance-readiness.ts,
+      // before the sleep and again after it) end the loop before its next
+      // getInstanceHealth call. On the failure paths this runs BEFORE the catch
+      // below starts its cleanup, so no probe races the destroy.
+      readinessAbort.abort();
     }
-    if (!callback) throw lastCallbackErr;
-    listenerCreated = true;
-    listenerUrl = instanceUrl(callback);
-    await waitForSpawnedInstanceReady(
-      ENCORE_CALLBACK_LISTENER_SERVICE_ID,
-      instanceId,
-      config
-    );
 
     const readyAt = Date.now();
     const record: EncoreInstanceRecord = {
@@ -1225,15 +1304,30 @@ export async function destroyInstance(
   try {
     await removeInstance(config.oscContext, ENCORE_SERVICE_ID, instanceId, sat);
   } catch (err) {
-    // 404 = instance already gone on OSC — treat as success so the pool record
-    // is still cleaned up below. Any other error means the instance may still
-    // be running: keep the pool record so the next tick retries rather than
+    // Already gone on OSC — treat as success so the pool record is still
+    // cleaned up below. Any other error means the instance may still be
+    // running: keep the pool record so the next tick retries rather than
     // spawning a replacement for something that's still alive.
-    const msg = err instanceof Error ? err.message : String(err);
-    if (!msg.includes('404') && !msg.includes('not found')) throw err;
+    //
+    // #1213: classified on the error's `httpCode` (isInstanceAlreadyGoneError)
+    // rather than by substring-matching its message. `removeInstance` rejects
+    // with a FetchError whose message is the SERVER's body text, so a genuine
+    // 404 from the instances endpoint ("Instance not found", an HTML error
+    // page, or a JSON `reason`) need not contain the digits "404" at all; this
+    // check used to re-throw those, which aborted the teardown of every
+    // remaining instance in WorkspaceEncoreScalerRegistry.teardown().
+    if (!isInstanceAlreadyGoneError(err)) throw err;
+    console.info(
+      '[encore-scaler] destroy: Encore instance %s was already removed on OSC (%s) — continuing with its callback listener (workspace=%s)',
+      instanceId,
+      err instanceof Error ? err.message : String(err),
+      config.workspaceId
+    );
   }
   // Best-effort teardown of the paired callback listener (same name). It may
-  // already be gone, so any error is swallowed.
+  // already be gone, which is the normal case on a retried stack teardown, so
+  // that outcome is reported as done rather than as a failure (#1213); a
+  // genuine failure is still logged for the orphan reaper (#778) to pick up.
   try {
     const callbackSat = await config.oscContext.getServiceAccessToken(
       ENCORE_CALLBACK_LISTENER_SERVICE_ID
@@ -1245,20 +1339,45 @@ export async function destroyInstance(
       callbackSat
     );
   } catch (err) {
-    // Listener already removed or unreachable — nothing more to do here; the
-    // orphan reaper (#778) picks up a listener that outlives its instance.
-    console.warn(
-      '[encore-scaler] destroy: callback listener %s removal failed (workspace=%s): %s',
-      instanceId,
-      config.workspaceId,
-      err instanceof Error ? err.message : String(err)
-    );
+    if (isInstanceAlreadyGoneError(err)) {
+      console.info(
+        '[encore-scaler] destroy: callback listener %s was already removed on OSC — nothing to release (workspace=%s)',
+        instanceId,
+        config.workspaceId
+      );
+    } else {
+      // Nothing more to do here; the orphan reaper (#778) picks up a listener
+      // that outlives its instance.
+      console.warn(
+        '[encore-scaler] destroy: callback listener %s removal failed (workspace=%s): %s',
+        instanceId,
+        config.workspaceId,
+        err instanceof Error ? err.message : String(err)
+      );
+    }
   }
   // Only drop the pool record after OSC removal succeeds (or confirmed gone).
   // Dropping it on a transient failure would cause the pool to lose track of a
   // still-running instance, making the next tick spawn a replacement — which is
   // exactly the runaway-spawning bug this fixes.
-  await config.redis.hdel(keys.pool(config.workspaceId), instanceId);
+  //
+  // #1213: tolerant of an already-removed BACKEND. On a stack teardown this
+  // runs while (or after) the stack's own Valkey is being deprovisioned, so
+  // this write can reject with ECONNREFUSED. The OSC instances are already
+  // gone at this point, and the whole key space is about to disappear with the
+  // store, so a failed bookkeeping delete must not propagate — it used to
+  // abort the teardown loop and leave the remaining instances (and their
+  // callback listeners) running and billing.
+  try {
+    await config.redis.hdel(keys.pool(config.workspaceId), instanceId);
+  } catch (err) {
+    console.warn(
+      '[encore-scaler] destroy: removed %s on OSC but failed to drop its pool record (workspace=%s): %s',
+      instanceId,
+      config.workspaceId,
+      err instanceof Error ? err.message : String(err)
+    );
+  }
 }
 
 // Evict pool records whose Encore instance no longer exists on OSC.

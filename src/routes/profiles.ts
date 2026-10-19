@@ -80,6 +80,18 @@ export type ProfilesRouterOptions = {
   repository: ProfileRepository;
   // The default Encore profile index URL used to seed the DB on bootstrap.
   bootstrapIndexUrl: string;
+  // Called after EVERY successful mutation of the profile store
+  // (create/update/delete/bootstrap) so the object-store-published profile index
+  // can be republished (ADR-026 D1, issue #1207 — see
+  // src/services/profile-index-publisher.ts). Optional: a deployment with no
+  // provisioned object store simply omits it.
+  //
+  // Contract: synchronous, non-throwing and fire-and-forget. The handlers below
+  // invoke it AFTER the mutation has been persisted and never await it, so the
+  // FIXED HTTP contract of this router — status codes, bodies, the
+  // `x-profile-count` header (#460) and the `{}`-for-empty index body (#459) —
+  // is unaffected by publish latency or publish failure (ADR-026 §6).
+  onProfilesChanged?: () => void;
 };
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
@@ -129,6 +141,17 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
 ) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const repo = opts.repository;
+
+  // Fire-and-forget republish notification (ADR-026 D1). Wrapped so a throwing
+  // callback can never turn a successful profile mutation into a 500 — the
+  // published index is a derived artefact, the store is the source of truth.
+  const notifyProfilesChanged = (): void => {
+    try {
+      opts.onProfilesChanged?.();
+    } catch (err) {
+      app.log.warn({ err }, 'profile index republish notification failed (ignored)');
+    }
+  };
 
   app.setErrorHandler((err, _request, reply) => {
     if (err instanceof ProfileExistsError) {
@@ -323,6 +346,7 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
           force: request.query.force ?? false,
           log: app.log
         });
+        notifyProfilesChanged();
         return reply.code(200).send(result);
       } catch (err) {
         app.log.warn({ err, indexUrl: opts.bootstrapIndexUrl }, 'profile bootstrap failed');
@@ -355,6 +379,7 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
         return reply.code(422).send({ error: 'profile_colour_uncarriable', message: colour.reason });
       }
       const profile = await repo.create(request.body);
+      notifyProfilesChanged();
       return reply.code(201).send({ ...profile, runnable: isProfileRunnable(profile.yaml) });
     }
   );
@@ -411,6 +436,7 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      notifyProfilesChanged();
       return reply.code(200).send({ ...updated, runnable: isProfileRunnable(updated.yaml) });
     }
   );
@@ -426,6 +452,7 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
     },
     async (request, reply) => {
       await repo.delete(request.params.name);
+      notifyProfilesChanged();
       return reply.code(204).send(null);
     }
   );

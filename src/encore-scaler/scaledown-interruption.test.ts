@@ -28,6 +28,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EncoreScalerLoop } from './scaler-loop.js';
 import {
   keys,
+  type DroppedJob,
   type EncoreScalerConfig,
   type EncoreInstanceRecord,
   type QueuedJob
@@ -340,5 +341,139 @@ describe('scale-down interruption classification + re-enqueue (#514)', () => {
     expect(destroyInstanceMock).not.toHaveBeenCalled();
     expect(await redis.lrange(keys.queue(WS), 0, -1)).toHaveLength(0);
     expect(await redis.hget(keys.jobStatus(WS), 'job-live')).toBe('running');
+  });
+
+  // #1228: a job lost to a scale-down whose stored dispatch payload has expired
+  // cannot be re-enqueued. It used to be logged and "left for dropped-job
+  // reconciliation", which could never reach it (reconcile() only classifies
+  // drops for jobs mapped to instances still present in keys.pool, and this
+  // instance has just been destroyed), so the job stayed RUNNING forever.
+  //
+  // Contract sources verified for these cases (CLAUDE.md rule 7):
+  //   - keys.jobPayload (24h TTL, absent here = expired) and keys.jobStatus /
+  //     keys.jobInstance — src/encore-scaler/types.ts keys.
+  //   - Terminal vocabulary + FAILED -> `failed` mapping — src/encore-scaler/
+  //     index.ts getJobStatus (`if (s === 'FAILED' || s === 'CANCELLED')`).
+  //   - 'CANCELLED' is what the cancel path writes to keys.jobStatus —
+  //     src/encore-scaler/index.ts cancel() and encore-scaler-router.ts.
+  //   - onJobsDropped signature + DroppedJob { encoreJobId, reason? } —
+  //     src/encore-scaler/types.ts EncoreScalerConfig.onJobsDropped.
+  it('resolves a lost job whose payload is unavailable to a terminal FAILED instead of leaving it in limbo (#1228)', async () => {
+    const redis = new FakeRedis();
+    const instanceId = 'inst-1';
+
+    await seedPool(redis, {
+      instanceId,
+      url: 'https://encore.example',
+      activeJobs: 0,
+      lastIdleAt: 0
+    });
+    // Mapped to the instance about to be torn down, still non-terminal, absent
+    // from Encore's active set — and NO keys.jobPayload (the 24h TTL expired),
+    // so it cannot be rebuilt for a re-enqueue.
+    await redis.hset(keys.jobInstance(WS), 'job-no-payload', instanceId);
+    await redis.hset(keys.jobStatus(WS), 'job-no-payload', 'running');
+
+    vi.stubGlobal('fetch', fetchMock([], []));
+    destroyInstanceMock.mockResolvedValue(undefined);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const onJobsDropped = vi.fn(async (_drops: DroppedJob[]) => undefined);
+    const onJobInterrupted = vi.fn(async () => undefined);
+    await new EncoreScalerLoop(
+      makeConfig(redis, { onJobsDropped, onJobInterrupted })
+    ).tick();
+
+    expect(destroyInstanceMock).toHaveBeenCalledTimes(1);
+
+    // Not re-enqueued (there is no payload to rebuild) and NOT reported as a
+    // recoverable interruption — nothing is pending for this job.
+    expect(await redis.lrange(keys.queue(WS), 0, -1)).toHaveLength(0);
+    expect(onJobInterrupted).not.toHaveBeenCalled();
+
+    // Resolved to a DEFINITE terminal state: the local status no longer reports
+    // the job as running, and the mapping to the destroyed instance is gone so
+    // it cannot linger as a drop candidate against an instance that no longer
+    // exists.
+    expect(await redis.hget(keys.jobStatus(WS), 'job-no-payload')).toBe('FAILED');
+    expect(await redis.hget(keys.jobInstance(WS), 'job-no-payload')).toBeNull();
+
+    // And the caller-facing job is driven terminal through the same hook
+    // reconcile()'s drops use, carrying a reason that names the cause.
+    expect(onJobsDropped).toHaveBeenCalledTimes(1);
+    const drops = onJobsDropped.mock.calls[0]![0];
+    expect(drops).toHaveLength(1);
+    expect(drops[0]!.encoreJobId).toBe('job-no-payload');
+    expect(drops[0]!.reason).toContain('could not be re-enqueued');
+
+    // The final outcome is visible in the log, not just the inability to retry.
+    const resolvedLine = warn.mock.calls.find((args) =>
+      String(args[0]).includes('RESOLVED FAILED')
+    );
+    expect(resolvedLine).toBeDefined();
+  });
+
+  it('leaves an already CANCELLED lost job alone when its payload is unavailable (#1228)', async () => {
+    const redis = new FakeRedis();
+    const instanceId = 'inst-1';
+
+    await seedPool(redis, {
+      instanceId,
+      url: 'https://encore.example',
+      activeJobs: 0,
+      lastIdleAt: 0
+    });
+    // Same unrecoverable shape (no payload), but the job was CANCELLED — the
+    // outcome is already decided, so reconciliation must not overwrite it with
+    // FAILED or push a spurious failure through onJobsDropped.
+    await redis.hset(keys.jobInstance(WS), 'job-cancelled', instanceId);
+    await redis.hset(keys.jobStatus(WS), 'job-cancelled', 'CANCELLED');
+
+    vi.stubGlobal('fetch', fetchMock([], []));
+    destroyInstanceMock.mockResolvedValue(undefined);
+
+    const onJobsDropped = vi.fn(async (_drops: DroppedJob[]) => undefined);
+    await new EncoreScalerLoop(makeConfig(redis, { onJobsDropped })).tick();
+
+    expect(await redis.hget(keys.jobStatus(WS), 'job-cancelled')).toBe('CANCELLED');
+    expect(onJobsDropped).not.toHaveBeenCalled();
+    expect(await redis.lrange(keys.queue(WS), 0, -1)).toHaveLength(0);
+  });
+
+  it('resolves a payload-unavailable job cancelled mid-sweep as CANCELLED, not FAILED (#1228)', async () => {
+    const redis = new FakeRedis();
+    const instanceId = 'inst-1';
+
+    await seedPool(redis, {
+      instanceId,
+      url: 'https://encore.example',
+      activeJobs: 0,
+      lastIdleAt: 0
+    });
+    await redis.hset(keys.jobInstance(WS), 'job-racing-cancel', instanceId);
+    await redis.hset(keys.jobStatus(WS), 'job-racing-cancel', 'running');
+
+    // Simulate a cancel landing AFTER the sweep read its status snapshot but
+    // BEFORE the unrecoverable job is resolved: the re-read inside the resolver
+    // must see 'CANCELLED' and leave the job alone. Hooking the payload read
+    // (the last thing the re-enqueue attempt does before failing) places the
+    // cancel exactly in that window.
+    const realGet = redis.get.bind(redis);
+    redis.get = async (key: string) => {
+      if (key === keys.jobPayload('job-racing-cancel')) {
+        await redis.hset(keys.jobStatus(WS), 'job-racing-cancel', 'CANCELLED');
+      }
+      return realGet(key);
+    };
+
+    vi.stubGlobal('fetch', fetchMock([], []));
+    destroyInstanceMock.mockResolvedValue(undefined);
+
+    const onJobsDropped = vi.fn(async (_drops: DroppedJob[]) => undefined);
+    await new EncoreScalerLoop(makeConfig(redis, { onJobsDropped })).tick();
+
+    // The cancel wins: the job is terminal as CANCELLED and is not re-failed.
+    expect(await redis.hget(keys.jobStatus(WS), 'job-racing-cancel')).toBe('CANCELLED');
+    expect(onJobsDropped).not.toHaveBeenCalled();
   });
 });
