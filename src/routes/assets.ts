@@ -759,6 +759,76 @@ const assetFilesSchema = z.object({
   fileGroups: z.array(assetFileGroupSchema)
 });
 
+// Per-asset storage usage of the CURRENT output set (issue #1242). A derived
+// read, like the files view above: nothing is stored, every number is measured
+// against the object store at request time from the asset's own storage fields
+// (`renditions[].objectKey`, the packaged prefix the stream proxy resolves).
+//
+// WHY: the deployment-wide total (`GET /api/v1/usage`, src/routes/usage.ts) says
+// how many bytes are consumed overall but not by WHAT, so an operator deciding
+// whether to re-encode an asset at a different ladder cannot see what the
+// existing output set costs. This attributes the bytes to one asset.
+//
+// SCOPE: outputs only — the transcoded renditions and the packaged (HLS/DASH)
+// object set. The ingested source object is deliberately NOT counted here: it is
+// an input, it is not reproduced by a re-encode, and counting it would make
+// "what does this output set cost" unanswerable from the response.
+const assetStorageUsageRenditionSchema = z.object({
+  // The rendition's stable ULID (asset-repo.ts Rendition.id).
+  id: z.string(),
+  // Rung label from the encode profile, when the rendition carries one.
+  label: z.string().optional(),
+  // Bucket-local object key actually measured (an `s3://bucket/key` rendition
+  // key is reported here bucket-excluded, matching the /:id/files convention).
+  objectKey: z.string(),
+  // The bucket the object was measured in.
+  bucket: z.string().optional(),
+  // Size in bytes, or null when the object could not be measured: either it is
+  // absent from the store (a stale rendition record) or the store could not be
+  // read. Null NEVER means zero — `complete` below reports whether any are null.
+  sizeBytes: z.number().nullable(),
+  // Whether this rendition's bytes are included in `renditions.bytes` /
+  // `totalBytes`. False for an unmeasurable object, and false for a rendition
+  // whose object lives inside the measured packaged prefix (its bytes are
+  // already counted in `packagedOutput.bytes`, so counting them again would
+  // double the total).
+  counted: z.boolean()
+});
+
+const assetStorageUsagePackagedSchema = z.object({
+  // The packaged bucket the prefix was listed in.
+  bucket: z.string(),
+  // The packaged-output key prefix measured, with a trailing slash. This is the
+  // SAME prefix the stream proxy serves objects from (resolveStreamPrefix).
+  prefix: z.string(),
+  // How many objects (manifests + CMAF init/media segments) sit under it.
+  objectCount: z.number(),
+  bytes: z.number()
+});
+
+const assetStorageUsageSchema = z.object({
+  assetId: z.string(),
+  // Renditions + packaged output, in bytes. Only `counted` renditions and a
+  // measured packaged set contribute, so this never includes a guessed size.
+  totalBytes: z.number(),
+  // True when every part of the output set was measured. False when a rendition
+  // object was missing/unreadable or the packaged prefix could not be listed —
+  // the reported bytes are then a LOWER BOUND, not the whole output set.
+  complete: z.boolean(),
+  renditions: z.object({
+    // How many rendition records the asset carries.
+    count: z.number(),
+    // How many of them contributed bytes to the total.
+    countedCount: z.number(),
+    bytes: z.number(),
+    items: z.array(assetStorageUsageRenditionSchema)
+  }),
+  // Null when the asset has no packaged output at all (never packaged), and
+  // null — with `complete: false` — when it has packaged output that could not
+  // be measured here (no object-store connection to list the prefix with).
+  packagedOutput: assetStorageUsagePackagedSchema.nullable()
+});
+
 // Thumbnail extraction request (issue #7): one or more timecodes in seconds.
 const thumbnailsBodySchema = z.object({
   timecodes: z.array(z.number().min(0)).min(1).max(50)
@@ -5147,6 +5217,212 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
 
       return reply.code(200).send({ files, fileGroups });
+    }
+  );
+
+  // Per-asset storage usage of the current output set (issue #1242).
+  //
+  // Answers "what does this asset's existing output set cost in storage" —
+  // the transcoded renditions plus the packaged (HLS/DASH) object set — so an
+  // operator can judge a re-encode before paying for it. The deployment-wide
+  // counters (`GET /api/v1/usage`) report the same bytes in aggregate; this is
+  // the per-asset attribution of them and adds no counter of its own: every
+  // number is measured against the object store at request time.
+  //
+  // Measurement, per part:
+  //   - renditions: `statObject().size` per `renditions[].objectKey`
+  //     (src/data/storage.ts:146). An `s3://bucket/key` rendition key (Encore
+  //     writes to its own output bucket) is resolved through `parseS3Uri` and
+  //     measured in THAT bucket, exactly as /:id/files presigns it.
+  //   - packaged output: a recursive prefix listing summed over the SAME prefix
+  //     the stream proxy serves from (`resolveStreamPrefix`), so the measured
+  //     object set is the one a player would actually fetch. Manifests and CMAF
+  //     segments are many small objects, so they are summed by prefix rather
+  //     than stat'ed one by one (src/data/storage.ts
+  //     `sumObjectSizesUnderPrefix`).
+  //
+  // A rendition whose object sits inside the measured packaged prefix is listed
+  // with its size but NOT counted again (`counted: false`) — the packaged sum
+  // already includes those bytes. An unmeasurable object reports
+  // `sizeBytes: null` and flips `complete` to false, so a partial read is never
+  // mistaken for a cheap asset.
+  //
+  //   200 — the usage projection
+  //   404 — unknown/foreign asset (existence not leaked; matches sibling routes)
+  //   501 — there is an output set to measure but object storage is not
+  //         configured here (same not_configured convention as /:id/files)
+  app.get(
+    '/:id/storage-usage',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: assetStorageUsageSchema, 404: errorSchema, 501: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+
+      const renditions = asset.renditions ?? [];
+      // Does this asset have packaged output at all? Either the durable
+      // packaged-output block (#502) or the manifest URLs the packager callback
+      // records. Both absent means it was never packaged, so there is no prefix
+      // worth listing and `packagedOutput` is reported as null without touching
+      // the store.
+      const packaged = asset.packagedOutput;
+      const hasPackagedOutput = Boolean(
+        packaged?.prefix ||
+          packaged?.masterHlsKey ||
+          packaged?.masterDashKey ||
+          asset.manifestUrls?.hls ||
+          asset.manifestUrls?.dash
+      );
+
+      const storageClient = request.connections?.storageClient;
+      const hasOutputs = renditions.length > 0 || hasPackagedOutput;
+      // Mirror /:id/files: only 501 when there is something to measure and no
+      // storage at all to measure it with. An asset with no outputs yet is a
+      // legitimate 200 with zero bytes.
+      if (hasOutputs && !storageFor && !storageClient) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'object storage is not configured'
+        });
+      }
+
+      let complete = true;
+
+      // --- Packaged output -----------------------------------------------
+      // Listed first so a rendition object that lives under the packaged
+      // prefix can be recognised and excluded from the total below.
+      //
+      // The bucket is the ambient packaged bucket (per-stack connection, else
+      // the env default) — the same resolution `/:id/stream/*` and `/:id/files`
+      // use, so this measures the bucket playback is actually served from, and
+      // it is echoed in the response so an operator can see which one that was.
+      let packagedUsage: z.infer<typeof assetStorageUsagePackagedSchema> | null = null;
+      let packagedPrefix: string | undefined;
+      let packagedBucketName: string | undefined;
+      if (hasPackagedOutput) {
+        if (storageClient) {
+          packagedBucketName = request.connections?.packagedBucket ?? packagedBucket();
+          // resolveStreamPrefix returns the prefix WITHOUT a trailing slash
+          // (it composes as `<prefix>/<relative>`); the listing and the
+          // double-count check below both want it slash-terminated.
+          const resolved = await resolveStreamPrefix(asset, storageClient, packagedBucketName);
+          packagedPrefix = `${resolved.replace(/\/+$/, '')}/`;
+          try {
+            const sum = await new WorkspaceStorage(
+              storageClient,
+              packagedBucketName
+            ).sumObjectSizesUnderPrefix(packagedPrefix);
+            packagedUsage = {
+              bucket: packagedBucketName,
+              prefix: packagedPrefix,
+              objectCount: sum.objectCount,
+              bytes: sum.totalBytes
+            };
+          } catch (err) {
+            // A listing failure must not 500 a read-only usage projection: the
+            // asset still has packaged output, we just cannot size it. Report
+            // it as unmeasured (null + complete:false) and log the cause.
+            request.log.warn(
+              { err, assetId: asset.id, bucket: packagedBucketName, prefix: packagedPrefix },
+              'storage-usage: failed to list packaged output prefix'
+            );
+            complete = false;
+            packagedPrefix = undefined;
+          }
+        } else {
+          // No object-store connection on this request: the prefix cannot be
+          // listed (a presigning-only storage factory has no listing surface).
+          complete = false;
+        }
+      }
+
+      // --- Renditions ------------------------------------------------------
+      const storage = storageFor ? storageFor() : undefined;
+      const items: z.infer<typeof assetStorageUsageRenditionSchema>[] = [];
+      // Two renditions can point at the same object (e.g. a re-transcode that
+      // reused a key); each object's bytes are counted ONCE.
+      const countedObjects = new Set<string>();
+      let renditionBytes = 0;
+
+      for (const r of renditions) {
+        const s3Uri = parseS3Uri(r.objectKey);
+        let bucket: string | undefined;
+        let key: string;
+        let objectStorage: WorkspaceStorage | undefined;
+        if (s3Uri && storageClient) {
+          bucket = s3Uri.bucket;
+          key = s3Uri.key;
+          objectStorage = new WorkspaceStorage(storageClient, bucket);
+        } else {
+          // A plain object key lives in the workspace source bucket, reached
+          // through the same factory /:id/files presigns with. An s3:// key with
+          // no client is NOT measurable: its bucket is not the factory's bucket,
+          // so measuring it there would report another object's size.
+          key = s3Uri ? s3Uri.key : r.objectKey;
+          objectStorage = s3Uri ? undefined : storage;
+        }
+
+        let sizeBytes: number | null = null;
+        if (objectStorage) {
+          try {
+            const stat = await objectStorage.statObject(key);
+            // statObject resolves undefined for a missing key (storage.ts:151).
+            sizeBytes = stat ? stat.size : null;
+          } catch (err) {
+            request.log.warn(
+              { err, assetId: asset.id, bucket, objectKey: key },
+              'storage-usage: failed to stat rendition object'
+            );
+            sizeBytes = null;
+          }
+        }
+
+        // Already inside the packaged prefix we summed? Then its bytes are in
+        // `packagedOutput.bytes` and must not be added again.
+        const insidePackaged =
+          packagedUsage !== null &&
+          packagedPrefix !== undefined &&
+          (bucket ?? packagedBucketName) === packagedUsage.bucket &&
+          key.startsWith(packagedPrefix);
+
+        const duplicate = countedObjects.has(`${bucket ?? ''}/${key}`);
+        const counted = sizeBytes !== null && !insidePackaged && !duplicate;
+        if (counted && sizeBytes !== null) {
+          countedObjects.add(`${bucket ?? ''}/${key}`);
+          renditionBytes += sizeBytes;
+        }
+        if (sizeBytes === null) {
+          complete = false;
+        }
+
+        items.push({
+          id: r.id,
+          label: r.label,
+          objectKey: key,
+          bucket,
+          sizeBytes,
+          counted
+        });
+      }
+
+      return reply.code(200).send({
+        assetId: asset.id,
+        totalBytes: renditionBytes + (packagedUsage?.bytes ?? 0),
+        complete,
+        renditions: {
+          count: renditions.length,
+          countedCount: items.filter((i) => i.counted).length,
+          bytes: renditionBytes,
+          items
+        },
+        packagedOutput: packagedUsage
+      });
     }
   );
 
