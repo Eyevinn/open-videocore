@@ -701,7 +701,22 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
         };
 
         for (const inst of instances) {
-          await destroyInstance(inst.instanceId, scalerConfig);
+          // #1213: one instance whose OSC removal genuinely failed must not
+          // abort the teardown of the others. destroyInstance tolerates an
+          // already-gone instance and an already-removed Valkey on its own, so
+          // anything that still escapes is a real per-instance failure: log it
+          // and carry on, so every other Encore instance and its paired
+          // callback listener is still released by this teardown.
+          try {
+            await destroyInstance(inst.instanceId, scalerConfig);
+          } catch (err) {
+            console.warn(
+              '[encore-scaler] teardown: failed to destroy instance %s (workspace=%s): %s',
+              inst.instanceId,
+              workspaceId,
+              err instanceof Error ? err.message : String(err)
+            );
+          }
         }
       }
 

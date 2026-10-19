@@ -47,6 +47,7 @@ import { keys, type EncoreInstanceRecord, type EncoreScalerConfig } from './type
 import { fetchEncoreActiveState } from './encore-active-state.js';
 import { hasPendingPackaging } from './packaging-pin.js';
 import {
+  isInstanceAlreadyGoneError,
   isNameAlreadyTakenError,
   isTransientOscError,
   oscHttpCode
@@ -1225,15 +1226,30 @@ export async function destroyInstance(
   try {
     await removeInstance(config.oscContext, ENCORE_SERVICE_ID, instanceId, sat);
   } catch (err) {
-    // 404 = instance already gone on OSC — treat as success so the pool record
-    // is still cleaned up below. Any other error means the instance may still
-    // be running: keep the pool record so the next tick retries rather than
+    // Already gone on OSC — treat as success so the pool record is still
+    // cleaned up below. Any other error means the instance may still be
+    // running: keep the pool record so the next tick retries rather than
     // spawning a replacement for something that's still alive.
-    const msg = err instanceof Error ? err.message : String(err);
-    if (!msg.includes('404') && !msg.includes('not found')) throw err;
+    //
+    // #1213: classified on the error's `httpCode` (isInstanceAlreadyGoneError)
+    // rather than by substring-matching its message. `removeInstance` rejects
+    // with a FetchError whose message is the SERVER's body text, so a genuine
+    // 404 from the instances endpoint ("Instance not found", an HTML error
+    // page, or a JSON `reason`) need not contain the digits "404" at all; this
+    // check used to re-throw those, which aborted the teardown of every
+    // remaining instance in WorkspaceEncoreScalerRegistry.teardown().
+    if (!isInstanceAlreadyGoneError(err)) throw err;
+    console.info(
+      '[encore-scaler] destroy: Encore instance %s was already removed on OSC (%s) — continuing with its callback listener (workspace=%s)',
+      instanceId,
+      err instanceof Error ? err.message : String(err),
+      config.workspaceId
+    );
   }
   // Best-effort teardown of the paired callback listener (same name). It may
-  // already be gone, so any error is swallowed.
+  // already be gone, which is the normal case on a retried stack teardown, so
+  // that outcome is reported as done rather than as a failure (#1213); a
+  // genuine failure is still logged for the orphan reaper (#778) to pick up.
   try {
     const callbackSat = await config.oscContext.getServiceAccessToken(
       ENCORE_CALLBACK_LISTENER_SERVICE_ID
@@ -1245,20 +1261,45 @@ export async function destroyInstance(
       callbackSat
     );
   } catch (err) {
-    // Listener already removed or unreachable — nothing more to do here; the
-    // orphan reaper (#778) picks up a listener that outlives its instance.
-    console.warn(
-      '[encore-scaler] destroy: callback listener %s removal failed (workspace=%s): %s',
-      instanceId,
-      config.workspaceId,
-      err instanceof Error ? err.message : String(err)
-    );
+    if (isInstanceAlreadyGoneError(err)) {
+      console.info(
+        '[encore-scaler] destroy: callback listener %s was already removed on OSC — nothing to release (workspace=%s)',
+        instanceId,
+        config.workspaceId
+      );
+    } else {
+      // Nothing more to do here; the orphan reaper (#778) picks up a listener
+      // that outlives its instance.
+      console.warn(
+        '[encore-scaler] destroy: callback listener %s removal failed (workspace=%s): %s',
+        instanceId,
+        config.workspaceId,
+        err instanceof Error ? err.message : String(err)
+      );
+    }
   }
   // Only drop the pool record after OSC removal succeeds (or confirmed gone).
   // Dropping it on a transient failure would cause the pool to lose track of a
   // still-running instance, making the next tick spawn a replacement — which is
   // exactly the runaway-spawning bug this fixes.
-  await config.redis.hdel(keys.pool(config.workspaceId), instanceId);
+  //
+  // #1213: tolerant of an already-removed BACKEND. On a stack teardown this
+  // runs while (or after) the stack's own Valkey is being deprovisioned, so
+  // this write can reject with ECONNREFUSED. The OSC instances are already
+  // gone at this point, and the whole key space is about to disappear with the
+  // store, so a failed bookkeeping delete must not propagate — it used to
+  // abort the teardown loop and leave the remaining instances (and their
+  // callback listeners) running and billing.
+  try {
+    await config.redis.hdel(keys.pool(config.workspaceId), instanceId);
+  } catch (err) {
+    console.warn(
+      '[encore-scaler] destroy: removed %s on OSC but failed to drop its pool record (workspace=%s): %s',
+      instanceId,
+      config.workspaceId,
+      err instanceof Error ? err.message : String(err)
+    );
+  }
 }
 
 // Evict pool records whose Encore instance no longer exists on OSC.
