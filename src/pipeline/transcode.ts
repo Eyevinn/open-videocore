@@ -46,6 +46,12 @@ import {
   type CancelledCompletionReclaim,
   type CancelledJobOutputStorage
 } from './cancelled-transcode-completion.js';
+// #1044: the shared delete path for output a re-run superseded.
+import {
+  deleteSupersededOutput,
+  supersededRenditionObjects,
+  type ResolveSupersededStorage
+} from './superseded-output.js';
 
 export const PACKAGED_OUTPUT_PREFIX = 'transcode';
 
@@ -321,6 +327,15 @@ export async function completeTranscode(
     // storage handle), and when absent the discard is still recorded on the job
     // record — the objects are simply left for an operator/later sweep.
     resolveOutputStorage?: () => Promise<CancelledJobOutputStorage | undefined>;
+    // #1044: resolves object storage for a named bucket (undefined = this
+    // stack's transcode-output bucket), so a successful RE-RUN can delete the
+    // renditions of the generation it just replaced. Lazy and optional in
+    // exactly the way `resolveOutputStorage` above is: nothing is resolved on a
+    // first transcode (there is no previous generation), and when it is absent
+    // the superseded objects are simply left in place rather than failing the
+    // completion. The deployment binding is the same resolver, widened to take a
+    // bucket (src/main.ts), so both paths target the one output bucket.
+    resolveSupersededStorage?: ResolveSupersededStorage;
     // #1226: called with what the reclaim did, and ONLY on that path, so the
     // caller can log one explicit line instead of the bare `applied false
     // renditionCount 0` the issue was reported from. Reported through a callback
@@ -447,6 +462,16 @@ export async function completeTranscode(
     bitrateBps: r.bitrateBps
   }));
 
+  // #1044: the generation this completion is about to replace, read BEFORE the
+  // wholesale `renditions` write below overwrites it. Each transcode writes under
+  // its own job-nested prefix (`transcodeOutputPrefix`), so a re-run's output
+  // lands beside the previous run's and repointing the asset here is what orphans
+  // it. Read only when a storage resolver is wired — without one there is nothing
+  // we could delete, so the completion does exactly the I/O it always did.
+  const supersededSource = deps.resolveSupersededStorage
+    ? await deps.assets.get(params.sourceAssetId)
+    : undefined;
+
   // Record renditions on the source and finalise the job.
   await deps.assets.update(params.sourceAssetId, { renditions });
   // The source asset itself returns to `ready` now that renditions exist.
@@ -548,6 +573,43 @@ export async function completeTranscode(
     },
     deps.auditLog
   );
+
+  // #1044: a successful RE-RUN replaced the asset's renditions — remove the
+  // objects of the generation it replaced.
+  //
+  // ORDER IS THE WHOLE POINT: this runs last, after the asset record was updated
+  // AND re-read back (`refreshed`) carrying the new rendition ids, and after the
+  // job settled `done`. A re-encode that failed returned far above without ever
+  // reaching here, so a failed run can never destroy the working output.
+  //
+  // Only genuinely unreferenced keys are removed: `supersededRenditionObjects`
+  // is a set difference against the NEW rendition keys (plus the asset's own
+  // source object), so a re-run that overwrote the same keys in place deletes
+  // nothing. Best effort — a storage failure is logged, never thrown, and the
+  // completion still succeeds.
+  if (deps.resolveSupersededStorage && supersededSource?.renditions?.length) {
+    const replacementConfirmed =
+      refreshed !== undefined &&
+      renditions.every((r) => refreshed.renditions?.some((stored) => stored.id === r.id));
+    const stale = replacementConfirmed
+      ? supersededRenditionObjects(supersededSource.renditions, renditions, [
+          supersededSource.objectKey,
+          refreshed?.objectKey
+        ])
+      : [];
+    if (!replacementConfirmed) {
+      deps.logWarn?.({
+        msg: 'transcode re-run: superseded renditions left in place, the replacement is not confirmed on the asset record',
+        jobId: job.id,
+        assetId: params.sourceAssetId
+      });
+    } else if (stale.length > 0) {
+      await deleteSupersededOutput(
+        { renditionObjects: stale },
+        { resolveStorage: deps.resolveSupersededStorage, logWarn: deps.logWarn }
+      );
+    }
+  }
 
   return { applied: true, renditionCount: renditions.length, renditions };
 }

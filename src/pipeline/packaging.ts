@@ -47,6 +47,11 @@ import {
   startPackageJob,
   type PackageJobDeps
 } from './package-job.js';
+import {
+  deleteSupersededOutput,
+  supersededPackagedPrefix,
+  type ResolveSupersededStorage
+} from './superseded-output.js';
 
 // The bucket the packager writes streaming output into (mirrors PACKAGED_BUCKET
 // in routes/provision.ts and the packager's OutputFolder).
@@ -256,6 +261,17 @@ export type PackagingDeps = {
   // (src/main.ts, `logStore`), so the `package` stage of a run is visible in the
   // Logs tab.
   pipelineLog?: PipelineLogSink;
+  // #1044: resolves object storage for a packaged bucket, so a re-run can delete
+  // the packaged subfolder it SUPERSEDED once the replacement is confirmed
+  // written. Lazy and optional: it is only ever invoked when an asset already
+  // carried a DIFFERENT packaged prefix (never on a first package), and when
+  // absent the superseded subfolder is simply left in place — packaging never
+  // becomes newly failable because cleanup could not run.
+  resolveStorage?: ResolveSupersededStorage;
+  // #1044: best-effort warn sink for a superseded-output removal that could not
+  // complete. Optional; absent => the failure is silent to the caller and the
+  // orphan is left for a later sweep.
+  logWarn?: (detail: Record<string, unknown>) => void;
 };
 
 // The base the packaging pipeline WRITES manifest URLs against. Stays
@@ -605,10 +621,41 @@ export class PackagingService implements PackagingTrigger {
     // derived flat path. Omitted (undefined) when the packager reported no
     // `outputPath`, so the record only ever holds a verified location.
     const packagedOutput = packagedOutputFromCallback(payload.outputPath, packagedBucket());
+    // #1044: the generation this callback is about to supersede, captured BEFORE
+    // the update overwrites it. Packaged output is written under a per-run
+    // subfolder (`<assetId>/<packagerJobId>/`, ADR-011), so a re-run lands beside
+    // the previous run rather than replacing it, and repointing the asset here is
+    // what orphans the old subfolder.
+    const supersededPrefix = supersededPackagedPrefix(asset.packagedOutput, packagedOutput);
     await this.deps.assets.update(assetId, {
       manifestUrls,
       ...(packagedOutput ? { packagedOutput } : {})
     });
+    // #1044: ORDER MATTERS — the superseded subfolder is removed only after the
+    // asset has been re-read back pointing at the NEW one. A failed/partial write
+    // here leaves the previous output exactly where it is, so the asset is still
+    // playable from the generation it still references. Runs only when there IS a
+    // different previous subfolder (never on a first package) and only when a
+    // storage resolver is wired; the removal itself is best effort and never
+    // propagates (deleteSupersededOutput collects, never throws).
+    if (supersededPrefix && this.deps.resolveStorage) {
+      const confirmed = await this.deps.assets.get(assetId);
+      const nowPointsAtNewOutput =
+        confirmed?.packagedOutput?.prefix === packagedOutput?.prefix &&
+        confirmed?.manifestUrls?.hls === manifestUrls.hls;
+      if (nowPointsAtNewOutput) {
+        await deleteSupersededOutput(
+          { packagedPrefix: supersededPrefix },
+          { resolveStorage: this.deps.resolveStorage, logWarn: this.deps.logWarn }
+        );
+      } else {
+        this.deps.logWarn?.({
+          msg: 'packaging re-run: superseded output left in place, the replacement is not confirmed on the asset record',
+          assetId,
+          supersededPrefix: supersededPrefix.prefix
+        });
+      }
+    }
     // Settle the observable `package` Job (issue #976). Idempotent: an
     // at-least-once packager callback for an already-settled job is a no-op.
     const packageJobId = await completePackageJob(this.packageJobDeps(), { assetId });
