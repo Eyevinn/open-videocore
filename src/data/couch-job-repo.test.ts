@@ -24,6 +24,7 @@
 
 import { describe, it, expect } from 'vitest';
 
+import { transcodeOutputPrefix } from '../pipeline/transcode.js';
 import { CouchJobRepository } from './couch-job-repo.js';
 import type { StoredDoc, StackCouch } from './couchdb.js';
 
@@ -216,5 +217,86 @@ describe('CouchJobRepository drop-correction trace (#1023)', () => {
     const after = await repo.get('job-abc123');
     expect(after!.droppedThenRecovered).toBeUndefined();
     expect(after!.correctedDropError).toBeUndefined();
+  });
+});
+
+// The late-completion-on-cancel trace has to survive on the PRODUCTION backend
+// too (issue #1226), for the same reason as the #1023 pair above: the reclaim
+// stamps `lateCompletionDiscarded` / `discardedRenditionCount` /
+// `discardedOutputPrefix` on the job record so a job left `cancelled` with 0
+// renditions explains itself from the record alone — including on the callback
+// poller path, which wires no audit emitter, so the record is the ONLY trace.
+// That only holds if CouchJobRepository's document mapping carries all three
+// fields in BOTH directions: toDoc (write) and fromDoc (read). fromDoc reads
+// through an unchecked cast, so a key-name mismatch between the two would
+// compile cleanly and silently drop the trace — these tests are what fails if
+// either side is renamed or dropped.
+//
+// Contracts verified before writing (CLAUDE.md rule 7):
+//   - Job.lateCompletionDiscarded?: boolean; Job.discardedRenditionCount?:
+//     number; Job.discardedOutputPrefix?: string (src/data/job-repo.ts type Job
+//     :231/:236/:242) and the SAME three members on UpdateJobInput (:321-323),
+//     carried by applyJobPatch by presence (:475-480).
+//   - toDoc writes all three under those exact key names, and fromDoc reads the
+//     same three keys (src/data/couch-job-repo.ts toDoc :231-233 /
+//     fromDoc :270-272).
+//   - The patch under test is EXACTLY the one the reclaim issues — three fields,
+//     no `status` — per reclaimCancelledTranscodeCompletion step 2
+//     (src/pipeline/cancelled-transcode-completion.ts :161-165).
+//   - transcodeOutputPrefix(sourceAssetId, jobId) is THE deterministic prefix
+//     the reclaim targets (src/pipeline/transcode.ts).
+describe('CouchJobRepository late-completion-discarded trace (#1226)', () => {
+  // The cancelled job's prefix, built the one way production builds it rather
+  // than hand-spelled, so this test keeps asserting the real value if the
+  // prefix shape ever changes.
+  const DISCARDED_PREFIX = transcodeOutputPrefix('asset-1', 'job-abc123');
+
+  it('round-trips the late-completion-discarded trace through the document mapping', async () => {
+    // A job settled `cancelled` by an operator cancel, as the cancel route
+    // leaves it (src/routes/jobs.ts: status 'cancelled', error 'cancelled by
+    // operator') — the state a late completion arrives into.
+    const { couch } = makeCouch({
+      ...JOB_DOC,
+      status: 'cancelled',
+      error: 'cancelled by operator'
+    });
+    const repo = new CouchJobRepository(() => couch);
+
+    // Exactly the patch the reclaim issues: the three trace fields and NO
+    // `status`, so the job stays `cancelled` and no transition is attempted.
+    const discarded = await repo.update('job-abc123', {
+      lateCompletionDiscarded: true,
+      discardedRenditionCount: 3,
+      discardedOutputPrefix: DISCARDED_PREFIX
+    });
+    expect(discarded!.status).toBe('cancelled');
+    expect(discarded!.lateCompletionDiscarded).toBe(true);
+
+    // Read back THROUGH the document mapping: a fresh fromDoc of what toDoc
+    // persisted. If either side omitted or misspelled a key, the trace would be
+    // written to the in-memory record and then lost on the way to disk.
+    const after = await repo.get('job-abc123');
+    expect(after!.lateCompletionDiscarded).toBe(true);
+    expect(after!.discardedRenditionCount).toBe(3);
+    expect(after!.discardedOutputPrefix).toBe(DISCARDED_PREFIX);
+    // The cancel's own state is untouched by the trace write.
+    expect(after!.status).toBe('cancelled');
+    expect(after!.error).toBe('cancelled by operator');
+  });
+
+  it('leaves the trace absent on a job that never had a completion discarded', async () => {
+    const { couch } = makeCouch(JOB_DOC);
+    const repo = new CouchJobRepository(() => couch);
+
+    // An ordinary successful run: queued -> running -> done, no late completion.
+    await repo.update('job-abc123', { status: 'running' });
+    await repo.update('job-abc123', { status: 'done', progress: 100 });
+
+    // Absent, not `false`/`0`/`''` — these annotations are optional and are
+    // never written on a job whose completion was applied normally.
+    const after = await repo.get('job-abc123');
+    expect(after!.lateCompletionDiscarded).toBeUndefined();
+    expect(after!.discardedRenditionCount).toBeUndefined();
+    expect(after!.discardedOutputPrefix).toBeUndefined();
   });
 });

@@ -1,0 +1,176 @@
+{
+  "$comment": "Recorded contract for the OSC eyevinn-ffmpeg-s3 ephemeral job: the create-job body fields, and — the load-bearing part for issue #1191 — exactly which of ffmpeg's two output streams reaches the job's log. This is NOT a byte-identical upstream snapshot: the service publishes no OpenAPI/JSON document for its job shape (the OSC catalog's get-service-schema returns only provisioning config, see docs/contracts/README.md), so every value below was read out of the service's own source at the pinned commit and is cited to file:line in `source.symbols`. The sha256 of each upstream blob read is recorded so a refresh can tell drift from a re-read.",
+  "source": {
+    "repo": "Eyevinn/ffmpeg-s3",
+    "repoIs": "the implementation behind the OSC catalog service `eyevinn-ffmpeg-s3` (readme.md links https://app.osaas.io/browse/eyevinn-ffmpeg-s3; the published image is built from this repo's Dockerfile)",
+    "ref": "95ede50d3486cc4b2145871af08a4138ba5e3b9d",
+    "refIs": "main HEAD on 2026-10-14 (committed 2026-02-17T21:42:03Z, message: \"fix: prevent S3 output path from being presigned before local staging replacement\")",
+    "refDate": "2026-02-17",
+    "verifiedOn": "2026-10-14",
+    "fetchedVia": "https://raw.githubusercontent.com/Eyevinn/ffmpeg-s3/95ede50d3486cc4b2145871af08a4138ba5e3b9d/<path>",
+    "blobSha256": {
+      "src/ffmpeg.ts": "1d0d81fb4c066f618a58559221414c0eb3b9e9430519a5e238111d9a41b51100",
+      "src/cli.ts": "04b041d20ac98471c972f33b99a0d3102c95762fc23f9c44e67e5a254229d2f1",
+      "src/util.ts": "a468e0afb68169446d511120a1b52b2a5581c7f31b6b54e99ac7fcc03e9c9dae",
+      "readme.md": "a150ef08af156164a48acf98d27eae456ad25fa51efdc3e8de3af65e846e30cc",
+      "docker-entrypoint.sh": "ec4c524f7bfa41ab03d0f4989446a061a4a4f7429f8362231a855dad274f5925"
+    },
+    "liveFetchStatus": "NOT ATTEMPTED — no OSC credential or OSC tool surface was available in the environment that recorded this contract on 2026-10-14, so no job was created and no /logs/:name response was captured. Every `requiresLiveRun: true` field below is therefore unanswered, not answered-and-recorded. See docs/investigations/1191-ffmpeg-s3-scene-cut-timestamps.md and the agents-repo friction log incoming-ffmpeg-s3-job-log-discards-ffmpeg-stderr-on-success.md.",
+    "symbols": [
+      {
+        "symbol": "doFFmpeg",
+        "at": "src/ffmpeg.ts:16-30",
+        "pins": "The whole job: prepare(stagingDir) -> rewriteCmdString(cmdString) -> runFFmpeg(...) -> uploadResult(dest, ...). runFFmpeg THROWS before uploadResult is reached, so a non-zero ffmpeg exit means nothing is ever uploaded."
+      },
+      {
+        "symbol": "runFFmpeg",
+        "at": "src/ffmpeg.ts:217-236",
+        "pins": "THE load-bearing symbol for issue #1191. `spawnSync(ffmpeg, args, { cwd: stagingDir })` is called with NO `stdio` option, so the default 'pipe' applies: ffmpeg's stderr is captured into a buffer, not inherited by the container. That buffer is written to the container log by exactly one statement — `console.error(stderr.toString())` at :232 — which is inside `if (status !== 0)` (:227) and inside its `else` branch (:231-232, i.e. only when spawn itself did not error). CONSEQUENCE: when ffmpeg exits 0, its stderr is DISCARDED and never appears in the job log. Everything `showinfo` prints (`pts_time=...`) and everything `-loglevel` controls goes to stderr, so a successful ffmpeg run carries no showinfo lines into the log."
+      },
+      {
+        "symbol": "doFFmpeg console.log statements",
+        "at": "src/ffmpeg.ts:25-27, :61, :147, :221, :266, :285, :335, :363",
+        "pins": "The only things the job writes to stdout on a SUCCESSFUL run: `Output file: <dest>`, `Staging directory: <dir>`, `Actual command string: <cmd>`, `cmdString: <cmd>`, the per-S3-argument `Generating signed URL for ...` lines, and `Uploaded <dest>` / `Uploaded package to <dest>` / `Successfully synced HLS output to <dest>`. No ffmpeg output of any kind."
+      },
+      {
+        "symbol": "cli.ts main",
+        "at": "src/cli.ts:7-19",
+        "pins": "`try { await doFFmpeg(...) } catch (err) { console.log(err.message) }` — a thrown error is printed as a single line and NOT rethrown, and no non-zero exit code is set. The container therefore exits 0 whether ffmpeg succeeded or failed, which is the mechanism behind the already-logged friction that a job reaches `SuccessCriteriaMet` with no output (docs/osc-feedback/incoming-issue786-ffmpeg-s3-terminal-status-without-output.md gap 1). For #1191 it means `job.status` cannot be used to tell 'ffmpeg exited 0' from 'ffmpeg exited non-zero', so it cannot be used to tell 'log has no ffmpeg stderr' from 'log has all of it'."
+      },
+      {
+        "symbol": "cli.ts cmdString assembly",
+        "at": "src/cli.ts:9",
+        "pins": "`stripQuotes(args.join(' ')).trim()` — the job's `cmdLineArgs` string is reassembled from argv and one pair of enclosing double quotes is stripped, then re-split by splitCmdLineArgs."
+      },
+      {
+        "symbol": "splitCmdLineArgs",
+        "at": "src/util.ts:21-49",
+        "pins": "Hand-rolled splitter: splits on unquoted spaces, treats `\"` as a quote TOGGLE and REMOVES it, treats `\\` as an escape, and gives single quotes NO special meaning (they survive into the argument). So `-vf \"select='gt(scene,0.4)',showinfo\"` arrives at ffmpeg as the single argument `select='gt(scene,0.4)',showinfo`, with the single quotes intact for libavfilter's own parser to strip. A filter string containing a SPACE must stay double-quoted or it will be split."
+      },
+      {
+        "symbol": "rewriteCmdString output detection",
+        "at": "src/ffmpeg.ts:90-99",
+        "pins": "The output is the LAST argument that does not start with `-`, and an output is MANDATORY (`throw new Error('No output file specified in ffmpeg command')` at :97-99). For `... -f null -` the trailing `-` starts with `-` and is skipped, so the detected output is the literal string `null`."
+      },
+      {
+        "symbol": "rewriteCmdString output substitution",
+        "at": "src/ffmpeg.ts:171-190 with toLocalFile (src/util.ts:17-19)",
+        "pins": "`localOutputFile = join(stagingDir, path.basename(toUrl(output).pathname))` and then `actualCmdString = actualCmdString.replace(output, localOutputFile)` — a plain FIRST-OCCURRENCE substring replace on the whole command string. For `-f null -` this rewrites the FORMAT NAME: `-f null -` becomes `-f /usercontent/<jobid>/null -`, which is not a muxer name. This is why the existing probe runner's command (`-i <url> -f null -`, src/pipeline/osc-ffprobe.ts:45-47 (ffprobeCmdLine)) cannot end in a zero exit — and, via runFFmpeg :227-232, why its ffmpeg stderr reaches the log at all."
+      },
+      {
+        "symbol": "uploadResult single-file S3 branch",
+        "at": "src/ffmpeg.ts:317, :336-364",
+        "pins": "For an `s3://` dest whose path does NOT end in `/`: `readdir(stagingDir)` then `files.find(f => f === basename(dest.pathname))`, and ONLY that one file is `aws s3 cp`'d to the dest. A missing match throws `Output file <name> not found in staging directory`. CONSEQUENCE for the #1191 fallback: a sidecar written by ffmpeg's `metadata=print:file=<name>` filter is NOT uploaded by this branch; only the muxer's own output file is."
+      },
+      {
+        "symbol": "uploadResult recursive S3 branch",
+        "at": "src/ffmpeg.ts:318-335",
+        "pins": "For an `s3://` dest whose path DOES end in `/`: `aws s3 cp --recursive <stagingDir> <new URL(dirname(dest.pathname), dest)>` — the entire staging directory is uploaded, so a `metadata=print:file=` sidecar WOULD be carried. Note the destination is `dirname()` of an already-trailing-slash path, i.e. one level ABOVE the prefix given (`s3://bucket/a/b/` uploads to `s3://bucket/a/`), and that ffmpeg still has to write its own output to `join(stagingDir, basename('/a/b/')) = <stagingDir>/b`."
+      },
+      {
+        "symbol": "aws s3 presign for s3:// inputs",
+        "at": "src/ffmpeg.ts:60-79",
+        "pins": "An `s3://bucket/key` INPUT is converted to a 6h presigned URL by the bundled aws-cli (`--endpoint-url $S3_ENDPOINT_URL` when set) before ffmpeg sees it. ffmpeg echoes its `-i` argument into stderr, so any captured log can contain a live SigV4 query string — which is what src/pipeline/osc-job-log.ts redactLogQueryStrings exists to strip."
+      },
+      {
+        "symbol": "Dockerfile runtime",
+        "at": "Dockerfile:8-25",
+        "pins": "alpine:3.19 with `apk add aws-cli` (:12) and `apk add ffmpeg` (:13); `VOLUME /usercontent` (:21); `ENV STAGING_DIR=/usercontent` (:22); ENTRYPOINT docker-entrypoint.sh (:24) -> `ffmpeg-s3 \"$@\"` (docker-entrypoint.sh:9-12). The ffmpeg build is Alpine's distro package (Dockerfile:13), NOT a pinned build — so which muxers/filters exist is an Alpine packaging property and is not pinned by this contract."
+      },
+      {
+        "symbol": "readme.md OSC usage",
+        "at": "readme.md:43-47 (and the two further examples at :53-57, :63-67)",
+        "pins": "The create-instance/job option names, as the service's own readme documents them for `npx @osaas/cli create eyevinn-ffmpeg-s3 <name> -o ...`: `cmdLineArgs`, `awsAccessKeyId`, `awsSecretAccessKey`, `s3EndpointUrl`. Secrets are passed as `{{secrets.<name>}}` references. These four are the ONLY body fields confirmed by an upstream source."
+      }
+    ]
+  },
+  "job": {
+    "serviceId": "eyevinn-ffmpeg-s3",
+    "serviceIdSource": "src/services/stack.ts:79 FFPROBE_SERVICE_ID",
+    "kind": "ephemeral job (create instance -> poll status -> read logs -> remove)",
+    "createJob": {
+      "sdkCall": "createJob(context, 'eyevinn-ffmpeg-s3', serviceAccessToken, body) — @osaas/client-core",
+      "bodyFields": {
+        "name": {
+          "required": true,
+          "type": "string",
+          "confirmedBy": "repo: src/pipeline/osc-ffprobe.ts:168-180 (every runner sends it) and the OSC job API's instance-name constraint (src/services/provision.ts); NOT listed in the service readme because the CLI takes the name positionally",
+          "constraint": "lowercase alphanumeric, bounded length — see probeJobName(), src/pipeline/osc-ffprobe.ts:147-151"
+        },
+        "cmdLineArgs": {
+          "required": true,
+          "type": "string",
+          "confirmedBy": "upstream readme.md:47; consumed by src/cli.ts:9",
+          "note": "A single ffmpeg command line, WITHOUT the leading `ffmpeg`. Must contain exactly one `-i` and a trailing output argument (src/ffmpeg.ts:48-57, :90-99)."
+        },
+        "awsAccessKeyId": {
+          "required": false,
+          "type": "string",
+          "confirmedBy": "upstream readme.md:44; accepts a `{{secrets.<name>}}` reference"
+        },
+        "awsSecretAccessKey": {
+          "required": false,
+          "type": "string",
+          "confirmedBy": "upstream readme.md:45; accepts a `{{secrets.<name>}}` reference"
+        },
+        "s3EndpointUrl": {
+          "required": false,
+          "type": "string",
+          "confirmedBy": "upstream readme.md:46; read by the job as $S3_ENDPOINT_URL (src/ffmpeg.ts:65-67, :151-153, :270-272, :321-323)"
+        },
+        "awsRegion": {
+          "required": false,
+          "type": "string",
+          "confirmedBy": "REPO ONLY — sent by src/pipeline/osc-ffprobe.ts:177. Not named in any upstream source read at this commit; the job code never reads an AWS_REGION itself (the bundled aws-cli would). Treated as accepted-but-unpinned.",
+          "requiresLiveRun": true
+        },
+        "awsSessionToken": {
+          "required": false,
+          "type": "string",
+          "confirmedBy": "REPO ONLY — sent by src/pipeline/osc-ffprobe.ts:178. Same caveat as awsRegion.",
+          "requiresLiveRun": true
+        }
+      }
+    },
+    "logs": {
+      "route": "/logs/:name",
+      "routeSource": "src/pipeline/osc-ffprobe.ts:156-158 — resolved from the service's apiUrl by @osaas/client-core getLogsForInstance(context, serviceId, name, sat); recorded there as confirmed against the live API. It is NOT /ffmpeg-s3job/:name/logs.",
+      "returnType": "string | string[]",
+      "returnTypeSource": "@osaas/client-core/lib/core.d.ts:85 (both shapes normalised in src/pipeline/osc-job-log.ts captureJobLogs and src/pipeline/osc-ffprobe.ts)",
+      "lifetime": "readable only while the ephemeral instance still exists — getLogsForInstance is an instance call, so `finally { removeJob }` destroys the artefact (src/pipeline/osc-job-log.ts header, gap 3 of the #786 friction log)",
+      "carriesFfmpegStdout": false,
+      "carriesFfmpegStderr": "ONLY WHEN ffmpeg EXITED NON-ZERO. Then the whole captured stderr buffer is emitted in one console.error (src/ffmpeg.ts:232). When ffmpeg exits 0 the buffer is dropped and the log holds only the wrapper's own console.log lines.",
+      "truncatedOrPagedByPlatform": null,
+      "truncationThresholdBytes": null,
+      "truncationNote": "UNANSWERED. Whether the OSC job-log route truncates, pages, or ring-buffers a long log — and at what size — is a platform property with no published contract and was not measured. Our own callers additionally cap what they RETAIN: src/pipeline/osc-job-log.ts MAX_LOG_CHARS = 4000, keeping the LAST 4000 characters; src/pipeline/osc-ffprobe.ts applies no cap of its own.",
+      "requiresLiveRun": true
+    }
+  },
+  "sceneCutReadback": {
+    "question": "Can a successful eyevinn-ffmpeg-s3 job return per-cut timestamps (issue #1191)?",
+    "viaLogShowinfo": {
+      "command": "-i <source> -vf \"select='gt(scene,0.4)',showinfo\" -f null -",
+      "verdict": "NOT A USABLE CONTRACT",
+      "reason": "showinfo writes `pts_time=` to stderr, and stderr reaches the log only on a non-zero ffmpeg exit (src/ffmpeg.ts:224-235). With this exact command the exit is in fact non-zero — but only because rewriteCmdString rewrites the muxer name `null` into a staging path (src/ffmpeg.ts:190), i.e. the lines are readable by accident of a bug, not by contract. An upstream fix to the output rewrite removes the cuts from the log without changing any field we send.",
+      "ifFfmpegExitedZero": "no showinfo lines in the log at all"
+    },
+    "viaS3Object": {
+      "verdict": "SUPPORTED BY THE UPLOADER, with one hard constraint",
+      "constraint": "The uploaded object must be ffmpeg's OWN muxer output: the single-file S3 branch uploads only the file whose basename equals the dest basename (src/ffmpeg.ts:337-345). A `-vf ...,metadata=print:file=scenes.txt` sidecar is written into the staging dir (cwd = stagingDir, src/ffmpeg.ts:224-226) but is NOT uploaded by that branch. The recursive branch (src/ffmpeg.ts:318-335, dest path ending in `/`) does upload it, at the cost of uploading the whole staging dir one prefix level above the dest.",
+      "alsoRequires": "ffmpeg must exit 0, or uploadResult is never reached (src/ffmpeg.ts:28-29). So the command must be a well-formed real encode/mux, not `-f null -`.",
+      "shapeThatFitsTheUploader": "-i s3://<bucket>/<key> -an -fps_mode passthrough -vf \"select='gt(scene,0.4)'\" -f framemd5 s3://<bucket>/<prefix>/<id>.framemd5 — the framemd5 muxer's own output lines carry the per-selected-frame pts plus a `#tb` timebase header, so the cut list IS the output file and the single-file upload branch applies unchanged.",
+      "requiresLiveRun": true,
+      "liveRunMustConfirm": [
+        "the Alpine ffmpeg build in the published image has the framemd5 muxer (Dockerfile:13 installs the distro package; the muxer set is not pinned)",
+        "`actualCmdString.replace(output, localOutputFile)` (src/ffmpeg.ts:190) rewrites the s3 output cleanly for this command (no earlier substring collision)",
+        "the job exits 0 and the object appears at the dest key"
+      ]
+    }
+  },
+  "openQuestionsRequiringALiveRun": [
+    "Are showinfo/pts_time lines present in the log of a job whose ffmpeg exited 0? Source says NO (src/ffmpeg.ts:224-235); a live run is only needed to confirm the platform adds nothing of its own.",
+    "Does the job log truncate or page on a long video, and at what size?",
+    "Does /logs/:name return the container's stderr stream as well as stdout? (The repo records the probe parse working in production, which implies yes for console.error, but no capture is recorded here.)",
+    "Does the framemd5-to-S3 shape above complete and upload?"
+  ]
+}

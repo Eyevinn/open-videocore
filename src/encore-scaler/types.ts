@@ -102,6 +102,14 @@ export type EncoreScalerConfig = {
   // job. On timeout the instance is quarantined from job assignment rather than
   // dispatched to. Default 60_000; override via ENCORE_CALLBACK_TRUST_TIMEOUT_MS.
   callbackTrustTimeoutMs?: number;
+  // Per-REQUEST bound (ms) for a single callback-trust probe HTTP request
+  // (issue #1171). Distinct from callbackTrustTimeoutMs, which is the
+  // cross-tick bounded WAIT: before this existed the 60s wait value doubled as
+  // the per-request AbortSignal window, so one hung probe could hold a tick —
+  // and therefore instance readiness and job assignment — for a full minute.
+  // Default DEFAULT_PROBE_REQUEST_TIMEOUT_MS (5_000); override via
+  // ENCORE_CALLBACK_PROBE_TIMEOUT_MS.
+  callbackProbeRequestTimeoutMs?: number;
   // #708: grace window (ms) during which reconcile() will NOT re-raise a job as
   // silently dropped if the callback poller recorded its completion very
   // recently (keys.jobCompletionSeen). Closes the narrow race where reconcile

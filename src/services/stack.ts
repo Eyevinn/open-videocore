@@ -39,10 +39,19 @@
 // serviceId, so this string is also the object store's namespace.
 export const OBJECT_STORE_SERVICE_ID = 'minio-minio' as const;
 
+// The queue (Valkey) serviceId. Exported as its own constant for the same
+// reason as OBJECT_STORE_SERVICE_ID above: paths that must match this service
+// BY IDENTITY rather than by position in STACK_SERVICES. The teardown reporting
+// in routes/provision.ts uses it to read what a run established about the
+// stack's queue instance specifically (issue #1213) — the stack's scaler state,
+// its callback completions and its packaging hand-off all live on this store,
+// so "is it still there?" decides what background work may stay bound to it.
+export const QUEUE_SERVICE_ID = 'valkey-io-valkey' as const;
+
 export const STACK_SERVICES = [
   { serviceId: OBJECT_STORE_SERVICE_ID, role: 'storage' },
   { serviceId: 'apache-couchdb', role: 'database' },
-  { serviceId: 'valkey-io-valkey', role: 'queue' }
+  { serviceId: QUEUE_SERVICE_ID, role: 'queue' }
 ] as const;
 
 // The Encore packager consumes the shared Valkey queue and writes CMAF output
