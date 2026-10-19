@@ -161,9 +161,9 @@ Seeds the profile store from the default Encore test profiles. The ops dashboard
 | `PORT` | No | HTTP port (default `3000`). |
 | `PROVISION_READY_TIMEOUT_MS` | No | How long provisioning waits for each backing instance to report healthy, in milliseconds (default `300000`, i.e. 5 minutes). The wait polls instance health on its own loop and treats a dropped poll as "not ready yet", so a single network blip no longer aborts the stack; on timeout the error names the service and the last probe error, and the usual rollback tears down what that run created. |
 | `PROVISION_READY_POLL_INTERVAL_MS` | No | How often that readiness wait re-checks instance health, in milliseconds (default `1000`). |
-| `ENCORE_MAX_INSTANCES` | No | Maximum Encore instances the auto-scaler may run per workspace (default `3`). Sets the boot-time value; it can be overridden at runtime without a restart via `PATCH /api/v1/scaler/config` (`maxInstances`). That change is persisted to the parameter store, but **not reloaded at boot**, so a restart reverts to this variable until the `PATCH` is re-sent — see [Runtime scaler config: where it lives, what wins](#runtime-scaler-config-where-it-lives-what-wins). |
-| `ENCORE_MIN_INSTANCES` | No | Minimum Encore instances the auto-scaler keeps warm per workspace even when idle (default `0` — scale to zero). Set to `1` or more to keep a warm floor for production / latency-sensitive shared pools. This variable is the **only** way to change the enforced floor: a `minInstances` sent to `PATCH /api/v1/scaler/config` is persisted and echoed back but is not applied to the running scaler. See [Auto-scaler warm floor](#auto-scaler-warm-floor-cost-vs-reliability) for the cost-vs-reliability trade-off. |
-| `ENCORE_IDLE_TIMEOUT_MS` | No | Idle time before an Encore instance is torn down, in milliseconds (default `300000`, i.e. 5 minutes). Sets the boot-time value; it can be overridden at runtime without a restart via `PATCH /api/v1/scaler/config` (`idleTimeoutMs`, minimum `10000`). That change is persisted to the parameter store, but **not reloaded at boot**, so a restart reverts to this variable until the `PATCH` is re-sent. |
+| `ENCORE_MAX_INSTANCES` | No | Maximum Encore instances the auto-scaler may run per workspace (default `3`). Sets the boot-time value; it can be overridden at runtime without a restart via `PATCH /api/v1/scaler/config` (`maxInstances`). That change is persisted to the parameter store **and reloaded at boot** (#1078), so after a restart the persisted value wins and this variable applies only until the first `PATCH` (or when the store cannot be read at boot, which is warn-logged) — see [Runtime scaler config: where it lives, what wins](#runtime-scaler-config-where-it-lives-what-wins). |
+| `ENCORE_MIN_INSTANCES` | No | Minimum Encore instances the auto-scaler keeps warm per workspace even when idle (default `0` — scale to zero). Set to `1` or more to keep a warm floor for production / latency-sensitive shared pools. A `minInstances` sent to `PATCH /api/v1/scaler/config` is not applied to the already-running scaler, but it is persisted and, since #1078, loaded at boot with precedence over this variable — so changing the enforced floor through the API takes one restart. See [Auto-scaler warm floor](#auto-scaler-warm-floor-cost-vs-reliability) for the cost-vs-reliability trade-off. |
+| `ENCORE_IDLE_TIMEOUT_MS` | No | Idle time before an Encore instance is torn down, in milliseconds (default `300000`, i.e. 5 minutes). Sets the boot-time value; it can be overridden at runtime without a restart via `PATCH /api/v1/scaler/config` (`idleTimeoutMs`, minimum `10000`). That change is persisted to the parameter store **and reloaded at boot** (#1078), so after a restart the persisted value wins; this variable is the value for a deployment never configured through the API. |
 | `ENCORE_S3_ENDPOINT` | No | Static object-store endpoint URL passed to Encore instances so they can read source media. **Normally leave this unset on OSC** — the endpoint is read per stack from the provisioned stack's own config in the parameter store. Set it only for local development, or as a fallback for deployments with no provisioned stack config. It is a *fallback*, not an override: when a stack does have a stored endpoint, that stored endpoint is what the transcoder gets, and this value is not used for that stack. When it is unset *and* no endpoint can be resolved from a stack's stored config, transcode submission fails loudly with an error naming the cause, rather than silently spawning a transcoder with no endpoint (which used to surface as an unexplained 404 on the `s3://` input). |
 | `ENCORE_S3_INTERNAL_ENDPOINT` | No | Set to `off` (also `false`/`0`/`no`/`disabled`) to stop handing spawned Encore instances the **in-cluster** object-store Service address (`http://<instance>.minio-minio.svc.cluster.local:8080`) and use the stack's public endpoint instead. Default is on: the address is looked up from the platform itself (the `getInternalEndpoint` API, which returns the instance's `serviceDns`), falling back to deriving it from the stack's stored public endpoint when the platform cannot answer — and it is used **only after a live health probe from this API succeeds**. Otherwise the public endpoint is used and a warning is logged, so a cross-cluster deployment keeps working unchanged. This exists because one long single-connection read of a large source through the public ingress is severed mid-stream (see `docs/investigations/294-minio-ingress-longlived-connections.md`); routing the transcoder's reads/writes in-cluster takes the ingress out of that data path. Client-facing URLs (presigned uploads, playback, API responses) always stay public. This applies to the endpoint read from a provisioned stack's config; a static `ENCORE_S3_ENDPOINT` is used verbatim on its own path and never passes through this resolver. Full audit: `docs/investigations/991-internal-object-store-endpoint-paths.md`. |
 | `ENCORE_S3_INTERNAL_PORT` | No | Service port used for the in-cluster object-store endpoint (default `8080`, the S3 API port). An invalid value falls back to the default rather than failing startup. The platform's `getInternalEndpoint` currently reports no ports for object-store instances (`ports: []`), so this default is what is actually used; if the platform starts reporting ports, the reported one is preferred over this. |
@@ -370,7 +370,7 @@ a restart.
 |---|---|---|
 | `GET` | `/api/v1/scaler/status` | Current Encore instance pool status (reports the effective `maxInstances`, `jobsPerInstance` — concurrent jobs one instance can take — and `idleTimeoutMs`; each instance carries `draining: true` while it is being drained ahead of teardown). Returns `scalerActive: false` until a stack is provisioned; the auto-scaler activates against the provisioned stack's Valkey immediately after `POST /api/v1/provision` completes, with no restart. Each provisioned stack has its own Valkey, so the read fans out over all of them: every entry in `workspaces[]` carries the `connectionId` its `queueDepth`/`inflightDepth`/`instances` were read from, and `connections[]` lists every store the read covered. A pool that could not be queried is reported with `observed: false` and an `unobservedReason` — its state is unknown, not empty — rather than being left out of the response. `connectionId` is a stable non-secret label; no connection string, host, port or credential is ever returned. |
 | `GET` | `/api/v1/scaler/config` | Get the auto-scaler configuration in force in the serving process (the runtime value if a `PATCH` has been accepted since startup, otherwise the boot-time environment values) |
-| `PATCH` | `/api/v1/scaler/config` | Update auto-scaler configuration (`maxInstances`, `minInstances`, `idleTimeoutMs`) at runtime; `idleTimeoutMs` must be at least `10000` ms. Written to the parameter store before it is applied — `501` if no parameter store is configured, `503` if the write fails, and in both cases nothing is applied. The stored value is not reloaded at boot yet, and `minInstances` is recorded but not applied. See [Runtime scaler config: where it lives, what wins](#runtime-scaler-config-where-it-lives-what-wins) |
+| `PATCH` | `/api/v1/scaler/config` | Update auto-scaler configuration (`maxInstances`, `minInstances`, `idleTimeoutMs`) at runtime; `idleTimeoutMs` must be at least `10000` ms. Written to the parameter store before it is applied — `501` if no parameter store is configured, `503` if the write fails, and in both cases nothing is applied. The stored value is reloaded at boot (#1078); `minInstances` is recorded and applied at the next boot, not to the already-running scaler. See [Runtime scaler config: where it lives, what wins](#runtime-scaler-config-where-it-lives-what-wins) |
 
 #### Runtime scaler config: where it lives, what wins
 
@@ -386,31 +386,41 @@ restart. It is worth being precise about what that does and does not mean:
   applied; if the store rejects the write or cannot be reached you get a `503`
   and nothing is applied, so `GET /api/v1/scaler/config` still reports the
   previous values.
-- **Precedence.** There are exactly two layers in force at runtime: the runtime
-  value, then the environment. The most recent `PATCH` the process accepted
-  wins; before any `PATCH`, the values read at boot from `ENCORE_MAX_INSTANCES`
-  and `ENCORE_IDLE_TIMEOUT_MS` apply. `GET /api/v1/scaler/config` and
+- **Precedence.** Three layers, in order: the most recent `PATCH` this process
+  accepted, then the persisted snapshot loaded at boot, then the environment.
+  Since #1078 boot reads the stored record first, so `ENCORE_MAX_INSTANCES`,
+  `ENCORE_MIN_INSTANCES` and `ENCORE_IDLE_TIMEOUT_MS` are the values for a
+  deployment that has never been configured through the API — or for a boot where
+  the parameter store could not be read, which is logged as a warning naming the
+  reason. `GET /api/v1/scaler/config` and
   `GET /api/v1/scaler/status` report whichever is in force, but do **not** say
   which of the two it came from, and neither reads the stored record — they
   report the live copy only.
 - **Resetting to the environment default.** There is no reset endpoint and no
   sentinel value. `PATCH` the environment values back explicitly, which
-  overwrites the stored snapshot. Restarting the process reverts the live values
-  to the environment but leaves the stored record in place.
-- **Restarts and replicas.** The stored snapshot survives a restart, but nothing
-  reads it back at boot yet, so a restarted or redeployed process serves its
-  environment values again until the `PATCH` is re-sent: treat a `PATCH` as
-  durable but not self-restoring. The applied value is also local to one
+  overwrites the stored snapshot. Since #1078 that is the only way back:
+  restarting the process no longer undoes a `PATCH`, because boot reads the
+  stored snapshot and serves it again (`source: "runtime"`). A field reports
+  `source: "env"` again only on a process that booted with no usable stored
+  record.
+- **Restarts and replicas.** The stored snapshot survives a restart **and is read
+  back at boot** (#1078): a restarted or redeployed process serves the persisted
+  values, for the config endpoint and for the scaler loops it creates, with no
+  need to re-send the `PATCH`. `GET /api/v1/scaler/config` reports a restored
+  field as `source: "runtime"` (with no `updatedAt`, because the stored record
+  carries no timestamp). If the store is unreachable at boot the process starts
+  on its environment values and logs a warning with the reason. The applied value
+  of a live `PATCH` is still local to one
   process: if you run more than one replica, a `PATCH` is applied by whichever
   one answered the request, not by all of them, even though all of them share
   the one stored record. For a change that must take effect everywhere after a
   restart, set the environment variable and redeploy.
 - **`minInstances` is the exception.** It is validated, persisted, and echoed
-  back, but it is **not** fanned out to the running scaler loops: they keep
-  enforcing the floor read from `ENCORE_MIN_INSTANCES` at boot. The value this
-  endpoint reports for `minInstances` is also `0` until something `PATCH`es it,
-  regardless of `ENCORE_MIN_INSTANCES`. Change the floor that is actually
-  enforced via the environment variable and a restart.
+  back, but it is **not** fanned out to the **already-running** scaler loops:
+  they keep enforcing the floor they were created with. Since #1078 the persisted
+  value *is* applied at the next boot, where it takes precedence over
+  `ENCORE_MIN_INSTANCES`, so a `PATCH` to the floor takes effect on the loops
+  after a restart rather than never.
 - **Patching while the scaler is inactive.** While `GET /api/v1/scaler/status`
   reports `scalerActive: false` (no stack provisioned yet) a `PATCH` is accepted
   and reported back, but it is not carried into the scaler that activates later

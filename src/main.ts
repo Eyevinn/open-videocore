@@ -37,6 +37,7 @@ import {
   type SecretStore
 } from './services/storage-backend-registry.js';
 import { PACKAGER_SERVICE_ID } from './services/stack.js';
+import { resolveScalerBootConfig } from './services/scaler-boot-config.js';
 import { assetsRouter } from './routes/assets.js';
 import { assetUploadRouter, type StorageFactory } from './routes/asset-upload.js';
 import { jobsRouter } from './routes/jobs.js';
@@ -967,7 +968,47 @@ const clipRunner = storageAvailable
 // cap the pool at a single instance (equivalent to the previous static behaviour).
 // Requires a Redis connection (resolved from the parameter store after provisioning).
 // When Redis is unavailable transcoding degrades to 501.
-const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 10);
+const encoreMaxInstancesFromEnv = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 10);
+const encoreMinInstancesFromEnv = parseInt(process.env['ENCORE_MIN_INSTANCES'] || '0', 10);
+const encoreIdleTimeoutMsFromEnv = parseInt(
+  process.env['ENCORE_IDLE_TIMEOUT_MS'] || String(5 * 60 * 1000),
+  10
+);
+
+// Boot-time restore of an operator's persisted scaler config (issue #1078).
+//
+// The env values above are the FALLBACK, not the winner. A PATCH
+// /api/v1/scaler/config has been written durably since #1077, but nothing read
+// it back, so every restart silently reverted an operator's cap to
+// ENCORE_MAX_INSTANCES. Boot now loads the stored snapshot first and the
+// resolved values feed BOTH the scaler registry/loops (below) and the config
+// endpoint (scalerRouterOptions), so GET /api/v1/scaler/config and the effective
+// instance cap cannot disagree.
+//
+// Contract sources verified (CLAUDE.md rule 7):
+//   - services/param-store.ts `makeScalerConfigStore(kv)` /
+//     `ScalerConfigStore.load(): Promise<ScalerRuntimeConfig | undefined>` and
+//     `SCALER_CONFIG_KEY` ('openvideocore/scalerconfig') — the complete
+//     {maxInstances,minInstances,idleTimeoutMs} snapshot PATCH persists.
+//   - services/scaler-boot-config.ts `resolveScalerBootConfig` — precedence,
+//     the never-reject fallback contract and the logged fallback reasons.
+//   - `backendKvStore` (configKvStoreFromEnv, above) is the same KV handle the
+//     PATCH route writes through, so read and write cannot diverge on key, auth
+//     or instance.
+// Undefined store (parameter store unconfigured) => env values, and PATCH
+// answers 501, so there is nothing persisted to miss.
+const scalerBootConfig = await resolveScalerBootConfig({
+  env: {
+    maxInstances: encoreMaxInstancesFromEnv,
+    minInstances: encoreMinInstancesFromEnv,
+    idleTimeoutMs: encoreIdleTimeoutMsFromEnv
+  },
+  store: backendKvStore ? makeScalerConfigStore(backendKvStore) : undefined,
+  log: app.log
+});
+const encoreMaxInstances = scalerBootConfig.maxInstances;
+const encoreMinInstances = scalerBootConfig.minInstances;
+const encoreIdleTimeoutMs = scalerBootConfig.idleTimeoutMs;
 // Optional operator-configured job-throughput cap (issue #580, ADR-020). Caps the
 // number of OUTSTANDING transcode/package jobs (pending in the scaler queue +
 // being dispatched) the deployment will admit at once; an over-limit submission
@@ -977,7 +1018,6 @@ const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 
 // cost) — it reuses the scaler's own Valkey queue state, NOT a second counter.
 // Unset/0/invalid => no cap (opt-in; submission behaviour unchanged).
 const encoreMaxQueuedJobs = resolveJobThroughputCap(process.env);
-const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] || String(5 * 60 * 1000), 10);
 // Bounded wait (issue #463) for the outbound TLS-trust probe to a freshly
 // spawned instance's per-instance callback-listener ingress before that instance
 // is eligible for its FIRST job. Closes the race between the ingress certificate
@@ -1487,7 +1527,12 @@ function activateScaler(redisUrl: string): void {
       if (!paramStore) return [];
       return paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
     },
-    minInstances: parseInt(process.env['ENCORE_MIN_INSTANCES'] || '0', 10),
+    // Warm floor. Resolved at boot (#1078): a persisted minInstances from a
+    // previous PATCH wins over ENCORE_MIN_INSTANCES, which stays the value for a
+    // deployment never configured through the API. This is the floor the loops
+    // actually enforce, so a restored config reaches the live loops rather than
+    // only being echoed by GET /scaler/config.
+    minInstances: encoreMinInstances,
     oscContext,
     maxInstances: encoreMaxInstances,
     // Optional opt-in job-throughput cap (issue #580, ADR-020). Forwarded to
@@ -2975,9 +3020,23 @@ const scalerRouterOptions: Parameters<typeof scalerRouter>[1] & { prefix: string
   // is off, which leaves the response reporting the process-global connection
   // only — and `connections` states that explicitly.
   listStackConnections: async () => (scalerRegistry ? scalerRegistry.listStackConnections() : []),
+  // Boot values, already resolved by resolveScalerBootConfig (#1078): the
+  // persisted snapshot when one exists, else the environment. The SAME three
+  // numbers the registry/loops above were initialised from, so the endpoint
+  // reports the cap the scaler is really enforcing.
+  //
+  // minInstances: before #1078 this was a hardcoded 0 (ENCORE_MIN_INSTANCES was
+  // never forwarded here). It still is for an unconfigured deployment —
+  // scalerBootConfig.minInstances falls back to ENCORE_MIN_INSTANCES, which
+  // defaults to 0 — but a RESTORED snapshot's minInstances is now reported, and
+  // was applied to the registry above.
   maxInstances: encoreMaxInstances,
-  minInstances: 0,
+  minInstances: encoreMinInstances,
   idleTimeoutMs: encoreIdleTimeoutMs,
+  // Provenance for `sources` (#1079 + #1078): 'persisted' makes a restored
+  // operator value report source "runtime" instead of masquerading as an env
+  // value. See the bootSource comment in routes/scaler.ts.
+  configSource: scalerBootConfig.source === 'persisted' ? 'persisted' : 'env',
   // Durable scaler runtime config (#1077). Reuses the SAME generic
   // eyevinn-app-config-svc key/value store the storage-backend registry writes
   // through (`backendKvStore`, built with configKvStoreFromEnv above) — one

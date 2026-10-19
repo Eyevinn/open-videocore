@@ -804,17 +804,36 @@ export type ScalerRuntimeConfig = {
   idleTimeoutMs: number;
 };
 
+// The authoritative range of each scaler config field, in ONE place so the
+// three readers of it cannot drift:
+//   - routes/scaler.ts `scalerConfigSchema` — request validation (400) AND, via
+//     `scalerConfigResponseSchema`, the 200 response schema of GET/PATCH
+//     /api/v1/scaler/config, so a value outside these bounds cannot be
+//     SERIALIZED either: it fails response validation (500).
+//   - services/scaler-boot-config.ts `resolveScalerBootConfig` — clamps a
+//     persisted record into these bounds at boot (#1078 review finding 8), so a
+//     record written under older/looser bounds cannot make the config endpoint
+//     unserializable or push the scaler loops past the documented ceiling.
+//   - this file's `parseScalerRuntimeConfig`, which deliberately does NOT apply
+//     them (see below).
+export const SCALER_CONFIG_BOUNDS = {
+  maxInstances: { min: 1, max: 20 },
+  minInstances: { min: 0, max: 10 },
+  // Lower bound only: a near-zero idle timeout thrashes the spawn/destroy cycle.
+  idleTimeoutMs: { min: 10_000 }
+} as const;
+
 // Parse a stored scaler-config blob, returning undefined for anything that is
 // not a usable config so a caller (boot load, #1078) can fall back to its env
 // defaults instead of throwing.
 //
-// The check is STRUCTURAL plus a minimal sanity floor, NOT the route's full
-// range check. The authoritative bounds live with the request validation in
-// routes/scaler.ts (`scalerConfigSchema`: maxInstances 1..20, minInstances
-// 0..10, idleTimeoutMs >= MIN_IDLE_TIMEOUT_MS) and are applied at WRITE time.
-// Re-applying them here would mean that tightening a bound later silently
-// discards a previously-valid persisted value at boot — so the reader only
-// rejects values that are not usable integers at all.
+// The check is STRUCTURAL plus a minimal sanity floor, NOT the full range check
+// in SCALER_CONFIG_BOUNDS above, which is applied at WRITE time by the route.
+// Re-applying the full range here would mean that tightening a bound later
+// silently discards a previously-valid persisted value at boot — so the reader
+// only rejects values that are not usable integers at all, and the boot path
+// CLAMPS what it reads into the bounds (resolveScalerBootConfig) instead of
+// dropping the whole record.
 export function parseScalerRuntimeConfig(raw: string): ScalerRuntimeConfig | undefined {
   let parsed: unknown;
   try {
