@@ -107,11 +107,13 @@ curl -sS "$PARAM_STORE_URL/api/v1/config/$KEY" \
 deployment.
 
 To sweep the whole deployment, take the stack names from
-`GET /api/v1/provision` (`src/routes/provision.ts:2076`, returns
+`GET /api/v1/provision/` (`src/routes/provision.ts:2076`, returns
 `listStackNames`) and run the read above for each. Note the listing is not
 paginated by this client and one page is 100 keys
 (`CONFIG_LIST_PAGE_LIMIT`, `src/services/param-store.ts:389`), so treat a full
-page as possibly truncated.
+page as possibly truncated. It also answers `200 []` rather than an error when
+the parameter store is unavailable (`src/routes/provision.ts:2094-2099`), so an
+empty sweep means "no answer" as often as it means "no stacks".
 
 ### The other signal
 
@@ -175,21 +177,48 @@ maintenance window, because the stack is unavailable from step 4 to step 6.
 2. **Inventory what the stack holds.** For each asset, record the metadata and
    the file list:
 
+   `GET /api/v1/assets/` answers an **object** — `{items, limit, offset, total}`
+   (`listSchema`, `src/routes/assets.ts:1213-1218`) — not a bare array, so the id
+   expression is `.items[].id`. Page explicitly (`limit` caps at 200,
+   `listQuerySchema`, `src/routes/assets.ts:501`) and fail loudly on any error:
+   an inventory that quietly comes up short is the worst way to arrive at step 4,
+   which is irreversible.
+
    ```sh
    OLD=legacy-stack-name
-   curl -sS "$API/api/v1/assets/" -H "X-Stack-Name: $OLD" > assets.json
-   jq -r '.[].id' assets.json | while read -r ID; do
-     curl -sS "$API/api/v1/assets/$ID"       -H "X-Stack-Name: $OLD" > "asset-$ID.json"
-     curl -sS "$API/api/v1/assets/$ID/files" -H "X-Stack-Name: $OLD" > "files-$ID.json"
+
+   : > asset-ids.txt
+   offset=0; total=0
+   while :; do
+     page=$(curl -fsS "$API/api/v1/assets/?limit=200&offset=$offset" \
+       -H "X-Stack-Name: $OLD") || {
+       echo "listing failed at offset $offset — do NOT continue to step 4" >&2; exit 1; }
+     n=$(printf '%s' "$page" | jq '.items | length')
+     total=$(printf '%s' "$page" | jq '.total')
+     printf '%s' "$page" | jq -r '.items[].id' >> asset-ids.txt
+     offset=$((offset + n))
+     [ "$offset" -ge "$total" ] && break
+     [ "$n" -eq 0 ] && {
+       echo "no progress at offset $offset of $total — do NOT continue" >&2; exit 1; }
    done
+
+   # The inventory must account for every asset before anything destructive runs.
+   got=$(wc -l < asset-ids.txt)
+   [ "$got" -eq "$total" ] || {
+     echo "inventoried $got of $total assets — do NOT continue to step 4" >&2; exit 1; }
+   echo "inventoried $got of $total assets"
+
+   while read -r ID; do
+     curl -fsS "$API/api/v1/assets/$ID"       -H "X-Stack-Name: $OLD" > "asset-$ID.json"
+     curl -fsS "$API/api/v1/assets/$ID/files" -H "X-Stack-Name: $OLD" > "files-$ID.json"
+   done < asset-ids.txt
    ```
 
    `X-Stack-Name` is the header that addresses a specific stack
    (`src/services/workspace-stack.ts:990`, `1044-1048`). `GET /assets/:id/files`
    returns `files[]` with `objectKey` and a `url` per file plus `fileGroups[]`
    with `manifestUrl` (response schema in `openapi.json`,
-   `/api/v1/assets/{id}/files`). Adjust the listing call for pagination as your
-   deployment needs.
+   `/api/v1/assets/{id}/files`).
 
 3. **Copy the bytes out, while the old stack still exists.** The source objects
    live in the old stack's own buckets — `openvideocore-source` and
@@ -206,9 +235,18 @@ maintenance window, because the stack is unavailable from step 4 to step 6.
    for the `removed` / `partial` / `not_found` / `failed` result semantics).
 
    ```sh
-   OP=$(curl -sS -X DELETE "$API/api/v1/provision/$OLD" | jq -r .operationId)
-   curl -sS "$API/api/v1/provision/operations/$OP" | jq '{status, error, result}'
+   OP=$(curl -fsS -X DELETE "$API/api/v1/provision/$OLD" | jq -r .operationId)
+
+   while :; do
+     st=$(curl -fsS "$API/api/v1/provision/operations/$OP" | jq -r .status) || exit 1
+     case "$st" in done|failed) break ;; esac
+     sleep 10
+   done
+   curl -fsS "$API/api/v1/provision/operations/$OP" | jq '{status, error, result}'
    ```
+
+   A single read right after the `DELETE` almost always shows `pending`, which
+   says nothing about the outcome; wait for `done` or `failed` before step 5.
 
    Teardown calls `removeInstance` for every service recorded in the stored
    config, in dependency-safe order — storage (`minio-minio`), database
@@ -225,10 +263,36 @@ maintenance window, because the stack is unavailable from step 4 to step 6.
 5. **Confirm the name is genuinely free before re-provisioning.** This is the
    guard for the fallback described above. Both of these must hold:
 
+   Check the HTTP status explicitly and make the listing check fail closed. A
+   bare `curl -sS … | jq 'index($n)'` is **not** safe here: `index()` over a
+   non-array error body also yields `null` with exit 0, so an unreachable or
+   erroring API would read exactly like "the name is free" — immediately before
+   the step that destroys data.
+
    ```sh
-   curl -sS -o /dev/null -w '%{http_code}\n' "$API/api/v1/provision/$OLD"   # expect 404
-   curl -sS "$API/api/v1/provision" | jq -r --arg n "$OLD" 'index($n)'      # expect null
+   # (a) the stack record must be gone
+   code=$(curl -sS -o /dev/null -w '%{http_code}' "$API/api/v1/provision/$OLD")
+   [ "$code" = "404" ] || {
+     echo "record still present (HTTP $code) — do NOT re-provision this name" >&2; exit 1; }
+
+   # (b) the name must be absent from a listing that genuinely parsed as an array.
+   #     -f so a 404/5xx fails the pipeline instead of flowing into jq.
+   names=$(curl -fsS "$API/api/v1/provision/") || {
+     echo "listing unavailable — cannot confirm the name is free" >&2; exit 1; }
+   printf '%s' "$names" | jq -e 'type == "array"' > /dev/null || {
+     echo "listing was not a JSON array — cannot confirm" >&2; exit 1; }
+   printf '%s' "$names" | jq -e --arg n "$OLD" 'index($n) | not' > /dev/null || {
+     echo "$OLD is still listed — do NOT re-provision this name" >&2; exit 1; }
    ```
+
+   **An empty listing is not proof.** `GET /api/v1/provision/` deliberately
+   answers `200 []` when the parameter store is unavailable, so the UI degrades
+   instead of erroring (`src/routes/provision.ts:2094-2099`) — a store outage is
+   indistinguishable from "no stacks exist", and it returns `501` when the store
+   is not configured at all (`notConfiguredSchema`,
+   `src/routes/provision.ts:2082`). If `names` comes back `[]`, corroborate
+   against the parameter store directly with the section 1 read before you treat
+   check (b) as passed.
 
    A `200` with `status: delete_failed`, or the name still present in the
    listing, means the teardown left something behind. Retry the `DELETE` (it is
@@ -237,7 +301,7 @@ maintenance window, because the stack is unavailable from step 4 to step 6.
    If you must move on, re-provision under a **different name** instead —
    the credential is minted fresh for a name that has no stored record.
 
-6. **Re-provision.** `POST /api/v1/provision` with the same name (now free) or a
+6. **Re-provision.** `POST /api/v1/provision/` with the same name (now free) or a
    new one. The run mints a fresh credential generation
    (`newObjectStoreCredentialGeneration()`, passed at
    `src/routes/provision.ts:1099`), so a reused name gets a genuinely new
@@ -245,12 +309,31 @@ maintenance window, because the stack is unavailable from step 4 to step 6.
    cannot be revoked, hence the nonce (`GENERATION` in the header of
    `src/services/object-store-credentials.ts`).
 
+   This call is **asynchronous**: it answers `202` with
+   `{operationId, name, status: "pending"}` (response schema for
+   `POST /api/v1/provision/` in `openapi.json`) and provisions in the
+   background. The stack is not usable when it returns, so poll the operation to
+   a terminal state the same way step 4 does — do not read the stack's
+   credential state (step 7) off a mid-flight provision.
+
    ```sh
    NEW=$OLD
-   curl -sS -X POST "$API/api/v1/provision" \
+   OP=$(curl -fsS -X POST "$API/api/v1/provision/" \
      -H 'content-type: application/json' \
-     -d "{\"name\":\"$NEW\"}" | jq .
+     -d "{\"name\":\"$NEW\"}" | jq -r .operationId)
+
+   while :; do
+     st=$(curl -fsS "$API/api/v1/provision/operations/$OP" | jq -r .status) || exit 1
+     case "$st" in done|failed) break ;; esac
+     sleep 10
+   done
+   curl -fsS "$API/api/v1/provision/operations/$OP" | jq '{status, error, result}'
    ```
+
+   `status` is one of `pending` / `running` / `done` / `failed` (response schema
+   for `GET /api/v1/provision/operations/{id}` in `openapi.json`). Only `done`
+   means the stack came up; on `failed`, read `error` and do not continue to
+   step 7.
 
    Note the name constraint: lowercase alphanumeric, 1-63 characters
    (`requestSchema`, `src/routes/provision.ts:200-205`).
@@ -474,7 +557,15 @@ Read on `main` at commit `db2b846`:
 | seed used for resolver + reachability probe | `src/main.ts:472`, `697-719` |
 | transcoder legacy secret fallback chain | `src/main.ts:1423`; `src/services/encore-s3-config.ts:345-376` (empty-secret guard at `:368`) |
 | asset endpoints used in the procedure | `openapi.json`: `/api/v1/assets/`, `/api/v1/assets/{id}`, `/api/v1/assets/{id}/files`, `/api/v1/assets/ingest-url`, `/api/v1/assets/{id}/metadata`, `/api/v1/assets/{id}/external-ids` |
+| asset list envelope (`{items, limit, offset, total}`) | `src/routes/assets.ts:1213-1218` `listSchema`; `:501` `listQuerySchema` (`limit` max 200); `openapi.json` `/api/v1/assets/` `get.responses.200` |
+| provision list/create path (trailing slash) | `app.get('/')` at `src/routes/provision.ts:2076-2077` and `app.post('/')` at `:879-880`, under `prefix: '/api/v1/provision'` (`src/main.ts:601-602`); `openapi.json` documents `/api/v1/provision/` |
+| provision list degraded/unconfigured responses | `src/routes/provision.ts:2094-2099` (`200 []` when the store is unavailable), `:2082` `notConfiguredSchema` (`501`) |
+| async provision/teardown contract | `openapi.json`: `POST /api/v1/provision/` `202 {operationId, name, status: "pending"}`; `GET /api/v1/provision/operations/{id}` `status` ∈ `pending`/`running`/`done`/`failed` |
 | no in-place credential change on the platform | OSC feedback entry `incoming-shared-minio-root-credential-across-stacks.md` (update 2026-10-14: service schema exposes only `name` / `RootUser` / `RootPassword`, `supportsUpdate: null`) |
 
 Not verified here, and marked as such above: the live teardown residue, and an
-end-to-end asset move between two live stacks.
+end-to-end asset move between two live stacks. The request paths, response
+shapes and status codes in this guide are each checked against the sources in
+the table, and the shell snippets are syntax-checked, but the procedure as a
+whole has **not** been run end to end against a live throwaway stack. Treat it
+as reviewed against the contract, not as an observed run.
