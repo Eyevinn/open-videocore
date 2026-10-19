@@ -14,6 +14,9 @@ import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js
 import type { AssetRepository } from '../data/asset-repo.js';
 import { keys } from '../encore-scaler/types.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
+// #1227: recompute the asset's state from the job's FINAL state once the cancel
+// has made that state terminal.
+import { recomputeAssetStateAfterTerminalJob } from '../pipeline/asset-state-after-terminal-job.js';
 import type { MessageFailureClass } from '../encore-scaler/retry-policy.js';
 import { authGate } from '../auth/middleware.js';
 
@@ -272,6 +275,37 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
             };
             await pipelineRepo.update(execution.id, { steps, status: 'failed' });
           }
+        }
+      }
+
+      // Release the ASSET (#1227). The cancel above makes the job terminal, but
+      // the asset was advanced to `processing` when the work was dispatched and
+      // only the transcode completion handler ever moved it back — so a
+      // cancelled (then re-run) job left the asset reading PROCESSING with
+      // nothing running, which is what #1227 was reported from. Recompute it
+      // from the job's FINAL state: the asset leaves `processing` once this was
+      // its last active job, to `ready` if renditions exist or to its prior
+      // state otherwise (src/pipeline/asset-state-after-terminal-job.ts states
+      // the rule). Best-effort by construction — the recompute never throws and
+      // the cancel's 200 does not depend on it; without an asset repository
+      // wired (tests, `jobsRouter` registered bare) this is simply skipped.
+      const assetRepository = opts.assetRepository;
+      if (assetRepository) {
+        const recompute = await recomputeAssetStateAfterTerminalJob(
+          updated ?? { ...job, status: 'cancelled' },
+          {
+            assets: assetRepository,
+            jobs: repo,
+            logWarn: (detail) => request.log?.warn(detail)
+          }
+        );
+        if (recompute.outcome === 'applied') {
+          request.log?.info({
+            msg: 'cancelled job released its asset',
+            jobId: job.id,
+            assetId: job.assetId,
+            assetStatus: recompute.status
+          });
         }
       }
 

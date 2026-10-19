@@ -49,18 +49,42 @@
 // boot, where the still-`running` job is settled again and the asset, no longer
 // `uploading`, is left untouched by the status guard below.
 //
-// Partial bytes are still NOT cleaned up here (issue #1086, unchanged).
+// SCOPE (issue #1086): and the PARTIAL BYTES the dead pull left in object
+// storage, which the #1084/#1085 versions left occupying the bucket forever. A
+// pull streams straight into its own object key, so a transfer killed mid-stream
+// leaves either a truncated object under that key or a multipart upload still
+// open with its staged parts — bytes nothing will ever read, under a key whose
+// job is now terminal. The in-process worker already discards the staged upload
+// when IT reaches terminal failure (`discardOrphanedUpload` ->
+// `storage.abortIncompleteMultipartUploads(objectKey)`,
+// src/pipeline/url-pull-worker.ts, called on terminal failure per issue #1088);
+// a worker killed by a restart never gets there, so the same cleanup is done
+// here, plus a `removeObject` for the truncated single-part object that the
+// multipart abort does not cover. RESUME IS NOT ATTEMPTED (explicitly out of
+// scope for #1086): the job is settled `failed` and the bytes are discarded.
 //
-// Partially-written bytes are also NOT cleaned up here (issue #1086). That gap
-// does not need new machinery: the in-process terminal-failure path already
-// discards the staged multipart upload for exactly this reason
-// (`discardOrphanedUpload` -> `storage.abortIncompleteMultipartUploads(objectKey)`,
-// src/pipeline/url-pull-worker.ts:102-127, called on terminal failure at :302 per
-// issue #1088). #1086 is the work of giving this reconciler the same two inputs
-// that helper needs — a WorkspaceStorage for the job's stack and the job's
-// `objectKey` — and calling it; it is out of scope for #1084 because the object
-// key is not on the Job record (src/data/job-repo.ts) and deriving it is its own
-// decision.
+// WHICH KEY: resolved from the ASSET record's `objectKey`
+// (src/data/asset-repo.ts) — the pull's key is minted by POST /ingest-url as
+// `ingest/<assetId>` and written to the asset BEFORE the job is created
+// (src/routes/assets.ts), and it is NOT on the Job record (src/data/job-repo.ts
+// has no object-key field). So cleanup needs `deps.assets`, and runs only on the
+// branch where this reconciler ITSELF moved the asset `uploading -> failed`: an
+// asset still in `uploading` at settle time is one whose bytes never completed,
+// which is exactly the proof that the object under its key is partial. An asset
+// that had already moved on to `processing`/`ready` is skipped by the status
+// guard below and its object — a COMPLETE source someone is using — is never
+// touched. An `s3://…` key is skipped too: that is the external-backend branch's
+// foreign bucket, whose bytes this deployment does not own and did not write.
+//
+// CLEANUP NEVER BLOCKS THE SETTLE (#1086 acceptance): it runs AFTER both durable
+// writes, and a storage error is logged and swallowed — the job stays `failed`
+// and the asset stays `failed`, because a bucket we cannot reach must not be
+// able to resurrect the "stuck running forever" defect #1084 fixed. The asset
+// keeps its `objectKey` in that case, so the record still names the bytes that
+// were not reclaimed: that is what a later sweep (or an asset delete/purge,
+// which removes the object itself) needs to find them. This reconciler does not
+// retry on a later boot by itself — the job it would retry from is terminal by
+// then and no longer a candidate.
 //
 // IDEMPOTENT and safe to run more than once: the settle re-reads each job
 // immediately before writing and only acts while it is STILL `running` and STILL
@@ -118,8 +142,34 @@
 //   - An asset is created in `uploading` with a `null -> uploading` entry before
 //     bytes arrive (why a dead pull leaves it there): src/data/asset-repo.ts
 //     initialHistory()
+//
+// Contract sources verified for the #1086 partial-byte cleanup:
+//   - Asset.objectKey — "Object key (workspace-local) for the asset payload":
+//     src/data/asset-repo.ts:559-560; patchable via UpdateAssetInput.objectKey
+//     (src/data/asset-repo.ts UpdateAssetInput) and written by the pull route
+//   - The pull's key is `ingest/<assetId>`, set on the asset before the ingest
+//     job is created, and passed to the worker as PullParams.objectKey:
+//     src/routes/assets.ts POST /ingest-url; PullParams: src/pipeline/url-pull-worker.ts:93-106
+//   - The Job record has NO object-key field (hence the asset lookup):
+//     src/data/job-repo.ts
+//   - WorkspaceStorage.removeObject(localKey: string): Promise<void>:
+//     src/data/storage.ts:158-160
+//   - WorkspaceStorage.abortIncompleteMultipartUploads(localKey: string):
+//     Promise<number> (clears the staged parts of an upload killed mid-stream;
+//     bounded loop over findUploadId): src/data/storage.ts:260-272
+//   - The in-process cleanup this mirrors, and its best-effort/never-throw
+//     stance: discardOrphanedUpload + its terminal-failure call site,
+//     src/pipeline/url-pull-worker.ts (issue #1088)
+//   - The external-backend `s3://<bucket>/<key>` objectKey that must NEVER be
+//     deleted from here: src/routes/assets.ts POST /ingest-url sourceBackend branch
+//   - Per-stack storage resolution used by the sibling object-removing sweep
+//     (resolve the ambient stack's connections, build WorkspaceStorage from
+//     them, undefined when storage is not configured):
+//     src/main.ts `storageForBucket` for the archived-asset purge;
+//     WorkspaceConnections.storageFor: src/services/workspace-stack.ts:158;
+//     StorageFactory = () => WorkspaceStorage: src/routes/asset-upload.ts:65
 
-import type { AssetRepository } from '../data/asset-repo.js';
+import type { Asset, AssetRepository } from '../data/asset-repo.js';
 import type { Job, JobRepository } from '../data/job-repo.js';
 import {
   emitAudit,
@@ -141,6 +191,33 @@ export const INTERRUPTED_PULL_ERROR = 'pull interrupted by process restart';
 // died. Kept shorter than the job's INTERRUPTED_PULL_ERROR above because the
 // asset entry is a status annotation, not the job's terminal error message.
 export const INTERRUPTED_PULL_ASSET_REASON = 'pull interrupted';
+
+// An `objectKey` with this prefix names an object in a REGISTERED EXTERNAL
+// bucket, not in this deployment's object storage: POST /ingest-url's
+// `sourceBackend` branch records the source in place as `s3://<bucket>/<key>`
+// and pulls no bytes at all (src/routes/assets.ts). Those bytes belong to the
+// customer's own bucket and were never written by a pull, so cleanup skips them
+// — deleting a foreign object would destroy data this system does not own.
+// (Such a job is settled `done` inline and so is never an interrupted-pull
+// candidate in the first place; this is the belt-and-braces check that a
+// mis-shaped record cannot turn into a destructive call.)
+const EXTERNAL_OBJECT_KEY_PREFIX = 's3://';
+
+// The two storage operations the partial-byte cleanup needs (issue #1086).
+// Structural, and satisfied as-is by WorkspaceStorage
+// (src/data/storage.ts:158-160, :260-272), so no adapter is needed in
+// production; declared narrowly so a test can supply a stub without
+// constructing a MinIO client.
+export type InterruptedPullCleanupStorage = {
+  // Clear any multipart upload still open for the key, reclaiming its staged
+  // parts. This is the half that covers a transfer big enough to have gone
+  // multipart, whose bytes are NOT visible as an object.
+  abortIncompleteMultipartUploads(localKey: string): Promise<number>;
+  // Delete the object at the key. Covers the other half: a single-part write
+  // that landed truncated, or a completed object from an earlier attempt that
+  // the interrupted one was overwriting.
+  removeObject(localKey: string): Promise<void>;
+};
 
 // How many jobs to enumerate per list call. JobRepository.list() has no status or
 // type filter (src/data/job-repo.ts:276), so the walk pages over the job list and
@@ -184,6 +261,26 @@ export type ReconcileInterruptedIngestsDeps = {
   // caller) that only cares about the job record keeps the exact #1084
   // behaviour: omitted, no asset is read or written.
   assets?: AssetRepository;
+  // Object storage for the stack currently being scanned (issue #1086).
+  // Supplied, the partial bytes a dead pull left under the asset's `objectKey`
+  // are discarded once the job and asset are settled. A FACTORY, not an
+  // instance, for the same reason the sibling object-removing sweep resolves one
+  // per tick (src/main.ts `storageForBucket`): the scan runs once inside EACH
+  // provisioned stack's context (`stacks` below), so the storage handle has to
+  // be resolved INSIDE that context or the bytes would be deleted from the
+  // wrong stack's bucket. Called at most once per settled job, and only on the
+  // branch that actually settled one.
+  //
+  // May return undefined (or reject) when the scanned stack has no object
+  // storage — a bare local run, or an in-memory fallback. That is not an error:
+  // nothing was written there, so there is nothing to clean up, and the job and
+  // asset settles are unaffected. OPTIONAL overall, so a caller or test that
+  // only cares about the records keeps the exact pre-#1086 behaviour: omitted,
+  // no storage call is made.
+  storage?: () =>
+    | InterruptedPullCleanupStorage
+    | undefined
+    | Promise<InterruptedPullCleanupStorage | undefined>;
   // The liveness boundary in epoch ms. A `running` ingest-url job whose
   // `updatedAt` is strictly EARLIER than this is declared interrupted; one
   // stamped AT OR AFTER it is left untouched (it may be a live pull). Injectable
@@ -365,7 +462,18 @@ async function settleInterruptedIngestsInCurrentStack(
       // job's settle (already durable) intact.
       if (deps.assets) {
         try {
-          await settleAssetForInterruptedPull(deps, job, assetReason);
+          const settledAsset = await settleAssetForInterruptedPull(deps, job, assetReason);
+
+          // Issue #1086: the bytes. Only on the branch where the asset was
+          // STILL `uploading` and this pass moved it to `failed` — that is the
+          // proof the object under its key is a partial write and not a
+          // complete source something else is now using. Runs LAST, after both
+          // durable writes, and never throws (every storage error is logged
+          // inside), so a bucket that cannot be reached leaves the job and asset
+          // settled exactly as they are above.
+          if (settledAsset) {
+            await discardPartialPullBytes(deps, job, settledAsset);
+          }
         } catch (err) {
           // Best-effort, exactly like the per-job guard: the asset keeps today's
           // behaviour (stuck `uploading` until the 24h abandoned-upload sweep)
@@ -392,7 +500,11 @@ async function settleInterruptedIngestsInCurrentStack(
 }
 
 // Move an interrupted pull's asset `uploading -> failed` (issue #1085),
-// annotated with `assetReason`. Returns true only when it actually wrote.
+// annotated with `assetReason`. Returns the WRITTEN asset record, and undefined
+// on every branch that did not write — so the caller's partial-byte cleanup
+// (#1086) is driven by the one condition that proves the object is partial
+// ("this pass took the asset out of `uploading`"), and reads the key off the
+// post-write record rather than taking a second read.
 //
 // ONLY an asset still in `uploading` is touched — the acceptance criterion
 // "never overwrite an asset that has already moved on". That guard matters for
@@ -408,10 +520,10 @@ async function settleAssetForInterruptedPull(
   deps: ReconcileInterruptedIngestsDeps,
   job: Job,
   assetReason: string
-): Promise<boolean> {
+): Promise<Asset | undefined> {
   const assets = deps.assets;
   if (!assets) {
-    return false;
+    return undefined;
   }
 
   const asset = await assets.get(job.assetId);
@@ -423,13 +535,15 @@ async function settleAssetForInterruptedPull(
       job.id,
       job.assetId
     );
-    return false;
+    return undefined;
   }
   if (asset.status !== 'uploading') {
     // Already moved on (processing/ready/failed/archived) — leave it exactly as
     // it is, and never append a second history entry on top of someone else's
-    // state.
-    return false;
+    // state. Returning undefined also withholds the #1086 cleanup: an asset
+    // that has moved on may be serving a COMPLETE object under this key, which
+    // must not be deleted.
+    return undefined;
   }
 
   // `statusReason` rides on the SAME update() that changes `status`, so the
@@ -445,7 +559,7 @@ async function settleAssetForInterruptedPull(
       '[interrupted-ingest-reconciler] asset %s vanished before settle',
       job.assetId
     );
-    return false;
+    return undefined;
   }
 
   deps.logger?.info?.(
@@ -454,7 +568,124 @@ async function settleAssetForInterruptedPull(
     job.id,
     assetReason
   );
-  return true;
+  return updated;
+}
+
+// Discard the bytes an interrupted pull left behind (issue #1086): the staged
+// parts of a multipart upload killed mid-stream, and any object sitting at the
+// pull's key. Called ONLY after this pass settled both the job and the asset,
+// and ONLY for an asset this pass took out of `uploading` — see the caller.
+//
+// NEVER THROWS, by design and by #1086 acceptance ("cleanup failure must be
+// logged and must not block settling the job or asset"). Both durable writes are
+// already done when this runs, so there is nothing left for a thrown error to
+// protect; what it could do is make an unreachable bucket look like a failed
+// settle and leave the job `running` for another boot to find — reintroducing
+// the exact defect #1084 fixed. Each storage call is therefore guarded
+// SEPARATELY, so a failing multipart abort does not skip the object delete (and
+// vice versa): the two reclaim different bytes and neither depends on the other.
+//
+// Idempotent and safe to repeat: aborting with no open upload is a no-op that
+// returns 0 (src/data/storage.ts:260-272), and deleting an absent object is a
+// no-op on the backend's own delete semantics. The asset keeps its `objectKey`
+// either way, so a record whose bytes could not be reclaimed still names them.
+async function discardPartialPullBytes(
+  deps: ReconcileInterruptedIngestsDeps,
+  job: Job,
+  asset: Asset
+): Promise<void> {
+  if (!deps.storage) {
+    return; // cleanup not wired — pre-#1086 behaviour
+  }
+
+  const objectKey = asset.objectKey;
+  if (!objectKey) {
+    // No key was ever recorded, so no pull target is known. POST /ingest-url
+    // writes it before creating the job, so this is a pre-#1086-era or
+    // hand-made record; there is nothing safe to delete without a key, and
+    // guessing one is not an option.
+    deps.logger?.warn?.(
+      '[interrupted-ingest-reconciler] asset %s (job %s) has no objectKey; partial bytes (if any) not reclaimed',
+      asset.id,
+      job.id
+    );
+    return;
+  }
+  if (objectKey.toLowerCase().startsWith(EXTERNAL_OBJECT_KEY_PREFIX)) {
+    // A registered external backend's own object (see the prefix constant). We
+    // did not write it and we do not delete it.
+    deps.logger?.info?.(
+      '[interrupted-ingest-reconciler] asset %s (job %s) sources an external object (%s); nothing to reclaim here',
+      asset.id,
+      job.id,
+      objectKey
+    );
+    return;
+  }
+
+  let storage: InterruptedPullCleanupStorage | undefined;
+  try {
+    storage = await deps.storage();
+  } catch (err) {
+    // The stack's storage could not be resolved at all (connection build
+    // failure, or no object storage on this stack). Logged, not fatal.
+    deps.logger?.warn?.(
+      '[interrupted-ingest-reconciler] could not resolve storage to reclaim %s (job %s): %o',
+      objectKey,
+      job.id,
+      err
+    );
+    return;
+  }
+  if (!storage) {
+    // No object storage on the scanned stack (bare local run / in-memory
+    // fallback) — no bytes were ever written there, so there is nothing to
+    // reclaim and this is not worth a warning.
+    return;
+  }
+
+  // The multipart half first: a pull large enough to have gone multipart leaves
+  // staged parts that are NOT reachable as an object, so the delete below would
+  // never find them. Mirrors the in-process worker's terminal-failure cleanup
+  // (src/pipeline/url-pull-worker.ts discardOrphanedUpload, issue #1088).
+  try {
+    const aborted = await storage.abortIncompleteMultipartUploads(objectKey);
+    if (aborted > 0) {
+      deps.logger?.info?.(
+        '[interrupted-ingest-reconciler] discarded %d incomplete multipart upload(s) for %s (job %s)',
+        aborted,
+        objectKey,
+        job.id
+      );
+    }
+  } catch (err) {
+    deps.logger?.warn?.(
+      '[interrupted-ingest-reconciler] failed to discard incomplete multipart upload(s) for %s (job %s): %o',
+      objectKey,
+      job.id,
+      err
+    );
+  }
+
+  // The object half: a single-part write that landed truncated, or whatever an
+  // earlier attempt had completed at this key before the process died.
+  try {
+    await storage.removeObject(objectKey);
+    deps.logger?.info?.(
+      '[interrupted-ingest-reconciler] deleted partial object %s left by interrupted pull (job %s, asset %s)',
+      objectKey,
+      job.id,
+      asset.id
+    );
+  } catch (err) {
+    deps.logger?.warn?.(
+      '[interrupted-ingest-reconciler] failed to delete partial object %s (job %s, asset %s): %o',
+      objectKey,
+      job.id,
+      asset.id,
+      err
+    );
+  }
 }
 
 // True when the job's `updatedAt` is strictly earlier than the boundary. An

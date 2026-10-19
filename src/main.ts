@@ -37,6 +37,7 @@ import {
   type SecretStore
 } from './services/storage-backend-registry.js';
 import { PACKAGER_SERVICE_ID } from './services/stack.js';
+import { resolveScalerBootConfig } from './services/scaler-boot-config.js';
 import { assetsRouter } from './routes/assets.js';
 import { assetUploadRouter, type StorageFactory } from './routes/asset-upload.js';
 import { jobsRouter } from './routes/jobs.js';
@@ -59,8 +60,12 @@ import {
   type StorageQuotaStore
 } from './data/storage-quota.js';
 import { StorageQuotaReconciler } from './data/storage-quota-reconcile.js';
+import {
+  makePerStackQuotaSum,
+  PerStackQuotaSumIncomplete
+} from './data/storage-quota-stack-sum.js';
 import { makeS3Reader } from './pipeline/source.js';
-import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE, type WorkspaceConnections } from './services/workspace-stack.js';
+import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE, stackResolvedMinioEndpoint, type WorkspaceConnections } from './services/workspace-stack.js';
 import {
   makeRequestScopedStorageFactory,
   requestStackNameFromHeaders,
@@ -72,6 +77,7 @@ import {
   currentDocumentStackName,
   PERSISTED_STACK_FALLBACK_MESSAGE
 } from './services/request-stack-context.js';
+import { forEachStack, perStackSweepRunner } from './services/for-each-stack.js';
 import { reconcileWatchFolders } from './services/watch-folder-wiring.js';
 import { makePostUploadThumbnailTrigger } from './services/post-upload-thumbnail.js';
 import { ResolverHealthSignal } from './services/resolver-health.js';
@@ -163,6 +169,10 @@ import { healthRouter } from './routes/health.js';
 import { resolveBuildInfo } from './build-info.js';
 import { startEncoreCallbackPoller, type PollerDeps } from './pipeline/encore-callback-poller.js';
 import {
+  RemovedStackQueues,
+  StackCallbackPollerRegistry
+} from './pipeline/stack-callback-poller-registry.js';
+import {
   reconcileFailedTranscodes,
   settleFailedTranscode
 } from './pipeline/failed-transcode-reconciler.js';
@@ -178,10 +188,11 @@ import {
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
 import {
   resolvePublicBaseUrl,
-  resolveEncoreProfilesUrl,
+  resolveEncoreProfilesUrlWithOrigin,
   resolveEncoreProfilesUrlFromParamStore,
   stackScopedProfilesIndexUrl
 } from './services/public-base-url.js';
+import { makeStackScopedProfileIndexPublisher } from './services/profile-index-publisher.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
 import { Client as MinioClient } from 'minio';
@@ -641,6 +652,23 @@ await app.register(provisionRouter, {
       indexUrl: encoreProfilesUrl,
       log: app.log
     }).then(() => undefined),
+  // Release the background work bound to a stack's Valkey before that Valkey is
+  // removed (#1213). Declared below (stopCallbackPollersForStack); the route
+  // only calls this at teardown time, long after the binding initialises.
+  onStackTeardownStart: (name) => stopCallbackPollersForStack(name),
+  // Remember what a teardown that KEPT the stored config established about the
+  // stack's Valkey (#1213), so the reconcile that follows does not re-arm a
+  // poller against a store that teardown already removed. Declared below
+  // (removedStackQueues); only invoked at request time.
+  onStackQueuePresence: (name, present) => {
+    if (!removedStackQueues.record(name, present)) return;
+    app.log.info(
+      { stackKey: name, queuePresent: present },
+      present
+        ? 'encore-callback-poller: stack Valkey reported present again; it may be polled'
+        : 'encore-callback-poller: stack Valkey reported removed; not polling it until the stack is gone'
+    );
+  },
   // Late-bound accessor for the scaler registry. scalerRegistry is a
   // module-level binding created lazily by reconcileScaler() only once a stack
   // exists (and reset to undefined on the last deprovision), which is *after*
@@ -940,7 +968,47 @@ const clipRunner = storageAvailable
 // cap the pool at a single instance (equivalent to the previous static behaviour).
 // Requires a Redis connection (resolved from the parameter store after provisioning).
 // When Redis is unavailable transcoding degrades to 501.
-const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 10);
+const encoreMaxInstancesFromEnv = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 10);
+const encoreMinInstancesFromEnv = parseInt(process.env['ENCORE_MIN_INSTANCES'] || '0', 10);
+const encoreIdleTimeoutMsFromEnv = parseInt(
+  process.env['ENCORE_IDLE_TIMEOUT_MS'] || String(5 * 60 * 1000),
+  10
+);
+
+// Boot-time restore of an operator's persisted scaler config (issue #1078).
+//
+// The env values above are the FALLBACK, not the winner. A PATCH
+// /api/v1/scaler/config has been written durably since #1077, but nothing read
+// it back, so every restart silently reverted an operator's cap to
+// ENCORE_MAX_INSTANCES. Boot now loads the stored snapshot first and the
+// resolved values feed BOTH the scaler registry/loops (below) and the config
+// endpoint (scalerRouterOptions), so GET /api/v1/scaler/config and the effective
+// instance cap cannot disagree.
+//
+// Contract sources verified (CLAUDE.md rule 7):
+//   - services/param-store.ts `makeScalerConfigStore(kv)` /
+//     `ScalerConfigStore.load(): Promise<ScalerRuntimeConfig | undefined>` and
+//     `SCALER_CONFIG_KEY` ('openvideocore/scalerconfig') — the complete
+//     {maxInstances,minInstances,idleTimeoutMs} snapshot PATCH persists.
+//   - services/scaler-boot-config.ts `resolveScalerBootConfig` — precedence,
+//     the never-reject fallback contract and the logged fallback reasons.
+//   - `backendKvStore` (configKvStoreFromEnv, above) is the same KV handle the
+//     PATCH route writes through, so read and write cannot diverge on key, auth
+//     or instance.
+// Undefined store (parameter store unconfigured) => env values, and PATCH
+// answers 501, so there is nothing persisted to miss.
+const scalerBootConfig = await resolveScalerBootConfig({
+  env: {
+    maxInstances: encoreMaxInstancesFromEnv,
+    minInstances: encoreMinInstancesFromEnv,
+    idleTimeoutMs: encoreIdleTimeoutMsFromEnv
+  },
+  store: backendKvStore ? makeScalerConfigStore(backendKvStore) : undefined,
+  log: app.log
+});
+const encoreMaxInstances = scalerBootConfig.maxInstances;
+const encoreMinInstances = scalerBootConfig.minInstances;
+const encoreIdleTimeoutMs = scalerBootConfig.idleTimeoutMs;
 // Optional operator-configured job-throughput cap (issue #580, ADR-020). Caps the
 // number of OUTSTANDING transcode/package jobs (pending in the scaler queue +
 // being dispatched) the deployment will admit at once; an over-limit submission
@@ -950,14 +1018,31 @@ const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 
 // cost) — it reuses the scaler's own Valkey queue state, NOT a second counter.
 // Unset/0/invalid => no cap (opt-in; submission behaviour unchanged).
 const encoreMaxQueuedJobs = resolveJobThroughputCap(process.env);
-const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] || String(5 * 60 * 1000), 10);
 // Bounded wait (issue #463) for the outbound TLS-trust probe to a freshly
 // spawned instance's per-instance callback-listener ingress before that instance
 // is eligible for its FIRST job. Closes the race between the ingress certificate
 // becoming ready/trusted and the instance beginning to process (and fail) its
 // first job. On timeout the instance is quarantined from job assignment rather
 // than dispatched to. Defaults to 60s; override via ENCORE_CALLBACK_TRUST_TIMEOUT_MS.
-const encoreCallbackTrustTimeoutMs = parseInt(process.env['ENCORE_CALLBACK_TRUST_TIMEOUT_MS'] || String(60 * 1000), 10);
+//
+// VALIDATED, not just parsed (#1171 review finding C). Both of these timeouts
+// end up inside `AbortSignal.timeout(...)` via probeCallbackTrust's
+// `Math.min(timeoutMs, requestTimeoutMs)`, and `AbortSignal.timeout(NaN)`
+// throws a RangeError on node 22 (verified by the reviewer) — which would make
+// every probe throw out of the tick and halt the pool. `parseInt` happily
+// returns NaN for a malformed value and NaN survives a `?? default` check, so
+// these go through parsePositiveMsEnv (defined above), which rejects
+// NaN/zero/negative values, warns at boot, and falls back to the default here.
+const encoreCallbackTrustTimeoutMs =
+  parsePositiveMsEnv('ENCORE_CALLBACK_TRUST_TIMEOUT_MS') ?? 60 * 1000;
+// Per-REQUEST bound (issue #1171) for ONE callback-trust probe request, as
+// opposed to the cross-tick bounded wait above. The wait value used to double as
+// the request timeout, so a hung probe held a tick — and instance readiness and
+// job assignment with it — for a full minute. A handshake plus a HEAD against a
+// live per-instance ingress completes in well under a second.
+// Defaults to 5s; override via ENCORE_CALLBACK_PROBE_TIMEOUT_MS.
+const encoreCallbackProbeTimeoutMs =
+  parsePositiveMsEnv('ENCORE_CALLBACK_PROBE_TIMEOUT_MS') ?? 5 * 1000;
 // Grace window (issue #708) for the reconcile loop's dropped-job diff. reconcile
 // can diff Encore's active set AFTER Encore drops a finished job but BEFORE the
 // callback poller has decremented the tracked activeJobs count (observed ~4.4s
@@ -1021,6 +1106,16 @@ let auditRetentionMs = auditRetentionMsFromEnv();
 // the other two windows are.
 let logRetentionMs = logRetentionMsFromEnv();
 
+// Shared logger for every background sweep that runs once per provisioned stack
+// (issue #1098). Mirrors the varargs-collapsing wrappers the sweep loops already
+// take (`info: (...a) => app.log.info(a)`), so a per-stack failure is logged
+// exactly like the rest of a tick's output.
+const sweepLogger = {
+  info: (...a: unknown[]) => app.log.info(a),
+  warn: (...a: unknown[]) => app.log.warn(a),
+  error: (...a: unknown[]) => app.log.error(a)
+};
+
 // The default Encore profile index used to seed the profile store on first
 // startup / on bootstrap. Same URL + default as before (issue #84).
 const encoreProfilesUrl =
@@ -1040,14 +1135,98 @@ const encoreProfilesUrl =
 // Encore at the local profile store; #283 confirmed OSC exposes no runtime self-URL,
 // so an explicit value is the only lever.
 const publicBaseUrl = resolvePublicBaseUrl();
-// Tier 3 (issue #315): resolve an operator-supplied full profiles-index URL from
+
+// ADR-026 D1/D2 (issue #1207): publish the profile index into the DEDICATED
+// `openvideocore-profiles` bucket and make that bucket's index.yml the PRIMARY
+// profilesUrl. The object store's reachability is a property this app configures
+// itself (the anonymous-read GetObject policy, ADR-026 D3/C6) and can read back,
+// whereas the derived app path depends on an orchestrator-level auth-gate
+// exemption no OSC contract can set, read, or assert (ADR-026 C3) — the standing
+// wager behind the customer-observed 401 on /api/v1/profiles/index.yml.
+//
+// Reuses the hardened in-cluster seam (ADR-026 C7): the resolver is opt-out
+// (ENCORE_S3_INTERNAL_ENDPOINT=off), PROBED before use and fail-soft back to the
+// stack's stored public endpoint, so the preferred
+// http://<service>.minio-minio.svc.cluster.local:8080 form (which matches the
+// `routing: INTERNAL` OSC itself models for Encore -> object store, C2) is used
+// only when it is actually reachable.
+//
+// Fail-soft end to end: `publishProfileIndex` never throws, and tier 2 is only
+// offered to the resolver on `ok: true`. A deployment with no provisioned object
+// store (env-override/in-memory), or a stack provisioned before this change and
+// therefore without the bucket (which stack provisioning creates — issue #1208),
+// resolves exactly as it did before ADR-026.
+const profilesObjectStoreSettings = resolveInternalEndpointSettings(process.env);
+const resolveProfilesObjectStoreEndpoint = makeInternalEndpointResolver({
+  enabled: profilesObjectStoreSettings.enabled,
+  lookup: makeOscInternalEndpointLookup({ oscContext, log: app.log }),
+  port: profilesObjectStoreSettings.port,
+  probeTimeoutMs: profilesObjectStoreSettings.probeTimeoutMs,
+  log: app.log
+});
+// SINGLE-SCOPED by construction (issue #1207 review, BLOCKING 1). `stackName` is
+// the ONE stack this publish reads from and writes to: it keys BOTH
+// `stackResolver.resolve()` (which selects the object store the bytes land in,
+// services/workspace-stack.ts `resolve(stackName?)`, cache key `stackName ?? ''`)
+// AND the profile list that is rendered into the index
+// (`connections.profiles.list()`).
+//
+// It deliberately does NOT read profiles through the ambient
+// `profileRepository`: `PerWorkspaceProfileRepository` resolves per call via
+// `currentRequestStackName()` (src/data/per-workspace-repos.ts), and because
+// `onProfilesChanged` fires synchronously inside a mutation handler the
+// `void`-detached publish INHERITS that request's AsyncLocalStorage store
+// (services/request-stack-context.ts). Mixing the two scopes meant a
+// `PUT /api/v1/profiles/:name` with `X-Stack-Name: stack-b` rendered stack-b's
+// profiles and wrote them into the DEFAULT stack's `openvideocore-profiles`
+// bucket — clobbering the index Encore fetches and exposing another workspace's
+// profile YAML under D3's anonymous-read policy. Passing one name through both
+// sides makes that unrepresentable.
+//
+// Scope chosen: PER-STACK (the mutated stack publishes into its OWN stack's
+// bucket). ADR-026 §4 costs the design as "one more provisioning step and one
+// more bucket PER STACK", the bucket is provisioned and torn down with the stack
+// (#1208), and the scaler already points each stack's Encore at that stack's own
+// index (`resolveProfilesUrl` / `stackScopedProfilesIndexUrl`, issue #1164). So
+// a mutation on stack-b must refresh stack-b's bucket, not the default's.
+const publishProfileIndexToObjectStore = makeStackScopedProfileIndexPublisher({
+  log: app.log,
+  // ONE `stackResolver.resolve(stackName)` produces the write target AND the
+  // read source, so the two can never name different stacks.
+  resolveTarget: async (stackName) => {
+    const connections = await stackResolver.resolve(stackName);
+    return {
+      storageClient: connections.storageClient,
+      // The stack's stored PUBLIC object-store endpoint (StackConfig.minioEndpoint).
+      // `stackResolvedMinioEndpoint` deliberately returns undefined for the
+      // env-override and in-memory paths, which is precisely the
+      // "no provisioned object store" case ADR-026 D2 reason 1 keeps on the
+      // fallback tiers.
+      objectStoreEndpoint: stackResolvedMinioEndpoint(connections),
+      resolveEndpoint: (publicEndpoint: string) =>
+        resolveProfilesObjectStoreEndpoint(publicEndpoint, connections.s3Config?.stackName),
+      // Same resolution as the write target above — the profile store that
+      // belongs to `stackName`, never the ambient request-scoped repository.
+      listProfiles: () => connections.profiles.list()
+    };
+  }
+});
+// Boot-time publish: explicitly the DEFAULT stack (no ambient request exists
+// here), because the URL it returns seeds the process-global `profilesUrl` the
+// resolver below computes.
+const publishedProfilesIndex = await publishProfileIndexToObjectStore(undefined);
+const publishedProfilesIndexUrl = publishedProfilesIndex.ok
+  ? publishedProfilesIndex.indexUrl
+  : undefined;
+
+// Tier 4 (issue #315): resolve an operator-supplied full profiles-index URL from
 // the provisioned stack record at boot, where the parameter store is already
 // awaited (see paramStore above). Undefined when there is no store, no stack, or
 // the field is unset — in which case resolveEncoreProfilesUrl falls through to
 // the remote default, byte-identical to pre-#315 behaviour.
 const paramStoreProfilesUrl =
-  publicBaseUrl || process.env['ENCORE_PROFILES_URL_OVERRIDE']
-    ? undefined // env-var seams (tier 1/2) win; skip the param-store read entirely
+  publishedProfilesIndexUrl || publicBaseUrl || process.env['ENCORE_PROFILES_URL_OVERRIDE']
+    ? undefined // a higher tier (override / published object-store index / app path) wins; skip the param-store read entirely
     : await resolveEncoreProfilesUrlFromParamStore({
         paramStore,
         namespace: STACK_CONFIG_NAMESPACE,
@@ -1057,15 +1236,24 @@ const paramStoreProfilesUrl =
             'profiles URL: failed to resolve from parameter store; falling back to remote default index'
           )
       });
-const encoreScalerProfilesUrl = resolveEncoreProfilesUrl(
+const resolvedProfilesUrl = resolveEncoreProfilesUrlWithOrigin(
   encoreProfilesUrl,
-  paramStoreProfilesUrl
+  paramStoreProfilesUrl,
+  publishedProfilesIndexUrl
 );
-if (
-  !publicBaseUrl &&
-  !process.env['ENCORE_PROFILES_URL_OVERRIDE'] &&
-  !paramStoreProfilesUrl
-) {
+const encoreScalerProfilesUrl = resolvedProfilesUrl.url;
+// Log the RESOLVED TIER and URL (ADR-026 §4, the five-tier-resolver trade-off):
+// with a fifth tier an operator must be able to read, from one line, which
+// origin Encore will actually fetch.
+app.log.info(
+  {
+    profilesUrl: encoreScalerProfilesUrl,
+    origin: resolvedProfilesUrl.origin,
+    publishOutcome: publishedProfilesIndex.ok ? 'published' : publishedProfilesIndex.reason
+  },
+  'Encore profilesUrl resolved (ADR-026 tier order: override -> published object-store index -> app path -> parameter store -> remote default)'
+);
+if (resolvedProfilesUrl.origin === 'remote-default') {
   app.log.warn('profiles URL unresolved to local store (neither PUBLIC_BASE_URL nor ENCORE_PROFILES_URL_OVERRIDE set, no parameter-store value / no OSC-derived app URL) — Encore instances will fetch profiles from the remote default index instead of the local profile store');
 }
 
@@ -1092,8 +1280,20 @@ let stopEncoreCallbackPoller: (() => void) | undefined;
 let callbackPollerOptions: Omit<PollerDeps, 'redis'> | undefined;
 let activationConnectionId: string | undefined;
 // Callback pollers for every stack Valkey other than the activation one, keyed
-// by connectionId. See syncStackCallbackPollers.
-const stackCallbackPollers = new Map<string, () => void>();
+// by connectionId and tracking which stacks each one serves (#1213). See
+// syncStackCallbackPollers and stopCallbackPollersForStack.
+const stackCallbackPollers = new StackCallbackPollerRegistry();
+// Stacks a teardown reported as having lost their Valkey while their stored
+// config survives (#1213). Fed by the DELETE route's onStackQueuePresence hook
+// and consulted by syncStackCallbackPollers, which refuses to arm a poller
+// against a store a teardown has already removed.
+const removedStackQueues = new RemovedStackQueues();
+// The stack whose Valkey the activation poller (stopEncoreCallbackPoller) is
+// bound to, when that connection is a stack's OWN store (#1213). Set by
+// syncStackCallbackPollers, which is the only place a stack is matched to the
+// activation connectionId; undefined on a single-Valkey env-override
+// deployment, where no stack owns the connection.
+let activationPollerStackKey: string | undefined;
 
 // The Valkey a stack's scaler state lives on. Since #615 each provisioned stack
 // has its own Valkey and its scaler loop, the callback listeners paired with its
@@ -1123,6 +1323,24 @@ async function stackRedisForAmbientStack(): Promise<IORedis | undefined> {
 // so a static default is correct for every workspace.
 const sourceBucket = process.env['MINIO_SOURCE_BUCKET'] ?? 'openvideocore-source';
 const outputBucket = process.env['MINIO_PACKAGED_BUCKET'] ?? 'openvideocore-packaged';
+
+// #1226: object storage for the transcode OUTPUT bucket of the stack the caller
+// is currently running inside. Both transcode-completion paths (the callback
+// poller and POST /api/v1/internal/encore-callback) hand this to
+// completeTranscode, which invokes it ONLY when a completion arrives for a job
+// the user already CANCELLED — the output of the stopped run is then reclaimed
+// so the job record (`cancelled`), its renditionCount (0) and the files in the
+// bucket agree. `resolve()` (not `resolveCached`) so it also warms the entry on
+// the poller path, which re-enters the job's PERSISTED stack rather than a
+// request-warmed one; `conns.packagedBucket` is the stack's own output bucket,
+// the same value the transcode submit paths resolve for `outputBucket`
+// (src/routes/assets.ts). Returns undefined when the stack has no object
+// storage, in which case the discard is still recorded durably on the job.
+const resolveTranscodeOutputStorage = async (): Promise<WorkspaceStorage | undefined> => {
+  const conns = await stackResolver.resolve(currentRequestStackName());
+  if (!conns.storageClient) return undefined;
+  return new WorkspaceStorage(conns.storageClient, conns.packagedBucket);
+};
 
 // S3 reader for URL-pull ingest of s3:// sources (issue #5). This reads the
 // source object via a MinIO client. With per-workspace stacks the worker runs
@@ -1309,7 +1527,12 @@ function activateScaler(redisUrl: string): void {
       if (!paramStore) return [];
       return paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
     },
-    minInstances: parseInt(process.env['ENCORE_MIN_INSTANCES'] || '0', 10),
+    // Warm floor. Resolved at boot (#1078): a persisted minInstances from a
+    // previous PATCH wins over ENCORE_MIN_INSTANCES, which stays the value for a
+    // deployment never configured through the API. This is the floor the loops
+    // actually enforce, so a restored config reaches the live loops rather than
+    // only being echoed by GET /scaler/config.
+    minInstances: encoreMinInstances,
     oscContext,
     maxInstances: encoreMaxInstances,
     // Optional opt-in job-throughput cap (issue #580, ADR-020). Forwarded to
@@ -1320,6 +1543,8 @@ function activateScaler(redisUrl: string): void {
     // Gate first-job dispatch on confirmed outbound callback-listener TLS trust
     // (issue #463): bounded wait before a freshly spawned instance is eligible.
     callbackTrustTimeoutMs: encoreCallbackTrustTimeoutMs,
+    // Per-request bound for a single probe request (issue #1171).
+    callbackProbeRequestTimeoutMs: encoreCallbackProbeTimeoutMs,
     // Grace window for reconcile's dropped-job diff (issue #708): skip jobs the
     // callback poller recorded completing (keys.jobCompletionSeen) within this
     // window rather than re-raising them as silently dropped.
@@ -1446,6 +1671,10 @@ function activateScaler(redisUrl: string): void {
       // sweeps once inside EACH provisioned stack's context instead. With no
       // parameter store (env override / bare local run) the list is empty and the
       // single default resolution runs, byte-identical to before.
+      //
+      // #1098: the inline per-stack loop this used to carry is now the shared
+      // `forEachStack` helper, which the four retention/quota sweeps below use
+      // too — one mechanism, and it adds per-stack failure isolation here.
       const runSweepsForCurrentStack = async (): Promise<void> => {
         await reconcileFailedTranscodes({
           jobs: jobRepository,
@@ -1493,12 +1722,10 @@ function activateScaler(redisUrl: string): void {
           }
         });
       };
-      const stackNames = await stackResolver.listStackNames();
-      const stackContexts: Array<string | undefined> =
-        stackNames.length > 0 ? stackNames : [undefined];
-      for (const stackContext of stackContexts) {
-        await runWithRequestStack(stackContext, runSweepsForCurrentStack);
-      }
+      await forEachStack(
+        { resolver: stackResolver, label: 'encore-reconcile', logger: sweepLogger },
+        runSweepsForCurrentStack
+      );
     },
     // When the scaler's reconcile() detects that tracked jobs have silently
     // vanished from an Encore instance's live QUEUED/IN_PROGRESS set with no
@@ -2032,6 +2259,12 @@ function activateScaler(redisUrl: string): void {
     // store GET /api/v1/logs reads (`logStore` above, durable since #996), so a transcode
     // that settles through this poller shows up in the Logs tab.
     pipelineLog: logStore,
+    // #1226: object storage for the output bucket of the stack a completion
+    // belongs to, used only when the completion arrives for a CANCELLED job so
+    // the stopped run's output is reclaimed instead of left orphaned in the
+    // bucket. Same closure the internal callback route gets, so both
+    // transcode-completion paths apply the identical rule.
+    resolveTranscodeOutputStorage,
     logger: app.log
   };
   stopEncoreCallbackPoller = startEncoreCallbackPoller({ redis, ...callbackPollerOptions });
@@ -2078,8 +2311,12 @@ async function deactivateScaler(): Promise<void> {
 
   stopEncoreCallbackPoller?.();
   stopEncoreCallbackPoller = undefined;
-  for (const stop of stackCallbackPollers.values()) stop();
-  stackCallbackPollers.clear();
+  activationPollerStackKey = undefined;
+  stackCallbackPollers.stopAll();
+  // No stack is being polled any more, so the per-stack "its Valkey is gone"
+  // records have nothing to gate (#1213). A later activation re-enumerates from
+  // the parameter store and starts clean.
+  removedStackQueues.clear();
   callbackPollerOptions = undefined;
   activationConnectionId = undefined;
 
@@ -2175,23 +2412,119 @@ function inScalerStack<T>(stackKey: string | undefined, fn: () => Promise<T>): P
 // stack that was just provisioned is not missed for its lifetime.
 async function syncStackCallbackPollers(): Promise<void> {
   if (!scalerRegistry || !sharedRedis || !callbackPollerOptions) return;
-  const live = new Set<string>();
+  const options = callbackPollerOptions;
+  const connections: Array<{ stackKey: string; connectionId: string }> = [];
+  // The connection object each poller must drain, by connectionId. Always the
+  // identical client the stack's scaler loop uses (resolveStackRedis), never a
+  // second socket to the same store.
+  const redisByConnection = new Map<string, IORedis>();
+  // Which stack OWNS the activation Valkey, if any (#1213). Recomputed on every
+  // sync from the same enumeration, so a stack whose own store is the
+  // activation connection can have its poller stopped at teardown time instead
+  // of polling a removed Valkey until the next reconcile.
+  activationPollerStackKey = undefined;
+  const listedStackKeys: string[] = [];
   for (const connection of await scalerRegistry.listStackConnections({ fresh: true })) {
     const { connectionId, redis, stackKey } = connection;
-    if (!connectionId || !redis || connectionId === activationConnectionId) continue;
-    live.add(connectionId);
-    if (stackCallbackPollers.has(connectionId)) continue;
-    stackCallbackPollers.set(
-      connectionId,
-      startEncoreCallbackPoller({ ...callbackPollerOptions, redis })
-    );
-    app.log.info({ stackKey, connectionId }, 'encore-callback-poller: started for stack Valkey');
+    listedStackKeys.push(stackKey);
+    if (!connectionId || !redis) continue;
+    // #1213: a stack whose Valkey a teardown already removed is NOT pollable,
+    // however healthy its stored config still looks. The config is kept on the
+    // failed-teardown path precisely so the DELETE can be retried, and
+    // TEARDOWN_ORDER removes the queue second, so `redis` here can be a
+    // connection to a store that is gone — arming a poller on it would re-create
+    // the once-a-second ECONNREFUSED loop this issue is about, against a Valkey
+    // the same process just removed. Skipped entirely: no poller, and no claim
+    // on the activation connection either, so a live stack sharing that store
+    // owns it instead. The record is dropped (below) as soon as the stack stops
+    // being enumerated, or when a later run reports the queue present again.
+    if (removedStackQueues.isRemoved(stackKey)) continue;
+    if (connectionId === activationConnectionId) {
+      // Only a real stack can OWN this connection. The fixed DEPLOYMENT_CONTEXT
+      // ('default', src/auth/workspace.ts) also resolves to it — it is the
+      // fallback identity of a single-Valkey env-override deployment, not a
+      // provisioned stack — and must never claim it, or a DELETE of the stack
+      // that genuinely owns the store would not stop this poller. First real
+      // stack wins; a second stack on the same store is the shared-Valkey case,
+      // where the owner is whichever one was enumerated first.
+      if (stackKey !== DEPLOYMENT_CONTEXT && activationPollerStackKey === undefined) {
+        activationPollerStackKey = stackKey;
+      }
+      // #1213: re-arm the activation poller when it was stopped for a teardown
+      // that then left this Valkey IN PLACE — a teardown whose Valkey removal
+      // itself failed, or one that failed before reaching it. Without this the
+      // deployment would stay active with nothing draining its completions
+      // until a restart. Reaching this line already means the store survived:
+      // the removedStackQueues gate above skipped the stack otherwise.
+      if (!stopEncoreCallbackPoller) {
+        stopEncoreCallbackPoller = startEncoreCallbackPoller({ ...options, redis });
+        app.log.info(
+          { stackKey, connectionId },
+          'encore-callback-poller: re-started for the activation stack Valkey'
+        );
+      }
+      continue;
+    }
+    connections.push({ stackKey, connectionId });
+    redisByConnection.set(connectionId, redis);
   }
-  for (const [connectionId, stop] of stackCallbackPollers) {
-    if (live.has(connectionId)) continue;
-    stop();
-    stackCallbackPollers.delete(connectionId);
+  const { started, stopped } = stackCallbackPollers.sync(connections, (connection) =>
+    startEncoreCallbackPoller({
+      ...options,
+      redis: redisByConnection.get(connection.connectionId)!
+    })
+  );
+  for (const connectionId of started) {
+    app.log.info({ connectionId }, 'encore-callback-poller: started for stack Valkey');
+  }
+  for (const connectionId of stopped) {
     app.log.info({ connectionId }, 'encore-callback-poller: stopped for stack Valkey');
+  }
+  // A stack that is no longer enumerated has had its stored config deleted —
+  // the retry finished the teardown — so the "its Valkey is gone" record has
+  // nothing left to protect and must not outlive the name (#1213).
+  for (const stackKey of removedStackQueues.forgetUnlisted(listedStackKeys)) {
+    app.log.info(
+      { stackKey },
+      'encore-callback-poller: forgot the removed-Valkey record for a stack that is gone'
+    );
+  }
+}
+
+// Stop the callback pollers bound to a stack's Valkey BEFORE that Valkey is
+// removed (#1213).
+//
+// Wired to the provision router's onStackTeardownStart hook, so it runs at the
+// start of DELETE /api/v1/provision/:name — ahead of the scaler teardown and
+// of every instance removal. Previously the only thing that stopped a stack's
+// poller was the reconcile at the END of a SUCCESSFUL teardown, so from the
+// moment the stack's Valkey instance was removed the poller's dedicated
+// blocking connection retried it about once a second with ECONNREFUSED, and a
+// teardown that reported failures (which never reaches that reconcile) left it
+// retrying for the lifetime of the process.
+//
+// Stops are exact: a per-stack poller is released only when this stack was the
+// last one using its connection (StackCallbackPollerRegistry.stopForStack), and
+// the activation poller only when this stack is the one whose own store that
+// connection is. Both stop functions are idempotent, and the reconcile that
+// follows the teardown re-arms whatever is still needed.
+function stopCallbackPollersForStack(stackName: string): void {
+  for (const connectionId of stackCallbackPollers.stopForStack(stackName)) {
+    app.log.info(
+      { stackKey: stackName, connectionId },
+      'encore-callback-poller: stopped for a stack being torn down'
+    );
+  }
+  if (stopEncoreCallbackPoller && activationPollerStackKey === stackName) {
+    stopEncoreCallbackPoller();
+    stopEncoreCallbackPoller = undefined;
+    // Drop the ownership claim with the poller: the next sync re-establishes it
+    // (and re-arms the poller) only if this Valkey is still there.
+    activationPollerStackKey = undefined;
+    app.log.info(
+      { stackKey: stackName, connectionId: activationConnectionId },
+      'encore-callback-poller: stopped for the activation stack being torn down'
+    );
   }
 }
 
@@ -2225,7 +2558,27 @@ async function reconcileScaler(): Promise<void> {
 await app.register(profilesRouter, {
   prefix: '/api/v1/profiles',
   repository: profileRepository,
-  bootstrapIndexUrl: encoreProfilesUrl
+  bootstrapIndexUrl: encoreProfilesUrl,
+  // ADR-026 §4 mitigation: with the index published as objects, a profile edit
+  // is no longer instantaneously visible to Encore, so EVERY mutation
+  // (create/update/delete/bootstrap) republishes. Fire-and-forget and fail-soft:
+  // a publish failure must never change the profiles HTTP contract (ADR-026 §6),
+  // and Encore instances read `profilesUrl` at startup, so the requirement is
+  // only that a publish completes before the next spawn — not that it is
+  // synchronous with the edit.
+  //
+  // The stack the mutation actually landed on is captured SYNCHRONOUSLY here,
+  // while the handler's AsyncLocalStorage store is still the current one, and
+  // passed explicitly into the detached publish (issue #1207 review, BLOCKING
+  // 1). `currentRequestStackName()` is exactly the key
+  // `PerWorkspaceProfileRepository` just resolved the mutation on
+  // (src/data/per-workspace-repos.ts), so the republish reads and writes the
+  // SAME stack the edit changed — never a mix of stack-b's profiles into the
+  // default stack's bucket.
+  onProfilesChanged: () => {
+    const mutatedStackName = currentRequestStackName();
+    void publishProfileIndexToObjectStore(mutatedStackName);
+  }
 });
 
 // Seed profiles from the default Encore index on first startup. Skipped when
@@ -2254,6 +2607,17 @@ await bootstrapProfiles({
   indexUrl: encoreProfilesUrl,
   log: app.log
 }).catch((err) => app.log.warn({ err }, 'profile bootstrap on startup failed'));
+
+// Republish the object-store index now that the store is seeded (ADR-026 D1).
+// The first publish above ran before bootstrap (it has to: its URL is the input
+// to the resolver), so on a first boot it published an empty index. AWAITED for
+// the same ordering reason bootstrapProfiles is: it must complete before
+// reconcileScaler() can spawn an Encore instance that fetches the published
+// index. Fail-soft — `publishProfileIndex` never throws, and a failure leaves
+// Encore on whichever tier the resolver already chose. Explicitly the DEFAULT
+// scope, like the boot publish above: `bootstrapProfiles` seeded the default
+// stack's store (there is no request in flight at boot).
+await publishProfileIndexToObjectStore(undefined);
 
 // Assets router also owns POST /ingest-url (issue #5) and POST /:id/transcode
 // (issue #8). It shares the same job repository so a job created here is
@@ -2416,7 +2780,10 @@ const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: st
   listStackNames: () => stackResolver.listStackNames(),
   // Operational log record for the transcode terminal-state callback (issue
   // #995). Same store GET /api/v1/logs reads (`logStore` above).
-  pipelineLog: logStore
+  pipelineLog: logStore,
+  // #1226: reclaim the output of a run cancelled before its completion landed,
+  // so this path and the callback poller apply the identical rule.
+  resolveTranscodeOutputStorage
 };
 await app.register(internalRouter, internalRouterOptions);
 
@@ -2653,9 +3020,23 @@ const scalerRouterOptions: Parameters<typeof scalerRouter>[1] & { prefix: string
   // is off, which leaves the response reporting the process-global connection
   // only — and `connections` states that explicitly.
   listStackConnections: async () => (scalerRegistry ? scalerRegistry.listStackConnections() : []),
+  // Boot values, already resolved by resolveScalerBootConfig (#1078): the
+  // persisted snapshot when one exists, else the environment. The SAME three
+  // numbers the registry/loops above were initialised from, so the endpoint
+  // reports the cap the scaler is really enforcing.
+  //
+  // minInstances: before #1078 this was a hardcoded 0 (ENCORE_MIN_INSTANCES was
+  // never forwarded here). It still is for an unconfigured deployment —
+  // scalerBootConfig.minInstances falls back to ENCORE_MIN_INSTANCES, which
+  // defaults to 0 — but a RESTORED snapshot's minInstances is now reported, and
+  // was applied to the registry above.
   maxInstances: encoreMaxInstances,
-  minInstances: 0,
+  minInstances: encoreMinInstances,
   idleTimeoutMs: encoreIdleTimeoutMs,
+  // Provenance for `sources` (#1079 + #1078): 'persisted' makes a restored
+  // operator value report source "runtime" instead of masquerading as an env
+  // value. See the bootSource comment in routes/scaler.ts.
+  configSource: scalerBootConfig.source === 'persisted' ? 'persisted' : 'env',
   // Durable scaler runtime config (#1077). Reuses the SAME generic
   // eyevinn-app-config-svc key/value store the storage-backend registry writes
   // through (`backendKvStore`, built with configKvStoreFromEnv above) — one
@@ -2731,26 +3112,36 @@ await app.register(logsRouter, { prefix: '/api/v1/logs', logStore });
 // (started inside activateScaler above). It reads the LIVE `archiveRetentionMs`
 // each tick, so it honours PATCH /api/v1/retention/config and is skipped
 // entirely while retention is unset (0/disabled). All sweep deps are resolved
-// per tick from the (default) stack connections so the sweep targets the same
+// per tick from the CURRENT stack's connections so the sweep targets the same
 // concrete repo + buckets the request path uses.
+//
+// ONCE PER PROVISIONED STACK (issue #1098). A sweep runs outside a request, so
+// before #1098 every dep here resolved with NO stack name — the first listed
+// stack — and archived assets on stacks 2..N were never purged. `forEachStack`
+// re-reads listStackNames() each tick and runs the sweep inside each stack's
+// request-stack context, so `assetRepository` enumerates that stack's documents
+// and the deps below resolve that stack's connections. One stack's failure is
+// logged and the rest are still swept. Single-stack / no-parameter-store: one
+// iteration, unchanged.
 //
 // purgeToTombstone is NOT on the AssetRepository interface (it is a concrete
 // method on CouchAssetRepository / InMemoryAssetRepository), so the sweep's
 // `purge` callback resolves the concrete `.assets` repo and invokes it directly.
 const archivedAssetPurgeLoop = new ArchivedAssetPurgeLoop({
   retentionMs: () => archiveRetentionMs,
-  logger: {
-    info: (...a: unknown[]) => app.log.info(a),
-    warn: (...a: unknown[]) => app.log.warn(a),
-    error: (...a: unknown[]) => app.log.error(a)
-  },
+  logger: sweepLogger,
+  forEachStack: perStackSweepRunner({
+    resolver: stackResolver,
+    label: 'archived-asset-purge',
+    logger: sweepLogger
+  }),
   sweepDeps: {
     assets: assetRepository,
     // Resolve the concrete repo and call its purgeToTombstone (doc-replace to a
     // tombstone). Present on both concrete implementations; typed loosely here
     // because it is not on the shared AssetRepository interface.
     purge: async (assetId: string) => {
-      const conns = await stackResolver.resolve();
+      const conns = await stackResolver.resolve(currentRequestStackName());
       const concrete = conns.assets as unknown as {
         purgeToTombstone?: (id: string) => Promise<string | undefined> | boolean;
       };
@@ -2763,8 +3154,10 @@ const archivedAssetPurgeLoop = new ArchivedAssetPurgeLoop({
     // client (mirrors GET /:id/files). Returns undefined when object storage is
     // not configured — the sweep then records the tombstone without object
     // removal, and a later tick reclaims stragglers once storage is available.
+    // The cache entry for the swept stack is warmed by forEachStack before the
+    // sweep body runs, exactly as the request preHandler warms it per request.
     storageForBucket: (bucket: string): PurgeStorage | undefined => {
-      const conns = stackResolver.resolveCached();
+      const conns = stackResolver.resolveCached(currentRequestStackName());
       if (!conns?.storageClient) return undefined;
       return new WorkspaceStorage(conns.storageClient, bucket);
     },
@@ -2786,24 +3179,30 @@ archivedAssetPurgeLoop.start(archivePurgeIntervalMsFromEnv());
 // purgeEntry), so each tick resolves the active stack's audit store and drives
 // the sweep directly. On the in-memory fallback the store is empty, so the sweep
 // enumerates nothing and purges nothing — a natural no-op, not a special case.
+//
+// ONCE PER PROVISIONED STACK (issue #1098): each stack keeps its OWN audit log,
+// so the retention window has to be applied to each of them. Before #1098 only
+// the first-listed stack's log was expired and every other stack retained
+// indefinitely in spite of the configured policy.
 const auditRetentionPurgeLoop = new AuditRetentionPurgeLoop({
   retentionMs: () => auditRetentionMs,
-  logger: {
-    info: (...a: unknown[]) => app.log.info(a),
-    warn: (...a: unknown[]) => app.log.warn(a),
-    error: (...a: unknown[]) => app.log.error(a)
-  },
+  logger: sweepLogger,
+  forEachStack: perStackSweepRunner({
+    resolver: stackResolver,
+    label: 'audit-retention-purge',
+    logger: sweepLogger
+  }),
   sweepDeps: {
-    // Resolve the active stack's audit store per tick. The sweep drives it via
+    // Resolve the CURRENT stack's audit store per call. The sweep drives it via
     // listOldestPage (enumerate aged tail) + purgeEntry (whole-entry expiry).
     // `conns.audit` is always present (issue #565), so no null-guard is needed.
     audit: {
       listOldestPage: async (opts: { limit: number; offset?: number }) => {
-        const conns = await stackResolver.resolve();
+        const conns = await stackResolver.resolve(currentRequestStackName());
         return conns.audit.listOldestPage(opts);
       },
       purgeEntry: async (id: string) => {
-        const conns = await stackResolver.resolve();
+        const conns = await stackResolver.resolve(currentRequestStackName());
         return conns.audit.purgeEntry(id);
       }
     }
@@ -2829,24 +3228,33 @@ auditRetentionPurgeLoop.start(auditPurgeIntervalMsFromEnv());
 // active stack's log store and drives the sweep directly — the same per-tick
 // resolution the audit loop uses, rather than going through the request-scoped
 // PerWorkspaceLogStore.
+//
+// ONCE PER PROVISIONED STACK (issue #1098): each stack keeps its OWN log
+// partition, so the retention window has to be applied to each of them. As
+// written on main this sweep resolved with no stack name, which outside a
+// request means the FIRST listed stack only — so stacks 2..N retained their
+// operational log indefinitely in spite of the configured policy. Wired here on
+// merge because #1067 landed on main after this branch forked; identical shape
+// to the audit loop above.
 const logRetentionPurgeLoop = new LogRetentionPurgeLoop({
   retentionMs: () => logRetentionMs,
-  logger: {
-    info: (...a: unknown[]) => app.log.info(a),
-    warn: (...a: unknown[]) => app.log.warn(a),
-    error: (...a: unknown[]) => app.log.error(a)
-  },
+  logger: sweepLogger,
+  forEachStack: perStackSweepRunner({
+    resolver: stackResolver,
+    label: 'log-retention-purge',
+    logger: sweepLogger
+  }),
   sweepDeps: {
-    // Resolve the active stack's log store per tick. The sweep drives it via
+    // Resolve the CURRENT stack's log store per call. The sweep drives it via
     // listOldestPage (enumerate the aged tail) + purgeEntry (whole-record
     // expiry). `conns.logs` is always present (issue #996), so no null-guard.
     logs: {
       listOldestPage: async (opts: { limit: number; offset?: number }) => {
-        const conns = await stackResolver.resolve();
+        const conns = await stackResolver.resolve(currentRequestStackName());
         return conns.logs.listOldestPage(opts);
       },
       purgeEntry: async (id: string) => {
-        const conns = await stackResolver.resolve();
+        const conns = await stackResolver.resolve(currentRequestStackName());
         return conns.logs.purgeEntry(id);
       }
     }
@@ -2865,13 +3273,19 @@ logRetentionPurgeLoop.start(logPurgeIntervalMsFromEnv());
 // 0/disabled. `assetRepository` exposes both list() (enumerate `uploading`) and
 // update() (transition to `failed`) directly, so — unlike the archived purge —
 // no concrete-repo callback is needed.
+//
+// ONCE PER PROVISIONED STACK (issue #1098): an upload lands on whichever stack
+// the request named (#1058), so a wedged `uploading` record can be on any stack.
+// Before #1098 only the first-listed stack's wedged uploads were ever settled
+// and the others stayed in the asset list forever.
 const abandonedUploadSweepLoop = new AbandonedUploadSweepLoop({
   thresholdMs: abandonedUploadThresholdMsFromEnv,
-  logger: {
-    info: (...a: unknown[]) => app.log.info(a),
-    warn: (...a: unknown[]) => app.log.warn(a),
-    error: (...a: unknown[]) => app.log.error(a)
-  },
+  logger: sweepLogger,
+  forEachStack: perStackSweepRunner({
+    resolver: stackResolver,
+    label: 'abandoned-upload-sweep',
+    logger: sweepLogger
+  }),
   sweepDeps: {
     assets: assetRepository
   }
@@ -2888,8 +3302,11 @@ abandonedUploadSweepLoop.start(abandonedUploadIntervalMsFromEnv());
 // pull streaming bytes right now and is left strictly alone. Settles the JOB
 // record and, in the same pass, the asset it was pulling into (#1085: moved
 // `uploading -> failed` with a reason naming the interrupted pull, distinct from
-// the abandoned-upload sweep's) — partial-byte cleanup is still #1086 — and does
-// NOT re-queue the pull. Idempotent, so a crash
+// the abandoned-upload sweep's) and the partial bytes the dead pull left in the
+// bucket (#1086: the asset's `objectKey` is deleted and any multipart upload
+// still open for it is discarded, best-effort — a storage failure is logged and
+// never un-settles the records). The pull is neither resumed nor
+// re-queued. Idempotent, so a crash
 // between boots cannot double-settle. Detached + swallowed: a reconcile failure
 // must never block the API from serving.
 //
@@ -2923,6 +3340,21 @@ void reconcileInterruptedIngests({
   // interruption). Only an asset still in `uploading` is touched. Resolved
   // per-stack like the job repository, via the same runInStack below.
   assets: assetRepository,
+  // Issue #1086: reclaim the bytes. Resolved per settled job and INSIDE the
+  // per-stack context below (`runInStack`), so the object is deleted from the
+  // bucket of the stack whose job we just settled and never from another
+  // stack's — the same reason the archived-asset purge builds its
+  // `storageForBucket` handle per tick instead of once at boot. `resolve()`
+  // (not `resolveCached`) because this reconciler runs ONCE AT BOOT with no
+  // request having warmed the cache for the stack being scanned, so a cached
+  // read would be a miss and silently skip cleanup. `conns.storageFor` is
+  // undefined on a stack with no object storage (in-memory fallback), which the
+  // reconciler treats as "nothing to reclaim"; a resolve that throws is logged
+  // there and leaves the already-durable job/asset settles untouched.
+  storage: async () => {
+    const conns = await stackResolver.resolve(currentRequestStackName());
+    return conns.storageFor?.();
+  },
   audit: auditEmitter,
   auditLog: app.log,
   stacks: {
@@ -3055,10 +3487,35 @@ if (routeDumpPath) {
 // confirms, at boot, whether OSC's 2026-07-08 promise to make /api/v1/profiles
 // publicly accessible for the app actually took effect (this environment cannot
 // reach live OSC to confirm it ahead of time).
+// ADR-026 D2/D4 (issues #1207, #1209): the probe follows the RESOLVED TIER
+// instead of inferring it from `Boolean(publicBaseUrl)`. With the published
+// object-store index as the new primary, `publicBaseUrl` being set no longer
+// means the resolved URL is this app's own index — so the login-wall/#284
+// wording would be plainly wrong for an object-store origin — and on a catalog
+// deploy, where `PUBLIC_BASE_URL` is unsettable (ADR-026 C9), the old boolean
+// skipped the check entirely and left the new primary unverified. The resolved
+// `origin` is therefore passed straight through: the probe keeps its exact
+// pre-ADR-026 behaviour and wording for `app-path`, additionally verifies the
+// `object-store` primary (fetchable unauthenticated AND serving the profile
+// count the publisher wrote — ADR-026 D4 publish verification, fed by the
+// `PublishOutcome` fields below), and stays a no-op for the operator-typed /
+// third-party tiers. Lifecycle is untouched: still one-shot (no periodic probe
+// — #1103's interval scope is rejected by D4), still non-fatal, still the
+// scoped TLS relaxation (#337) and the same `ReachabilityOutcome` shape.
 void checkProfilesIndexReachable({
   profilesIndexUrl: encoreScalerProfilesUrl,
-  usingLocalIndex: Boolean(publicBaseUrl),
-  log: app.log
+  origin: resolvedProfilesUrl.origin,
+  log: app.log,
+  // Only present when the boot publish succeeded — i.e. exactly when the
+  // resolved origin can be 'object-store'. `profileCount` is what makes the
+  // check a publish VERIFICATION rather than a bare fetchability probe.
+  ...(publishedProfilesIndex.ok
+    ? {
+        expectedProfileCount: publishedProfilesIndex.profileCount,
+        bucket: publishedProfilesIndex.bucket,
+        endpointKind: publishedProfilesIndex.endpointKind
+      }
+    : {})
 }).catch((err) => app.log.error({ err }, 'profiles-index reachability check errored unexpectedly'));
 
 // Start watch-folder ingest only after the server is listening and every router
@@ -3076,30 +3533,83 @@ watchFolder?.start();
 // there is nothing to enforce or sweep. Runs one immediate sweep on boot then on
 // STORAGE_QUOTA_RECONCILE_INTERVAL_MS (default 6h).
 //
-// KNOWN GAP on a multi-stack install (#1090, found reviewing #1058). This resolves
-// `resolveCached()` with NO stack name at boot, so it sums only the FIRST listed
+// EVERY PROVISIONED STACK, ONE DEPLOYMENT-WIDE TOTAL (issue #1098, closing the
+// gap recorded as #1090). This used to build its buckets ONCE at boot from
+// `resolveCached()` with NO stack name, so it summed only the FIRST listed
 // stack's two buckets — but since #1058 the data plane writes bytes to whichever
-// stack the request named. Because the sweep OVERWRITES the committed total
-// rather than adding to it, usage on stacks 2..N is erased from the counter on
-// every sweep, so the cap silently UNDER-counts and admits more than the operator
-// configured. Fixing it needs the architect call #1090 is waiting on (is a quota
-// per deployment or per stack?): ADR-020 Decision 1 says one deployment is one
-// tenant, which argues for summing every provisioned stack via listStackNames()
-// here, but that is a behaviour change to a billing-adjacent number, not a bug
-// fix. Single-stack deployments — every one on OSC today — are unaffected.
+// stack the request named, and because the sweep OVERWRITES the committed total
+// rather than adding to it, usage on stacks 2..N was erased from the counter on
+// every sweep: the cap silently UNDER-counted and admitted more than the
+// operator configured.
+//
+// The architect call #1090 was waiting on is settled in #1098 (sweeps are
+// per-stack; ADR addendum docs/architecture/ADR-020-addendum-per-stack-sweeps.md).
+// For THIS sweep the per-stack rule applies to the ENUMERATION only: the counter
+// is a single deployment-wide number (ADR-020 Decision 1 — one deployment is one
+// tenant, keyed by DEPLOYMENT_CONTEXT), so makePerStackQuotaSum walks every
+// stack listed on each sweep and returns one total, which the reconciler writes
+// once. A sweep that could not read some stack throws instead of writing a short
+// total, so the cap is never re-armed on a partial number. Single-stack
+// deployments sum exactly the same two buckets as before.
 if (storageCapBytesFromEnv() !== undefined && storageAvailable) {
-  const conns = stackResolver.resolveCached();
-  if (conns?.storageClient) {
-    const reconciler = new StorageQuotaReconciler({
-      store: quotaStore,
-      buckets: [
-        new WorkspaceStorage(conns.storageClient, conns.sourceBucket),
-        new WorkspaceStorage(conns.storageClient, conns.packagedBucket)
-      ],
-      onError: (err) => app.log.warn({ err }, 'storage-quota reconciliation sweep failed')
-    });
-    reconciler.start();
-  }
+  const reconciler = new StorageQuotaReconciler({
+    store: quotaStore,
+    buckets: [
+      makePerStackQuotaSum({
+        resolver: stackResolver,
+        logger: sweepLogger,
+        // Walk only the stacks the resolver will actually CONNECT (#1141 review
+        // finding 1). `listStackNames()` has no status filter, so a
+        // `provisioning`/`failed` record — which the provision route persists on
+        // purpose, and which `resolve()` deliberately refuses to connect —
+        // otherwise looked exactly like a ready stack whose object storage had
+        // degraded, and aborted the sweep. One un-deprovisioned failed provision
+        // would then freeze the deployment-wide total indefinitely. A stack the
+        // resolver will not connect receives no data-plane writes, so its bytes
+        // are not in the total and skipping it cannot under-count.
+        listReadyStackNames: () => stackResolver.listReadyStackNames(),
+        // The swept stack's OWN source + packaged buckets, from ITS connections
+        // (the per-stack bucket names persisted with the stack config), built on
+        // the same MinIO client the request path uses. No object storage on that
+        // stack -> no buckets, which contributes nothing instead of failing.
+        bucketsForStack: async (stackName) => {
+          const conns = await stackResolver.resolve(stackName);
+          if (!conns.storageClient) return [];
+          return [
+            new WorkspaceStorage(conns.storageClient, conns.sourceBucket),
+            new WorkspaceStorage(conns.storageClient, conns.packagedBucket)
+          ];
+        }
+      })
+    ],
+    onError: (err) => {
+      // A deployment with no object storage yet (fresh install, no stack
+      // provisioned) is the normal state, not a fault: the sweep correctly
+      // declines to overwrite the total and says so at info level.
+      if (err instanceof PerStackQuotaSumIncomplete && err.reason === 'no-object-storage') {
+        app.log.info({ err: err.message }, 'storage-quota reconciliation skipped');
+        return;
+      }
+      // A READY stack that resolved WITHOUT object storage (#1141 review
+      // findings 1 and 2): the resolver degraded to its no-storage fallback or
+      // substituted another stack, so the sum on hand is short by that stack's
+      // bytes and was deliberately not written. Distinct from an unreachable
+      // stack and worth an operator's attention at the parameter store, so it
+      // carries its own message rather than the generic sweep-failed line.
+      // Stacks that are merely not ready (`provisioning`/`failed`) never reach
+      // here — they are not walked, so a stalled provision cannot wedge the
+      // sweep permanently behind this warning.
+      if (err instanceof PerStackQuotaSumIncomplete && err.reason === 'stack-without-object-storage') {
+        app.log.warn(
+          { err: err.message },
+          'storage-quota reconciliation skipped: a provisioned stack resolved without object storage; the committed total keeps its last good value'
+        );
+        return;
+      }
+      app.log.warn({ err }, 'storage-quota reconciliation sweep failed');
+    }
+  });
+  reconciler.start();
 }
 
 // Parameter-store path (Open Source Cloud, issue #643): if any stack was already

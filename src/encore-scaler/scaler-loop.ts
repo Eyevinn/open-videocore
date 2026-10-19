@@ -32,15 +32,30 @@ import {
   reapOrphanedInstances,
   resolvePendingSpawns,
   spawnInstance,
-  updateInstance
+  updateInstance,
+  ENCORE_CALLBACK_LISTENER_SERVICE_ID
 } from './instance-pool.js';
 import {
   makePriorAttemptCanceler,
   recordDispatch,
   requeueInterruptedByScaleDown
 } from './retry-store.js';
-import { probeCallbackTrust, buildCallbackUri } from './callback-trust-probe.js';
+import {
+  probeCallbackTrust,
+  buildCallbackUri,
+  DEFAULT_PROBE_REQUEST_TIMEOUT_MS
+} from './callback-trust-probe.js';
 import { logScalerEvent, ScalerLogThrottle, type ScalerLogPhase } from './scaler-log.js';
+import {
+  assignmentTrailFingerprint,
+  describeProbeResult,
+  formatAssignmentTrail,
+  recordedProbeOutcome,
+  shouldLogAssignmentTrail,
+  type AssignmentDecision,
+  type AssignmentOutcome,
+  type ProbeOutcome
+} from './assignment-log.js';
 import { spawnFailureSecrets } from './spawn-failure.js';
 import { hasPendingPackaging } from './packaging-pin.js';
 import {
@@ -159,6 +174,66 @@ export function isIdlePastTimeout(
   return now - idleSince > idleTimeoutMs;
 }
 
+// #1171 review finding A: how long before a service access token's own `exp`
+// this loop stops using its cached copy. The probe is a single HEAD with a 5s
+// bound, so anything comfortably longer than one request is enough; 60s also
+// absorbs modest clock skew between this process and the token issuer.
+export const SAT_EXPIRY_MARGIN_MS = 60_000;
+
+// Fallback cache lifetime for a token whose expiry we cannot read (not a JWT,
+// or no usable `exp` claim). Deliberately far shorter than the ~1h a real SAT
+// lasts: minting is one HTTPS POST on a path that only runs while an instance
+// is still being gated, so re-minting too often costs nothing, whereas holding
+// an expired token is what #1171's review flagged.
+export const SAT_UNKNOWN_EXPIRY_TTL_MS = 5 * 60_000;
+
+// #1171 review finding H: the bound on ONE service-access-token mint.
+//
+// The mint is a single HTTPS POST to the token service, awaited inside the
+// scaler's non-overlapping tick guard, and the OSC client passes no
+// `signal`/`timeout` to its fetch — so without this bound a token service that
+// accepts the connection and never answers stalls the tick (readiness, dispatch,
+// orphan sweep) for as long as the socket lives. Deliberately the same 5s as
+// DEFAULT_PROBE_REQUEST_TIMEOUT_MS (callback-trust-probe.ts:207): both bound a
+// single request on the readiness path, and the mint only exists to serve that
+// probe, so there is no reason for the token leg to be allowed to outlast the
+// probe request it feeds. Losing the token is not a failure — the probe falls
+// back to its unauthenticated behaviour (getCallbackListenerSat).
+export const SAT_MINT_TIMEOUT_MS = 5_000;
+
+// Epoch ms at which a service access token expires, read from the `exp` claim of
+// its (unverified) JWT payload, or undefined when that is not readable.
+//
+// Contract (CLAUDE.md rule 7): RFC 7519 §4.1.4 — `exp` is a NumericDate, i.e.
+// SECONDS since the epoch, in the second of the three dot-separated base64url
+// segments of a JWS (RFC 7515 §3.1). Verified against a live token minted
+// 2026-10-14 from `POST https://token.svc.prod.osaas.io/servicetoken` for
+// `eyevinn-encore-callback-listener`: three segments, payload
+// `{"...","iat":1760...,"exp":1760...}` with `exp - iat === 3601`.
+//
+// NOTE: the signature is deliberately NOT verified — this is a local cache-TTL
+// hint for a token WE minted and only send outbound, never a trust decision. A
+// token whose payload does not parse simply falls back to
+// SAT_UNKNOWN_EXPIRY_TTL_MS.
+export function jwtExpiryEpochMs(token: string): number | undefined {
+  const parts = token.split('.');
+  if (parts.length !== 3) return undefined;
+  const payload = parts[1];
+  if (payload === undefined || payload.length === 0) return undefined;
+  try {
+    const decoded = JSON.parse(
+      Buffer.from(payload, 'base64url').toString('utf8')
+    ) as { exp?: unknown };
+    const exp = decoded.exp;
+    if (typeof exp === 'number' && Number.isFinite(exp) && exp > 0) {
+      return exp * 1000;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export class EncoreScalerLoop {
   private timer: NodeJS.Timeout | undefined;
   private running = false;
@@ -176,6 +251,24 @@ export class EncoreScalerLoop {
   // loop — one loop per workspace, created once (workspace-registry.ts) — so the
   // state lives exactly as long as the loop whose appends it is limiting.
   private readonly logThrottle = new ScalerLogThrottle();
+  // #1171: callback-listener service access token with the epoch ms at which
+  // this loop stops trusting it. Only used to disambiguate a 401/403 on the
+  // callback-trust probe (see ensureCallbackTrust), so it is fetched lazily — a
+  // pool that never probes never mints one. Caching it for the loop's lifetime
+  // was the #1171 review's finding A: a minted SAT expires (~1h) and the client
+  // renews nothing, so an indefinite cache turns every later re-probe into an
+  // expired-JWT 401. `expiresAtMs` comes from the token's own `exp` claim where
+  // readable (see getCallbackListenerSat). Never logged; `spawnFailureSecrets`
+  // redaction already covers SAT-shaped strings in log paths.
+  private callbackListenerSat:
+    | { token: string; expiresAtMs: number }
+    | undefined;
+  // #1172 assignment-trail suppression state (see logAssignmentTrail). Owned by
+  // the loop, like logThrottle: one loop per workspace, so the state lives
+  // exactly as long as the trail it is limiting.
+  private lastAssignmentFingerprint: string | undefined;
+  private lastAssignmentLoggedAt = 0;
+  private unchangedAssignmentTicks = 0;
 
   constructor(private config: EncoreScalerConfig) {}
 
@@ -516,11 +609,38 @@ export class EncoreScalerLoop {
     await this.reapOrphansIfDue();
 
     // 5. Dispatch pending jobs to instances with spare capacity.
+    //
+    // #1172: every `continue`/`break` below is a decision an operator needs to
+    // be able to read back ("why did this ready instance get no job?"), so each
+    // one now records WHY on `decisions` before taking its existing branch. The
+    // control flow is untouched — the records are written, never consulted — and
+    // the whole set is emitted as ONE trail entry after the loop
+    // (logAssignmentTrail).
+    const decisions: AssignmentDecision[] = [];
+    const decide = (
+      inst: EncoreInstanceRecord,
+      outcome: AssignmentOutcome,
+      probe: ProbeOutcome,
+      assignedJobIds: string[] = []
+    ): void => {
+      decisions.push({
+        instanceId: inst.instanceId,
+        // Ready = the trust gate cleared it and it was not withheld for
+        // draining/pending-spawn. `at-capacity` is ready-but-full.
+        ready: outcome !== 'draining' && outcome !== 'pending-spawn' && outcome !== 'trust-probe-pending',
+        outcome,
+        probe,
+        assignedJobIds,
+        activeJobs: inst.activeJobs,
+        capacity: JOBS_PER_INSTANCE
+      });
+    };
     for (const inst of instances) {
       // A draining instance (issue #513) is being torn down: it must receive no
       // new job dispatches. Skip it so its real active-job count can reach zero
       // and a later tick can safely remove it.
       if (inst.draining === true) {
+        decide(inst, 'draining', recordedProbeOutcome(inst));
         continue;
       }
       // #1071: a PENDING spawn is in the pool so it counts against maxInstances
@@ -529,6 +649,7 @@ export class EncoreScalerLoop {
       // node. It becomes eligible the tick after resolvePendingSpawns promotes
       // it, which is also when its callback-trust probe starts.
       if (inst.pendingReadySince !== undefined) {
+        decide(inst, 'pending-spawn', recordedProbeOutcome(inst));
         continue;
       }
       // Gate first-job dispatch on confirmed outbound TLS trust to the paired
@@ -538,15 +659,29 @@ export class EncoreScalerLoop {
       // entirely, so warm instances incur no added latency. A quarantined
       // instance is never dispatched to. This never throws into the tick: a
       // probe failure keeps the job in the queue for a later tick.
-      if (!(await this.ensureCallbackTrust(inst))) {
+      const trust = await this.ensureCallbackTrust(inst);
+      if (!trust.eligible) {
+        // #1172: the trail now names the probe outcome that withheld the job,
+        // so "ready instance, no work" is explained on the tick it happens.
+        decide(inst, 'trust-probe-pending', trust.probe);
         continue; // not eligible this tick — leave its capacity unused
       }
+      // #1172: an instance that is full before the queue is consulted never
+      // enters the loop below, which is a legitimate (and previously invisible)
+      // reason for a queued job to sit still.
+      if (inst.activeJobs >= JOBS_PER_INSTANCE) {
+        decide(inst, 'at-capacity', trust.probe);
+        continue;
+      }
+      // Recorded per instance and reported once after the loop.
+      const assignedJobIds: string[] = [];
+      let outcome: AssignmentOutcome = 'queue-empty';
       while (inst.activeJobs < JOBS_PER_INSTANCE) {
         const claimed = await redis.rpoplpush(
           keys.queue(workspaceId),
           keys.inflight(workspaceId)
         );
-        if (!claimed) break; // queue empty
+        if (!claimed) break; // queue empty (outcome stays 'queue-empty')
 
         let job: QueuedJob;
         try {
@@ -565,6 +700,9 @@ export class EncoreScalerLoop {
         if (job.notBefore && job.notBefore > Date.now()) {
           await redis.lrem(keys.inflight(workspaceId), 1, claimed);
           await redis.rpush(keys.queue(workspaceId), claimed);
+          // #1172: a queue that is NOT empty while an instance sits idle looks
+          // identical to a broken dispatcher unless the backoff is stated.
+          if (assignedJobIds.length === 0) outcome = 'retry-backoff';
           break;
         }
 
@@ -576,13 +714,73 @@ export class EncoreScalerLoop {
         if (!dispatched) {
           // Re-queue at the head so it is retried on the next tick.
           await redis.rpush(keys.queue(workspaceId), claimed);
+          // #1172: the CAUSE is already reported by the #1136 dispatch-phase
+          // error entry, which this must not duplicate — the trail only records
+          // that this instance stopped taking work for that reason.
+          if (assignedJobIds.length === 0) outcome = 'dispatch-failed';
           break; // instance likely unhealthy; stop feeding it this tick
         }
 
         inst.activeJobs += 1;
+        assignedJobIds.push(job.jobId);
+        outcome = 'assigned';
         await updateInstance(redis, workspaceId, inst);
       }
+      decide(inst, outcome, trust.probe, assignedJobIds);
     }
+
+    // 5b. #1172: ONE entry that explains this tick's assignment decisions —
+    //     queue depth, every instance considered, its probe outcome, and the
+    //     jobs it was given. Emitted after dispatch so it reports what actually
+    //     happened, and never before: a trail written mid-loop could not say
+    //     whether a later instance took the work.
+    this.logAssignmentTrail(pending, decisions);
+  }
+
+  // Append the per-tick readiness/assignment trail (issue #1172).
+  //
+  // Gated by shouldLogAssignmentTrail (src/encore-scaler/assignment-log.ts): a
+  // CHANGED decision picture is logged on the tick it changes, an unchanged one
+  // is re-stated at most once per ASSIGNMENT_TRAIL_REPEAT_MS with the count of
+  // the ticks it stood in for. Without that gate a 10s loop would write ~8,600
+  // info records a day per workspace into a bounded, oldest-first retained
+  // window (LOG_STORE_MAX_RECORDS, src/services/log-store.ts) and evict the
+  // history the trail exists to provide — the same reasoning, and the same
+  // window, as the #1136 error throttle.
+  //
+  // Skipped entirely when the tick considered NO instance: with an empty pool
+  // there is no per-instance decision to explain, and why the pool is empty is
+  // the scale-up path's story, already told by the spawn-failure record
+  // (keys.spawnFailure / GET /scaler/status, #1071) and the #1136 spawn-phase
+  // entry. Never throws and never awaits (logScalerEvent).
+  private logAssignmentTrail(queueDepth: number, decisions: AssignmentDecision[]): void {
+    if (!this.config.logSink) return;
+    if (decisions.length === 0) return;
+    const trail = { queueDepth, decisions };
+    const fingerprint = assignmentTrailFingerprint(trail);
+    const now = Date.now();
+    const unchangedTicks = shouldLogAssignmentTrail({
+      fingerprint,
+      lastFingerprint: this.lastAssignmentFingerprint,
+      lastLoggedAt: this.lastAssignmentLoggedAt,
+      unchangedTicks: this.unchangedAssignmentTicks,
+      now
+    });
+    if (unchangedTicks === undefined) {
+      this.unchangedAssignmentTicks += 1;
+      return;
+    }
+    this.lastAssignmentFingerprint = fingerprint;
+    this.lastAssignmentLoggedAt = now;
+    this.unchangedAssignmentTicks = 0;
+    logScalerEvent(this.config.logSink, {
+      phase: 'assign',
+      // A normal outcome, not a failure: the trail must never raise the level
+      // badge (public/logs-table.js) on a healthy pool.
+      level: 'info',
+      workspaceId: this.config.workspaceId,
+      message: formatAssignmentTrail({ ...trail, unchangedTicks })
+    });
   }
 
   // Report an instance whose record carries no usable idle timestamp — at most
@@ -929,13 +1127,13 @@ export class EncoreScalerLoop {
           }
         } else {
           // Payload unavailable (e.g. TTL expired): cannot rebuild the job, so
-          // leave it for reconcile()'s generic dropped-job path rather than fake
-          // a payload. Observable so the gap is diagnosable (issue #451 style).
+          // it cannot be re-enqueued and must be RESOLVED here instead (#1228).
           console.warn(
             `[encore-scaler] scale-down: job ${jobId} interrupted by scale-down of ` +
               `instance ${instanceId} but its payload is unavailable — cannot ` +
-              `re-enqueue; leaving for dropped-job reconciliation`
+              `re-enqueue; resolving it terminally (#1228)`
           );
+          await this.resolveUnrequeueableScaleDownLoss(instanceId, jobId);
         }
       }
     } catch (err) {
@@ -949,6 +1147,160 @@ export class EncoreScalerLoop {
         'reap',
         `scale-down interruption re-enqueue failed for instance ${instanceId}; ` +
           'jobs lost to this teardown may not have been re-queued',
+        err
+      );
+    }
+  }
+
+  // #1228: resolve a job that was lost to a scale-down / vanished-instance
+  // eviction and CANNOT be re-enqueued because its dispatch payload is gone
+  // (keys.jobPayload carries a 24h TTL — retry-store.ts recordDispatch /
+  // PAYLOAD_TTL_SECONDS — so a job interrupted after that window has nothing
+  // left to rebuild from).
+  //
+  // WHY THIS EXISTS AT ALL. Before #1228 this case only logged "leaving for
+  // dropped-job reconciliation" and returned, on the assumption that
+  // reconcile()'s generic dropped-job diff would pick the job up. It cannot:
+  // that diff only ever iterates instances present in keys.pool (reconcile()
+  // reads keys.pool and returns early when it is empty) and classifies drops
+  // for jobs mapped to THOSE instances — while the instance this job is mapped
+  // to has just been destroyed or evicted, so it has no pool record any more.
+  // Nothing therefore ever looked at the job again: keys.jobStatus stayed
+  // RUNNING, keys.jobInstance kept pointing at a dead instance, and the
+  // caller-facing Job stayed `running` indefinitely with no retry pending and
+  // no terminal outcome — the ambiguous limbo state #1228 reports. Resolution
+  // happens HERE because this is the one place that has both the identity of
+  // the lost job and the knowledge that it is unrecoverable.
+  //
+  // RESOLUTION RULES
+  //   - A job whose local status is ALREADY TERMINAL is left completely alone —
+  //     including a CANCELLED one (keys.jobStatus 'CANCELLED', written by
+  //     index.ts cancel() and encore-scaler-router.ts). The outcome was already
+  //     decided; overwriting it with FAILED would erase a deliberate cancel and
+  //     push a spurious failure through onJobsDropped. The status is RE-READ
+  //     here instead of reused from the caller's hgetall snapshot so a cancel
+  //     that landed during this sweep still wins the race.
+  //   - Anything else resolves to FAILED, definitively: there is no payload to
+  //     re-run, the job is not in Encore's active set, and no callback can
+  //     arrive for it. The local status is overwritten so getJobStatus() stops
+  //     reporting `running` (index.ts maps FAILED -> `failed`), the dead
+  //     keys.jobInstance mapping is removed so the job cannot linger as a drop
+  //     candidate against an instance that no longer exists, and the drop is
+  //     raised through the SAME onJobsDropped hook reconcile() uses so main.ts
+  //     drives the caller-facing Job terminal via the shared idempotent settle.
+  //
+  // Either way the outcome is logged explicitly (FAILED / left CANCELLED /
+  // left terminal) so an operator reading the scaler log can see how every
+  // payload-unavailable job ended, and the FAILED case is also appended to the
+  // operational log sink — it is a job that will never run again and no retry
+  // is pending.
+  //
+  // CONTRACT SOURCES VERIFIED (CLAUDE.md rule 7)
+  //   - keys.jobStatus / keys.jobInstance / keys.jobPayload semantics and TTL:
+  //     src/encore-scaler/types.ts keys (jobStatus, jobInstance, jobPayload).
+  //   - Terminal status vocabulary DONE/SUCCESSFUL/FAILED/CANCELLED and the
+  //     FAILED -> `failed` mapping: src/encore-scaler/index.ts getJobStatus
+  //     (`if (s === 'FAILED' || s === 'CANCELLED') return 'failed'`).
+  //   - CANCELLED is the cancel path's terminal write: index.ts cancel() and
+  //     encore-scaler-router.ts (redis.hset(keys.jobStatus(...), id,
+  //     'CANCELLED')).
+  //   - DroppedJob shape { encoreJobId, reason? } and the onJobsDropped
+  //     signature `(drops: DroppedJob[]) => Promise<void>`:
+  //     src/encore-scaler/types.ts DroppedJob / EncoreScalerConfig.
+  //   - Terminal settle performed by the hook (reason text -> failureText ->
+  //     settleFailedTranscode with 'gone-from-active-set'): src/main.ts
+  //     onJobsDropped.
+  //
+  // Best-effort per job: a failure resolving one job must never break the
+  // teardown or the rest of the sweep, so everything here is wrapped.
+  private async resolveUnrequeueableScaleDownLoss(
+    instanceId: string,
+    jobId: string
+  ): Promise<void> {
+    const { redis, workspaceId } = this.config;
+    try {
+      // Re-read, don't trust the snapshot: a cancel may have landed since.
+      const current = ((await redis.hget(keys.jobStatus(workspaceId), jobId)) ?? '')
+        .toUpperCase();
+      if (
+        current === 'CANCELLED' ||
+        current === 'FAILED' ||
+        current === 'DONE' ||
+        current === 'SUCCESSFUL'
+      ) {
+        console.warn(
+          '[encore-scaler] scale-down: job %s (lost with instance %s, payload ' +
+            'unavailable) is already terminal (%s) — leaving it alone, no ' +
+            'resolution needed (#1228)',
+          jobId,
+          instanceId,
+          current
+        );
+        return;
+      }
+
+      // Definite terminal outcome: FAILED.
+      await redis.hset(keys.jobStatus(workspaceId), jobId, 'FAILED');
+      try {
+        await redis.hdel(keys.jobInstance(workspaceId), jobId);
+      } catch {
+        // A surviving stale mapping is harmless now the status is terminal:
+        // every drop-candidate filter requires a RUNNING/QUEUED status.
+      }
+
+      const reason =
+        `interrupted by scale-down of instance ${instanceId} and could not be ` +
+        're-enqueued: the stored dispatch payload had expired, so the encode ' +
+        'cannot be rebuilt or retried';
+      console.warn(
+        '[encore-scaler] scale-down: job %s RESOLVED FAILED — lost with instance ' +
+          '%s and its dispatch payload is unavailable, so it is unrecoverable; ' +
+          'no retry is pending (#1228)',
+        jobId,
+        instanceId
+      );
+      this.logFailure(
+        'reap',
+        `job ${jobId} was lost when instance ${instanceId} was torn down and its ` +
+          'stored dispatch payload had already expired, so it could not be ' +
+          're-queued; resolved FAILED (no retry pending) — re-submit the encode ' +
+          'to run it again'
+      );
+
+      if (this.config.onJobsDropped) {
+        try {
+          await this.config.onJobsDropped([{ encoreJobId: jobId, reason }]);
+        } catch (hookErr) {
+          // The local status is already terminal, so the job is no longer in
+          // limbo for the scaler's own bookkeeping; surface the repo-side gap.
+          console.error(
+            '[encore-scaler] onJobsDropped failed while resolving payload-' +
+              'unavailable job %s (workspace=%s):',
+            jobId,
+            workspaceId,
+            hookErr
+          );
+          this.logFailure(
+            'reap',
+            `terminal settle of unrecoverable job ${jobId} failed; the scaler ` +
+              'marked it FAILED but the job record may still read running',
+            hookErr
+          );
+        }
+      }
+    } catch (err) {
+      console.error(
+        '[encore-scaler] failed to resolve payload-unavailable job %s ' +
+          '(workspace=%s, instance=%s):',
+        jobId,
+        workspaceId,
+        instanceId,
+        err
+      );
+      this.logFailure(
+        'reap',
+        `could not resolve unrecoverable job ${jobId} lost with instance ` +
+          `${instanceId}; it may still read running`,
         err
       );
     }
@@ -1688,9 +2040,11 @@ export class EncoreScalerLoop {
   //     fires during the ~14s window after a fresh listener's ingress starts
   //     answering, in which the origin returns 200 while `/encoreCallback` is
   //     still auth-walled (measured live; see callback-trust-probe.ts header).
-  //     That window is the #811/#812 failure, and it resolves on its own well
-  //     inside the bounded wait — the instance is simply held ineligible until
-  //     it does. Past the bounded wait it resolves to the degraded
+  //     That window is the #811/#812 failure. It lifted inside the bounded wait
+  //     on the instances measured for #814 (~14s) but NOT on the four in #1171
+  //     (401 for ~62s), so "it resolves on its own in time" is an expectation,
+  //     not a guarantee: the instance is held ineligible while it might, and
+  //     past the bounded wait it resolves to the degraded
   //     `callbackPathUnusableAt` state — persisted, logged, and dispatched to
   //     anyway so completion falls back to the terminal-job sweep instead of
   //     halting the pool. `callbackTrustReady` is never set for it, so
@@ -1703,16 +2057,140 @@ export class EncoreScalerLoop {
   //      probe. A PKIX/handshake failure fast-fails (~1s) and does NOT consume
   //      the AbortSignal window, so the deadline is what actually bounds the
   //      wait across re-probes.
-  private async ensureCallbackTrust(inst: EncoreInstanceRecord): Promise<boolean> {
-    if (inst.callbackTrustReady) return true;
-    if (inst.callbackTrustQuarantinedAt) return false;
+  //
+  // #1172: the gate now also REPORTS what it decided and why, alongside the
+  // eligibility it has always returned. Every branch of ensureCallbackTrust
+  // below already knew its probe outcome and threw it away unless it was one of
+  // the two terminal failures (quarantine / sweep-only fallback) — which is
+  // exactly why "ready instance, no work" was unexplainable from the logs. The
+  // return shape carries the outcome out to the dispatch step, which folds it
+  // into the per-tick assignment trail (src/encore-scaler/assignment-log.ts).
+  // `eligible` keeps the old boolean's meaning EXACTLY, so no gate behaviour
+  // changes.
+
+  // Lazily mint + cache the callback-listener service access token used ONLY to
+  // disambiguate a 401/403 from the listener ingress (#1171). Returns undefined
+  // (never throws) if the token cannot be minted: the probe then behaves exactly
+  // as it did before, grading an unauthenticated 401/403 as 'callback-unusable'.
+  //
+  // EXPIRY-AWARE (#1171 review finding A). The first cut cached the token for
+  // the process lifetime, which silently un-fixed #1171 after about an hour:
+  // every re-probe then sent an EXPIRED JWT, the ingress answered 401 just as it
+  // does for a missing one, and every instance graded back to
+  // 'callback-unusable'. The cache therefore carries the token's own expiry and
+  // re-mints `SAT_EXPIRY_MARGIN_MS` before it, and `forceRefresh` lets the probe
+  // discard a token the ingress just rejected.
+  //
+  // Contracts (CLAUDE.md rule 7):
+  //   - `getServiceAccessToken(serviceId: string): Promise<string>` —
+  //     `@osaas/client-core@0.24.0` `lib/context.d.ts:25`, called with
+  //     `ENCORE_CALLBACK_LISTENER_SERVICE_ID`
+  //     (`src/encore-scaler/instance-pool.ts:68`), the same service id and the
+  //     same accessor instance-pool.ts:722 already uses for the paired listener.
+  //   - No renewal exists in the client to lean on: `lib/context.js:22-45`
+  //     POSTs `https://token.svc.<env>.osaas.io/servicetoken` per call and
+  //     returns `serviceAccessToken.token` ONLY — the `expiry` field of the
+  //     `ServiceAccessToken` type (`lib/context.d.ts:5-9`:
+  //     `{ serviceId; token; expiry }`) is discarded before we can see it — and
+  //     `refreshServiceAccessToken` (`lib/context.js:58-60`) is a plain
+  //     re-mint. Hence reading `exp` off the JWT here (jwtExpiryEpochMs).
+  private async getCallbackListenerSat(
+    opts: { forceRefresh?: boolean } = {}
+  ): Promise<string | undefined> {
+    const now = Date.now();
+    const cached = this.callbackListenerSat;
+    if (!opts.forceRefresh && cached !== undefined && cached.expiresAtMs > now) {
+      return cached.token;
+    }
+    // Drop the rejected/stale entry before the mint so a failed mint cannot
+    // leave an unusable token in the cache for the next probe to replay.
+    this.callbackListenerSat = undefined;
+    // BOUNDED (#1171 review finding H). `getServiceAccessToken` passes no
+    // `signal`/`timeout` to its own fetch (see the contract note above), and this
+    // is awaited inside the non-overlapping tick guard, so a slow token service
+    // would otherwise hold the whole scaler tick — readiness, dispatch and the
+    // orphan sweep — for as long as that socket stays open. Race the mint against
+    // a short timer that resolves `undefined`, which lands on exactly the
+    // fail-safe path the `catch` below already defines: no token, probe keeps its
+    // pre-#1171 behaviour, tick proceeds. The mint is left to settle in the
+    // background (it cannot be cancelled); it just no longer blocks anyone.
+    let mintTimer: ReturnType<typeof setTimeout> | undefined;
+    let mintDeadlineHit = false;
+    try {
+      const deadline = new Promise<undefined>((resolve) => {
+        mintTimer = setTimeout(() => {
+          mintDeadlineHit = true;
+          resolve(undefined);
+        }, SAT_MINT_TIMEOUT_MS);
+        // Never hold the event loop open for this guard timer.
+        if (typeof mintTimer.unref === 'function') mintTimer.unref();
+      });
+      const sat = await Promise.race([
+        this.config.oscContext.getServiceAccessToken(
+          ENCORE_CALLBACK_LISTENER_SERVICE_ID
+        ),
+        deadline
+      ]);
+      if (mintDeadlineHit && sat === undefined) {
+        console.warn(
+          '[encore-scaler] callback-listener service access token mint did not complete within %dms for the callback-trust probe (workspace=%s); continuing unauthenticated so the tick is not stalled',
+          SAT_MINT_TIMEOUT_MS,
+          this.config.workspaceId
+        );
+        return undefined;
+      }
+      if (typeof sat === 'string' && sat.length > 0) {
+        const exp = jwtExpiryEpochMs(sat);
+        this.callbackListenerSat = {
+          token: sat,
+          expiresAtMs:
+            exp !== undefined
+              ? exp - SAT_EXPIRY_MARGIN_MS
+              : Date.now() + SAT_UNKNOWN_EXPIRY_TTL_MS
+        };
+        return sat;
+      }
+      return undefined;
+    } catch (err) {
+      // Token minting is best-effort here: without it the probe simply loses
+      // the disambiguation, it does not fail. Logged once per occurrence at
+      // warn level, never with the token itself.
+      console.warn(
+        '[encore-scaler] could not mint callback-listener service access token for the callback-trust probe (workspace=%s): %s',
+        this.config.workspaceId,
+        err instanceof Error ? err.message : String(err)
+      );
+      return undefined;
+    } finally {
+      if (mintTimer) clearTimeout(mintTimer);
+    }
+  }
+
+  private async ensureCallbackTrust(
+    inst: EncoreInstanceRecord
+  ): Promise<{ eligible: boolean; probe: ProbeOutcome }> {
+    if (inst.callbackTrustReady) return { eligible: true, probe: { kind: 'confirmed-earlier' } };
+    if (inst.callbackTrustQuarantinedAt) {
+      return { eligible: false, probe: { kind: 'quarantined' } };
+    }
     // Already resolved to the degraded sweep-only fallback (issue #813): the
     // listener ingress rejected the probe for the whole bounded wait. The state
     // was persisted and logged once; do not re-probe every tick and do not
     // withhold jobs (completion falls back to the terminal-job sweep).
-    if (inst.callbackPathUnusableAt) return true;
+    if (inst.callbackPathUnusableAt) {
+      return {
+        eligible: true,
+        probe: {
+          kind: 'sweep-only-fallback',
+          detail:
+            inst.callbackPathUnusableStatus === undefined
+              ? undefined
+              : String(inst.callbackPathUnusableStatus)
+        }
+      };
+    }
     // No listener URL to probe (reconciled-from-OSC instance): fail open.
-    if (!inst.callbackListenerUrl) return true;
+    if (!inst.callbackListenerUrl) return { eligible: true, probe: { kind: 'none-to-probe' } };
 
     const timeoutMs =
       this.config.callbackTrustTimeoutMs ?? DEFAULT_CALLBACK_TRUST_TIMEOUT_MS;
@@ -1730,13 +2208,33 @@ export class EncoreScalerLoop {
       await updateInstance(this.config.redis, this.config.workspaceId, inst);
     }
 
-    const result = await probeCallbackTrust(inst.callbackListenerUrl, timeoutMs);
+    // #1171: hand the probe (a) a SHORT per-request bound so one hung request
+    // cannot occupy a tick for the whole 60s bounded wait and stall readiness /
+    // job assignment, (b) the callback-listener SAT so an ingress auth-wall
+    // 401 is told apart from a genuinely closed callback path, and (c) a way to
+    // re-mint that SAT. (c) is review finding A: if the ingress rejects the
+    // authenticated attempt too, an expired cached token looks identical to a
+    // closed callback path, so the probe gets ONE re-mint-and-retry before it
+    // may grade the instance 'callback-unusable'.
+    const result = await probeCallbackTrust(
+      inst.callbackListenerUrl,
+      timeoutMs,
+      undefined,
+      {
+        requestTimeoutMs:
+          this.config.callbackProbeRequestTimeoutMs ??
+          DEFAULT_PROBE_REQUEST_TIMEOUT_MS,
+        authToken: await this.getCallbackListenerSat(),
+        refreshAuthToken: () =>
+          this.getCallbackListenerSat({ forceRefresh: true })
+      }
+    );
 
     if (result.ok) {
       inst.callbackTrustReady = true;
       inst.callbackTrustConfirmedAt = Date.now();
       await updateInstance(this.config.redis, this.config.workspaceId, inst);
-      return true;
+      return { eligible: true, probe: { kind: 'trusted-now' } };
     }
 
     // Probe did NOT confirm the callback path. If we are still inside the
@@ -1747,7 +2245,11 @@ export class EncoreScalerLoop {
     // the deadline has not been exceeded.
     const elapsedMs = Date.now() - inst.callbackTrustFirstProbeAt;
     if (elapsedMs <= timeoutMs) {
-      return false;
+      // #1172: previously a SILENT `false` — the single most common reason a
+      // freshly ready instance has no work. The live probe outcome travels out
+      // so the trail can say which of tls-trust / timeout / connection /
+      // auth-walled ingress is holding the instance back on this tick.
+      return { eligible: false, probe: describeProbeResult(result) };
     }
 
     // Bounded wait EXCEEDED with the listener ingress still REJECTING the probe
@@ -1759,7 +2261,18 @@ export class EncoreScalerLoop {
     // dispatched: their completion is reconciled by the terminal-job sweep
     // (src/pipeline/encore-callback-poller.ts sweepTerminalJobs), which is
     // strictly better than quarantining every instance and halting transcoding.
-    if (result.state === 'callback-unusable') {
+    //
+    // 'ingress-auth-window' (#1171) lands here the same way, and is reported
+    // with its own `probeState` so the two are distinguishable in the logs: for
+    // that state the authenticated re-probe proved the ingress and the listener
+    // are live and only the platform's inbound auth wall answered the
+    // unauthenticated probe. It is retried for the whole bounded wait like any
+    // other non-confirmation above, and if the wall somehow outlasts the wait we
+    // still dispatch rather than sidelining a healthy instance.
+    if (
+      result.state === 'callback-unusable' ||
+      result.state === 'ingress-auth-window'
+    ) {
       inst.callbackPathUnusableAt = Date.now();
       inst.callbackPathUnusableStatus = result.status;
       await updateInstance(this.config.redis, this.config.workspaceId, inst);
@@ -1769,6 +2282,7 @@ export class EncoreScalerLoop {
           workspaceId: this.config.workspaceId,
           instanceId: inst.instanceId,
           callbackIngressHostname: hostname,
+          probeState: result.state,
           status: result.status,
           detail: result.detail,
           timeoutMs,
@@ -1782,7 +2296,7 @@ export class EncoreScalerLoop {
           `(ingress ${hostname} answered ${result.status} for the whole ${timeoutMs}ms ` +
           'bounded wait); dispatching anyway with sweep-only completion'
       );
-      return true;
+      return { eligible: true, probe: { kind: 'sweep-only-fallback', detail: String(result.status) } };
     }
 
     // Bounded wait EXCEEDED: quarantine the instance from job assignment and
@@ -1808,7 +2322,7 @@ export class EncoreScalerLoop {
         `(ingress ${hostname}, errorClass=${String(result.errorClass)}); ` +
         'instance quarantined from job assignment'
     );
-    return false;
+    return { eligible: false, probe: { kind: 'quarantined', detail: result.errorClass } };
   }
 
   // POST a queued job's raw Encore payload to a chosen instance and record the

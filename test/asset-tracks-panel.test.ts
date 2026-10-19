@@ -37,11 +37,13 @@
 //     back (:693-694). So an omitted array renders the kind's EMPTY state.
 //
 //   GET /api/v1/assets/{id}/tracks exists (the ONLY key on that path is `get`)
-//     but is NOT a second source: its handler returns
+//     but is NOT a second source for the EDITORIAL tracks: its handler returns
 //     `asset.audioTracks ?? []` / `asset.subtitleTracks ?? []` from the same
-//     document (src/routes/assets.ts:5268-5271, `repo.get(request.params.id)` at
-//     :5264). A caller holding the asset would be paying a round-trip for bytes
-//     it has, so the panel does not call it — asserted below.
+//     document (`repo.get(request.params.id)`). A caller holding the asset would
+//     be paying a round-trip for bytes it has, so the panel does not call it —
+//     asserted below. (Since #1066 that response ALSO carries `videoTracks`,
+//     likewise derived from the same document's `technicalMetadata`, so it is
+//     still not a second source for this panel.)
 //
 //   There is NO GET on /api/v1/assets/{id}/audio-tracks or …/subtitle-tracks —
 //     those paths carry only `post`, and …/{trackId} only `delete`
@@ -51,16 +53,17 @@
 //     carries a video-track array. The only video attributes exposed anywhere are
 //     on `technicalMetadata` (GET /api/v1/assets/{id} 200 schema, nullable object,
 //     NOT in `required`): { codec, width, height, durationSeconds, bitrateBps,
-//     containerFormat, audioTracks[], extractedAt }, all eight required,
-//     additionalProperties: false (src/routes/assets.ts:884, schema :752-762,
-//     with technicalMetadataError :885).
-//     The four that are TRACK-level are exactly the tuple the persistence layer
-//     writes into the document's video track array —
-//     `technical.video = [{ codec, width, height, bitrateBps }]`
-//     (src/data/asset-document.ts:402-404), read back as `technical.video?.[0]`
-//     (:422) — so the API can report at most ONE video track per asset.
-//     `frameRate` / `index` exist on the stored VideoTrackSchema
-//     (src/data/asset-document.ts:51-58) but no response exposes them.
+//     containerFormat, audioTracks[], extractedAt } all required, plus the
+//     OPTIONAL `frameRate` / `startTimecode` added in #1066;
+//     additionalProperties: false (technicalMetadataSchema,
+//     src/routes/assets.ts, with technicalMetadataError alongside it).
+//     The TRACK-level ones are exactly the tuple the persistence layer writes
+//     into the document's video track array — `technical.video = [{ codec, width,
+//     height, bitrateBps, frameRate?, startTimecode? }]`
+//     (src/data/asset-document.ts technicalFromAsset), read back as
+//     `technical.video?.[0]` — so the API can report at most ONE video track per
+//     asset. This panel lifts the four that predate #1066; `index` exists on the
+//     stored VideoTrackSchema but no response exposes it.
 //
 //   AUDIO, AS PROBED — technicalMetadata.audioTracks[]:
 //     { index, codec, channels, sampleRateHz }, all four required,

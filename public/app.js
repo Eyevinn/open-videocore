@@ -67,6 +67,26 @@ import { mountDeleteProtection } from './lock-detail.js';
 // `?force=true` can never defeat a delete lock, is in that module's header.
 import { classifyDeleteBlock, protectedBlock, showDeleteBlocked } from './delete-blocked.js';
 
+// Structured refusal reasons (issue #920), extracted to their own leaf module by
+// issue #921 so the pre-flight and post-flight paths share one deck. Full
+// contract grounding for the `delete_blocked` envelope and its closed `reason`
+// enum is in that module's header.
+import {
+  ACTION_FAILURE_REASON_COPY,
+  actionFailureReasonCopy,
+} from './action-failure-reasons.js';
+
+// Pre-flight validation for destructive actions (issue #921, broken out of
+// #853): where the list payload already shows the API will refuse the delete,
+// the operator is told why INSTEAD of being asked to confirm an action that
+// cannot happen. Contract grounding for the collection delete guards — and why
+// this UI's bare DELETE makes the prediction sound — is in that module's header.
+import {
+  blockedActionFlag,
+  collectionDeleteBlock,
+  showPreflightBlocked,
+} from './preflight-delete.js';
+
 // Editorial review-state block (issue #901, broken out of #792): the current
 // review state rendered distinctly from the lifecycle `status` badge (#134), and
 // a transition control built ONLY from the `allowedTransitions` the API
@@ -244,6 +264,30 @@ function canChangeDeleteLock() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
+
+/**
+ * Copy for the unified Editorial panel — review state + tags + comments as one
+ * surface on asset detail (issue #937). Verbatim from the copy deck in
+ * docs/design/editorial-panel-layout.md §9, where the intro sentence is §4.2.
+ *
+ * The intro names the lifecycle field (`status`) and where it is rendered (the
+ * summary grid) instead of saying "above": the two axes are INDEPENDENT
+ * (src/data/asset-repo.ts:55-61 — "a `ready` asset can be `draft`,
+ * `in-review`, `approved`, or `rejected`, and moving one never moves the
+ * other"), and a positional claim silently becomes false the moment the panel
+ * is re-ordered or the pane is narrowed.
+ *
+ * Exported so a test asserts the rendered string against the deck rather than
+ * against a copy of it.
+ */
+export const EDITORIAL_COPY = Object.freeze({
+  heading: 'Editorial',
+  intro:
+    'Editorial state — set by people, not by the pipeline. Review state, tags ' +
+    'and comments are all edited here. Review state is a separate axis from ' +
+    "the asset's lifecycle status in the summary grid: moving one never moves " +
+    'the other.',
+});
 
 // Whether the current client role may apply an editorial review transition
 // (issue #901). Same matrix, checked before this was written: `MATRIX`
@@ -1613,9 +1657,10 @@ function errorToast(message, opts) {
 // errorToast() shows whatever text it is handed, and apiFetch (app.js:260-269)
 // hands it `body.message` — which for a refusal is written for a developer, not
 // an operator: `collection 01J8… is in use (2 member asset(s))`
-// (CollectionInUseError, src/data/collection-repo.ts:160) or `asset 01J8… is
-// protected from deletion by an explicit lock` (DeleteProtectedError,
-// src/data/asset-repo.ts:830). Those internal sentences are what this issue
+// (the `CollectionInUseError` message in src/data/collection-repo.ts) or
+// `asset 01J8… is protected from deletion by an explicit lock` (the
+// `DeleteProtectedError` message in src/data/asset-repo.ts). Those internal
+// sentences are what this issue
 // exists to stop showing.
 //
 // CONTRACT GROUNDING (CLAUDE.md rule 7 — read in the live tree, not assumed)
@@ -1643,31 +1688,33 @@ function errorToast(message, opts) {
 // (collections.ts:148-177, e.g. "description exceeds the maximum length of 2048
 // characters"). Restating those numbers here would duplicate a server-owned
 // value that can change without this file.
-const ACTION_FAILURE_REASON_COPY = Object.freeze({
-  delete_protected:
-    'A delete lock is set on it, so the API refuses the delete. Clear the lock from the ' +
-    'item’s detail view first — the lock cannot be forced.',
-  member_of_collection:
-    'It is still a member of one or more collections. Remove it from those collections ' +
-    'first, then try again.',
-  referenced_by_job:
-    'A job that is still running references it. Wait for that job to finish or cancel it, ' +
-    'then try again.',
-});
+//
+// WHERE THE DECK LIVES (issue #921): the reason -> copy mapping moved to
+// public/action-failure-reasons.js so the PRE-flight path (a block the client can
+// see before it asks the operator to confirm anything) and this POST-flight path
+// read one source. ACTION_FAILURE_REASON_COPY keeps its name, shape and exact
+// strings and is re-exported below, so every existing caller is unaffected.
 
 // Map an apiFetch rejection to operator-facing copy, or null when the body
 // carries no reason this client recognises.
 //
-// `err.body` is the parsed error body apiFetch attaches (app.js:271-274).
-// hasOwnProperty, not `in`, so a body whose `reason` is `constructor` or
-// `toString` cannot reach an inherited property.
-function humanizeErrorReason(err) {
+// `err.body` is the parsed error body apiFetch attaches (app.js:271-274). The
+// lookup itself is in the shared deck, which uses hasOwnProperty rather than
+// `in`, so a body whose `reason` is `constructor` or `toString` cannot reach an
+// inherited property.
+//
+// `opts.subject` (issue #921) selects the subject-specific wording where one
+// reason means different things per router: `member_of_collection` is "this
+// asset is in a collection" from the assets router (`AssetMemberOfCollectionError`,
+// thrown in its DELETE /:id handler) and "this collection still holds members"
+// from the collections router (`CollectionInUseError`). A call site that knows
+// which it is says so; omitting it keeps the item-centric default.
+function humanizeErrorReason(err, opts) {
   const body = err && err.body;
   if (!body || typeof body !== 'object') return null;
   const reason = typeof body.reason === 'string' ? body.reason : null;
   if (!reason) return null;
-  if (!Object.prototype.hasOwnProperty.call(ACTION_FAILURE_REASON_COPY, reason)) return null;
-  return ACTION_FAILURE_REASON_COPY[reason];
+  return actionFailureReasonCopy(reason, { subject: opts && opts.subject });
 }
 
 // Report a failed operator action in app styling (issue #920). The single
@@ -1675,11 +1722,12 @@ function humanizeErrorReason(err) {
 // reason when the API sent a structured one, falls back to the server's own
 // message, and — via errorToast — to a generic sentence when there is neither.
 //
-// `opts` is errorToast's (action / detail / title / closeLabel / onClose);
-// `action` and `detail` are what the native alert could never carry, so a caller
-// names WHICH action failed and what is consequently still true.
+// `opts` is errorToast's (action / detail / title / closeLabel / onClose) plus
+// the optional `subject` humanizeErrorReason reads (issue #921); `action` and
+// `detail` are what the native alert could never carry, so a caller names WHICH
+// action failed and what is consequently still true.
 function reportActionFailure(err, opts) {
-  return errorToast(humanizeErrorReason(err) || (err && err.message), opts);
+  return errorToast(humanizeErrorReason(err, opts) || (err && err.message), opts);
 }
 
 // ─── Permanently unrecoverable outcome (issue #933) ────────────────────────────
@@ -2997,39 +3045,11 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     // Bind the ULID copy affordance (issue #851).
     wireCopyIdButtons(kvDiv);
 
-    // ── Tags: add / remove (issue #934, broken out of #792) ──
-    //
-    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
-    // cited in full — with the verified constraints — in public/asset-tags.js:
-    //   READ: there is NO GET /assets/{id}/tags. `openapi.json
-    //        .paths["/api/v1/assets/{id}/tags"]` declares `post` only; the list
-    //        is the optional `tags` array on the asset body already awaited
-    //        above (`assetSchema`, src/routes/assets.ts:919), so the panel adds
-    //        no round-trip. Absent and `[]` both mean "no tags" and both occur.
-    //   POST /api/v1/assets/{id}/tags — body REQUIRED
-    //        { tags: string[] }, each 1..128 chars, 1..128 items,
-    //        additionalProperties: false; 200 = the FULL asset, 404 { error }.
-    //        APPENDS and deduplicates (src/routes/assets.ts:5568-5590, merge at
-    //        :5583 via normalizeTags, src/data/asset-repo.ts:1297).
-    //   DELETE /api/v1/assets/{id}/tags/{tag} — no body; 200 = the FULL asset,
-    //        404 { error }. Removing an absent tag is a 200 no-op
-    //        (src/routes/assets.ts:5595-5618, filter at :5609).
-    // Mounted directly under the key/value grid, where the read-only "Tags" row
-    // used to be, so the tags stay where operators already look for them — and
-    // so there is exactly ONE rendering of the list. Both mutations return the
-    // full asset and the panel re-renders from THAT (never from a local edit),
-    // which is what keeps the list in step with the server after every change.
-    //
-    // The sub-resource takes the ULID (`asset.id`): unlike GET /:id neither
-    // handler resolves a slug (verified — POST to /assets/<slug>/tags 404s), and
-    // this pane holds the ULID even when it was opened by slug.
-    mountAssetTags({
-      asset: asset,
-      host: body,
-      canChange: canChangeTags(),
-      apiFetch: apiFetch,
-      showMsg: showMsg,
-    });
+    // Tags used to be a read-only key/value row here, then (issue #934) an
+    // editable block mounted directly under this grid. Since issue #937 they
+    // are a sub-section of the single "Editorial" panel further down, next to
+    // review state and comments — see the mount below. There is still exactly
+    // ONE rendering of the tag list anywhere on this pane.
 
     // ── Status history (issue #889) ──
     // The audited lifecycle trail. Rendered here so a status transition an
@@ -3591,6 +3611,70 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       showMsg(host, text, kind);
     };
 
+    // ── The Editorial panel: review state + tags + comments (issue #937) ──
+    //
+    // One named container for the three things a HUMAN decides about an asset,
+    // per docs/design/editorial-panel-layout.md §1-§4 (the layout defined in
+    // #898 / PR #1035). It replaces three separately-wedged blocks; the three
+    // sub-sections themselves are untouched modules (public/review-state.js,
+    // public/asset-tags.js, public/comments-panel.js) and still mount, render
+    // and re-render independently — the panel only supplies their host element,
+    // so any one of them can ship, change or be removed on its own.
+    //
+    // Fixed order, identical on every asset (§2): Review → Tags → Comments.
+    // Review first because it is the only sub-section with a state machine and
+    // the only one an operator is blocked by; comments last because the thread
+    // is unbounded and unpaginated, so nothing may sit below it.
+    //
+    // The panel is inserted before the action row — exactly the slot the review
+    // block occupied before — so no block moves out of the review/comments slot
+    // and nothing above it shifts. The blocks the panel ABSORBS do move relative
+    // to each other, by design: comments and tags now render inside the panel,
+    // so `#asset-comments` sits above `#asset-external-ids` and the export action
+    // instead of below them (both still anchor on the action row, which the panel
+    // now precedes), and tags come up from under the summary grid. §2's "nothing
+    // is placed below comments" therefore holds within the panel, not pane-wide.
+    // The pane still reads: what the asset is (grid, technical) → what happened
+    // to it (status history, pipeline) → what humans decide and say about it
+    // (this panel) → what you can do to it (the action row).
+    //
+    // The panel NEVER collapses (§3): hiding the review axis behind a click is
+    // the exact failure #134 asks this layout to prevent.
+    const editorialPanel = document.createElement('div');
+    editorialPanel.id = 'editorial-panel';
+    editorialPanel.className = 'mt20 editorial-panel';
+    const editorialTitle = document.createElement('div');
+    editorialTitle.className = 'section-title';
+    editorialTitle.textContent = EDITORIAL_COPY.heading;
+    editorialPanel.appendChild(editorialTitle);
+    // The axis sentence, promoted from the review block so it covers all three
+    // sub-sections (§4.2, copy deck §9). It names the lifecycle `status` field
+    // and where it lives rather than pointing "above" at it, so the claim stays
+    // true if this panel is ever re-ordered or the pane is narrowed.
+    const editorialIntro = document.createElement('div');
+    editorialIntro.className = 'text-muted editorial-intro';
+    editorialIntro.textContent = EDITORIAL_COPY.intro;
+    editorialPanel.appendChild(editorialIntro);
+    actionsDiv.parentNode.insertBefore(editorialPanel, actionsDiv);
+    /**
+     * One sub-section wrapper inside the panel. The wrapper — not the module —
+     * carries the group id and class, which is what lets the three modules stay
+     * independent: they keep their own ids (`#review-state`, `#asset-tags`,
+     * `#asset-comments`), their own `aria-live` hosts and their own in-place
+     * re-render, and the panel supplies nothing but a parent element.
+     *
+     * @param {string} id  the group id (`editorial-review` | `editorial-tags` |
+     *                     `editorial-comments`)
+     * @returns {HTMLElement}
+     */
+    const editorialGroup = function (id) {
+      const group = document.createElement('div');
+      group.id = id;
+      group.className = 'editorial-group';
+      editorialPanel.appendChild(group);
+      return group;
+    };
+
     // ── Editorial review state + legal transitions (issue #901) ──
     //
     // Contract, fetched before this call was written (CLAUDE.md rule 7) and
@@ -3604,21 +3688,65 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     //        404 { error }, 422 { error: 'invalid_review_transition', message }.
     //        (…].post; src/routes/assets.ts:5470-5484, 422 mapping :2663-2664)
     //
-    // The block is mounted ABOVE "Delete protection" and renders its own badge
-    // class, because the review axis is INDEPENDENT of the lifecycle `status`
-    // shown in the KV grid above (src/data/asset-repo.ts:55-61) — the two must
-    // not read as one control (#134). The transition buttons are built only from
+    // The block is the FIRST sub-section of the editorial panel and renders its
+    // own badge class, because the review axis is INDEPENDENT of the lifecycle
+    // `status` shown in the KV grid (src/data/asset-repo.ts:55-61) — the two
+    // must not read as one control (#134). Keeping review state inside the
+    // accented editorial boundary and the lifecycle badge outside it in the
+    // summary grid is the first of the separations in
+    // docs/design/editorial-panel-layout.md §4; the differing badge SHAPE
+    // (.review-badge is square, .badge is a pill), the non-overlapping
+    // vocabularies, the literal "Review state" label and the panel intro
+    // sentence carry the rest. The transition buttons are built only from
     // the server's `allowedTransitions`, so an illegal move has no control to
     // originate from; the asset's own `reviewState` field is deliberately NOT
     // used to gate anything, since it carries the state but not the graph.
     //
     // Sub-resource paths take the ULID (`asset.id`), which this pane holds even
     // when it was opened by slug.
+    // `host` with no `anchorEl`: the module's own place() appends to `host` in
+    // that case ("The block is inserted before `anchorEl` when given, else
+    // appended to `host`", public/review-state.js), so re-parenting it into the
+    // panel needs no signature change.
     await mountReviewState({
       assetId: asset.id,
-      anchorEl: actionsDiv,
-      host: body,
+      host: editorialGroup('editorial-review'),
       canChange: canChangeReviewState(),
+      apiFetch: apiFetch,
+      showMsg: showMsg,
+    });
+
+    // ── Tags: add / remove (issue #934, broken out of #792) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full — with the verified constraints — in public/asset-tags.js:
+    //   READ: there is NO GET /assets/{id}/tags. `openapi.json
+    //        .paths["/api/v1/assets/{id}/tags"]` declares `post` only; the list
+    //        is the optional `tags` array on the asset body already awaited
+    //        above (`assetSchema`, src/routes/assets.ts:919), so the panel adds
+    //        no round-trip. Absent and `[]` both mean "no tags" and both occur.
+    //   POST /api/v1/assets/{id}/tags — body REQUIRED
+    //        { tags: string[] }, each 1..128 chars, 1..128 items,
+    //        additionalProperties: false; 200 = the FULL asset, 404 { error }.
+    //        APPENDS and deduplicates (src/routes/assets.ts:5568-5590, merge at
+    //        :5583 via normalizeTags, src/data/asset-repo.ts:1297).
+    //   DELETE /api/v1/assets/{id}/tags/{tag} — no body; 200 = the FULL asset,
+    //        404 { error }. Removing an absent tag is a 200 no-op
+    //        (src/routes/assets.ts:5595-5618, filter at :5609).
+    //
+    // Second sub-section of the editorial panel (issue #937): classification is
+    // what the review decision above it is made ABOUT, and the pill list has a
+    // fixed, scannable height. Both mutations return the full asset and the
+    // block re-renders from THAT (never from a local edit) — it re-renders only
+    // itself, never the whole pane, so the comment draft below survives.
+    //
+    // The sub-resource takes the ULID (`asset.id`): unlike GET /:id neither
+    // handler resolves a slug (verified — POST to /assets/<slug>/tags 404s), and
+    // this pane holds the ULID even when it was opened by slug.
+    mountAssetTags({
+      asset: asset,
+      host: editorialGroup('editorial-tags'),
+      canChange: canChangeTags(),
       apiFetch: apiFetch,
       showMsg: showMsg,
     });
@@ -3690,9 +3818,11 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     //        schema. (…].post; src/routes/assets.ts:4776-4793,
     //        commentBodySchema :1174-1176)
     //
-    // Mounted directly below "Editorial review" and above the action row, with
-    // the other editorial blocks: a comment is editorial commentary on the
-    // asset, not a lifecycle operation.
+    // Last sub-section of the editorial panel (issue #937), below Review and
+    // Tags and above the action row: a comment is editorial commentary on the
+    // asset, not a lifecycle operation. It is last because the thread is
+    // unbounded and the API offers no pagination, so anything placed below it
+    // would be pushed off-screen as the thread grows.
     //
     // ADD + READ ONLY, and not as a scope decision to revisit: the path carries
     // only `post` and `get`, there is no `…/comments/{commentId}` path, and
@@ -3712,8 +3842,7 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     // (src/routes/assets.ts:4786, :4807).
     await mountAssetComments({
       assetId: asset.id,
-      anchorEl: actionsDiv,
-      host: body,
+      host: editorialGroup('editorial-comments'),
       canAdd: canAddComment(),
       apiFetch: apiFetch,
       showMsg: showMsg,
@@ -4845,28 +4974,58 @@ async function renderCollectionsTab(container) {
       return;
     }
 
-    const rows = collections.map(function(c) {
+    const rows = collections.map(function(c, rowIndex) {
       const assetCount = c.assets ? c.assets.length : (c.assetCount != null ? c.assetCount : '—');
       // Authoritative member count for the delete confirmation (issue #919):
-      // GET /api/v1/collections returns `assetIds` (collectionSchema,
-      // src/routes/collections.ts:80-91) — `assets` is only present on GET
-      // /collections/{id} (collectionWithAssetsSchema, :96-98). Empty string when
-      // neither is present, so the dialog degrades to count-free wording rather
-      // than asserting a number it cannot know.
+      // GET /api/v1/collections returns `assetIds` (`collectionSchema.assetIds`
+      // in src/routes/collections.ts) — `assets` is only present on
+      // GET /collections/{id} (`collectionWithAssetsSchema.assets`).
+      // Empty string when neither is present, so the dialog degrades to
+      // count-free wording rather than asserting a number it cannot know.
       const memberCount = Array.isArray(c.assetIds)
         ? c.assetIds.length
         : (Array.isArray(c.assets) ? c.assets.length : '');
       // Explicit delete-lock, carried alongside the member count because the
       // lock decides the delete outcome BEFORE emptiness does: DELETE
-      // /api/v1/collections/{id} throws CollectionDeleteProtectedError on a
-      // locked collection (src/routes/collections.ts:404-406) ahead of the
-      // member check (:407-414), and `?force=true` is never consulted for it.
-      // `deleteLock` is part of collectionSchema (collections.ts:80-91, field at
-      // :90) and is
-      // returned by GET /collections (:315-324), so the list already knows.
+      // /api/v1/collections/{id} throws `CollectionDeleteProtectedError` on a
+      // locked collection ahead of the `assetIds.length` member check (both
+      // guards sit in the `app.delete('/:id', …)` handler in
+      // src/routes/collections.ts, in that order), and `?force=true` is never
+      // consulted for the lock. `deleteLock` is part of `collectionSchema`
+      // (`deleteLock: deleteLockSchema.optional()`) and so is returned by
+      // GET /collections, so the list already knows.
       const deleteLocked = !!(c.deleteLock && c.deleteLock.locked);
+      // ── Pre-flight (issue #921) ──
+      // The list payload already carries everything the two delete guards read
+      // (`deleteLock` and `assetIds`), and this UI sends a bare DELETE with
+      // neither `?force=true` nor `?confirmMemberCount=`, so for a locked or a
+      // non-empty collection the 409 is certain. The derivation lives in ONE
+      // place — collectionDeleteBlock() — and is called here for the row flag
+      // and again in the click handler for the dialog, so the flag and the
+      // dialog cannot disagree.
+      //
+      // The flag is plain text next to the control (never colour alone, the rule
+      // public/lock-state.js follows) and is wired to the button with
+      // aria-describedby, so the reason is announced with the control's name
+      // instead of only existing in a `title`. The button itself stays ENABLED:
+      // a disabled control cannot be focused and carries no reason, which is the
+      // trade docs/ux/asset-lock-state-spec.md §5.1 already settled for the
+      // asset archive. Activating it opens the blocked dialog, which has no
+      // confirm button and sends nothing.
+      //
+      // `data-blocked-reason` records WHICH reason the row was flagged for. The
+      // click handler does not read it back — it re-derives from the live list
+      // entry so a row cannot act on a stale attribute — but it keeps the
+      // rendered state inspectable, which is what a DOM test asserts against.
+      const preflight = collectionDeleteBlock(c);
+      const preflightFlag = preflight ? blockedActionFlag(preflight) : null;
+      const whyId = 'coll-delete-why-' + rowIndex;
       // `coll-row` + `tabindex="0"`: the whole row activates the detail panel by
       // pointer or keyboard (issue #917). See wireCollectionRowActivation().
+      // The pre-flight flag below is rendered inside the Actions cell as plain
+      // text, so it is not one of COLLECTION_ROW_CONTROL_SELECTOR's controls:
+      // clicking the reason falls through to row activation and opens the
+      // collection, which is where a non-empty collection's members are removed.
       return '<tr class="coll-row" data-id="' + escHtml(c.id) + '" tabindex="0">' +
         '<td class="cell-id">' + escHtml(c.id) + '</td>' +
         '<td>' + escHtml(c.name || '—') + '</td>' +
@@ -4874,7 +5033,19 @@ async function renderCollectionsTab(container) {
         '<td>' + escHtml(fmtDate(c.createdAt)) + '</td>' +
         '<td>' +
           '<button class="btn-ghost coll-view-btn" data-id="' + escHtml(c.id) + '" style="font-size:12px;padding:3px 8px;">View</button>' +
-          '<button class="btn-danger coll-delete-btn" data-id="' + escHtml(c.id) + '" data-name="' + escHtml(c.name || '') + '" data-members="' + escHtml(String(memberCount)) + '" data-locked="' + (deleteLocked ? '1' : '') + '" style="font-size:12px;padding:3px 8px;margin-left:4px;">Delete</button>' +
+          '<button class="btn-danger coll-delete-btn' + (preflight ? ' action-blocked' : '') + '"' +
+            ' data-id="' + escHtml(c.id) + '"' +
+            ' data-name="' + escHtml(c.name || '') + '"' +
+            ' data-members="' + escHtml(String(memberCount)) + '"' +
+            ' data-locked="' + (deleteLocked ? '1' : '') + '"' +
+            (preflight ? ' data-blocked-reason="' + escHtml(preflight.reason) + '"' : '') +
+            (preflightFlag
+              ? ' title="' + escHtml(preflightFlag) + '" aria-describedby="' + whyId + '"'
+              : '') +
+            ' style="font-size:12px;padding:3px 8px;margin-left:4px;">Delete</button>' +
+          (preflightFlag
+            ? '<span class="action-blocked-note" id="' + whyId + '">' + escHtml(preflightFlag) + '</span>'
+            : '') +
         '</td>' +
         '</tr>';
     }).join('');
@@ -4899,62 +5070,101 @@ async function renderCollectionsTab(container) {
     });
     tableWrap.querySelectorAll('.coll-delete-btn').forEach(function(btn) {
       btn.addEventListener('click', async function() {
-        // Collection delete confirmation (issue #919). Impact wording verified
-        // against DELETE /api/v1/collections/{id}
-        // (src/routes/collections.ts:383-436), NOT assumed:
-        //   - The handler calls `repo.delete(id)` only. There is NO cascade into
-        //     assets: a collection stores a flat list of member ids
-        //     (`assetIds`, src/data/collection-repo.ts:19-25), so deleting it
-        //     removes the grouping, never the media.
-        //   - It is audited as `collection.deleted` (collections.ts:418-433).
+        // Collection delete (issue #919; pre-flight short-circuit added by
+        // #921). Wording verified against DELETE /api/v1/collections/{id} — the
+        // `app.delete('/:id', …)` route in src/routes/collections.ts — NOT
+        // assumed. Cited by symbol rather than by line: this handler has already
+        // moved twice under unrelated merges, and a stale line number reads as a
+        // verified fact when it is not.
+        //   - The handler calls `repo.delete(request.params.id)` only. There is
+        //     NO cascade into assets: a collection stores a flat list of member
+        //     ids (`assetIds` on the `Collection` type in
+        //     src/data/collection-repo.ts), so deleting it removes the grouping,
+        //     never the media.
+        //   - It is audited as `collection.deleted` via `emitAudit`, called
+        //     AFTER the delete, so a refusal writes no entry.
         //   - A delete-locked collection is REFUSED with 409 `delete_blocked` /
-        //     reason `delete_protected` (collections.ts:404-406,
-        //     CollectionDeleteProtectedError; envelope deleteBlockedSchema
-        //     :62-70; handler mapping :257-265). This guard is HARD and runs
-        //     FIRST — before the member check — and `?force=true` is never
-        //     consulted for it, so a locked collection can never be deleted from
-        //     here. The only way out is DELETE /collections/{id}/lock
-        //     (collections.ts:478-491, "the only way to lift protection").
-        //     Hence the lock branch below must not promise the delete lands.
+        //     reason `delete_protected` (`CollectionDeleteProtectedError`,
+        //     thrown on `existing?.deleteLock?.locked`; envelope
+        //     `deleteBlockedSchema`; mapped in the router's `setErrorHandler`).
+        //     This guard is HARD and runs FIRST — before the member check — and
+        //     `?force=true` is never consulted for it, so a locked collection
+        //     can never be deleted from here. The only way out is
+        //     DELETE /collections/{id}/lock ("the only way to lift protection").
         //   - A collection that still holds member ids is REFUSED with 409
-        //     `delete_blocked` / reason `member_of_collection` unless
-        //     `?force=true` (collections.ts:407-414, CollectionInUseError;
-        //     ADR-020 decision 2 marks this block SOFT/overridable). This UI
-        //     deliberately does not send `force`, so a non-empty collection is a
-        //     no-op the operator is told about up front.
+        //     `delete_blocked` / reason `member_of_collection` + `memberCount`
+        //     (`CollectionInUseError`, thrown on `existing.assetIds.length > 0`;
+        //     mapped in the same `setErrorHandler`) unless `?force=true` or a
+        //     matching `?confirmMemberCount=` is sent (both declared on the
+        //     route's `querystring` schema; ADR-020 decision 2 marks this block
+        //     SOFT/overridable). This UI sends NEITHER, so a non-empty
+        //     collection is a certain refusal — which is exactly what makes the
+        //     pre-flight check below sound rather than a guess.
         //   - There is no restore path for a deleted collection (the router
         //     exposes no equivalent of the asset `/restore` route).
         const label = nameOrFallback(btn.dataset.name, 'this collection');
+        const id = btn.dataset.id;
+
+        // ── Pre-flight short-circuit (issue #921) ──
+        // Both refusals above are visible in the payload this table already
+        // read, so a blocked delete is explained HERE and the confirmation is
+        // never offered: asking an operator to confirm an action, then
+        // answering with a failure dialog, is the sequence this issue removes.
+        // The descriptor comes from the same collectionDeleteBlock() the row
+        // flag was built from (re-read from the live list entry, so a row
+        // refreshed since render is judged on what it says now), and the dialog
+        // copy comes from the same structured-reason deck the post-flight
+        // handler below uses (issue #920) — one block, one set of words,
+        // whichever side of the request it was noticed on.
+        const live = collections.filter(function (x) { return x && String(x.id) === String(id); })[0];
+        const preflight = live ? collectionDeleteBlock(live) : null;
+        if (preflight) {
+          await showPreflightBlocked({
+            block: preflight,
+            name: label,
+            confirmModal,
+            unaffected: [
+              'No request was sent: the collection, its member list and every asset in it are exactly as they were.',
+              'Nothing was recorded in the audit log, because nothing happened.',
+            ],
+            // Where the block can actually be resolved. For a non-empty
+            // collection that is its own view, which lists the members with a
+            // Remove control per row. A delete-locked collection has NO control
+            // in this UI — the only route that lifts the lock is DELETE
+            // /collections/{id}/lock (the `app.delete('/:id/lock', …)` route in
+            // src/routes/collections.ts) — so no
+            // secondary button is offered there rather than one that leads
+            // nowhere. Never a "force"/"delete anyway" affordance.
+            secondary:
+              preflight.reason === 'member_of_collection'
+                ? {
+                    label: 'View collection',
+                    onActivate: function () {
+                      showCollectionDetail(id, detailPanel, loadCollections);
+                    },
+                  }
+                : null,
+          });
+          return;
+        }
+
+        // Not predictably blocked. `assetIds` is required on collectionSchema,
+        // so in practice this is the empty-collection case; a payload that
+        // omitted membership lands here too and gets the count-free wording
+        // rather than an assertion the client cannot support.
         const members = btn.dataset.members;
         const hasCount = members !== '' && members != null && !Number.isNaN(Number(members));
         const count = hasCount ? Number(members) : null;
-        const locked = btn.dataset.locked === '1';
-        // The delete outcome is NOT seeded unconditionally: in a refused branch
-        // BOTH of its clauses are false. The lock guard throws
-        // CollectionDeleteProtectedError BEFORE `repo.delete(id)` is reached
-        // (collections.ts:404-406 vs :417), and the `collection.deleted` audit
-        // emit sits AFTER the delete inside `if (existing)` (:418-433), so a
-        // refused delete writes no audit entry either. Same construction as the
-        // asset archive dialog above (app.js:1538-1539): refusal bullet first,
-        // outcome only where the delete can actually land — or as an
-        // "Otherwise …" clause when the branch cannot tell in advance.
+        // The outcome is NOT promised unconditionally: an unknown member count
+        // can still be refused, and the `collection.deleted` `emitAudit` call
+        // sits AFTER `repo.delete(...)` and inside `if (existing)`, so a refused
+        // delete writes no audit entry either. Same construction as the
+        // asset archive dialog above: state the refusal first, and promise the
+        // outcome only where the delete can actually land.
         const affected = [];
-        // Lock first: it mirrors the handler's guard order, and it is the only
-        // refusal that holds whether or not the collection is empty.
-        if (locked) {
-          affected.push(
-            'This collection is delete-locked, so the API will refuse the delete and nothing will change. ' +
-            'The lock has to be cleared first (DELETE /collections/{id}/lock) — it cannot be forced.'
-          );
-        } else if (hasCount && count === 0) {
+        if (hasCount && count === 0) {
           affected.push('This collection is empty, so the delete will go through.');
           affected.push('The collection record and its list of members are deleted, and the deletion is recorded in the audit log.');
-        } else if (hasCount) {
-          affected.push(
-            'This collection still holds ' + count + ' asset' + (count === 1 ? '' : 's') +
-            ', so the API will refuse the delete and nothing will change. Remove its members first.'
-          );
-          affected.push('Otherwise — once its members are removed — the collection record and its list of members are deleted, and the deletion is recorded in the audit log.');
         } else {
           affected.push('If the collection still holds assets, the API refuses the delete and nothing changes — remove its members first.');
           affected.push('Otherwise the collection record and its list of members are deleted, and the deletion is recorded in the audit log.');
@@ -4973,26 +5183,40 @@ async function renderCollectionsTab(container) {
         });
         if (!ok) return;
         try {
-          await apiFetch('/collections/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
+          await apiFetch('/collections/' + encodeURIComponent(id), { method: 'DELETE' });
           loadCollections();
         } catch (err) {
           // First call site for errorToast (issue #918), now routed through
           // reportActionFailure (issue #920) because this is the path that most
           // often carries a structured reason.
           //
-          // DELETE /api/v1/collections/{id} (openapi.json) answers 204 | 404 |
-          // 409. The 409 body is { error: 'delete_blocked', message, reason:
-          // 'referenced_by_job'|'member_of_collection'|'delete_protected',
-          // blockedBy } (deleteBlockedSchema, src/routes/collections.ts:62-70;
-          // emitted at :262 and :275). apiFetch reduces that body to the server's
-          // `message`, which for the in-use case is the internal sentence
-          // `collection <id> is in use (N member asset(s))`
-          // (src/data/collection-repo.ts:160) — so the reason is humanized here
-          // and only falls back to that message when no reason is recognised.
+          // DELETE /api/v1/collections/{id} (openapi.json) answers 204 | 400 |
+          // 404 | 409. The 409 body is { error: 'delete_blocked', message,
+          // reason: 'referenced_by_job'|'member_of_collection'|
+          // 'delete_protected', blockedBy, memberCount? } (`deleteBlockedSchema`
+          // in src/routes/collections.ts; sent from that router's
+          // `setErrorHandler`, in its `CollectionDeleteProtectedError` and
+          // `CollectionInUseError` branches). apiFetch reduces that body to the
+          // server's `message`, which for the in-use case is the internal
+          // sentence `collection <id> is in use (N member asset(s))` (the
+          // `CollectionInUseError` message in src/data/collection-repo.ts) — so
+          // the reason is humanized here and only falls back to that message
+          // when no reason is recognised.
+          //
+          // `subject: 'collection'` (issue #921) picks the collections-router
+          // meaning of the shared enum: `member_of_collection` from THIS route
+          // means the collection still holds members (`CollectionInUseError`
+          // from the collections router), not that the subject sits inside some other
+          // collection. Reaching this path at all means the block appeared
+          // between the list read and the click, so the list is reloaded
+          // afterwards and the row then carries the flag the pre-flight check
+          // would have shown.
           reportActionFailure(err, {
             action: 'Delete collection',
             detail: 'Collection "' + label + '" was not deleted.',
+            subject: 'collection',
           });
+          loadCollections();
         }
       });
     });
@@ -9042,6 +9266,10 @@ export {
   // an unknown/absent one falls back to the server message.
   reportActionFailure,
   humanizeErrorReason,
+  // Re-exported from public/action-failure-reasons.js, where issue #921 moved
+  // the deck so the pre-flight and post-flight paths share one mapping. Kept on
+  // this module's surface because it is where every existing caller and test
+  // reads it from.
   ACTION_FAILURE_REASON_COPY,
   // Permanently-unrecoverable outcome (issue #933). Exported so a DOM/unit test
   // can assert that a 410 `gone` is told apart from a retryable failure, that the

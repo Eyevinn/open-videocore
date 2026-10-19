@@ -614,6 +614,7 @@ Response 201 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/by-external-id/{namespace}/{id}
@@ -669,6 +670,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/by-tams-address
@@ -852,6 +854,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   PATCH /api/v1/assets/{id}
@@ -917,6 +920,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   DELETE /api/v1/assets/{id}
@@ -1034,6 +1038,7 @@ Response 201 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/comments
@@ -1338,6 +1343,7 @@ Response 201 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/external-ids
@@ -1420,6 +1426,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   DELETE /api/v1/assets/{id}/external-ids/{namespace}/{externalId}
@@ -1544,6 +1551,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   DELETE /api/v1/assets/{id}/lock
@@ -1594,6 +1602,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   PUT /api/v1/assets/{id}/metadata
@@ -1650,6 +1659,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   POST /api/v1/assets/{id}/multipart/initiate
@@ -1838,6 +1848,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/review-state
@@ -1914,6 +1925,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/stream/{*}
@@ -2028,6 +2040,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   DELETE /api/v1/assets/{id}/tags/{tag}
@@ -2081,6 +2094,7 @@ Response 200 (application/json)
   "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
+- sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/thumbnails
@@ -2169,7 +2183,8 @@ Response 200 (application/json)
       "height": 0,
       "index": 0,
       "bitrateBps": 0,
-      "frameRate": 0
+      "frameRate": 0,
+      "startTimecode": "string"
     }
   ],
   "audioTracks": [
@@ -2637,7 +2652,7 @@ Auto-scaler
 
   Get the auto-scaler configuration in force in the serving process: the most recent runtime `PATCH` if one has been accepted since startup, otherwise the boot-time values from `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS`. It reads the live copy, never the parameter store, and does not say which of the two sources a value came from.
 
-  Report the auto-scaler settings this process is using. These are the live values: the most recent PATCH /api/v1/scaler/config if one has been accepted since startup, otherwise the boot values from ENCORE_MAX_INSTANCES and ENCORE_IDLE_TIMEOUT_MS. A PATCHed value is persisted in the parameter store, but that record is not read back at boot yet, so after a restart this reports the environment values again. This endpoint reads the live copy only — it never reads the store, so it cannot be used to check what is persisted, and it does not distinguish the two sources. minInstances is reported from this endpoint's own record and is not the floor the scaler loops enforce (see the field description).
+  Report the auto-scaler settings this process is using. These are the live values: the most recent PATCH /api/v1/scaler/config if one has been accepted since startup, otherwise the boot values from ENCORE_MAX_INSTANCES and ENCORE_IDLE_TIMEOUT_MS. A PATCHed value is persisted in the parameter store, but that record is not read back at boot yet, so after a restart this reports the environment values again. This endpoint reads the live copy only — it never reads the store, so it cannot be used to check what is persisted. sources says, per field, whether the value is the deployment's environment value or was set through PATCH on this process (#1079). minInstances is reported from this endpoint's own record and is not the floor the scaler loops enforce (see the field description).
 
   Response
 The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, but nothing re-reads that record at boot yet, so after a restart this reports the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values again until the PATCH is re-sent.
@@ -2645,11 +2660,26 @@ Response 200 (application/json)
 {
   "maxInstances": 0,
   "minInstances": 0,
-  "idleTimeoutMs": 0
+  "idleTimeoutMs": 0,
+  "sources": {
+    "maxInstances": {
+      "source": "env",
+      "updatedAt": "string"
+    },
+    "minInstances": {
+      "source": "env",
+      "updatedAt": "string"
+    },
+    "idleTimeoutMs": {
+      "source": "env",
+      "updatedAt": "string"
+    }
+  }
 }
 Field notes- maxInstances — Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset).
 - minInstances — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded — persisted and reported back here — and is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart.
 - idleTimeoutMs — Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset).
+- sources — Where each config value in this response came from (#1079).
 
   PATCH /api/v1/scaler/config
 
@@ -2659,7 +2689,7 @@ Field notes- maxInstances — Upper bound on transcoder instances in one workspa
 **Storage.** The values are written to the parameter store first and applied second, as one complete snapshot of all three fields, so a 200 always means "saved AND applied". A deployment with no parameter store configured gets a 501 and nothing is applied; a store that rejects the write or cannot be reached gets a 503 and nothing is applied, so GET /api/v1/scaler/config still reports the previous values. The live copy is per process and is not pushed to other replicas.
 **Precedence.** The most recent PATCH accepted by this process wins. Until one arrives, the values read at boot from ENCORE_MAX_INSTANCES (default 3) and ENCORE_IDLE_TIMEOUT_MS (default 300000) apply. So the order is: runtime PATCH, else environment.
 **Restart.** The stored record survives a restart, but it is not read back at boot yet, so a restarted process serves the environment values again until the PATCH is re-sent. Treat a PATCH as durable but not self-restoring.
-**Reset to the environment default.** There is no reset endpoint and no sentinel value. PATCH the environment values back explicitly, which overwrites the stored snapshot; restarting reverts the live values but leaves the stored record in place. GET /api/v1/scaler/config shows what is in force, but not whether it came from a PATCH or from the environment.
+**Reset to the environment default.** There is no reset endpoint and no sentinel value. PATCH the environment values back explicitly, which overwrites the stored snapshot; restarting reverts the live values but leaves the stored record in place. GET /api/v1/scaler/config shows what is in force, and sources says per field whether the value came from a PATCH on this process or from the environment (#1079) — note that PATCHing an environment value back still reports source: "runtime", because sources reports who set the value, not whether the number changed; only a restart puts a field back to source: "env".
 **Caveats.** minInstances is recorded, persisted and echoed back but is not applied to the running scaler loops (see the field description). A PATCH sent while GET /api/v1/scaler/status reports scalerActive: false is accepted and reported back, but is not carried into the scaler that later activates against a newly provisioned stack — that activation uses the environment values, so re-send the PATCH afterwards.
 
   Request
@@ -2679,11 +2709,26 @@ Response 200 (application/json)
 {
   "maxInstances": 0,
   "minInstances": 0,
-  "idleTimeoutMs": 0
+  "idleTimeoutMs": 0,
+  "sources": {
+    "maxInstances": {
+      "source": "env",
+      "updatedAt": "string"
+    },
+    "minInstances": {
+      "source": "env",
+      "updatedAt": "string"
+    },
+    "idleTimeoutMs": {
+      "source": "env",
+      "updatedAt": "string"
+    }
+  }
 }
 Field notes- maxInstances — Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset).
 - minInstances — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded — persisted and reported back here — and is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart.
 - idleTimeoutMs — Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset).
+- sources — Where each config value in this response came from (#1079).
 
   GET /api/v1/scaler/status
 
@@ -2731,10 +2776,21 @@ Response 200 (application/json)
   "maxInstances": 0,
   "jobsPerInstance": 0,
   "idleTimeoutMs": 0,
-  "scalerActive": true
+  "scalerActive": true,
+  "sources": {
+    "maxInstances": {
+      "source": "env",
+      "updatedAt": "string"
+    },
+    "idleTimeoutMs": {
+      "source": "env",
+      "updatedAt": "string"
+    }
+  }
 }
 Field notes- maxInstances — Instance cap per workspace pool in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been accepted since startup, otherwise ENCORE_MAX_INSTANCES from boot. A PATCHed value is persisted but is not reloaded at boot, so this reverts to the environment value on restart. Reported even when scalerActive is false.
 - idleTimeoutMs — Idle teardown timeout (ms) in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been accepted since startup, otherwise ENCORE_IDLE_TIMEOUT_MS from boot. A PATCHed value is persisted but is not reloaded at boot, so this reverts to the environment value on restart.
+- sources — Where the config values in this response came from (#1079). Covers the values this endpoint reports that an operator can change; see GET /config for the full set, including minInstances.
 
 ---
 
@@ -2875,7 +2931,9 @@ Response 200 (application/json)
         "bitrateBps": 0,
         "containerFormat": "string",
         "audioTracks": [],
-        "extractedAt": "string"
+        "extractedAt": "string",
+        "frameRate": 0,
+        "startTimecode": "string"
       },
       "technicalMetadataError": "string"
     }

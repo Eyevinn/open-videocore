@@ -216,6 +216,30 @@ export type Job = {
   // wording, or a cause Encore reported), which is the part that tells an
   // operator WHY the job was inferred dropped.
   correctedDropError?: string;
+  // --- Late completion on a CANCELLED job (#1226) ---
+  // True when an Encore completion arrived for this job AFTER it was cancelled
+  // and was therefore DISCARDED: `cancelled` is the one status with no outgoing
+  // transition (ALLOWED_JOB_TRANSITIONS below), so the cancel stands and the
+  // run's output is reclaimed instead of registered
+  // (src/pipeline/cancelled-transcode-completion.ts states the full rule).
+  // Modelled exactly like `droppedThenRecovered` above: an additive, OPTIONAL
+  // annotation that does NOT drive status (the job really is `cancelled`), is
+  // absent (not false) on every other job, and is never cleared. It is what
+  // explains a cancelled job with 0 renditions on the RECORD — the symptom
+  // #1226 was reported from was a log line reading `applied false
+  // renditionCount 0` with nothing durable to go on.
+  lateCompletionDiscarded?: boolean;
+  // How many renditions that discarded completion reported, present only when
+  // `lateCompletionDiscarded` is true. 0 when the completion carried no output
+  // document (the poller's Encore-unreachable fallback) — which does NOT mean
+  // nothing was written, hence the prefix below.
+  discardedRenditionCount?: number;
+  // The job's deterministic transcode output prefix
+  // (`transcodeOutputPrefix(assetId, jobId)`, src/pipeline/transcode.ts) whose
+  // objects the reclaim removed, present only when `lateCompletionDiscarded` is
+  // true. Recorded even when the removal itself failed, so an operator (or a
+  // later sweep) knows exactly which prefix to reclaim.
+  discardedOutputPrefix?: string;
   // Both fields are INTERNAL to the record for now, exactly like
   // `droppedByScaler` above: the response contract (jobSchema, src/routes/
   // jobs.ts) deliberately does not carry the #709 drop-detection vocabulary, and
@@ -290,6 +314,13 @@ export type UpdateJobInput = {
   // and both repository backends record it without needing an audit emitter.
   droppedThenRecovered?: boolean;
   correctedDropError?: string;
+  // Late completion on a CANCELLED job (#1226). Written by the reclaim
+  // (src/pipeline/cancelled-transcode-completion.ts) in ONE patch that carries
+  // no `status`, so the job stays `cancelled` and no transition is attempted.
+  // Additive/optional, carried through applyJobPatch unchanged.
+  lateCompletionDiscarded?: boolean;
+  discardedRenditionCount?: number;
+  discardedOutputPrefix?: string;
   // Explicit REMOVAL of `error` (#1023). Every other field here is patched by
   // presence (`!== undefined`), which by construction cannot express "unset this
   // field": passing `error: undefined` is indistinguishable from not patching
@@ -440,6 +471,13 @@ export function applyJobPatch(existing: IngestJob, patch: UpdateJobInput, now: s
   if (patch.droppedByScaler !== undefined) next.droppedByScaler = patch.droppedByScaler;
   if (patch.droppedThenRecovered !== undefined) next.droppedThenRecovered = patch.droppedThenRecovered;
   if (patch.correctedDropError !== undefined) next.correctedDropError = patch.correctedDropError;
+  // #1226: durable trace of a discarded late completion on a cancelled job.
+  if (patch.lateCompletionDiscarded !== undefined)
+    next.lateCompletionDiscarded = patch.lateCompletionDiscarded;
+  if (patch.discardedRenditionCount !== undefined)
+    next.discardedRenditionCount = patch.discardedRenditionCount;
+  if (patch.discardedOutputPrefix !== undefined)
+    next.discardedOutputPrefix = patch.discardedOutputPrefix;
   // #1023: explicit clear, applied LAST so it beats a same-patch `error` write.
   // `delete` (not `= undefined`) so the field is genuinely absent: the CouchDB
   // backend serialises the whole record (couch-job-repo.ts toDoc), where an
