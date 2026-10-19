@@ -243,4 +243,62 @@ describe('spawnInstance provisions both halves concurrently (#1170)', () => {
     // Not destroyed: a readiness timeout is not evidence of a broken instance.
     expect(removeInstance).not.toHaveBeenCalled();
   });
+
+  // Overlapping the waits means the Encore wait is ALREADY RUNNING while the
+  // listener is created, so every way out of that block has to cancel it. The
+  // listener create sits between the start of the Encore wait and the
+  // Promise.all; a create that fails non-transiently rejects the spawn without
+  // ever reaching the Promise.all, and the wait would otherwise keep polling
+  // getInstanceHealth (once a second in production, for up to the full spawn
+  // readiness timeout) against an instance the cleanup path has just destroyed.
+  // `encoreReady.catch(() => undefined)` only silences that loop's rejection.
+  it('aborts the in-flight Encore readiness wait when the listener create fails, so no further health probes are issued after the spawn rejects', async () => {
+    const redis = new FakeRedis();
+    const workspaceId = 'ws-1170-listener-create-fails';
+
+    createInstance.mockImplementation(async (_ctx, serviceId, _tok, body) => {
+      const name = (body as { name: string }).name;
+      if (String(serviceId) === ENCORE_CALLBACK_LISTENER_SERVICE_ID) {
+        // Let the Encore readiness wait get properly in flight first (its poll
+        // interval is 1ms in this config), so this really covers "the create
+        // fails WHILE the wait is running".
+        await new Promise((r) => setTimeout(r, 10));
+        // Non-transient, so the create loop rethrows on the first attempt:
+        // isTransientOscError classifies on the error's own `httpCode`
+        // (src/encore-scaler/osc-error.ts), and 400 is not retryable.
+        throw Object.assign(new Error('listener create rejected'), {
+          httpCode: 400
+        });
+      }
+      return { name, url: `https://${name}-${serviceId}.example` };
+    });
+
+    // The Encore half never reports `running`, so the ONLY thing that can stop
+    // its poll loop within this test is the abort.
+    getInstanceHealth.mockImplementation(async () => 'creating');
+
+    const config = makeConfig(redis, workspaceId);
+    // Far longer than the test's own observation window, so the wait's own
+    // deadline cannot be what stops the polling.
+    config.spawnReadyTimeoutMs = 60_000;
+
+    await expect(spawnInstance(config)).rejects.toThrow(
+      'listener create rejected'
+    );
+
+    const encoreProbes = () =>
+      getInstanceHealth.mock.calls.filter(
+        (call) => String(call[1]) === ENCORE_SERVICE_ID
+      ).length;
+
+    // The wait was genuinely in flight when the create failed...
+    const probesAtRejection = encoreProbes();
+    expect(probesAtRejection).toBeGreaterThan(0);
+
+    // ...and it stopped. At a 1ms cadence this window would otherwise add ~100
+    // more probes to an instance the spawn has already abandoned and destroyed.
+    await new Promise((r) => setTimeout(r, 150));
+    expect(encoreProbes()).toBe(probesAtRejection);
+    expect(removeInstance).toHaveBeenCalled();
+  });
 });

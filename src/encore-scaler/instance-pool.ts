@@ -744,77 +744,96 @@ async function spawnPooledInstance(
     // still running from surfacing as an unhandled rejection; it attaches a
     // second handler and does not consume the rejection for the await below.
     const readinessAbort = new AbortController();
-    const encoreReady = waitForSpawnedInstanceReady(
-      ENCORE_SERVICE_ID,
-      instanceId,
-      config,
-      readinessAbort.signal
-    );
-    encoreReady.catch(() => undefined);
-    // Pair this Encore instance with a dedicated callback listener (same name)
-    // configured with this exact Encore URL, so completion callbacks are routed
-    // to the scaler-managed instance rather than a static one. RedisQueue is set
-    // explicitly to a dedicated queue (`ovc:transcode-done`) that no external
-    // eyevinn-encore-packager consumes, so an external packager can't win the
-    // BZPOPMIN race against our poller and swallow our completion messages
-    // (issue #93). This MUST match DEFAULT_QUEUE_KEY in
-    // src/pipeline/encore-callback-poller.ts.
-    const callbackSat = await config.oscContext.getServiceAccessToken(
-      ENCORE_CALLBACK_LISTENER_SERVICE_ID
-    );
-    progress.secrets.push(callbackSat);
-    // Retry callback listener creation with the same transient-error logic as
-    // the Encore instance above. The OSC ingress webhook sometimes returns
-    // ORCHESTRATOR_UNAVAILABLE under load; a short back-off is enough.
-    let callback: OscInstance | undefined;
-    let lastCallbackErr: unknown;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      progress.attempts += 1;
-      try {
-        const result = await createOrAdoptCallbackListener(
-          config,
-          instanceId,
-          encoreUrl,
-          callbackSat
-        );
-        callback = result.instance;
-        listenerAdopted = result.adopted;
-        break;
-      } catch (err) {
-        lastCallbackErr = err;
-        // The adopt-on-"already taken" step lives in
-        // createOrAdoptCallbackListener above, shared with resolvePendingSpawns.
-        const isTransient = isTransientOscError(err);
-        if (!isTransient || attempt === maxAttempts) throw err;
-        await new Promise((r) => setTimeout(r, attempt * 5_000));
-      }
-    }
-    if (!callback) throw lastCallbackErr;
-    listenerCreated = true;
-    listenerUrl = instanceUrl(callback);
-    // #1170: both halves are now provisioning; wait for them CONCURRENTLY
-    // rather than one after the other. Each wait keeps its own deadline and
-    // cadence (waitForSpawnedInstanceReady), and Promise.all rejects with the
-    // first failure — which the cleanup path below classifies exactly as
-    // before: a SpawnReadyTimeoutError keeps the instance and records it as a
-    // PENDING pool entry for resolvePendingSpawns to finish. That pending
-    // record now carries `callbackListenerUrl` even when it is the ENCORE half
-    // that timed out, because the listener already exists by this point — the
-    // "a timed-out spawn never got to the listener" case resolvePendingSpawns
-    // documents is one less thing a resumed spawn has to redo.
-    const listenerReady = waitForSpawnedInstanceReady(
-      ENCORE_CALLBACK_LISTENER_SERVICE_ID,
-      instanceId,
-      config,
-      readinessAbort.signal
-    );
-    listenerReady.catch(() => undefined);
+    // #1170 review finding: EVERYTHING from the start of the first wait down to
+    // the Promise.all lives inside ONE try/finally, so the wait is aborted on
+    // every exit from the block that started it — not only on the Promise.all
+    // path. Three paths in between throw straight past that point:
+    //   - the listener's getServiceAccessToken rejects,
+    //   - a listener create that is non-transient or has exhausted maxAttempts,
+    //   - `!callback` (loop fell through without an instance).
+    // Each of those used to leave the Encore wait polling getInstanceHealth
+    // once a second for up to 15 minutes after spawnPooledInstance had already
+    // rejected — against an instance the catch below may have destroyed on its
+    // way out. `encoreReady.catch(() => undefined)` silences that loop's
+    // rejection, it does not stop the loop; only the abort does.
     try {
+      const encoreReady = waitForSpawnedInstanceReady(
+        ENCORE_SERVICE_ID,
+        instanceId,
+        config,
+        readinessAbort.signal
+      );
+      encoreReady.catch(() => undefined);
+      // Pair this Encore instance with a dedicated callback listener (same name)
+      // configured with this exact Encore URL, so completion callbacks are routed
+      // to the scaler-managed instance rather than a static one. RedisQueue is set
+      // explicitly to a dedicated queue (`ovc:transcode-done`) that no external
+      // eyevinn-encore-packager consumes, so an external packager can't win the
+      // BZPOPMIN race against our poller and swallow our completion messages
+      // (issue #93). This MUST match DEFAULT_QUEUE_KEY in
+      // src/pipeline/encore-callback-poller.ts.
+      const callbackSat = await config.oscContext.getServiceAccessToken(
+        ENCORE_CALLBACK_LISTENER_SERVICE_ID
+      );
+      progress.secrets.push(callbackSat);
+      // Retry callback listener creation with the same transient-error logic as
+      // the Encore instance above. The OSC ingress webhook sometimes returns
+      // ORCHESTRATOR_UNAVAILABLE under load; a short back-off is enough.
+      let callback: OscInstance | undefined;
+      let lastCallbackErr: unknown;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        progress.attempts += 1;
+        try {
+          const result = await createOrAdoptCallbackListener(
+            config,
+            instanceId,
+            encoreUrl,
+            callbackSat
+          );
+          callback = result.instance;
+          listenerAdopted = result.adopted;
+          break;
+        } catch (err) {
+          lastCallbackErr = err;
+          // The adopt-on-"already taken" step lives in
+          // createOrAdoptCallbackListener above, shared with
+          // resolvePendingSpawns.
+          const isTransient = isTransientOscError(err);
+          if (!isTransient || attempt === maxAttempts) throw err;
+          await new Promise((r) => setTimeout(r, attempt * 5_000));
+        }
+      }
+      if (!callback) throw lastCallbackErr;
+      listenerCreated = true;
+      listenerUrl = instanceUrl(callback);
+      // #1170: both halves are now provisioning; wait for them CONCURRENTLY
+      // rather than one after the other. Each wait keeps its own deadline and
+      // cadence (waitForSpawnedInstanceReady), and Promise.all rejects with the
+      // first failure — which the cleanup path below classifies exactly as
+      // before: a SpawnReadyTimeoutError keeps the instance and records it as a
+      // PENDING pool entry for resolvePendingSpawns to finish. That pending
+      // record now carries `callbackListenerUrl` even when it is the ENCORE half
+      // that timed out, because the listener already exists by this point — the
+      // "a timed-out spawn never got to the listener" case resolvePendingSpawns
+      // documents is one less thing a resumed spawn has to redo.
+      const listenerReady = waitForSpawnedInstanceReady(
+        ENCORE_CALLBACK_LISTENER_SERVICE_ID,
+        instanceId,
+        config,
+        readinessAbort.signal
+      );
+      listenerReady.catch(() => undefined);
       await Promise.all([encoreReady, listenerReady]);
     } finally {
-      // Whichever way this ends, the other wait has nothing left to wait for.
-      // Cancelling it keeps the #778 property that no health probe is issued
-      // after the spawn has already settled.
+      // Whichever way the readiness phase ends — both halves running, one half
+      // timing out, or a throw before the second wait was even started — any
+      // wait still in flight has nothing left to wait for. Aborting here, in
+      // the same block the waits are started in, keeps the #778 property that
+      // no health probe is issued once the spawn has settled: the abort checks
+      // in waitForInstanceReadyBounded (src/services/instance-readiness.ts,
+      // before the sleep and again after it) end the loop before its next
+      // getInstanceHealth call. On the failure paths this runs BEFORE the catch
+      // below starts its cleanup, so no probe races the destroy.
       readinessAbort.abort();
     }
 
