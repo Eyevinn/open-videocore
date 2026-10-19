@@ -44,11 +44,13 @@ import { logPipelineEvent, type PipelineLogSink } from '../services/pipeline-log
 import {
   completePackageJob,
   failPackageJob,
+  inFlightPackageJob,
   startPackageJob,
   type PackageJobDeps
 } from './package-job.js';
 import {
   deleteSupersededOutput,
+  samePackagedLocation,
   supersededPackagedPrefix,
   type ResolveSupersededStorage
 } from './superseded-output.js';
@@ -64,8 +66,73 @@ export function packagedBucket(): string {
 // A correlation id carried through the queue + packager callback so a
 // completion event can be mapped back to the originating asset. It is the
 // asset id (OSC provides structural isolation, so no workspace namespace).
+//
+// NOTE (#1044 review, MAJOR 3): this id identifies the ASSET, not the RUN. Two
+// packaging runs over one asset share it, so the packager's success callback
+// carries no run identity of ours — which is why `packagedCallbackSupersededRun`
+// below has to infer "is this callback for the current run?" from the asset's
+// package Job record instead of comparing run ids.
 export function packagingId(assetId: string): string {
   return assetId;
+}
+
+// Whether a packaging run is in flight for an asset, as far as the package Job
+// record can tell us (src/pipeline/package-job.ts: one `package` Job per
+// packaging episode, created `running` at enqueue and settled from the
+// completion callbacks).
+//   - 'in-flight' — a non-terminal `package` job exists: a run IS awaiting a
+//                   callback, so an arriving callback is plausibly its.
+//   - 'settled'   — no non-terminal `package` job exists: nothing is awaiting a
+//                   callback, so an arriving callback belongs to a run that was
+//                   already settled.
+//   - 'unknown'   — no job repository wired, or the lookup failed. No evidence
+//                   either way; the callback is handled exactly as before.
+export type PackagingRunLiveness = 'in-flight' | 'settled' | 'unknown';
+
+// Is this packager success callback for a run that was already SUPERSEDED?
+// Returns the reason to ignore it, or undefined to handle it normally.
+//
+// THE FAILURE THIS PREVENTS (#1044 review, MAJOR 3): the packager queue is
+// at-least-once and the callback carries no run id, so run 1's success callback
+// can be redelivered AFTER run 2 completed. Handled normally it repointed the
+// asset BACK to run 1's subfolder — which run 2's cleanup had already deleted —
+// and then deleted run 2's subfolder as "superseded", leaving the asset pointing
+// at nothing. Both writes are wrong, so the whole callback is ignored: persist
+// nothing, delete nothing.
+//
+// EVIDENCE-BASED, deliberately: it only fires when the asset ALREADY points at a
+// generation, the callback proposes a DIFFERENT one, and no packaging run is in
+// flight to have produced it. Absent that evidence (first package, same
+// generation re-delivered, a run in flight, or no job repository) the callback is
+// handled exactly as before, so the normal re-run path — and #1044's cleanup with
+// it — is untouched.
+//
+// RESIDUAL GAP, recorded rather than guessed at: a redelivery that lands while a
+// LATER run is still in flight is indistinguishable from that run's own callback,
+// because `packagingId` is the asset id and the packager reports only its own
+// job id inside `outputPath`. Closing it needs a run token minted by us at
+// enqueue time and echoed back by the packager — a queue/callback contract
+// change, out of scope here.
+export function packagedCallbackSupersededRun(input: {
+  // What the asset points at right now (read BEFORE this callback's update).
+  recorded: PackagedOutput | undefined;
+  // What this callback proposes to point it at.
+  incoming: PackagedOutput | undefined;
+  liveness: PackagingRunLiveness;
+  // The bucket an absent `bucket` resolves to, so the two generations are
+  // compared as locations and not as spellings (see samePackagedLocation).
+  defaultBucket?: string;
+}): string | undefined {
+  if (input.liveness !== 'settled') return undefined;
+  if (!input.recorded?.prefix || !input.incoming?.prefix) return undefined;
+  if (samePackagedLocation(input.recorded, input.incoming, input.defaultBucket)) {
+    return undefined;
+  }
+  return (
+    `callback reports packaged output ${input.incoming.prefix} while the asset points at ` +
+    `${input.recorded.prefix} and no packaging run is in flight: treating it as a ` +
+    'redelivered callback for a superseded run'
+  );
 }
 
 // Parse a packagingId back into its parts. Returns undefined for a malformed
@@ -592,6 +659,26 @@ export class PackagingService implements PackagingTrigger {
   // The package-job bookkeeping dependencies (issue #976). Absent repositories
   // make every helper a no-op, so a PackagingService constructed without them
   // behaves exactly as it did before package jobs existed.
+  // Whether a packaging run is in flight for the asset (#1044 review, MAJOR 3).
+  // Reads the asset's `package` Job through the same active-job narrowing the
+  // settle helpers use (src/pipeline/package-job.ts). Degrades to 'unknown' when
+  // no job repository is wired or the lookup fails, so a bookkeeping gap can
+  // never turn into a dropped callback.
+  private async packagingRunLiveness(assetId: string): Promise<PackagingRunLiveness> {
+    if (!this.deps.jobs) return 'unknown';
+    try {
+      const inFlight = await inFlightPackageJob(this.deps.jobs, assetId);
+      return inFlight ? 'in-flight' : 'settled';
+    } catch (err) {
+      this.deps.logWarn?.({
+        msg: 'could not resolve the asset package job liveness; packager callback handled as before',
+        assetId,
+        error: err instanceof Error ? err.message : String(err)
+      });
+      return 'unknown';
+    }
+  }
+
   private packageJobDeps(): PackageJobDeps {
     return {
       jobs: this.deps.jobs,
@@ -621,12 +708,46 @@ export class PackagingService implements PackagingTrigger {
     // derived flat path. Omitted (undefined) when the packager reported no
     // `outputPath`, so the record only ever holds a verified location.
     const packagedOutput = packagedOutputFromCallback(payload.outputPath, packagedBucket());
+    // #1044 review (MAJOR 3): is this callback for the run that is CURRENT, or a
+    // redelivered one for a run already superseded? A superseded run's callback
+    // would repoint the asset backwards (at output the newer run's cleanup has
+    // already deleted) and then delete the newest generation, so it is ignored
+    // outright — nothing persisted, nothing deleted, nothing settled. Checked
+    // BEFORE the update, with the generation the asset currently points at.
+    const supersededRun = packagedCallbackSupersededRun({
+      recorded: asset.packagedOutput,
+      incoming: packagedOutput,
+      liveness: await this.packagingRunLiveness(assetId),
+      defaultBucket: packagedBucket()
+    });
+    if (supersededRun) {
+      this.deps.logWarn?.({
+        msg: 'packaging callback ignored: it reports a superseded packaging run',
+        assetId,
+        reason: supersededRun
+      });
+      // `true` (not false): the callback was understood and deliberately
+      // discarded. `false` is reserved for an asset the callback cannot resolve,
+      // which the route answers 404 to.
+      return true;
+    }
     // #1044: the generation this callback is about to supersede, captured BEFORE
     // the update overwrites it. Packaged output is written under a per-run
     // subfolder (`<assetId>/<packagerJobId>/`, ADR-011), so a re-run lands beside
     // the previous run rather than replacing it, and repointing the asset here is
     // what orphans the old subfolder.
-    const supersededPrefix = supersededPackagedPrefix(asset.packagedOutput, packagedOutput);
+    //
+    // `packagedBucket()` is passed as the default bucket both generations resolve
+    // against (#1044 review, CRITICAL 1): it is the same value handed to
+    // `packagedOutputFromCallback` above, so a persisted record that omits
+    // `bucket` (the schema makes it optional — PackagedOutput,
+    // src/data/asset-repo.ts) is compared as the default bucket instead of as a
+    // different one, and the equality/ancestor KEEP guards still apply.
+    const supersededPrefix = supersededPackagedPrefix(
+      asset.packagedOutput,
+      packagedOutput,
+      packagedBucket()
+    );
     await this.deps.assets.update(assetId, {
       manifestUrls,
       ...(packagedOutput ? { packagedOutput } : {})

@@ -61,6 +61,36 @@
 //     (docs/architecture/ADR-011-per-execution-packaged-output-destination.md),
 //     `OutputSubfolderTemplate` default `$INPUTNAME$/$JOBID$`; derived in
 //     `packagedOutputFromCallback`, src/pipeline/packaging.ts.
+//
+// BUCKET AND KEY SPELLING ARE NOT IDENTITY (#1044 review, CRITICAL 1 + 2).
+//
+// The same physical object/location is recorded in more than one spelling, and
+// every guard above is only as safe as the comparison it rests on:
+//
+//   - `bucket` is OPTIONAL on the persisted `PackagedOutput`
+//     (src/data/asset-repo.ts:438) and on a rendition's `objectKey` (a plain
+//     bucket-relative key, src/data/asset-repo.ts:450), while the DELETE path
+//     resolves an absent bucket to the stack's default output bucket
+//     (`resolveStorage(undefined)` -> `conns.packagedBucket`, src/main.ts). A raw
+//     string compare of the two `bucket` fields therefore reported "different
+//     bucket" for two records that both address the SAME bucket, which skipped
+//     the equality/ancestor guards and would have deleted the replacement: the
+//     legacy `{ prefix: '<assetId>/' }` (no bucket) vs a new
+//     `{ bucket: '<packaged>', prefix: '<assetId>/<jobId>/' }` is exactly the
+//     ancestor case the comment above claims is protected.
+//   - `objectKey` is taken VERBATIM from the encoder callback
+//     (`normaliseRenditions`, src/routes/internal.ts and
+//     src/pipeline/encore-callback-poller.ts — `objectKey: o.file`), so
+//     `transcode/a/j1/720p.mp4` and `s3://<bucket>/transcode/a/j1/720p.mp4` are
+//     the same object in two spellings. Compared verbatim, the live rendition
+//     classified as superseded and would have been deleted.
+//
+// So EVERY comparison here runs on a resolved location: the `s3://<bucket>/`
+// scheme+bucket is stripped off into an explicit bucket, an absent bucket
+// resolves to the caller's `defaultBucket` (the same default the delete path
+// uses), and two buckets only count as DIFFERENT when both are known and
+// disagree. An unknown default therefore makes the guards fire, never skip —
+// "might be the same object/location" always means KEEP.
 
 import type { PackagedOutput, Rendition } from '../data/asset-repo.js';
 import { parseS3Uri } from '../routes/assets.js';
@@ -126,27 +156,104 @@ function normalisePrefix(prefix: string | undefined): string {
   return (prefix ?? '').trim().replace(/^\/+|\/+$/g, '');
 }
 
-// Identity of a rendition object for set comparison: bucket (or '' for the
-// default output bucket) plus key. Built from the recorded `objectKey`, which is
-// either a plain bucket-relative key or an `s3://bucket/key` URI (both shapes are
-// produced today — see the archived-asset purge sweep's handling of the same
-// field).
-function objectIdentity(objectKey: string): { bucket?: string; key: string } | undefined {
+// A resolved storage location: the bucket it addresses (undefined only when
+// NEITHER the record nor the caller's default names one — i.e. "the stack
+// default, whose name we do not know here") plus a scheme-free key/prefix.
+type ResolvedLocation = { bucket?: string; key: string };
+
+// Resolve a record's optional bucket against the default the DELETE path uses
+// (`resolveStorage(undefined)`). An empty/blank name counts as absent.
+function resolveBucketName(
+  bucket: string | undefined,
+  defaultBucket: string | undefined
+): string | undefined {
+  const explicit = (bucket ?? '').trim();
+  if (explicit.length > 0) return explicit;
+  const fallback = (defaultBucket ?? '').trim();
+  return fallback.length > 0 ? fallback : undefined;
+}
+
+// Could these two resolved buckets be the SAME bucket? Two buckets differ only
+// when both are known and disagree; an unknown bucket (no explicit name, no
+// caller default) could be any bucket, so it compares as "possibly the same".
+// Every caller uses this to decide whether a KEEP guard applies, so "possibly"
+// resolving to true is the conservative direction: it keeps data.
+function mayBeSameBucket(a: string | undefined, b: string | undefined): boolean {
+  if (a === undefined || b === undefined) return true;
+  return a === b;
+}
+
+// Identity of a rendition object for comparison: the bucket it lives in plus its
+// key, with any `s3://<bucket>/` scheme+bucket prefix stripped into the bucket.
+// The recorded `objectKey` is either a plain bucket-relative key or an
+// `s3://bucket/key` URI — both shapes are produced today, from the SAME encoder
+// callback field (`o.file`, normaliseRenditions in src/routes/internal.ts and
+// src/pipeline/encore-callback-poller.ts), so the two spellings must compare
+// equal or a live rendition reads as superseded (#1044 review, CRITICAL 2).
+function objectIdentity(
+  objectKey: string,
+  defaultBucket?: string
+): ResolvedLocation | undefined {
   const raw = objectKey.trim();
   if (raw.length === 0) return undefined;
   const s3 = parseS3Uri(raw);
   if (s3) {
-    return s3.key.length > 0 ? { bucket: s3.bucket, key: s3.key } : undefined;
+    return s3.key.length > 0
+      ? { bucket: resolveBucketName(s3.bucket, defaultBucket), key: s3.key }
+      : undefined;
   }
   const key = raw.replace(/^\/+/, '');
   // Reject traversal outright — WorkspaceStorage.scopedKey would throw on it,
   // and a key we cannot reason about is never a delete candidate.
   if (key.length === 0 || key.includes('..')) return undefined;
-  return { key };
+  return { bucket: resolveBucketName(undefined, defaultBucket), key };
 }
 
-function identityToken(identity: { bucket?: string; key: string }): string {
-  return `${identity.bucket ?? ''}\u0000${identity.key}`;
+// Are these two resolved locations possibly the SAME object/location? Key
+// equality plus a bucket that cannot be proven different. Used for every KEEP
+// decision, so an unknown bucket keeps rather than deletes.
+function mayBeSameLocation(a: ResolvedLocation, b: ResolvedLocation): boolean {
+  return a.key === b.key && mayBeSameBucket(a.bucket, b.bucket);
+}
+
+// The location a `PackagedOutput` addresses, as a resolved bucket + a
+// slash-trimmed prefix. `prefix` is normally already scheme-free
+// (`normalizePackagedPrefix`, src/pipeline/packaging.ts strips scheme+bucket),
+// but a lazily-resolved or hand-written record can carry an `s3://` URI, so it
+// goes through the same stripping as a rendition key: one spelling rule for
+// both. Returns undefined when there is no usable prefix (nothing to delete and
+// nothing to compare).
+function packagedLocation(
+  output: PackagedOutput | undefined,
+  defaultBucket?: string
+): { resolved: ResolvedLocation; explicitBucket?: string } | undefined {
+  const raw = (output?.prefix ?? '').trim();
+  if (raw.length === 0) return undefined;
+  const s3 = parseS3Uri(raw);
+  const explicitFromUri = s3?.bucket;
+  const prefix = normalisePrefix(s3 ? s3.key : raw);
+  if (prefix.length === 0 || prefix.includes('..')) return undefined;
+  const explicitBucket = explicitFromUri ?? ((output?.bucket ?? '').trim() || undefined);
+  return {
+    resolved: { bucket: resolveBucketName(explicitBucket, defaultBucket), key: prefix },
+    ...(explicitBucket ? { explicitBucket } : {})
+  };
+}
+
+// Do these two packaged records address the SAME location (same bucket as far as
+// can be proven, same prefix)? Exported for the run-identity guards in
+// packaging.ts (#1044 review, MAJOR 3), so "is this callback proposing the
+// generation the asset already points at?" is answered by the ONE comparison
+// this module uses for its own KEEP decisions rather than a second spelling.
+export function samePackagedLocation(
+  a: PackagedOutput | undefined,
+  b: PackagedOutput | undefined,
+  defaultBucket?: string
+): boolean {
+  const left = packagedLocation(a, defaultBucket);
+  const right = packagedLocation(b, defaultBucket);
+  if (!left || !right) return false;
+  return mayBeSameLocation(left.resolved, right.resolved);
 }
 
 // Which packaged subfolder the re-run SUPERSEDED, if any.
@@ -158,22 +265,39 @@ function identityToken(identity: { bucket?: string; key: string }): string {
 //   - the prefixes are the same location (the re-run overwrote in place);
 //   - the previous prefix CONTAINS the new one (deleting it would delete the
 //     replacement too).
+//
+// `defaultBucket` is the name of the bucket the DELETE path resolves an absent
+// bucket to (the stack's default output bucket). Pass it whenever it is known:
+// both sides' buckets resolve against it before being compared, so a record that
+// omits `bucket` — the persisted schema makes it optional, while
+// `packagedOutputFromCallback` always sets it — is treated as the default rather
+// than as a DIFFERENT bucket that skips the guards below (#1044 review,
+// CRITICAL 1). When it is unknown, an unnamed bucket compares as "possibly the
+// same", so the guards still fire.
 export function supersededPackagedPrefix(
   previous: PackagedOutput | undefined,
-  next: PackagedOutput | undefined
+  next: PackagedOutput | undefined,
+  defaultBucket?: string
 ): SupersededPrefix | undefined {
-  const oldPrefix = normalisePrefix(previous?.prefix);
-  const newPrefix = normalisePrefix(next?.prefix);
-  if (oldPrefix.length === 0 || newPrefix.length === 0) return undefined;
-  const oldBucket = previous?.bucket;
-  const newBucket = next?.bucket;
-  const sameBucket = (oldBucket ?? '') === (newBucket ?? '');
-  if (sameBucket) {
+  const old = packagedLocation(previous, defaultBucket);
+  const replacement = packagedLocation(next, defaultBucket);
+  if (!old || !replacement) return undefined;
+  const oldPrefix = old.resolved.key;
+  const newPrefix = replacement.resolved.key;
+  // The guards are keyed on "could these be the same bucket?", NOT on a raw
+  // string compare of two optional fields: a missing bucket that resolves to the
+  // delete path's default (or that cannot be resolved at all) must still reach
+  // the equality + ancestor checks below, because skipping them is what deletes
+  // the replacement.
+  if (mayBeSameBucket(old.resolved.bucket, replacement.resolved.bucket)) {
     if (oldPrefix === newPrefix) return undefined;
     if (newPrefix.startsWith(`${oldPrefix}/`)) return undefined;
   }
   return {
-    ...(oldBucket ? { bucket: oldBucket } : {}),
+    // Only an EXPLICIT bucket is carried onto the delete target: when the record
+    // named none, the removal must keep resolving to the delete path's own
+    // default rather than to a name this comparison resolved for it.
+    ...(old.explicitBucket ? { bucket: old.explicitBucket } : {}),
     // Restore the trailing slash so the removal is scoped to the subfolder and
     // can never match a sibling whose name merely starts with it.
     prefix: `${oldPrefix}/`
@@ -191,33 +315,50 @@ export function supersededPackagedPrefix(
 // `alsoReferenced` carries keys that are NOT renditions but must never be
 // deleted (the asset's own source `objectKey`), so a record that points a
 // rendition at the source file cannot make a re-run delete the master.
+//
+// Identity is the RESOLVED location, never the recorded spelling: the same
+// physical object recorded as `transcode/a/j1/720p.mp4` by one callback and as
+// `s3://<bucket>/transcode/a/j1/720p.mp4` by another is ONE object, still
+// referenced, and must never be deleted (#1044 review, CRITICAL 2).
+// `defaultBucket` resolves a bucket-relative key exactly as in
+// `supersededPackagedPrefix`; when it is unknown, a key with no bucket matches a
+// scheme-qualified key with the same key path, which keeps the object.
 export function supersededRenditionObjects(
   previous: Rendition[] | undefined,
   next: Rendition[] | undefined,
-  alsoReferenced: Array<string | undefined> = []
+  alsoReferenced: Array<string | undefined> = [],
+  defaultBucket?: string
 ): SupersededObject[] {
   if (!previous || previous.length === 0) return [];
-  const referenced = new Set<string>();
+  const referenced: ResolvedLocation[] = [];
   for (const rendition of next ?? []) {
-    const identity = objectIdentity(rendition.objectKey);
-    if (identity) referenced.add(identityToken(identity));
+    const identity = objectIdentity(rendition.objectKey, defaultBucket);
+    if (identity) referenced.push(identity);
   }
   for (const key of alsoReferenced) {
     if (!key) continue;
-    const identity = objectIdentity(key);
-    if (identity) referenced.add(identityToken(identity));
+    const identity = objectIdentity(key, defaultBucket);
+    if (identity) referenced.push(identity);
   }
 
   const superseded: SupersededObject[] = [];
-  const seen = new Set<string>();
+  // Pairwise rather than a set lookup: with an unresolvable default bucket,
+  // "same object" is a MAY-match (an unnamed bucket could be any bucket), which
+  // is not a hashable equality. The lists are one ABR ladder each, so the cost
+  // is irrelevant next to deleting a live rendition.
+  const kept: ResolvedLocation[] = [];
   for (const rendition of previous) {
-    const identity = objectIdentity(rendition.objectKey);
+    const identity = objectIdentity(rendition.objectKey, defaultBucket);
     if (!identity) continue;
-    const token = identityToken(identity);
-    if (referenced.has(token) || seen.has(token)) continue;
-    seen.add(token);
+    if (referenced.some((ref) => mayBeSameLocation(ref, identity))) continue;
+    if (kept.some((already) => mayBeSameLocation(already, identity))) continue;
+    kept.push(identity);
+    // As above: only a bucket the record named EXPLICITLY (via an `s3://` URI)
+    // is carried onto the delete target, so a plain key keeps resolving to the
+    // delete path's own default bucket.
+    const explicit = parseS3Uri(rendition.objectKey.trim())?.bucket;
     superseded.push({
-      ...(identity.bucket ? { bucket: identity.bucket } : {}),
+      ...(explicit ? { bucket: explicit } : {}),
       key: identity.key
     });
   }

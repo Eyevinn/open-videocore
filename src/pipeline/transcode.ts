@@ -33,6 +33,7 @@ import { ulid } from 'ulid';
 import { isValidTransition, type AssetRepository, type Rendition } from '../data/asset-repo.js';
 import {
   encodeEncoreJobId,
+  type Job,
   type JobRepository
 } from '../data/job-repo.js';
 import type { EncoreClient } from './encore-client.js';
@@ -62,6 +63,37 @@ export const PACKAGED_OUTPUT_PREFIX = 'transcode';
 // prefix other than the one Encore was told to write to.
 export function transcodeOutputPrefix(sourceAssetId: string, jobId: string): string {
   return `${PACKAGED_OUTPUT_PREFIX}/${sourceAssetId}/${jobId}`;
+}
+
+// Which RUN (transcode job id) an asset's recorded rendition key belongs to, or
+// undefined when the key carries no run segment.
+//
+// The run id is in the key because every transcode writes under
+// `transcodeOutputPrefix(assetId, jobId)` above — that is THE output location
+// submitTranscode hands Encore — so the asset's current rendition keys say which
+// run produced the generation it points at. That is the only run identity
+// available on the completion path: the callback itself only carries OUR jobId
+// for the run reporting in, never the run the asset currently references.
+//
+// The `s3://<bucket>/` scheme+bucket prefix is stripped first because the key is
+// recorded verbatim from the encoder callback (`objectKey: o.file`,
+// normaliseRenditions in src/routes/internal.ts and
+// src/pipeline/encore-callback-poller.ts) and appears in both spellings. A key
+// with no run segment (a legacy/flat `transcode/<assetId>/1080.mp4`, or output
+// written anywhere else) yields undefined: no run identity, so no evidence.
+export function transcodeRunIdFromObjectKey(
+  sourceAssetId: string,
+  objectKey: string
+): string | undefined {
+  const key = objectKey.trim().replace(/^s3:\/\/[^/]+\//, '').replace(/^\/+/, '');
+  const prefix = `${PACKAGED_OUTPUT_PREFIX}/${sourceAssetId}/`;
+  if (!key.startsWith(prefix)) return undefined;
+  const rest = key.slice(prefix.length);
+  const slash = rest.indexOf('/');
+  // No further `/` means the key sits DIRECTLY under the asset folder, so there
+  // is no per-run segment to read (and `rest` is an object name, not a run id).
+  if (slash <= 0) return undefined;
+  return rest.slice(0, slash);
 }
 
 // Profile submitted when a caller names none. 'program' is the conventional
@@ -305,6 +337,53 @@ export type CompleteTranscodeResult = {
   renditions: Rendition[];
 };
 
+// Is this completion reporting a run the asset has ALREADY moved past? Returns
+// the reason to ignore it, or undefined to apply it normally (#1044 review,
+// MAJOR 3).
+//
+// EVIDENCE, not inference: the asset's current rendition keys name the run that
+// produced them (`transcodeRunIdFromObjectKey`), and a Job record carries
+// `createdAt` (CONTRACT: `Job.createdAt: string`, src/data/job-repo.ts; ISO
+// timestamp set at create time in both backends). This fires ONLY when such a
+// run id resolves to a real job that was created STRICTLY LATER than the job
+// reporting in — i.e. the asset already points at a newer generation, so this
+// callback is a late/redelivered one for a superseded run. Anything less (no run
+// segment in the keys, an unresolvable job, equal or earlier timestamps, an
+// unparseable timestamp, a repository error) is NO evidence and the completion
+// is applied exactly as before.
+async function transcodeCallbackSupersededRun(
+  input: { job: Job; sourceAssetId: string; current: Rendition[] | undefined },
+  jobs: JobRepository
+): Promise<string | undefined> {
+  const incomingAt = Date.parse(input.job.createdAt);
+  if (Number.isNaN(incomingAt)) return undefined;
+  const runIds = new Set<string>();
+  for (const rendition of input.current ?? []) {
+    const runId = transcodeRunIdFromObjectKey(input.sourceAssetId, rendition.objectKey);
+    if (runId && runId !== input.job.id) runIds.add(runId);
+  }
+  for (const runId of runIds) {
+    let referenced: Job | undefined;
+    try {
+      referenced = await jobs.get(runId);
+    } catch {
+      // Best effort: a lookup failure is not evidence of anything.
+      return undefined;
+    }
+    if (!referenced) continue;
+    const referencedAt = Date.parse(referenced.createdAt);
+    if (Number.isNaN(referencedAt)) continue;
+    if (referencedAt > incomingAt) {
+      return (
+        `the asset already references output of run ${referenced.id} (created ` +
+        `${referenced.createdAt}), which is newer than the reporting run ${input.job.id} ` +
+        `(created ${input.job.createdAt})`
+      );
+    }
+  }
+  return undefined;
+}
+
 // Apply an Encore completion to the job + source asset. Idempotent: a second
 // call for an already-terminal job no-ops. On success, builds one embedded
 // Rendition per produced variant (issue #79 — no child assets) and records the
@@ -451,6 +530,36 @@ export async function completeTranscode(
     return { applied: true, renditionCount: 0, renditions: [] };
   }
 
+  // #1044 review (MAJOR 3): the generation the asset points at RIGHT NOW, read
+  // before the wholesale `renditions` write below overwrites it. Serves two
+  // purposes: the stale-run guard immediately after, and the superseded-output
+  // cleanup at the end (each transcode writes under its own job-nested prefix —
+  // `transcodeOutputPrefix` — so a re-run's output lands beside the previous
+  // run's, and repointing the asset here is what orphans it).
+  const supersededSource = await deps.assets.get(params.sourceAssetId);
+
+  // #1044 review (MAJOR 3): a LATE/redelivered completion for an OLDER run must
+  // not repoint the asset backwards and then delete the newest generation as
+  // "superseded". The per-jobId terminal guards above only stop a redelivery for
+  // THIS job; they say nothing about a still-`running` older job whose callback
+  // arrives after a newer run already completed. So before writing anything,
+  // check the run the asset currently references (see
+  // transcodeRunIdFromObjectKey) and ignore this callback when that run is
+  // strictly NEWER than the one reporting in: persist nothing, delete nothing.
+  const supersededRun = await transcodeCallbackSupersededRun(
+    { job, sourceAssetId: params.sourceAssetId, current: supersededSource?.renditions },
+    deps.jobs
+  );
+  if (supersededRun) {
+    deps.logWarn?.({
+      msg: 'transcode completion ignored: it reports a superseded run',
+      jobId: job.id,
+      assetId: params.sourceAssetId,
+      reason: supersededRun
+    });
+    return { applied: false, renditionCount: 0, renditions: [] };
+  }
+
   // Success: build one self-contained embedded rendition per produced variant.
   const renditions: Rendition[] = params.renditions.map((r) => ({
     id: ulid(),
@@ -461,16 +570,6 @@ export async function completeTranscode(
     codec: r.codec,
     bitrateBps: r.bitrateBps
   }));
-
-  // #1044: the generation this completion is about to replace, read BEFORE the
-  // wholesale `renditions` write below overwrites it. Each transcode writes under
-  // its own job-nested prefix (`transcodeOutputPrefix`), so a re-run's output
-  // lands beside the previous run's and repointing the asset here is what orphans
-  // it. Read only when a storage resolver is wired — without one there is nothing
-  // we could delete, so the completion does exactly the I/O it always did.
-  const supersededSource = deps.resolveSupersededStorage
-    ? await deps.assets.get(params.sourceAssetId)
-    : undefined;
 
   // Record renditions on the source and finalise the job.
   await deps.assets.update(params.sourceAssetId, { renditions });
