@@ -50,6 +50,10 @@
 //     are explicitly out of scope (ADR-026 §6).
 
 import { isProfileRunnable } from './profile-runnability.js';
+// Contract (CLAUDE.md rule 7): src/pipeline/profile-level-fit.ts —
+// `levelSafeProfileYaml(yaml: string): string`, pure, idempotent, never throws,
+// returns its input when the ladder needs no bounding width (issue #1167).
+import { levelSafeProfileYaml } from '../pipeline/profile-level-fit.js';
 
 // The DEDICATED bucket for the published profile index (ADR-026 D1). Dedicated,
 // not a prefix on `openvideocore-packaged`, so the profiles policy and the media
@@ -280,8 +284,19 @@ export async function publishProfileIndex(deps: {
     // Per-profile documents first, then the index, so the index never names an
     // object that is not there yet. (The reverse order would give Encore a
     // window in which a listed profile 404s.)
+    //
+    // Each published document is the LEVEL-SAFE form of the stored profile
+    // (issue #1167 review, findings 2 + 3): this mirror is what the transcoding
+    // service actually reads, so bounding widths are applied here, at publish
+    // time, rather than relying on a bootstrap pass having rewritten the stored
+    // document first. That makes the guarantee hold for a profile an operator
+    // authored through `POST`/`PUT /api/v1/profiles` as well, and it means a
+    // publish never depends on WHO mutated the store. `levelSafeProfileYaml` is
+    // pure, idempotent and never throws; it returns its input unchanged when
+    // there is nothing to fit, so a profile without a height-only levelled rung
+    // publishes byte-identically to before.
     for (const profile of runnable) {
-      const body = Buffer.from(profile.yaml, 'utf8');
+      const body = Buffer.from(levelSafeProfileYaml(profile.yaml), 'utf8');
       await storageClient.putObject(
         bucket,
         publishedProfileObjectKey(profile.name),
