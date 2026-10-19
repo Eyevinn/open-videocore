@@ -3,7 +3,7 @@
 **Status:** PROPOSED 2026-10-15 — decision record only; no product code changes in this PR
 **Date:** 2026-10-15
 **Author agent:** architect
-**Issue:** #1190 — *ADR-027: scene detection runs on `eyevinn-ffmpeg-s3`, not `eyevinn-function-scenes`*. Records the decision the maintainer took on **2026-10-14 in #883** (*re-scope `sceneMetadata` — `eyevinn-function-scenes` cannot return cut timecodes*, now closed). Grounded in #797 / `docs/investigations/797-function-scenes-runtime-contract.md` and in the partial fix #881. Supersedes ADR-001's silence on the scene-detect slot ([D4](#d4--supersedes-adr-001s-silence-on-the-scene-detect-slot)) and amends ADR-023 §4 ([D5](#d5--adr-023-4-is-superseded-in-principle-now-and-retired-with-1193)). Blocking spike: **#1191** (open, unmerged — see [§2 C5](#c5--the-ffmpeg-s3-runtime-job-contract-is-not-in-the-catalog-schema-and-is-not-yet-pinned-1191)). Follow-ups: #1192 (detector rewrite), #1193 (retire the old path). Related: #115 (the step), #798 (closed 2026-10-14 as *not planned* — superseded, see [§5](#5-follow-up-implementation-issues)), #799 (the pinned request contract).
+**Issue:** #1190 — *ADR-027: scene detection runs on `eyevinn-ffmpeg-s3`, not `eyevinn-function-scenes`*. Records the decision the maintainer took on **2026-10-14 in #883** (*re-scope `sceneMetadata` — `eyevinn-function-scenes` cannot return cut timecodes*, now closed). Grounded in #797 / `docs/investigations/797-function-scenes-runtime-contract.md` and in the partial fix #881. Supersedes ADR-001's silence on the scene-detect slot ([D4](#d4--supersedes-adr-001s-silence-on-the-scene-detect-slot)) and amends ADR-023 §4 ([D5](#d5--adr-023-4-is-superseded-in-principle-now-and-retired-with-1193)). Spike: **#1191** (merged as #1205; D1, D3 and D6 amended 2026-10-19 to its result — see [§2 C5](#c5--the-ffmpeg-s3-runtime-job-contract-is-not-in-the-catalog-schema-and-is-not-yet-pinned-1191)). Follow-ups: #1192 (detector rewrite), #1193 (retire the old path). Related: #115 (the step), #798 (closed 2026-10-14 as *not planned* — superseded, see [§5](#5-follow-up-implementation-issues)), #799 (the pinned request contract).
 
 **Citation style.** Code is cited as **file path + symbol name**, without line
 numbers, for the reason ADR-026 gives: this branch will drift behind `main`
@@ -22,7 +22,7 @@ number, the symbol at that line is named instead.
 | Which service is retired? | **`eyevinn-function-scenes`**. It cannot return cut timecodes through any documented endpoint (#797). |
 | Does `sceneMetadata` change? | **No.** It keeps its timecode contract: `boundaries[].startSeconds` / `endSeconds` / `keyframeSeconds`, plus `sceneCount` and `detectedAt`. No OpenAPI change. |
 | What does a failed job persist? | **Nothing.** Never `{ boundaries: [], sceneCount: 0 }`. The #881 rule becomes normative ([D3](#d3--failure-semantics-a-failed-or-unreadable-job-persists-nothing-the-881-rule-made-normative)). |
-| Is the new path proven? | **Not yet.** #1191 is the pending spike that pins the ffmpeg-s3 job + log contract. Fallbacks if it fails: [D6](#d6--fallbacks-if-1191-fails). |
+| Is the new path proven? | **Partly.** #1191 (PR #1205) settled that the log route cannot carry the cuts on a successful job; the S3 object route is supported by the uploader but needs one live run before #1192 merges ([D1](#d1--scene-detection-runs-as-an-ephemeral-eyevinn-ffmpeg-s3-job)). Fallbacks if the object route fails: [D6](#d6--fallbacks-f1-is-now-the-decision). |
 | Net service count | **−1.** This removes a catalog dependency instead of adding one. |
 
 ---
@@ -194,13 +194,12 @@ source for the *shape* (`{ name, cmdLineArgs, … }`, `/logs/:name`,
 `SuccessCriteriaMet`), and this ADR relies on it only for that shape.
 
 What it is **not** a source for is the one new fact this decision needs: whether
-a **successfully completed** job's log carries the scene filter's per-cut
-timestamps, and whether that log is truncated on a long video. **That is exactly
-#1191, which is open and whose PR is not merged.** Nothing in this ADR should be
-read as a spike result. No `docs/contracts/` snapshot for
-`eyevinn-ffmpeg-s3` exists yet (`docs/contracts/` holds
-`eyevinn-function-scenes-api.json` and `encore-findbystatus-paging.json` only);
-producing one is #1191's deliverable and a precondition for #1192.
+a **successfully completed** job carries the scene filter's per-cut
+timestamps, and where. **That was #1191, now merged as #1205.** Its pinned
+snapshot `docs/contracts/eyevinn-ffmpeg-s3-job-and-logs.json` settles, from the
+service's source, that the log does not carry them on success, and recommends the
+S3 object route that D1 now adopts. That route was **not executed**; its
+live-run items are listed in D1 and are preconditions for #1192.
 
 Logged as OSC friction (the catalog cannot describe an ephemeral job runner's job
 body or result surface) in the agents repo (`Eyevinn/eng-open-videocore-agents`) at
@@ -232,21 +231,38 @@ the same stored object:
   **references** in the job body, exactly as `ffprobeExternalCmdLine` and the
   source-role mapping in `src/services/storage-backend-registry.ts` already do.
   Bytes never transit the API process in either case.
-- *Filter:* a scene-change `select` plus `showinfo`, with `-f null -` so no
-  output file is produced — the form #1191 is specified to run. The detection
-  **threshold must stay at the upstream service's `0.4`**
-  (`select='gt(scene,0.4)'`, recorded in investigation 797 as the incumbent's
-  own invocation) so that moving services does not silently change results.
+- *Filter and output:* a scene-change `select`, written as a `framemd5` object to the
+  stack's object store with ffmpeg-s3's native S3 writer, e.g.
+  `-i <source> -an -fps_mode passthrough -vf "select='gt(scene,0.4)'" -f framemd5 s3://<bucket>/<prefix>/<id>.framemd5`
+  (the command shape recommended by the #1191 spike,
+  `docs/investigations/1191-ffmpeg-s3-scene-cut-timestamps.md`). The detection
+  **threshold must stay at the upstream service's `0.4`** (recorded in
+  investigation 797 as the incumbent's own invocation) so that moving services
+  does not silently change results.
 - *Job name:* generated by the same lowercase-alphanumeric bounded-length rule
   as `probeJobName()`.
 
-**Output contract.** The job's **log** is the result surface, read with
-`getLogsForInstance` over `/logs/:name` and parsed into `cuts: number[]`
-(seconds, from `showinfo`'s `pts_time`). Per C2 that feeds the existing
-`parseSceneResult` path untouched. This is a *log-parsing* detector, which is
-the same compromise `parseFfmpegLogToProbeResult` already makes for technical
-metadata — accepted there, accepted here, and for the same reason: ffmpeg-s3
-exposes no structured result channel.
+**Output contract.** The result surface is an **object**, not the log. When the job
+reaches `SuccessCriteriaMet`, the API reads `s3://<bucket>/<prefix>/<id>.framemd5`
+back with the stack's storage credentials and parses it into `cuts: number[]`
+(seconds). `framemd5` stamps each selected frame with a pts in the stream
+timebase and states that timebase in a `#tb` header line, so the parser must
+divide by it; it is **not** `pts_time`. Per C2 the resulting list feeds the
+existing `parseSceneResult` path untouched. The log is **not** a result surface:
+the #1191 spike settled from the service's source (`src/ffmpeg.ts`, pinned in
+`docs/contracts/eyevinn-ffmpeg-s3-job-and-logs.json`, `sceneCutReadback.viaLogShowinfo`)
+that a job exiting 0 writes no `showinfo` lines to its log, so a log-parsing
+detector would read an empty result for every video. The object is deleted with
+the job, or expires under the bucket's lifecycle; the location and lifecycle are
+decided in #1192 against the live run below.
+
+**Unconfirmed until a live run (preconditions for #1192).** The spike recorded
+the object route as supported by the uploader but **not executed**
+(`sceneCutReadback.viaS3Object.requiresLiveRun: true`). A live run on a clip with
+known cuts must confirm that: the published image's ffmpeg has the `framemd5`
+muxer; the output-path rewrite in the service does not mangle the `s3://`
+destination; the object appears and parses as described; and the object location
+and lifecycle. #1192 must not merge before the snapshot records that run.
 
 **Rejected input variant:** passing the asset bytes through the API process, or
 copying the source to a scratch bucket first. Neither is needed; both break the
@@ -290,25 +306,21 @@ Normative consequences, in the order a run can fail:
 |---|---|
 | `createJob` / token / presign fails | nothing; `sceneDetectionError` records the reason, `sceneMetadata` stays null |
 | Poll ends `Failed` / `Error`, or the poll budget expires | nothing; error recorded |
-| Job reached `SuccessCriteriaMet` but the log read fails | nothing; error recorded |
-| Log read succeeds but cannot be parsed, or is **detectably truncated** | nothing; error recorded |
-| Log parsed, cuts found | `sceneMetadata` with the boundaries, `detectedAt` = completion time |
-| Log parsed, **zero** cuts found | see the rule immediately below |
+| Job reached `SuccessCriteriaMet` but the object is missing or its read fails | nothing; error recorded |
+| Object read succeeds but cannot be parsed (no `#tb` header, malformed line), or is **detectably truncated** | nothing; error recorded |
+| Object parsed, cuts found | `sceneMetadata` with the boundaries, `detectedAt` = completion time |
+| Object parsed, **zero** cuts found | see the rule immediately below |
 
-**The zero-cut case is the sharp edge, and it is conditional on #1191.** A
-genuinely single-shot video legitimately produces no cuts, so `sceneCount: 0` is
-a *valid* result — but only if "no cuts in the log" is distinguishable from "the
-log did not carry the cuts" or "the log was cut short". #1191 question 2 (*is
-the log truncated or paged on a long video, and at what size?*) is precisely
-that question. Therefore:
-
-- **Until #1191 confirms both that a successful job's log carries the filter
-  output and that truncation is detectable, a zero-cut result MUST be treated as
-  unreadable** — recorded as an error, not persisted as success.
-- Once #1191 confirms it, a zero-cut result may be persisted as success **only**
-  when the parser has positive evidence the log is complete (the spike's
-  snapshot must name that evidence — e.g. ffmpeg's end-of-run summary line).
-  Absent such a marker, the conservative behaviour above stands permanently.
+**The zero-cut case is the sharp edge.** A genuinely single-shot video
+legitimately produces no cuts, so `sceneCount: 0` is a *valid* result — but only
+when "no cuts" is distinguishable from "the result did not arrive". With an object
+route that is checkable: a zero-cut result may be persisted as success **only**
+when the job reached `SuccessCriteriaMet` **and** the object exists and parses
+as a well-formed `framemd5` file (its header and `#tb` line present, with zero
+data lines). A missing object, an empty object, or one without the header is
+unreadable and persists nothing. Until the live run in D1 confirms that a valid
+zero-cut clip yields a header-only object, **a zero-cut result MUST be treated
+as unreadable** — recorded as an error, not persisted as success.
 
 The step's **surfacing** semantics are unchanged from ADR-023 §4.4: scene
 detection is optional and fire-and-forget, so a failure settles the step
@@ -360,17 +372,18 @@ deleted now**. Instead:
 2. The **full** amendment — striking §4.1–§4.3 and §4.5–§4.7 and keeping §4.4's
    failure-surfacing rule, which survives D3 unchanged — happens as part of
    **#1193**, whose scope already says *"amend ADR-023 §4 accordingly"*. #1193
-   is blocked by #1192, which is blocked by #1191.
+   is blocked by #1192, which waits on the live run named in D1.
 
 ADR-023's **subtitles** decision (§5: explicit provisioning stays primary for
 `eyevinn-auto-subtitles`) is untouched by this ADR.
 
-### D6 — Fallbacks if #1191 fails
+### D6 — Fallbacks (F1 is now the decision)
 
-#1191 asks whether a successful job's log carries `showinfo` `pts_time` lines.
-If it does not, in order:
+#1191 found that a successful job's log carries no `showinfo` `pts_time` lines, so
+F1 below is promoted into D1. F2 to F4 stay as the fallbacks if the live run
+shows the object route does not work, in order:
 
-- **F1 — write the filter metadata to an object instead of the log.** ffmpeg's
+- **F1 — adopted in D1: write the filter output to an object instead of the log.** ffmpeg's
   `metadata=print:file=<path>` is how the incumbent service already captures the
   cuts (797), and ffmpeg-s3 has a **native S3 writer** that the thumbnail,
   re-wrap and clip runners already use to put outputs at `s3://bucket/key` with
@@ -434,20 +447,20 @@ If it does not, in order:
 
 **Negative / risks**
 
-- **The decision is ahead of its evidence.** #1191 is unmerged; if the log does
-  not carry the cuts on success, the implementation shape changes (F1) or the
-  slot stays unfilled (F2). This is accepted deliberately: the *negative* result
+- **The decision is ahead of its evidence.** The spike ruled out the log route
+  but did not run the object route; if the live run in D1 shows the object
+  cannot carry the cuts, the slot stays unfilled (F2). This is accepted deliberately: the *negative* result
   about `eyevinn-function-scenes` is fully confirmed, so retiring it is correct
   regardless of which fallback wins.
-- **Log parsing is a brittle result channel.** An ffmpeg version bump in the
-  service can change the `showinfo` format, and this repo has already been bitten
-  by exactly that class of coupling (`parseFfmpegLogToProbeResult`, the frame-rate
-  precision note in `src/pipeline/osc-ffprobe.ts`). Mitigation: the pinned
-  snapshot #1191 produces under `docs/contracts/`, plus a CI contract test in the
-  shape of `test/scene-detect-contract.test.ts`.
-- **Log truncation would silently under-report cuts on long videos** — which is
-  why D3 makes zero-cut and truncation-suspect results non-persisting until
-  #1191 settles it.
+- **A parsed muxer format is still a coupling.** An ffmpeg version bump in the
+  service can change the `framemd5` header or timebase, and this repo has already
+  been bitten by that class of coupling (`parseFfmpegLogToProbeResult`, the
+  frame-rate precision note in `src/pipeline/osc-ffprobe.ts`). Mitigation: the
+  pinned snapshot under `docs/contracts/`, plus a CI contract test in the shape
+  of `test/scene-detect-contract.test.ts`.
+- **A missing or truncated object would silently under-report cuts** — which is
+  why D3 makes zero-cut and unparseable results non-persisting until the live run
+  confirms a valid zero-cut object.
 - **Cost shape changes** from one idle instance per stack to one short-lived
   instance per detection run. ADR-001 prices ffmpeg-s3 at ~10 tokens/day per
   active job instance, so a burst of ingests now costs more concurrent job
@@ -468,8 +481,8 @@ If it does not, in order:
 
 | Issue | State | Scope |
 |---|---|---|
-| **#1191** | open — **blocks everything below** | Spike: confirm the cuts are readable from a successful ffmpeg-s3 job; pin a `docs/contracts/` snapshot + a `docs/investigations/` finding; confirm the F1 fallback if the log route fails. |
-| **#1192** | open, blocked by #1191 | Detector rewrite: new `SceneDetector` on ffmpeg-s3 per D1/D2, D3's failure table, the endpoint decision from §4's last risk, and a contract test. |
+| **#1191** | merged (#1205) | Spike: settled that the log route cannot carry the cuts on success; pinned the snapshot and the finding; recommended the S3 object route (not executed). |
+| **#1192** | open, blocked by the live run in D1 | Detector rewrite: new `SceneDetector` on ffmpeg-s3 per D1/D2, D3's failure table, the endpoint decision from §4's last risk, and a contract test. |
 | **#1193** | open, blocked by #1192 | Retire `eyevinn-function-scenes`: `src/pipeline/osc-scene-detect.ts`, `src/pipeline/function-scenes-contract.ts`, `test/scene-detect-contract.test.ts`, `docs/contracts/eyevinn-function-scenes-api.json`, the `SCENE_DETECT_SERVICE_ID` lazy-provisioning wiring in `src/services/stack.ts`, existing provisioned instances, **and the full ADR-023 §4 amendment (D5.2)**. |
 | #798 | **closed 2026-10-14 — _not planned_** | Not a live follow-up. Its premise — a `GET` against `eyevinn-function-scenes` with a source-URL query parameter — does not exist (797), so it was closed alongside the #883 decision rather than carried forward. The outcome it wanted (`sceneMetadata` populated) is delivered by #1192; this ADR does not plan to reopen it. |
 
@@ -494,14 +507,14 @@ No new issue is filed by this ADR; #1191/#1192/#1193 already cover its scope.
 
 | #1190 acceptance criterion | Where met |
 |---|---|
-| ADR-027 merged under `docs/architecture/`, citing the spike result from the spike issue | This file. #1191 is cited as the **pending** spike ([§2 C5](#c5--the-ffmpeg-s3-runtime-job-contract-is-not-in-the-catalog-schema-and-is-not-yet-pinned-1191), [D6](#d6--fallbacks-if-1191-fails)); its PR is unmerged, so no result is claimed. The confirmed evidence this ADR rests on is investigation 797 plus the maintainer decision in #883. |
+| ADR-027 merged under `docs/architecture/`, citing the spike result from the spike issue | This file. #1191 is cited as the merged spike (#1205) ([§2 C5](#c5--the-ffmpeg-s3-runtime-job-contract-is-not-in-the-catalog-schema-and-is-not-yet-pinned-1191), [D6](#d6--fallbacks-f1-is-now-the-decision)); its negative log result is used, and its object-route recommendation is adopted but flagged as not yet run. The confirmed evidence this ADR rests on is investigation 797 plus the maintainer decision in #883. |
 | ADR-023 §4 amended, or an explicit note of when it will be | **Both.** §4 carries a superseded-in-principle note from this PR; the full amendment lands with #1193 ([D5](#d5--adr-023-4-is-superseded-in-principle-now-and-retired-with-1193)). |
 | Scope: the decision and its consequences | [Summary](#summary-of-the-decision), [D1](#d1--scene-detection-runs-as-an-ephemeral-eyevinn-ffmpeg-s3-job), [§4](#4-consequences) |
 | Scope: supersedes ADR-001's silence on this slot | [D4](#d4--supersedes-adr-001s-silence-on-the-scene-detect-slot) |
 | Scope: amends ADR-023 §4 once the old path is retired | [D5](#d5--adr-023-4-is-superseded-in-principle-now-and-retired-with-1193) |
 | Scope: the detector's input and output contract | [D1](#d1--scene-detection-runs-as-an-ephemeral-eyevinn-ffmpeg-s3-job), [D2](#d2--scenemetadata-keeps-its-timecode-contract-unchanged), [§2 C1–C3](#c1--scenemetadata-already-models-timecodes-at-all-three-layers) |
 | Scope: failure semantics (the #881 rule) | [D3](#d3--failure-semantics-a-failed-or-unreadable-job-persists-nothing-the-881-rule-made-normative) |
-| Scope: the fallback if #1191 fails | [D6](#d6--fallbacks-if-1191-fails) |
+| Scope: the fallback if #1191 fails | [D6](#d6--fallbacks-f1-is-now-the-decision) |
 
 ---
 
@@ -528,4 +541,4 @@ No new issue is filed by this ADR; #1191/#1192/#1193 already cover its scope.
 - `src/data/asset-document.ts` — `SceneBoundarySchema`, `structural.sceneDetection`.
 - `src/pipeline/pipelines.ts` — the `scene-detect` step description.
 
-**Issues** — #115, #797, #798, #799, #881, #883 (the decision), #1190 (this ADR), #1191 (pending spike), #1192, #1193; #789 (`skipped` + `skipReason`), #548 (external-backend credential references), #92/#316 (ffmpeg cannot write to a presigned PUT), #991 (in-cluster object-store endpoint).
+**Issues** — #115, #797, #798, #799, #881, #883 (the decision), #1190 (this ADR), #1191 (spike, merged as #1205), #1192, #1193; #789 (`skipped` + `skipReason`), #548 (external-backend credential references), #92/#316 (ffmpeg cannot write to a presigned PUT), #991 (in-cluster object-store endpoint).
