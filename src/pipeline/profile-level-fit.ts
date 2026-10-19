@@ -78,6 +78,25 @@
 //       Eyevinn/encore-test-profiles `program.yml` (branch main), whose five
 //       X264Encode rungs declare `height: 1080|720|540|360|234`, no `width`,
 //       `params.level: 4.1|3.1|3.1|3.1|3.1` and `x264-params.ref: 4|4|4|4|3`.
+//   C5. The portrait transpose `predictScaledOutput` models (fetched 2026-10-19
+//       via the GitHub contents API, svt/encore default branch) —
+//       `encore-common/src/main/kotlin/se/svt/oss/encore/model/profile/VideoEncode.kt`,
+//       `fun videoFilter(...)`, the lines immediately BEFORE the scale filter:
+//         val outputDar = (padTo ?: cropTo ?: videoInput.padTo ?: videoInput.cropTo)?.toFractionOrNull()
+//           ?: (videoStream.displayAspectRatio?.toFractionOrNull() ?: Fraction(videoStream.width, videoStream.height))
+//             .let { if (isRotated90) it.reciprocal() else it }
+//         val outputIsPortrait = outputDar < Fraction.ONE
+//         val isScalingWithinLandscape =
+//           scaleToWidth != null && scaleToHeight != null && Fraction(scaleToWidth, scaleToHeight) > Fraction.ONE
+//         if (encodingProperties.flipWidthHeightIfPortrait && outputIsPortrait && isScalingWithinLandscape) {
+//           scaleToWidth = height; scaleToHeight = width
+//         }
+//       and `encore-common/src/main/kotlin/se/svt/oss/encore/config/EncodingProperties.kt`:
+//       `val flipWidthHeightIfPortrait: Boolean = true` — the flag is ON by
+//       default, so a portrait source against a landscape box is fitted into the
+//       TRANSPOSED box (HxW). This does not affect the bounding width the fit
+//       computes (the macroblock bound of a box is transpose-invariant), only the
+//       geometry a caller predicts.
 
 // Macroblock edge in pixels for H.264 (16x16 luma samples). Frame size limits in
 // Table A-1 are expressed in these units.
@@ -200,13 +219,58 @@ export function nominalSixteenNineWidth(height: number): number {
 // to a multiple of 2). Used by the tests to assert a real source size lands
 // inside its rung's level limits; exported so other call sites can predict the
 // same geometry without duplicating the rule.
+//
+// PORTRAIT TRANSPOSE (contract C5). Before it emits the scale filter, the
+// transcoding service TRANSPOSES a landscape box when the output is portrait, so
+// a portrait source is fitted into HxW rather than letterboxed inside WxH. The
+// branch is modelled here because without it the predicted geometry for a
+// portrait source is wrong by construction (it predicted 606x1080 for a
+// 1080x1920 source against the 1920x1080 box, a frame the encoder never emits).
+// `flipWidthHeightIfPortrait` defaults to TRUE upstream, so that is the default
+// here too; `opts.flipWidthHeightIfPortrait: false` models a deployment that
+// turns the flag off.
+//
+// The transpose cannot change level safety: `frameSizeMbs` is
+// ceil(w/16)*ceil(h/16), so a transposed box has exactly the same macroblock
+// bound as the box the fit sized against. Only the predicted pixel geometry
+// changes.
+//
+// `opts.displayAspectRatio` mirrors upstream's preference for the analyzed
+// stream's DAR over its raw pixel dimensions (and is how a rotated source is
+// expressed — upstream takes the reciprocal of the DAR for a 90-degree
+// rotation). Omitted, the source's own width/height is the DAR, which is
+// upstream's own fallback.
 export function predictScaledOutput(
   source: { width: number; height: number },
-  box: { width?: number; height?: number }
+  box: { width?: number; height?: number },
+  opts?: {
+    flipWidthHeightIfPortrait?: boolean;
+    displayAspectRatio?: { width: number; height: number };
+  }
 ): { width: number; height: number } {
   const floorEven = (v: number): number => Math.max(2, Math.floor(v / 2) * 2);
   const roundEven = (v: number): number => Math.max(2, Math.round(v / 2) * 2);
   if (box.width !== undefined && box.height !== undefined) {
+    // Upstream, verbatim (contract C5):
+    //   val outputIsPortrait = outputDar < Fraction.ONE
+    //   val isScalingWithinLandscape = scaleToWidth != null && scaleToHeight != null &&
+    //     Fraction(scaleToWidth, scaleToHeight) > Fraction.ONE
+    //   if (encodingProperties.flipWidthHeightIfPortrait && outputIsPortrait &&
+    //       isScalingWithinLandscape) { scaleToWidth = height; scaleToHeight = width }
+    // Both comparisons are STRICT, so a square source (DAR 1) and a square box
+    // are both left alone.
+    const dar = opts?.displayAspectRatio ?? source;
+    const outputIsPortrait = dar.height > 0 && dar.width / dar.height < 1;
+    const isScalingWithinLandscape = box.width > box.height;
+    const flip = opts?.flipWidthHeightIfPortrait ?? true;
+    if (flip && outputIsPortrait && isScalingWithinLandscape) {
+      return predictScaledOutput(source, { width: box.height, height: box.width }, {
+        ...opts,
+        // The transpose happens once; re-entering with the transposed (now
+        // portrait) box must not flip it back.
+        flipWidthHeightIfPortrait: false
+      });
+    }
     // ffmpeg's `scale` with force_original_aspect_ratio=decrease derives each
     // dimension from the OTHER box dimension by integer rescale and then takes
     // the smaller of that and the box dimension
@@ -378,4 +442,30 @@ export function fitProfileLadderToLevel(yaml: string): LadderFitResult {
     out.push(lines[i]);
   }
   return { yaml: out.join('\n'), changed: true, adjustments };
+}
+
+// The level-safe form of a profile for the READ/PUBLISH path (issue #1167
+// review, findings 2 + 3).
+//
+// WHY THE READ PATH. Fitting only on the bootstrap paths left two holes: a
+// bootstrap that rewrote a stored ladder did not always refresh the object-store
+// mirror the encoder actually reads, and `POST`/`PUT /api/v1/profiles` stored
+// whatever the operator sent — so an unfitted height-only rung with a declared
+// level could be authored (or re-authored) at any time and reproduce the bug
+// until the next bootstrap silently rewrote it. Fitting at the point a profile
+// is HANDED TO THE ENCODER instead makes the guarantee unconditional and leaves
+// the stored document exactly as the operator wrote it: the management views
+// (`GET /api/v1/profiles`, `GET /api/v1/profiles/:name`) still return the
+// authored YAML, while the two surfaces the encoder consumes — the per-profile
+// YAML document and the published object-store mirror — are always level-safe.
+//
+// Never throws: a profile this parser cannot handle is served verbatim, i.e.
+// exactly the pre-fix behaviour, because a derived guard must not be able to
+// take a profile read out.
+export function levelSafeProfileYaml(yaml: string): string {
+  try {
+    return fitProfileLadderToLevel(yaml).yaml;
+  } catch {
+    return yaml;
+  }
 }

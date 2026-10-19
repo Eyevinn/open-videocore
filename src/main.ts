@@ -646,12 +646,33 @@ await app.register(provisionRouter, {
   // failure and does not fail the provision). Declared below (const
   // profileRepository / encoreProfilesUrl); this closure is only invoked at
   // provision-request time, long after those bindings initialise.
-  seedProfiles: () =>
-    bootstrapProfiles({
+  //
+  // The republish below closes issue #1167 review finding 2. `bootstrapProfiles`
+  // MUTATES stored profile YAML (it seeds the index and adds level-safe bounding
+  // widths to already-stored ladders — services/profile-bootstrap.ts), and since
+  // ADR-026 the document the transcoding service actually reads is the
+  // object-store MIRROR, not this store. The other two bootstrap call sites
+  // refresh that mirror (the boot path awaits `publishProfileIndexToObjectStore`
+  // below; `POST /api/v1/profiles/bootstrap` fires `onProfilesChanged`), but this
+  // one did neither — so a stack provisioned after a ladder fix was seeded with
+  // correct profiles whose published mirror was stale (or, on a fresh stack,
+  // absent). The publish is scoped to the stack this seed ran against:
+  // `currentRequestStackName()` is set by the provision route, which invokes this
+  // callback inside `runWithRequestStack(name, ...)`
+  // (routes/provision.ts:368 `seedProfiles?: () => Promise<void>`, :1863), so it
+  // is the SAME stack `profileRepository` just resolved — the same pairing
+  // `onProfilesChanged` uses. AWAITED (the publisher is fail-soft and never
+  // throws, returning a PublishOutcome) so the provision does not report success
+  // until the newly-seeded index is on the stack's object store, before the
+  // scaler can spawn an instance that fetches it.
+  seedProfiles: async () => {
+    await bootstrapProfiles({
       repository: profileRepository,
       indexUrl: encoreProfilesUrl,
       log: app.log
-    }).then(() => undefined),
+    });
+    await publishProfileIndexToObjectStore(currentRequestStackName());
+  },
   // Release the background work bound to a stack's Valkey before that Valkey is
   // removed (#1213). Declared below (stopCallbackPollersForStack); the route
   // only calls this at teardown time, long after the binding initialises.
