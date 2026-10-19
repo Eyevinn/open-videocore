@@ -14,6 +14,19 @@
 // or the remote index is unreachable. An operator edit to a built-in profile is
 // preserved: an existing profile of the same name is left untouched.
 //
+// Level-safe ladder fitting (issue #1167): the seeded default ladders declare
+// each rung by HEIGHT only alongside a hardcoded H.264 `level`, which makes the
+// output width follow the SOURCE aspect ratio and overflows the declared level
+// for a source that is only approximately 16:9 (an 854x480 source scaled to
+// height 1080 becomes 1922x1080 = 8228 macroblocks > level 4.1's 8192, the
+// encoder warns, and the transcoding service turns that warning into a hard
+// job failure). Every profile is therefore passed through
+// fitProfileLadderToLevel (src/pipeline/profile-level-fit.ts) — on the seed path
+// before it is stored, and in place for already-stored profiles on every run,
+// including the skip path, because a long-lived deployment never re-seeds. The
+// fit is idempotent and only ever ADDS a bounding `width` to a rung that
+// declares a numeric height, an H.264 level and no width of its own.
+//
 // Skip-guard fix (issue #662): the guard used to be `repository.count() > 0`,
 // but built-ins are ensured on EVERY run BEFORE the guard, so after a first
 // startup whose remote index fetch failed the store is non-empty (built-ins
@@ -32,6 +45,7 @@
 
 import type { ProfileRepository } from '../data/profile-repo.js';
 import { BUILTIN_PROFILES } from './builtin-profiles.js';
+import { fitProfileLadderToLevel } from '../pipeline/profile-level-fit.js';
 
 // Timeout for each upstream fetch so a slow/hung index host can't block startup.
 const FETCH_TIMEOUT_MS = 5000;
@@ -107,6 +121,55 @@ export function parseProfileIndex(yaml: string): { name: string; ref: string }[]
   return entries;
 }
 
+// Make every stored profile's encode ladder level-safe, in place (issue #1167).
+//
+// WHY THIS RUNS ON EVERY BOOTSTRAP, not just when seeding. The seeded default
+// ladders declare each rung by HEIGHT only plus a hardcoded H.264 `level`, so
+// the output width comes from the SOURCE aspect ratio and a source that is only
+// approximately 16:9 (854x480) overflows the declared level's frame-size/DPB
+// limits — the encoder warns, the transcoding service turns that warning into a
+// hard failure, and the job is settled not-retryable
+// (src/pipeline/profile-level-fit.ts, contracts C1-C4). The remote-index seed is
+// SKIPPED once real profiles exist, so fixing only the seed path would leave
+// every already-provisioned store broken until someone ran a forced bootstrap.
+// This pass therefore re-fits what is already stored as well. It is idempotent
+// (a rung that already declares a width is never touched), so it is a no-op from
+// the second run onwards, and each change is logged with the rung geometry.
+async function fitStoredProfileLadders(
+  repository: ProfileRepository,
+  log?: BootstrapLogger
+): Promise<number> {
+  let fitted = 0;
+  let stored;
+  try {
+    stored = await repository.list();
+  } catch (err) {
+    log?.warn({ err }, 'profile bootstrap: could not list profiles for level fitting');
+    return 0;
+  }
+  for (const profile of stored) {
+    let result;
+    try {
+      result = fitProfileLadderToLevel(profile.yaml);
+    } catch (err) {
+      log?.warn({ err, profile: profile.name }, 'profile bootstrap: level fit failed');
+      continue;
+    }
+    if (!result.changed) continue;
+    try {
+      await repository.update(profile.name, result.yaml);
+      fitted += 1;
+      log?.info(
+        { profile: profile.name, adjustments: result.adjustments },
+        'profile bootstrap: added level-safe bounding widths to profile ladder (issue #1167)'
+      );
+    } catch (err) {
+      log?.warn({ err, profile: profile.name }, 'profile bootstrap: level fit update failed');
+    }
+  }
+  return fitted;
+}
+
 async function fetchText(url: string): Promise<string> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -148,6 +211,11 @@ export async function bootstrapProfiles(opts: {
   const builtinSeeded = await ensureBuiltinProfiles(repository, log);
 
   if (!force && preExistingRemote > 0) {
+    // Already-stored ladders are re-fitted even on the skip path (issue #1167):
+    // this is the ONLY path a long-lived deployment takes at startup, and the
+    // level-overflow failure lives in the ladders that were seeded before the
+    // fix. Idempotent, so this is a no-op once fitted.
+    await fitStoredProfileLadders(repository, log);
     // Skip path is now logged (issue #662): the old code returned silently, so a
     // skipped seed was invisible in the startup log. State whether the remote
     // index has ever been ingested (non-built-in profiles present) so an operator
@@ -165,7 +233,11 @@ export async function bootstrapProfiles(opts: {
   let seeded = 0;
   for (const entry of entries) {
     try {
-      const yaml = await fetchText(new URL(entry.ref, indexUrl).toString());
+      const fetched = await fetchText(new URL(entry.ref, indexUrl).toString());
+      // Bound every height-only rung that declares an H.264 level BEFORE the
+      // profile is stored, so a freshly seeded store is level-safe for non-16:9
+      // sources (issue #1167). No-op for a profile with nothing to fit.
+      const yaml = fitProfileLadderToLevel(fetched).yaml;
       const already = await repository.get(entry.name);
       if (already) {
         await repository.update(entry.name, yaml);
@@ -177,6 +249,11 @@ export async function bootstrapProfiles(opts: {
       log?.warn({ err, profile: entry.name, ref: entry.ref }, 'profile bootstrap: skipped one profile');
     }
   }
+
+  // Catch anything the seed loop did not cover: a profile an operator added
+  // before this fix, or one whose remote fetch failed this run (issue #1167).
+  // Idempotent and a no-op for ladders already fitted above.
+  await fitStoredProfileLadders(repository, log);
 
   log?.info({ seeded, builtinSeeded, indexUrl }, 'profile bootstrap complete');
   return { seeded, skipped: false, builtinSeeded };
