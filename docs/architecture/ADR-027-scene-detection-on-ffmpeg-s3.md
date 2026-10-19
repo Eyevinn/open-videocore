@@ -204,12 +204,11 @@ producing one is #1191's deliverable and a precondition for #1192.
 
 Logged as OSC friction (the catalog cannot describe an ephemeral job runner's job
 body or result surface) in the agents repo (`Eyevinn/eng-open-videocore-agents`) at
-`docs/osc-feedback/incoming-ffmpeg-s3-job-contract-not-in-catalog-schema.md`,
-written 2026-10-15 and committed there on `main`; it is not yet pushed, so the
-file is local to that working copy until the agents repo is published. The log
-records the limitation from the prior first-hand records cited above (797,
-ADR-023 §2.2, ADR-026 §2 C1) plus this repo's four runners. It does **not** claim
-a fresh `get-service-schema` probe — no catalog tooling was reachable.
+`docs/osc-feedback/incoming-ffmpeg-s3-job-contract-not-in-catalog-schema.md`
+(added in `Eyevinn/eng-open-videocore-agents#105`). The log records the limitation
+from the prior first-hand records cited above (797, ADR-023 §2.2, ADR-026 §2 C1)
+plus this repo's four runners. It does **not** claim a fresh `get-service-schema`
+probe — no catalog tooling was reachable.
 
 ---
 
