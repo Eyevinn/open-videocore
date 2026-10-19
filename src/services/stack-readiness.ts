@@ -51,7 +51,19 @@ export type StackCapability = (typeof STACK_SERVICES)[number]['role'];
 // is missing and the stack cannot (a non-ready state distinct from the
 // lifecycle states 'provisioning'/'failed', which mean the stack never finished
 // coming up in the first place).
-export type ReadinessState = 'ready' | 'provisioning' | 'failed' | 'degraded';
+//
+// 'deleting'/'delete_failed' (issue #1210) are the teardown lifecycle states:
+// the stack is still listed — its stored config is the only record of what is
+// left to remove — but a teardown is in flight ('deleting') or finished with
+// services still running ('delete_failed'). Both mirror the stored
+// StackConfig.status values of the same name.
+export type ReadinessState =
+  | 'ready'
+  | 'provisioning'
+  | 'failed'
+  | 'degraded'
+  | 'deleting'
+  | 'delete_failed';
 
 // Stable machine-readable reason codes for a non-ready readiness result. A
 // consumer switches on `code`; `capability` names the specific missing
@@ -62,6 +74,13 @@ export type ReadinessReasonCode =
   | 'stack_provisioning'
   // The stored StackConfig.status is 'failed' — provisioning did not complete.
   | 'stack_provisioning_failed'
+  // The stored StackConfig.status is 'deleting' — a teardown is in flight for
+  // this stack (issue #1210).
+  | 'stack_deleting'
+  // The stored StackConfig.status is 'delete_failed' — a teardown finished
+  // with at least one service NOT removed, so the stack is still (partly)
+  // there. Retry DELETE /api/v1/provision/{stack} to finish it (issue #1210).
+  | 'stack_delete_failed'
   // A core capability (storage/database/queue) is absent from services[].
   | 'core_capability_missing'
   // The stack cannot package: the on-demand packager's dependencies
@@ -146,6 +165,31 @@ export function computeStackReadiness(config: StackConfig): ReadinessResult {
       reason: {
         code: 'stack_provisioning_failed',
         message: 'stack provisioning did not complete'
+      }
+    };
+  }
+  // Teardown lifecycle (issue #1210). A stack being deleted — or one whose
+  // delete left services behind — is still listed, but it is NOT a live stack
+  // and must never report ready. Checked here with the other lifecycle states,
+  // before the capability checks: a half-torn-down inventory would otherwise
+  // report a misleading "missing capability" degradation.
+  if (config.status === 'deleting') {
+    return {
+      status: 'deleting',
+      reason: {
+        code: 'stack_deleting',
+        message: 'stack teardown is in progress'
+      }
+    };
+  }
+  if (config.status === 'delete_failed') {
+    return {
+      status: 'delete_failed',
+      reason: {
+        code: 'stack_delete_failed',
+        message:
+          'stack teardown left one or more services in place; retry the delete ' +
+          'to finish removing them'
       }
     };
   }

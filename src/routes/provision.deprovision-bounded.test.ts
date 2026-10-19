@@ -251,7 +251,7 @@ describe('DELETE /api/v1/provision/:name always reaches a terminal state (#1212)
 
     const op = await deleteAndWait(app, 'mystack');
 
-    expect(op.status).toBe('done');
+    expect(op.status).toBe('failed');
     const result = op.result as {
       status: string;
       services: { serviceId: string; status: string; failure?: string; error?: string }[];

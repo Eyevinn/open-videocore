@@ -421,6 +421,55 @@ const acceptedSchema = z.object({
   status: z.literal('pending')
 });
 
+// Map a finished teardown onto the async operation's TERMINAL state (issue
+// #1210).
+//
+// The DELETE route used to close every teardown as `status: 'done'` and leave
+// the real outcome buried in `result.status`. A teardown that left the
+// packager, the database and the object store running therefore reported the
+// operation as done — and every consumer that switches on the operation state
+// (public/app.js pollDeprovisionOp: `op.status === 'done'` -> "✓ removed" and
+// it drops the row) read a partial failure as a clean removal.
+//
+// So: an operation whose teardown reports `failed` (StackTeardownResult.status,
+// services/deprovision.ts:42 — set when ANY service failed to tear down or its
+// absence could not be confirmed) is itself `failed`. Every other teardown
+// status ('removed' | 'partial' | 'not_found') means nothing is left running,
+// which is a `done` operation.
+//
+// The full StackTeardownResult is carried on `result` either way, so the
+// per-service statuses (ServiceTeardownResult[], deprovision.ts:29 — serviceId,
+// role, status, error) are available for both outcomes; `error` additionally
+// names the services still in place, because that is the only field the
+// existing failure-rendering consumers show (`op.error`).
+//
+// Reuses the EXISTING OperationStatus enum ('pending' | 'running' | 'done' |
+// 'failed', services/operation-store.ts:3, mirrored by the operationSchema
+// above): no new operation state is introduced, so every existing poller keeps
+// working and already distinguishes this case.
+function teardownOperationPatch(result: StackTeardownResult): {
+  status: 'done' | 'failed';
+  completedAt: number;
+  result: StackTeardownResult;
+  error?: string;
+} {
+  if (result.status !== 'failed') {
+    return { status: 'done', completedAt: Date.now(), result };
+  }
+  const stillThere = result.services
+    .filter((s) => s.status === 'failed')
+    .map((s) => `${s.role} (${s.serviceId})`);
+  return {
+    status: 'failed',
+    completedAt: Date.now(),
+    result,
+    error:
+      `stack teardown did not complete: ${stillThere.length} service(s) ` +
+      `still in place: ${stillThere.join(', ')}. The stack remains listed as ` +
+      `delete_failed; retry the delete to finish removing them.`
+  };
+}
+
 // Non-secret storage backend metadata for one role, mirrors
 // StorageBackendConfig in param-store.ts. NO secret fields (issue #211).
 const storageBackendSchema = z.object({
@@ -441,8 +490,19 @@ const storedConfigSchema = z.object({
   // it is NOT the raw stored StackConfig.status. 'ready' means the stack can
   // complete the full ingest -> transcode -> package -> deliver flow; 'degraded'
   // means a required capability (e.g. packaging) is missing; the lifecycle
-  // states 'provisioning'/'failed' mean the stack never finished coming up.
-  status: z.enum(['provisioning', 'ready', 'failed', 'degraded']).optional(),
+  // states 'provisioning'/'failed' mean the stack never finished coming up;
+  // 'deleting'/'delete_failed' mean a teardown is in flight or left services
+  // behind (issue #1210) — the stack stays listed until every service is gone.
+  status: z
+    .enum([
+      'provisioning',
+      'ready',
+      'failed',
+      'degraded',
+      'deleting',
+      'delete_failed'
+    ])
+    .optional(),
   // Machine-readable explanation, present ONLY when status !== 'ready' (issue
   // #338). `code` is a stable enum a consumer switches on; `capability` names
   // the specific missing capability for the *_capability_missing codes.
@@ -451,6 +511,8 @@ const storedConfigSchema = z.object({
       code: z.enum([
         'stack_provisioning',
         'stack_provisioning_failed',
+        'stack_deleting',
+        'stack_delete_failed',
         'core_capability_missing',
         'packaging_capability_missing'
       ]),
@@ -2218,12 +2280,23 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   // DELETE /api/v1/provision/:name — tear down a named stack.
   //
   // Removes every OSC instance that makes up the stack in dependency-safe
-  // order (consumers before producers). Behaviour:
-  //   - 200 status=removed    every instance was removed this call
-  //   - 200 status=partial    some removed, some already gone (no failures)
-  //   - 404 status=not_found  no instances existed for this name
-  //   - 502 status=failed     one or more instances failed to remove; the
-  //                           call is safe to retry (idempotent)
+  // order (consumers before producers). The teardown result reports:
+  //   - status=removed    every instance was removed this call
+  //   - status=partial    some removed, some already gone (no failures)
+  //   - status=not_found  no instances existed for this name
+  //   - status=failed     one or more instances failed to remove; the
+  //                       call is safe to retry (idempotent)
+  //
+  // The teardown runs asynchronously: the route answers 202 with an
+  // operationId and the caller polls GET /operations/:id. That operation's own
+  // terminal state mirrors the outcome (issue #1210): `failed` when the
+  // teardown reports `failed` — with the surviving services named in
+  // `error` and every per-service status on `result.services[]` — and `done`
+  // only when nothing is left running. While the teardown is in flight the
+  // stored config is marked 'deleting', and a failed teardown leaves it marked
+  // 'delete_failed', so GET /api/v1/provision keeps listing the stack and
+  // GET /api/v1/provision/:name reports what state it is in until every
+  // service is gone.
   app.delete(
     '/:name',
     {
@@ -2242,6 +2315,44 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       // /operations/:id for the final teardown result.
       const op = ops.create('deprovision', name);
       reply.code(202).send({ operationId: op.id, name, status: 'pending' });
+
+      // Mark the stored config with a teardown lifecycle state (issue #1210).
+      // The stack MUST stay in the listing (GET /api/v1/provision reads
+      // ParamStore.listStackNames, which lists every stored entry regardless of
+      // status) until every service is gone — the entry is also the only record
+      // of what is left to remove — but it must not read as a live stack while
+      // it is going away. 'deleting' is written before teardown starts and
+      // 'delete_failed' when teardown leaves services in place; the entry is
+      // deleted only on a clean teardown. StackConfig.status is the existing
+      // lifecycle field (services/param-store.ts) and the write goes through
+      // the same storeStackConfig + constant namespace the provision path uses.
+      //
+      // Best-effort, exactly like the post-teardown deleteStackConfig: a failed
+      // marker write is logged and must never abort the teardown — the worst
+      // case is the stack staying listed with its previous status, which is
+      // strictly better than an unlisted stack with services still running.
+      const markStackTeardownStatus = async (
+        config: StackConfig,
+        status: 'deleting' | 'delete_failed'
+      ): Promise<void> => {
+        if (!paramStore) return;
+        try {
+          await paramStore.storeStackConfig(STACK_CONFIG_NAMESPACE, name, {
+            ...config,
+            status
+          });
+        } catch (err) {
+          app.log.error(
+            { err, name, status },
+            'failed to mark stored stack config with its teardown state'
+          );
+        }
+      };
+
+      // Hoisted so the failure paths can still mark a stack whose teardown threw or
+      // timed out (issue #1210): an unexpected failure mid-teardown must leave the
+      // stack listed as delete_failed, not stranded mid-'deleting'.
+      let loadedConfig: StackConfig | undefined;
 
       // Exactly one TERMINAL update per operation (issue #1212). The closure
       // below runs under a deadline; when that fires the operation is reported
@@ -2341,7 +2452,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             if (result.status === 'failed') {
               app.log.error({ result }, 'stack teardown reported failures');
             }
-            settle({ status: 'done', completedAt: Date.now(), result });
+            // The operation state mirrors the teardown outcome (issue #1210):
+            // nothing to mark in a store on this path (there is no store), but
+            // a teardown that left services running must not close as `done`.
+            settle(teardownOperationPatch(result));
             return;
           }
 
@@ -2387,6 +2501,14 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             });
             return;
           }
+
+          // The stack exists and is about to be torn down: mark the stored
+          // entry 'deleting' so it stays listed, but not as a live stack, for
+          // the whole teardown (issue #1210). Done before the first destructive
+          // call below so a teardown that dies part-way never leaves a
+          // half-removed stack still advertising itself as ready.
+          loadedConfig = config;
+          await markStackTeardownStatus(config, 'deleting');
 
           // Stop the per-workspace Encore scaler and destroy every pooled
           // Encore/callback-listener instance *before* removing the static
@@ -2510,12 +2632,20 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             // only for a stack whose Valkey survived (its removal failed), and
             // leaves one whose Valkey is gone released until the retry finishes
             // the teardown and the config is deleted.
+            // Since issue #1210 the entry is also re-marked 'delete_failed': the
+            // stack is still (partly) there, so it must stay listed AND say so,
+            // rather than sitting at 'deleting' with nothing running.
+            await markStackTeardownStatus(config, 'delete_failed');
+            //
             const queuePresent = queueInstancePresentAfterTeardown(result);
             if (queuePresent !== undefined) {
               onStackQueuePresence?.(name, queuePresent);
             }
             onStackChange?.(workspaceId);
-            settle({ status: 'done', completedAt: Date.now(), result });
+            // ...and the operation itself reports the partial failure instead of
+            // closing as `done` with a failed result buried inside it (issue
+            // #1210). Per-service statuses stay on result.services[].
+            settle(teardownOperationPatch(result));
             return;
           }
 
@@ -2552,7 +2682,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // not served from cache after teardown.
           onStackChange?.(workspaceId);
 
-          settle({ status: 'done', completedAt: Date.now(), result });
+          // Clean teardown: nothing is left running, so the operation is done
+          // and the stored entry is gone (deleted above) — the stack drops out
+          // of the listing, which is the only case where that is correct.
+          settle(teardownOperationPatch(result));
       };
 
       setImmediate(async () => {
@@ -2579,6 +2712,14 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           app.log.error({ err, name }, 'deprovisioning failed');
+          // An unexpected throw or a deadline mid-teardown is a partial failure
+          // too: whatever was reached may be half-removed, so the stack stays
+          // listed and is marked 'delete_failed' rather than left mid-'deleting'
+          // (issue #1210). Only possible once the config was loaded; a throw
+          // before that never touched any instance.
+          if (loadedConfig) {
+            await markStackTeardownStatus(loadedConfig, 'delete_failed');
+          }
           settle({
             status: 'failed',
             completedAt: Date.now(),

@@ -306,7 +306,7 @@ describe('DELETE /api/v1/provision/:name releases the stack-bound callback polle
     });
 
     const op = await deleteAndWait(app, 'mystack');
-    expect(op.status).toBe('done');
+    expect(op.status).toBe('failed');
     expect((op.result as { status: string }).status).toBe('failed');
 
     const stackPoller = pollers.find(
@@ -383,7 +383,7 @@ describe('DELETE /api/v1/provision/:name releases the stack-bound callback polle
     });
 
     const op = await deleteAndWait(app, 'mystack');
-    expect(op.status).toBe('done');
+    expect(op.status).toBe('failed');
     expect((op.result as { status: string }).status).toBe('failed');
     // The Valkey really was removed by this run, and reported as such.
     expect(events).toContain(`removeInstance:${VALKEY_SERVICE_ID}`);
@@ -446,7 +446,7 @@ describe('DELETE /api/v1/provision/:name releases the stack-bound callback polle
     });
 
     const op = await deleteAndWait(app, 'mystack');
-    expect(op.status).toBe('done');
+    expect(op.status).toBe('failed');
     expect((op.result as { status: string }).status).toBe('failed');
     expect(removedQueues.isRemoved('mystack')).toBe(false);
     // Stopped for the teardown, then brought back by the reconcile because the
