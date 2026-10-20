@@ -35,16 +35,33 @@ GHCR_USER=... GHCR_TOKEN=... OSC_ACCESS_TOKEN=... E2E_INSTANCE_OSC_ACCESS_TOKEN=
 until someone deletes the record by hand. A platform hiccup must therefore not record red. `infra-error` is not
 final, so the next cycle tries the same commit again.
 
-- **In the `transcode` case.** Infrastructure: a 502/503/504 on the transcode request or on a read of its job (the application documents
-  502/504 as `{error: "dependency_unreachable", dependency: "queue"|"encore"|"storage"}`, and the ingress can answer
-  504 as an HTML page with no JSON at all), and a timeout while the job never left `pending`/`queued` — nothing ever
-  picked the job up. Still red: a job that reaches a terminal `failed` state, a job that ran and stopped progressing
-  (reported as `stalled`), and a job that completes with no renditions. A deterministic encode failure (#1167) stays
-  red.
+- **In the `transcode` case.** Infrastructure:
+  - a 502/503/504 on the transcode request or on a read of its job. On `POST /api/v1/assets/{id}/transcode`,
+    openapi.json v1.5.0 documents **504** as `{error: "dependency_unreachable", dependency:
+    "queue"|"encore"|"storage", endpoint, message}` — `dependency` is 504's alone — and **502** as the generic
+    `{error, message}`; **503** is not documented, it is the ingress answering for the instance (an HTML page with no
+    JSON at all). `GET /api/v1/jobs/{id}` documents only 200 and 404, so any of the three on a job read is the
+    ingress too.
+  - a job read that is never answered at all — a dropped connection (`TypeError: fetch failed`), a TLS failure, the
+    `AbortError` from the 30 s per-request budget. A single blip does not end the wait: the read is retried on the
+    next tick and only three unanswered reads **in a row** end it, as `infra-error` (`observed.readErrors`,
+    `observed.lastReadError`). Any other error that breaks the wait itself is infrastructure whatever the job was
+    last seen doing — a transport error is no evidence about the encode.
+  - a timeout while the job reported `interrupted: true` or any `interruptionReason`. openapi.json v1.5.0
+    `GET /api/v1/jobs/{id}` describes `interrupted` as "an infrastructure/topology event (not a media failure)" with
+    the job "being auto-retried" and staying `running`, and `interruptionReason: interrupted_by_scaledown` as
+    "RECOVERABLE and typically AUTO-RETRIED by the service". Such a job gets its own phase word, `interrupted`.
+  - a timeout while the job never left `pending`/`queued` — nothing ever picked the job up.
+
+  Still red: a job that reaches a terminal `failed` state, a **non-interrupted** job that ran and stopped
+  progressing (reported as `stalled` or `running`), and a job that completes with no renditions. A deterministic
+  encode failure (#1167) stays red.
 - **What the timeout saw.** A transcode failure carries `observed` in the verdict — `jobStatus`, `progress`,
-  `maxProgress`, `phase` (`queued`, `running`, `stalled` or the terminal status), `polls`, and `attempts` /
-  `interrupted` when the job reports them — and repeats it in the case `detail`, so the verdict says whether the job
-  was queued, running or stalled rather than only that 900 s went by.
+  `maxProgress`, `phase` (`queued`, `running`, `stalled`, `interrupted` or the terminal status), `polls`, and
+  `attempts` / `interrupted` / `interruptionReason` / `readErrors` / `lastReadError` when there are any — and repeats
+  it in the case `detail`, so the verdict says whether the job was queued, running, stalled or interrupted rather
+  than only that 900 s went by. `observed` goes through the same credential masking as `detail`, because its
+  `error`/`message` fields are copied from an upstream response body.
 - **One retry.** When a suite run ends `infra-error` the cycle runs the whole suite once more (`opts.suiteRetries`,
   default 1) before recording anything. Only the last run is the verdict; `suiteAttempts` says how many runs it took
   and `retriedAfter` keeps the failure that was retried away.

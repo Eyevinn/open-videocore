@@ -1,6 +1,6 @@
 import { cases, CaseFailure, InfraFailure, SUITE_VERSION } from './cases.mjs';
 import { createClient } from '../lib/http.mjs';
-import { redact } from '../lib/redact.mjs';
+import { redact, redactValue } from '../lib/redact.mjs';
 import { sweepLeftovers } from './sweep.mjs';
 
 // Budgets, in ms. `transcodeMs` is 900 s (#1248): every run spawns a fresh encode instance and the observed cold
@@ -64,7 +64,9 @@ export async function runSuite({ client, anon, ingress, config, sleep, now = Dat
         status: 'fail',
         ms: now() - t0,
         ...(e instanceof InfraFailure && { failureClass: 'infra' }),
-        ...(e?.observed && { observed: e.observed }),
+        // `observed` is masked like `detail`: its `error`/`message` fields are copied from an upstream response body
+        // (a 502 is the free-form `{error, message}`), so an echoed credential must not reach the result store raw.
+        ...(e?.observed && { observed: redactValue(e.observed, config.secrets) }),
         detail: redact(String(e instanceof CaseFailure ? e.message : `${e?.name}: ${e?.message}`), config.secrets).slice(0, 500),
       });
       if (c.chain) chainBroken = true;
