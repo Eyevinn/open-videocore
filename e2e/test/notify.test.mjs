@@ -38,6 +38,27 @@ test('slackNotifier posts to the channel with the bot token, masks secrets, and 
   assert.doesNotMatch(calls[0][2].text, /sekret-value/);
 });
 
+test('formatAlert for infra-error says it is infrastructure and that the commit is retried, never "red" (#1248)', () => {
+  const text = formatAlert(rec('infra-error', {
+    suiteAttempts: 2,
+    retriedAfter: 'transcode: transcode request answered HTTP 504',
+    cases: [{ id: 'health', status: 'pass' }, { id: 'transcode', status: 'fail', failureClass: 'infra', detail: 'transcode request answered HTTP 504' }, { id: 'package', status: 'skipped' }],
+  }));
+  assert.match(text, /infrastructure problem/);
+  assert.match(text, /retried on the next cycle/);
+  assert.doesNotMatch(text, /\bred\b/i);
+  assert.match(text, /`transcode` fail \(infrastructure\): transcode request answered HTTP 504/);
+  assert.match(text, /ran 2 times/);
+  assert.doesNotMatch(text, /package/, 'skipped cases are not listed');
+});
+
+test('formatAlert for red still reads as a red verdict', () => {
+  const text = formatAlert(rec('red', { cases: [{ id: 'transcode', status: 'fail', detail: 'transcode job ended failed' }] }));
+  assert.match(text, /rotating_light/);
+  assert.match(text, /\*red\*/);
+  assert.doesNotMatch(text, /infrastructure/);
+});
+
 test('slackNotifier throws on an HTTP error or a Slack error answer', async () => {
   await assert.rejects(slackNotifier({ token: 't', fetchImpl: async () => ({ ok: false, status: 500 }) })(rec('red')), /HTTP 500/);
   await assert.rejects(slackNotifier({ token: 't', fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ ok: false, error: 'not_in_channel' }) }) })(rec('red')), /not_in_channel/);
