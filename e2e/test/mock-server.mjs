@@ -39,7 +39,10 @@ export function startMock({ token = 'tok', commit = 'abc1234', sourceDigest = 's
       return json(res, 202, { assetId: id, jobId });
     }
     if (req.method === 'GET' && (x = m(/^\/api\/v1\/jobs\/([^/]+)$/))) {
-      const j = jobs.get(x[1]); return j ? json(res, 200, j) : json(res, 404, {});
+      const j = jobs.get(x[1]);
+      // A gateway answer while a transcode job is polled: the platform, not the application.
+      if (j?.type === 'transcode' && faults.transcodeJobGateway) return json(res, Number(faults.transcodeJobGateway), { error: 'dependency_unreachable', dependency: 'queue', message: 'queue did not answer' });
+      return j ? json(res, 200, j) : json(res, 404, {});
     }
     if ((x = m(/^\/api\/v1\/assets\/([^/]+)(\/.*)?$/))) {
       const a = assets.get(x[1]); const sub = x[2] ?? '';
@@ -57,8 +60,23 @@ export function startMock({ token = 'tok', commit = 'abc1234', sourceDigest = 's
       }
       if (req.method === 'POST' && sub === '/transcode') {
         calls.push(`PROFILE ${body.profile}`);
-        const jobId = randomUUID(); jobs.set(jobId, { id: jobId, type: 'transcode', assetId: a.id, status: 'done', encoreJobId: 'enc1' });
-        a.renditions = [{ id: 'r1', label: '360p', width: 640, height: 360, objectKey: 'k' }];
+        // A gateway answer: the application documents 502/504 as {error: dependency_unreachable, dependency}
+        // (openapi.json), the platform ingress answers with an HTML page and no JSON at all.
+        if (faults.transcodeGateway) {
+          const code = Number(faults.transcodeGateway);
+          if (faults.transcodeGatewayHtml) { res.writeHead(code, { 'content-type': 'text/html' }); return res.end('<html><head><title>504 Gateway Time-out</title></head><body>504</body></html>'); }
+          return json(res, code, { error: 'dependency_unreachable', dependency: 'encore', endpoint: 'http://encore/encoreJobs', message: 'encore did not answer' });
+        }
+        const jobId = randomUUID();
+        // faults.transcodeJobStatus keeps the job in a non-terminal state for ever: 'queued' is the platform never
+        // picking the job up, 'running' with no progress is a stalled encode.
+        const stuck = faults.transcodeJobStatus;
+        const job = { id: jobId, type: 'transcode', assetId: a.id, sourceUrl: 'http://fixture/clip.mp4', attempts: 1, progress: 0, bytesTransferred: 0, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), encoreJobId: 'enc1', status: stuck ?? (faults.transcodeJobFails ? 'failed' : 'done') };
+        if (job.status === 'failed') job.error = 'encore job failed: no suitable encoder for the input';
+        if (job.status === 'done') { job.progress = 100; job.renditionAssetIds = faults.noRenditions ? [] : ['ra1']; }
+        if (stuck === 'running' && faults.transcodeProgress) job.progress = faults.transcodeProgress;
+        jobs.set(jobId, job);
+        if (job.status === 'done' && !faults.noRenditions) a.renditions = [{ id: 'r1', label: '360p', width: 640, height: 360, objectKey: 'k' }];
         return json(res, 202, { jobId, encoreJobId: 'enc1' });
       }
       if (req.method === 'POST' && sub === '/package') {

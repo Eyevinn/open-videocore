@@ -13,18 +13,77 @@ import { poll } from '../lib/poll.mjs';
 
 export const SUITE_VERSION = 'v1';
 
-class CaseFailure extends Error {}
-const fail = (msg) => { throw new CaseFailure(msg); };
+/**
+ * A case failure. `observed` carries structured facts the verdict should keep (see `runSuite`, which copies it
+ * into the case result as `observed`).
+ */
+class CaseFailure extends Error {
+  constructor(message, observed) { super(message); if (observed) this.observed = observed; }
+}
+/** A failure caused by the platform, not by the image under test: the suite ends `infra-error`, which is not final. */
+class InfraFailure extends CaseFailure {}
+const fail = (msg, observed) => { throw new CaseFailure(msg, observed); };
+const infraFail = (msg, observed) => { throw new InfraFailure(msg, observed); };
 const expectStatus = (res, ...codes) => {
   if (!codes.includes(res.status)) fail(`expected HTTP ${codes.join('/')}, got ${res.status}: ${res.text.slice(0, 300)}`);
 };
 const TERMINAL_JOB = new Set(['done', 'failed', 'cancelled']);
+/** The states a job has not started work in yet (openapi.json GET /api/v1/jobs/{id} status enum). */
+const INITIAL_JOB = new Set(['pending', 'queued']);
+/**
+ * Gateway answers that mean a dependency, not the code, is unreachable. The product documents 502 and 504 on
+ * POST /api/v1/assets/{id}/transcode as `{error: "dependency_unreachable", dependency: "queue"|"encore"|"storage"}`
+ * (openapi.json v1.5.0); 503 is added because the platform ingress can answer for the instance (an HTML page, not
+ * JSON) before the application is reached.
+ */
+const GATEWAY_STATUS = new Set([502, 503, 504]);
 
-/** Poll a job to a terminal state; fails unless it ends `done`. */
-async function waitForJob(ctx, jobId, timeoutMs, what) {
+/** What the last look at a job says it was doing, in the words the verdict should use. */
+function jobPhase(seen) {
+  if (seen.status === undefined) return 'never read';
+  if (TERMINAL_JOB.has(seen.status)) return seen.status;
+  if (INITIAL_JOB.has(seen.status)) return 'queued';
+  return seen.maxProgress > 0 ? 'running' : 'stalled';
+}
+/** The structured facts a transcode failure keeps in the verdict, plus a sentence for the detail text. */
+function jobObserved(seen, extra = {}) {
+  const phase = jobPhase(seen);
+  const observed = {
+    jobStatus: seen.status ?? null, progress: seen.progress ?? null, maxProgress: seen.maxProgress, phase, polls: seen.polls,
+    ...(seen.attempts !== undefined && { attempts: seen.attempts }),
+    ...(seen.interrupted !== undefined && { interrupted: seen.interrupted }),
+    ...(seen.interruptionReason !== undefined && { interruptionReason: seen.interruptionReason }),
+    ...extra,
+  };
+  const says = `last job status ${observed.jobStatus ?? 'never read'}, progress ${observed.progress ?? 'none'} (${phase})`
+    + (observed.interrupted ? `, interrupted${observed.interruptionReason ? ` (${observed.interruptionReason})` : ''}` : '');
+  return { observed, says };
+}
+
+/**
+ * Poll a job to a terminal state; fails unless it ends `done`.
+ * @param {object} [seen] filled in with the last body seen ({status, progress, maxProgress, polls, ...}), so a
+ *   timeout can say whether the job was queued, running or stalled.
+ */
+async function waitForJob(ctx, jobId, timeoutMs, what, seen) {
   const job = await poll(async () => {
     const r = await ctx.client.request('GET', `/api/v1/jobs/${encodeURIComponent(jobId)}`);
+    // Only the cases that ask for `seen` (the transcode case) classify a gateway answer as the platform's doing;
+    // elsewhere a non-200 on the job read stays a plain case failure, as before.
+    if (seen && GATEWAY_STATUS.has(r.status)) {
+      infraFail(`reading ${what} answered HTTP ${r.status}: ${r.text.slice(0, 200)}`, { httpStatus: r.status, request: 'job-status' });
+    }
     expectStatus(r, 200);
+    if (seen && r.body) {
+      // Field names from openapi.json GET /api/v1/jobs/{id}: status, progress, attempts, interrupted, interruptionReason.
+      seen.polls = (seen.polls ?? 0) + 1;
+      seen.status = r.body.status;
+      seen.progress = r.body.progress;
+      seen.maxProgress = Math.max(seen.maxProgress ?? 0, Number(r.body.progress) || 0);
+      seen.attempts = r.body.attempts;
+      if (r.body.interrupted !== undefined) seen.interrupted = r.body.interrupted;
+      if (r.body.interruptionReason !== undefined) seen.interruptionReason = r.body.interruptionReason;
+    }
     return TERMINAL_JOB.has(r.body?.status) ? r.body : undefined;
   }, { timeoutMs, intervalMs: ctx.config.pollMs, sleep: ctx.sleep, now: ctx.now, what });
   if (job.status !== 'done') fail(`${what} ended ${job.status}${job.error ? `: ${String(job.error).slice(0, 300)}` : ''}`);
@@ -146,6 +205,10 @@ export const cases = [
       // container type" (seen 2026-10-09 in the packager log), so the package case then waits for manifest URLs that never
       // come. `program` is the standard x264 profile. Inline `customProfile.outputs` is rejected by the product
       // (open-videocore #1022), so there is no custom fallback.
+      //
+      // Platform failures here are classed `infra-error`, not red (#1248): a 502/503/504 on the transcode request,
+      // and a timeout while the job never left `pending`/`queued`. A job that ends `failed` and a job that finishes
+      // with no renditions stay RED — those are the product's own verdict on the encode (regression guard for #1167).
       const wanted = ctx.config.transcodeProfile ?? 'program';
       const list = await ctx.client.request('GET', '/api/v1/profiles/');
       expectStatus(list, 200);
@@ -153,12 +216,35 @@ export const cases = [
       if (!names.has(wanted)) fail(`transcode profile "${wanted}" is not on the instance; available: ${[...names].slice(0, 20).join(', ') || 'none'}`);
       const json = { profile: wanted };
       const r = await ctx.client.request('POST', `/api/v1/assets/${ctx.state.assetId}/transcode`, { json });
+      if (GATEWAY_STATUS.has(r.status)) {
+        // 504 carries {error: "dependency_unreachable", dependency} when it comes from the application; the ingress
+        // answers with an HTML page and no body at all, so both are reported from what is there.
+        const dep = r.body?.dependency ? ` (dependency ${r.body.dependency})` : '';
+        infraFail(`transcode request answered HTTP ${r.status}${dep}: ${r.text.slice(0, 200)}`,
+          { httpStatus: r.status, ...(r.body?.dependency && { dependency: r.body.dependency }), ...(r.body?.error && { error: r.body.error }) });
+      }
       expectStatus(r, 202);
       if (!r.body?.jobId) fail('202 response lacks jobId');
       ctx.state.encoreJobId = r.body.encoreJobId;
-      const job = await waitForJob(ctx, r.body.jobId, ctx.config.timeouts.transcodeMs, 'transcode job');
+      const seen = { maxProgress: 0, polls: 0 };
+      let job;
+      try {
+        job = await waitForJob(ctx, r.body.jobId, ctx.config.timeouts.transcodeMs, 'transcode job', seen);
+      } catch (e) {
+        const { observed, says } = jobObserved(seen);
+        // Already classified inside waitForJob: a terminal failed/cancelled job is red, a gateway answer on the job
+        // read is infra. Either way the verdict gets what the last look at the job saw.
+        if (e instanceof CaseFailure) { e.observed ??= observed; e.message = `${e.message} [${says}]`; throw e; }
+        // A timeout. The job never started work (encore was never there to pick it up): the platform, not the image.
+        const msg = `${String(e.message)}; ${says}`;
+        if (observed.phase === 'queued' || observed.phase === 'never read') infraFail(msg, observed);
+        fail(msg, observed); // it did run and stopped progressing: that is the image's problem, red
+      }
       const asset = await getAsset(ctx);
-      if (!asset.renditions?.length && !job.renditionAssetIds?.length) fail('no renditions after transcode');
+      if (!asset.renditions?.length && !job.renditionAssetIds?.length) {
+        const { observed, says } = jobObserved(seen);
+        fail(`no renditions after transcode; ${says}`, observed);
+      }
     },
   },
   {
@@ -235,4 +321,4 @@ export const cases = [
   },
 ];
 
-export { CaseFailure };
+export { CaseFailure, InfraFailure };
