@@ -29,14 +29,24 @@
 // so the un-contract-verified runtime wire shape stays isolated in exactly one
 // place (osc-scene-detect.ts).
 //
-// Contract sources:
+// Contract sources (runtime shape confirmed 2026-09-25, issue #797):
 //   - eyevinn-function-scenes ("Scene Detect Media Function"), get-service-schema:
 //     a serverless media function whose create-service-instance config requires
 //     `name` (string) ONLY. get-service-schema exposes ONLY the provisioning
-//     config, NOT the runtime endpoint's request/response wire shape — so that
-//     runtime shape is deliberately NOT modelled here and is isolated behind this
-//     injected interface (see osc-scene-detect.ts header).
+//     config, NOT the runtime endpoint's request/response wire shape.
+//   - The runtime shape was instead confirmed from the upstream service source
+//     `Eyevinn/function-scenes` @ 492a18f23e253194c27800563ea0c96bef187aef —
+//     `api.json` (`#/model/request.medialocator`, `#/model/createJobResponse`) and
+//     the `index.js` route table. It is an ASYNC JOB API rooted at `/api/v1`, and
+//     it returns only keyframe image URIs — see
+//     docs/investigations/797-function-scenes-runtime-contract.md.
 //   - services/stack.ts SCENE_DETECT_SERVICE_ID.
+//
+// NOTE (#798): the confirmed service returns NO scene-boundary timecodes, so the
+// `scenes`/`cuts` result modelled below cannot be populated from it as things
+// stand. `sceneMetadata` needs re-scoping (keyframe URIs, or a different source
+// for cut timecodes) before this step can work end to end; the types are left
+// unchanged here because #797 is contract-confirmation only.
 
 import type { AssetRepository, SceneMetadata, SceneBoundary } from '../data/asset-repo.js';
 import type { WorkspaceStorage } from '../data/storage.js';
@@ -53,9 +63,11 @@ export function sceneUrlTtlSeconds(): number {
 }
 
 // The raw result a `SceneDetector` returns for one detection run. Kept permissive
-// (every field optional) because the runtime wire shape of eyevinn-function-scenes
-// is NOT contract-verified (see file header): the parser below defends every
-// field. A detector may report boundaries as either a list of structured cut
+// (every field optional) — originally because the wire shape was unverified, and
+// now because the confirmed eyevinn-function-scenes contract produces NEITHER of
+// these fields (see file header + #798): the parser below defends every field, so
+// a real run degrades to "no scenes" rather than throwing. A detector may report
+// boundaries as either a list of structured cut
 // points (`scenes`) or a bare list of cut timecodes in seconds (`cuts`); the
 // orchestrator normalizes either into our SceneMetadata shape.
 export type SceneDetectorResult = {

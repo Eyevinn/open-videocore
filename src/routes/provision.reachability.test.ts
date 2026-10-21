@@ -30,6 +30,9 @@ vi.mock('@osaas/client-core', () => ({
   removeInstance: vi.fn(),
   getPortsForInstance: vi.fn(async () => []),
   waitForInstanceReady: vi.fn(async () => undefined),
+  // Readiness waits go through the bounded helper, which polls
+  // getInstanceHealth (src/services/instance-readiness.ts, issue #1038).
+  getInstanceHealth: vi.fn(async () => 'running'),
   saveSecret: vi.fn(),
   Context: class {}
 }));

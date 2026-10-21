@@ -8,17 +8,44 @@
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
+import { isStepTerminal } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import type { JobRepository } from '../data/job-repo.js';
 import type { AssetRepository } from '../data/asset-repo.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
+// #1227: ONE rule for recomputing an asset's state from the final state of a
+// job that just went terminal. Shared with DELETE /api/v1/jobs/:id and the
+// late-completion reclaim.
+import { recomputeAssetStateAfterTerminalJob } from '../pipeline/asset-state-after-terminal-job.js';
+// Structured step failure detail (issue #1060). ONE shared schema so this
+// router's copy of stepExecutionSchema and the assets router's copy
+// (src/routes/assets.ts) cannot drift on it.
+import { stepErrorDetailSchema } from '../pipeline/step-error-detail.js';
 
 const stepExecutionSchema = z.object({
   name: z.enum(['extract-metadata', 'thumbnail', 'subtitles', 'scene-detect', 'transcode', 'package']),
-  status: z.enum(['pending', 'running', 'done', 'failed']),
+  // `skipped` (issue #789): the step did not run because its OPTIONAL service
+  // instance is unconfigured — distinct from `done`. See StepStatus in
+  // ../data/pipeline-repo.ts.
+  status: z.enum(['pending', 'running', 'done', 'failed', 'skipped']),
   jobId: z.string().optional(),
   encoreJobId: z.string().optional(),
   error: z.string().optional(),
+  // Machine-readable companion to `error` (issue #1060). Present only for the
+  // failure classes we can recognise — today `source_read_failed`, a transcode
+  // whose SOURCE object could not be read — and carrying the code, the redacted
+  // source location (url/bucket/key), the HTTP status and the transcoder job +
+  // asset ids. ADDITIVE and OPTIONAL: `error` still carries the same free text,
+  // so existing consumers are unaffected. See StepErrorDetail in
+  // ../pipeline/step-error-detail.ts.
+  errorDetail: stepErrorDetailSchema
+    .optional()
+    .describe(
+      'Structured, machine-readable failure detail. Present only for ' +
+        'recognised failure classes; branch on `errorDetail.code` rather than ' +
+        'parsing `error`.'
+    ),
+  skipReason: z.string().optional(),
   startedAt: z.string().optional(),
   completedAt: z.string().optional(),
   progress: z.number().optional()
@@ -136,10 +163,13 @@ export const pipelinesRouter: FastifyPluginAsync<PipelinesRouterOptions> = async
         }
       }
 
-      // Mark each non-terminal step as failed and the execution overall.
+      // Mark each non-terminal step as failed and the execution overall. An
+      // already-settled step is left as-is: `done` for a completed one and
+      // `skipped` for an optional step that never ran (issue #789) — cancelling
+      // the execution must not retroactively turn either into a failure.
       const now = new Date().toISOString();
       const updatedSteps = exec.steps.map((step) =>
-        step.status === 'done' ? step : { ...step, status: 'failed' as const, completedAt: now }
+        isStepTerminal(step) ? step : { ...step, status: 'failed' as const, completedAt: now }
       );
       const updated = await pipelineRepository.update(exec.id, {
         status: 'failed',
@@ -149,7 +179,24 @@ export const pipelinesRouter: FastifyPluginAsync<PipelinesRouterOptions> = async
       // Also mark the linked job(s) as failed in the job repository.
       for (const step of exec.steps) {
         if (step.jobId && step.status !== 'done') {
-          await jobRepository.update(step.jobId, { status: 'failed', error: 'Cancelled by operator' }).catch(() => {});
+          const settled = await jobRepository
+            .update(step.jobId, { status: 'failed', error: 'Cancelled by operator' })
+            .catch(() => undefined);
+          // #1227: a job that reaches a terminal state here must take the asset
+          // with it. This cancel settles each non-terminal step's job, and
+          // nothing else ever moved the asset out of `processing` — only the
+          // transcode completion handler did — so the execution read `failed`
+          // while its asset still read PROCESSING. Recomputed from the job's
+          // FINAL state (`failed` on this path, hence the asset follows it) by
+          // the same rule the job-cancel route uses. Best-effort: it never
+          // throws and the 200 below does not depend on it.
+          if (settled) {
+            await recomputeAssetStateAfterTerminalJob(settled, {
+              assets: assetRepository,
+              jobs: jobRepository,
+              logWarn: (detail) => request.log?.warn(detail)
+            });
+          }
         }
       }
 

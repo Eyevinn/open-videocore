@@ -29,10 +29,29 @@
 // means a freshly provisioned stack creates NO packager instance and mints no
 // packager secrets/tokens until packaging is actually used — the shared queue
 // (valkey-io-valkey), database and storage are unaffected.
+// The object-store serviceId. Exported as its own constant (rather than only
+// living inline in STACK_SERVICES below) because two other paths need to match
+// on it by identity rather than by position: the deprovision ordering, and the
+// #991 in-cluster endpoint lookup, which finds the stack's object-store
+// instance name in `StackConfig.services` (services/param-store.ts) to call
+// `getInternalEndpoint(context, serviceId, instanceName, token)`. On the
+// platform the Kubernetes namespace an instance runs in is named after its
+// serviceId, so this string is also the object store's namespace.
+export const OBJECT_STORE_SERVICE_ID = 'minio-minio' as const;
+
+// The queue (Valkey) serviceId. Exported as its own constant for the same
+// reason as OBJECT_STORE_SERVICE_ID above: paths that must match this service
+// BY IDENTITY rather than by position in STACK_SERVICES. The teardown reporting
+// in routes/provision.ts uses it to read what a run established about the
+// stack's queue instance specifically (issue #1213) — the stack's scaler state,
+// its callback completions and its packaging hand-off all live on this store,
+// so "is it still there?" decides what background work may stay bound to it.
+export const QUEUE_SERVICE_ID = 'valkey-io-valkey' as const;
+
 export const STACK_SERVICES = [
-  { serviceId: 'minio-minio', role: 'storage' },
+  { serviceId: OBJECT_STORE_SERVICE_ID, role: 'storage' },
   { serviceId: 'apache-couchdb', role: 'database' },
-  { serviceId: 'valkey-io-valkey', role: 'queue' }
+  { serviceId: QUEUE_SERVICE_ID, role: 'queue' }
 ] as const;
 
 // The Encore packager consumes the shared Valkey queue and writes CMAF output
@@ -42,6 +61,15 @@ export const STACK_SERVICES = [
 // its serviceId so the on-demand ensure/teardown paths never hardcode the
 // string (mirrors the FFPROBE_SERVICE_ID / AUTO_SUBTITLES_SERVICE_ID pattern).
 export const PACKAGER_SERVICE_ID = 'eyevinn-encore-packager' as const;
+
+// The human-readable role reported for the packager in a teardown result. The
+// on-demand packager is torn down from TWO places — the static TEARDOWN_ORDER
+// below (store-less path) and teardownOnDemandPackager (the ground-truth
+// reconciliation used when it is absent from the stored services[]). Both fold
+// into the SAME per-service result list, so the role must be identical in both
+// or the merged entry would be incoherent. Exported as one constant rather than
+// repeating the literal (issue #1056).
+export const PACKAGER_TEARDOWN_ROLE = 'packaging' as const;
 
 // A stack service descriptor: the OSC serviceId plus its human-readable role.
 // This is a structural supertype of the STACK_SERVICES entries (which narrow to
@@ -76,7 +104,8 @@ export const AUTO_SUBTITLES_SERVICE_ID = 'eyevinn-auto-subtitles' as const;
 
 // eyevinn-function-scenes ("Scene Detect Media Function"): the serverless media
 // function used by the OPTIONAL scene/shot-detection pipeline step (issue #115).
-// It produces keyframe + scene-boundary metadata for the clip/trim workflows.
+// It produces keyframe IMAGES for the clip/trim workflows — note it does NOT
+// return scene-boundary timecodes over its API (confirmed #797, see below).
 // Like eyevinn-auto-subtitles it is a resolvable instance called over HTTP at its
 // instance URL (see pipeline/osc-scene-detect.ts), NOT an ephemeral job like
 // eyevinn-ffmpeg-s3. It is NOT part of the long-lived provisioned stack above — it
@@ -87,9 +116,13 @@ export const AUTO_SUBTITLES_SERVICE_ID = 'eyevinn-auto-subtitles' as const;
 // Contract source: get-service-schema for `eyevinn-function-scenes`.
 // create-service-instance config: required `name` (string) ONLY — it is a
 // serverless media function. NOTE: get-service-schema exposes ONLY this
-// provisioning config, NOT the runtime endpoint's request/response wire shape;
-// that un-verified wire shape is isolated in pipeline/osc-scene-detect.ts behind
-// the injected SceneDetector interface.
+// provisioning config, NOT the runtime endpoint's request/response wire shape.
+// That runtime shape was confirmed separately (#797) from the upstream service
+// source `Eyevinn/function-scenes` @ 492a18f2 (`api.json` + `index.js`): an async
+// job API — POST /api/v1 `{medialocator}` -> `{thumbnails,status}`, then poll.
+// See docs/investigations/797-function-scenes-runtime-contract.md. The (still
+// non-conforming) call is isolated in pipeline/osc-scene-detect.ts behind the
+// injected SceneDetector interface, pending the #798 fix.
 export const SCENE_DETECT_SERVICE_ID = 'eyevinn-function-scenes' as const;
 
 // Teardown order is the reverse of provision order: consumers are removed
@@ -109,7 +142,7 @@ export const SCENE_DETECT_SERVICE_ID = 'eyevinn-function-scenes' as const;
 // packaging ever executed. role 'packaging' matches the pre-#243 provision entry.
 const TEARDOWN_ONLY_PACKAGER: StackService = {
   serviceId: PACKAGER_SERVICE_ID,
-  role: 'packaging'
+  role: PACKAGER_TEARDOWN_ROLE
 };
 
 export const TEARDOWN_ORDER: readonly StackService[] = [

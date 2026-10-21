@@ -433,6 +433,49 @@ describe('direct client-side upload (issue #4)', () => {
       expect(abortCall.args[1]).toBe('upload-xyz');
     });
 
+    // Acceptance criterion for #748: an aborted upload must not leave the asset
+    // stranded in `uploading`. A freshly created asset is `uploading`; aborting
+    // its multipart session transitions it to `failed` so no live `uploading`
+    // record survives with nothing behind it (asset-upload.ts:356-358;
+    // `uploading -> failed` is an allowed transition, asset-repo.ts:35).
+    it('transitions an uploading asset to failed on abort (issue #748)', async () => {
+      const id = await createAsset(app);
+
+      const res = await app.inject({
+        method: 'DELETE',
+        url: `/api/v1/assets/${id}/multipart/upload-xyz`,
+        headers: A
+      });
+      expect(res.statusCode).toBe(204);
+
+      const read = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}`, headers: A });
+      expect(read.json().status).toBe('failed');
+    });
+
+    // Idempotency guard (asset-upload.ts:356): a late/duplicate abort arriving
+    // after the asset has advanced past `uploading` (here: upload-complete moved
+    // it to `processing`) must NOT clobber the current status back to `failed`.
+    it('leaves a non-uploading asset unchanged on abort (idempotency guard)', async () => {
+      const id = await createAsset(app);
+      // Advance past `uploading`: upload-complete transitions uploading -> processing.
+      const complete = await app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${id}/upload-complete`,
+        headers: A
+      });
+      expect(complete.json().status).toBe('processing');
+
+      const res = await app.inject({
+        method: 'DELETE',
+        url: `/api/v1/assets/${id}/multipart/upload-xyz`,
+        headers: A
+      });
+      expect(res.statusCode).toBe(204);
+
+      const read = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}`, headers: A });
+      expect(read.json().status).toBe('processing');
+    });
+
     it('returns 404 when aborting against an unknown asset', async () => {
       const res = await app.inject({
         method: 'DELETE',

@@ -20,7 +20,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Redis } from 'ioredis';
 import { EncoreScalerLoop } from './scaler-loop.js';
-import { probeCallbackTrust } from './callback-trust-probe.js';
+import { probeCallbackTrust, buildCallbackUri } from './callback-trust-probe.js';
 import { keys, type EncoreInstanceRecord, type EncoreScalerConfig } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -30,15 +30,109 @@ import { keys, type EncoreInstanceRecord, type EncoreScalerConfig } from './type
 describe('probeCallbackTrust (#463 handshake classification)', () => {
   const URL = 'https://listener-abc.auto.prod-se.osaas.io';
 
-  it('treats any completed HTTP response (even 404) as trust confirmed', async () => {
+  it('treats a completed non-rejecting HTTP response (even 404) as trust confirmed', async () => {
     const fetchImpl = vi.fn(async () => ({ status: 404 }));
     const r = await probeCallbackTrust(URL, 5_000, fetchImpl);
     expect(r.ok).toBe(true);
-    // Probes the ingress ORIGIN with a HEAD.
+    expect(r.state).toBe('trusted');
+    // #814: probes the CALLBACK PATH with a HEAD, not the bare ingress origin.
     expect(fetchImpl).toHaveBeenCalledWith(
-      'https://listener-abc.auto.prod-se.osaas.io',
+      'https://listener-abc.auto.prod-se.osaas.io/encoreCallback',
       expect.objectContaining({ method: 'HEAD' })
     );
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #814 acceptance: the probe must grade the URL Encore actually POSTs
+  // to. On a freshly created listener the ingress origin answers 200 for ~14s
+  // while `/encoreCallback` is still auth-walled and returns 401 (measured live
+  // on two throwaway instances, 2026-09-26). An origin-targeted probe therefore
+  // graded that window as 'trusted' and licensed the first job straight into
+  // the failure. This test replays that exact divergence.
+  // -------------------------------------------------------------------------
+  it('reports callback-unusable during the fresh-instance window where the origin answers 200 but /encoreCallback 401s', async () => {
+    const fetchImpl = vi.fn(async (input: string) =>
+      input === `${URL}/encoreCallback` ? { status: 401 } : { status: 200 }
+    );
+    const r = await probeCallbackTrust(URL, 5_000, fetchImpl);
+    // Would have been { ok: true, state: 'trusted', status: 200 } before #814.
+    expect(r.ok).toBe(false);
+    expect(r.state).toBe('callback-unusable');
+    expect(fetchImpl).toHaveBeenCalledWith(
+      `${URL}/encoreCallback`,
+      expect.objectContaining({ method: 'HEAD' })
+    );
+  });
+
+  // The probe URI and the dispatch-time `progressCallbackUri` must be the same
+  // string, including trailing-slash normalisation — that is the invariant
+  // buildCallbackUri() exists to hold (#814).
+  it('normalises a trailing slash the same way the dispatch-time URI does', async () => {
+    const fetchImpl = vi.fn(async () => ({ status: 404 }));
+    await probeCallbackTrust(`${URL}/`, 5_000, fetchImpl);
+    expect(fetchImpl).toHaveBeenCalledWith(
+      `${URL}/encoreCallback`,
+      expect.objectContaining({ method: 'HEAD' })
+    );
+    expect(buildCallbackUri(`${URL}/`)).toBe(buildCallbackUri(URL));
+  });
+
+  // Never POST: the listener has no GET/HEAD route for this path (a healthy
+  // instance answers Fastify's 404), but a POST would enqueue a synthetic
+  // progress callback onto the listener's Redis queue.
+  it('never probes with a method that would enqueue a synthetic callback', async () => {
+    const fetchImpl = vi.fn(
+      async (_input: string, _init?: { method?: string; signal?: AbortSignal }) => ({
+        status: 404
+      })
+    );
+    await probeCallbackTrust(URL, 5_000, fetchImpl);
+    expect(fetchImpl).toHaveBeenCalled();
+    for (const call of fetchImpl.mock.calls) {
+      expect(call[1]?.method).toBe('HEAD');
+    }
+  });
+
+  // Issue #813 acceptance: "A 2xx response from the listener still produces a
+  // 'trusted' result (no regression for the working case)."
+  it.each([200, 204])('treats a %i from the listener as trusted', async (status) => {
+    const fetchImpl = vi.fn(async () => ({ status }));
+    const r = await probeCallbackTrust(URL, 5_000, fetchImpl);
+    expect(r).toEqual({ ok: true, state: 'trusted', status });
+  });
+
+  // Issue #813 acceptance: "On a fresh stack where the listener returns
+  // 401/403, the probe result is no longer 'trusted'; it is reported as a
+  // distinct not-usable/degraded state."
+  it.each([401, 403])(
+    'treats a %i from the listener as callback-unusable, NOT trusted',
+    async (status) => {
+      const fetchImpl = vi.fn(async () => ({ status }));
+      const r = await probeCallbackTrust(URL, 5_000, fetchImpl);
+      expect(r.ok).toBe(false);
+      expect(r.state).toBe('callback-unusable');
+      if (r.state !== 'callback-unusable') throw new Error('unreachable');
+      // The rejecting status is carried through for operator triage, and the
+      // state is distinct from a transport/handshake failure.
+      expect(r.status).toBe(status);
+      expect(r.detail).toContain(String(status));
+    }
+  );
+
+  // A rejection is NOT folded into the transport-failure bucket either: the TLS
+  // handshake demonstrably completed, so 'tls-trust' would be a wrong diagnosis.
+  it('does not classify a 401 as a tls-trust/probe-failed outcome', async () => {
+    const r = await probeCallbackTrust(URL, 5_000, vi.fn(async () => ({ status: 401 })));
+    expect(r.state).not.toBe('probe-failed');
+    expect(r.state).not.toBe('trusted');
+  });
+
+  // Only an auth rejection is "unusable" — a listener still booting (5xx) has
+  // proved the trust path and must not be mistaken for a rejecting ingress.
+  it('still treats a 503 (listener booting) as trusted', async () => {
+    const r = await probeCallbackTrust(URL, 5_000, vi.fn(async () => ({ status: 503 })));
+    expect(r.ok).toBe(true);
+    expect(r.state).toBe('trusted');
   });
 
   it('classifies a PKIX/handshake failure as tls-trust (the #463 race)', async () => {
@@ -52,7 +146,7 @@ describe('probeCallbackTrust (#463 handshake classification)', () => {
     });
     const r = await probeCallbackTrust(URL, 5_000, fetchImpl);
     expect(r.ok).toBe(false);
-    if (r.ok) throw new Error('unreachable');
+    if (r.state !== 'probe-failed') throw new Error('unreachable');
     expect(r.errorClass).toBe('tls-trust');
   });
 
@@ -64,7 +158,7 @@ describe('probeCallbackTrust (#463 handshake classification)', () => {
     });
     const r = await probeCallbackTrust(URL, 10, fetchImpl);
     expect(r.ok).toBe(false);
-    if (r.ok) throw new Error('unreachable');
+    if (r.state !== 'probe-failed') throw new Error('unreachable');
     expect(r.errorClass).toBe('timeout');
   });
 });
@@ -145,6 +239,13 @@ function asRedis(f: FakeRedis): Redis {
 
 const WS = 'ws1';
 const LISTENER_URL = 'https://listener-abc.auto.prod-se.osaas.io';
+// #814: the trust probe targets the callback PATH Encore is told to POST to,
+// not the bare ingress origin — on a fresh listener the origin answers ~14s
+// before `/encoreCallback` stops returning 401, so an origin-targeted probe
+// passed during the window that #811/#812 fail in. The stubs below therefore
+// answer on this URL; a probe that still hit the origin would fall through to
+// the `unexpected fetch to ...` throw and fail the test.
+const LISTENER_PROBE_URL = `${LISTENER_URL}/encoreCallback`;
 
 function seedInstance(redis: FakeRedis, record: EncoreInstanceRecord): void {
   const h = redis.hashes.get(keys.pool(WS)) ?? new Map<string, string>();
@@ -216,7 +317,7 @@ describe('EncoreScalerLoop first-job callback-trust gate (#463)', () => {
     // --- Tick 1 (t=0): probe FAILS with a PKIX handshake error (the #463 race).
     globalThis.fetch = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
-      if (url === LISTENER_URL) {
+      if (url === LISTENER_PROBE_URL) {
         // Trust probe: certificate not yet trusted (the #463 race).
         const err = new Error('fetch failed');
         (err as Error & { cause?: unknown }).cause = Object.assign(
@@ -248,7 +349,7 @@ describe('EncoreScalerLoop first-job callback-trust gate (#463)', () => {
     vi.setSystemTime(35_000);
     globalThis.fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
-      if (url === LISTENER_URL) {
+      if (url === LISTENER_PROBE_URL) {
         // Handshake completes: trust confirmed.
         return { status: 200, ok: true } as unknown as Response;
       }
@@ -292,7 +393,7 @@ describe('EncoreScalerLoop first-job callback-trust gate (#463)', () => {
     // The probe fails with a PKIX handshake error on every tick.
     globalThis.fetch = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
-      if (url === LISTENER_URL) {
+      if (url === LISTENER_PROBE_URL) {
         const err = new Error('fetch failed');
         (err as Error & { cause?: unknown }).cause = Object.assign(
           new Error('unable to verify the first certificate'),
@@ -343,8 +444,8 @@ describe('EncoreScalerLoop first-job callback-trust gate (#463)', () => {
 
     const fetchSpy = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
-      // If the probe ran it would hit LISTENER_URL — assert it does NOT.
-      if (url === LISTENER_URL) throw new Error('warm instance was re-probed (regression)');
+      // If the probe ran it would hit LISTENER_PROBE_URL — assert it does NOT.
+      if (url === LISTENER_PROBE_URL) throw new Error('warm instance was re-probed (regression)');
       if (url.endsWith('/encoreJobs') && init?.method === 'POST') {
         return { ok: true, status: 201, json: async () => ({ id: 'u' }) } as unknown as Response;
       }
@@ -358,9 +459,117 @@ describe('EncoreScalerLoop first-job callback-trust gate (#463)', () => {
     expect(await redis.llen(keys.queue(WS))).toBe(0);
     expect(await redis.hget(keys.jobInstance(WS), `${WS}__job-1`)).toBe('inst-warm');
     for (const call of fetchSpy.mock.calls) {
+      expect(String(call[0])).not.toBe(LISTENER_PROBE_URL);
       expect(String(call[0])).not.toBe(LISTENER_URL);
     }
 
     globalThis.fetch = realFetch;
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #813: a listener ingress that answers 401/403 is NOT trusted.
+  // -------------------------------------------------------------------------
+
+  it.each([401, 403])(
+    'a listener returning %i is never marked trust-ready — it resolves to the degraded callback-unusable state, not a silent pass',
+    async (status) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(0);
+
+      seedInstance(redis, {
+        instanceId: 'inst-401',
+        url: 'https://encore-401.osaas.io',
+        callbackListenerUrl: LISTENER_URL,
+        activeJobs: 0,
+        lastIdleAt: Date.now()
+      });
+      queueOneJob();
+
+      // The listener ingress rejects every probe (the #811 symptom).
+      globalThis.fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url === LISTENER_PROBE_URL) {
+          return { status, ok: false } as unknown as Response;
+        }
+        if (url.endsWith('/encoreJobs') && init?.method === 'POST') {
+          return {
+            ok: true,
+            status: 201,
+            json: async () => ({ id: 'encore-uuid-401' })
+          } as unknown as Response;
+        }
+        throw new Error(`unexpected fetch to ${url}`);
+      }) as unknown as typeof fetch;
+
+      // --- Tick 1 (t=0, inside the bounded wait): the rejection is treated as
+      // "not confirmed" — the instance is NOT eligible and gets no job. Before
+      // #813 the 401 was folded into the trusted case and the job dispatched.
+      await loop.tick();
+
+      let inst = readInstance(redis, 'inst-401');
+      expect(inst.callbackTrustReady).toBeFalsy();
+      expect(inst.callbackPathUnusableAt).toBeFalsy();
+      expect(await redis.llen(keys.queue(WS))).toBe(1);
+      expect(await redis.hget(keys.jobInstance(WS), `${WS}__job-1`)).toBeNull();
+
+      // --- Tick 2 (t=61s > the default 60_000ms bounded wait): the rejection
+      // has persisted, so it resolves to the DEGRADED state: recorded on the
+      // instance (queryable/alertable) and explicitly NOT "trusted".
+      vi.setSystemTime(61_000);
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      await loop.tick();
+      inst = readInstance(redis, 'inst-401');
+
+      expect(inst.callbackTrustReady).toBeFalsy();
+      expect(inst.callbackTrustConfirmedAt).toBeFalsy();
+      expect(inst.callbackPathUnusableAt).toBeTruthy();
+      expect(inst.callbackPathUnusableStatus).toBe(status);
+      // Not a transport failure: it must NOT be quarantined as a #463 handshake
+      // timeout, and it must not pass silently — a structured degraded error is
+      // logged so an operator/alert can see the sweep-only fallback.
+      expect(inst.callbackTrustQuarantinedAt).toBeFalsy();
+      expect(errSpy).toHaveBeenCalled();
+      const logged = errSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(logged).toContain('callback path NOT usable');
+      errSpy.mockRestore();
+
+      // Completion now relies on the terminal-job reconciliation sweep, so the
+      // instance is still dispatched to rather than halting the pool.
+      expect(await redis.llen(keys.queue(WS))).toBe(0);
+      expect(await redis.hget(keys.jobInstance(WS), `${WS}__job-1`)).toBe('inst-401');
+    }
+  );
+
+  it('a listener returning 2xx still produces a trusted result and dispatches (no regression)', async () => {
+    seedInstance(redis, {
+      instanceId: 'inst-200',
+      url: 'https://encore-200.osaas.io',
+      callbackListenerUrl: LISTENER_URL,
+      activeJobs: 0,
+      lastIdleAt: Date.now()
+    });
+    queueOneJob();
+
+    globalThis.fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url === LISTENER_PROBE_URL) return { status: 200, ok: true } as unknown as Response;
+      if (url.endsWith('/encoreJobs') && init?.method === 'POST') {
+        return {
+          ok: true,
+          status: 201,
+          json: async () => ({ id: 'encore-uuid-200' })
+        } as unknown as Response;
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as unknown as typeof fetch;
+
+    await loop.tick();
+
+    const inst = readInstance(redis, 'inst-200');
+    expect(inst.callbackTrustReady).toBe(true);
+    expect(inst.callbackTrustConfirmedAt).toBeTruthy();
+    expect(inst.callbackPathUnusableAt).toBeFalsy();
+    expect(await redis.llen(keys.queue(WS))).toBe(0);
+    expect(await redis.hget(keys.jobInstance(WS), `${WS}__job-1`)).toBe('inst-200');
   });
 });

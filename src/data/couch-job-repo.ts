@@ -22,6 +22,7 @@ import {
   type UpdateJobInput
 } from './job-repo.js';
 import type { MessageFailureClass } from '../encore-scaler/retry-policy.js';
+import { currentDocumentStackName } from '../services/request-stack-context.js';
 import { updateWithRetry, type StoredDoc, type StackCouch } from './couchdb.js';
 
 const RESOURCE_TYPE = 'job';
@@ -46,6 +47,13 @@ export class CouchJobRepository implements JobRepository {
       attempts: 0,
       encoreJobId: input.encoreJobId,
       profile: input.profile,
+      packagingId: input.packagingId,
+      outputPrefix: input.outputPrefix,
+      // Durable stack identity (#1097): the stack this job is being created
+      // against, so a worker that picks the job up after the request (or after a
+      // process restart) can re-enter it. Undefined outside a request, which
+      // preserves the previous default-stack behaviour on boot/sweep paths.
+      stackName: input.stackName ?? currentDocumentStackName(),
       createdAt: now,
       updatedAt: now
     };
@@ -203,11 +211,30 @@ function toDoc(job: Job): Record<string, unknown> {
     encoreInternalJobId: job.encoreInternalJobId,
     profile: job.profile,
     renditionAssetIds: job.renditionAssetIds,
+    packagingId: job.packagingId,
+    outputPrefix: job.outputPrefix,
     encodeAttempts: job.encodeAttempts,
     encodeAttemptLog: job.encodeAttemptLog,
     interrupted: job.interrupted,
     interruptionReason: job.interruptionReason,
     droppedByScaler: job.droppedByScaler,
+    // #1023: the durable trace that a drop was reported and later corrected.
+    // Persisted here (not only in the audit trail) so it survives on the record
+    // for every correction path, including the callback poller, which applies
+    // completions with no audit emitter wired.
+    droppedThenRecovered: job.droppedThenRecovered,
+    correctedDropError: job.correctedDropError,
+    // #1226: the durable trace that a completion arrived for this job after it
+    // was cancelled and was discarded, with the output prefix that was
+    // reclaimed. Persisted here (not only logged) so a cancelled job reporting
+    // 0 renditions explains itself from the record alone.
+    lateCompletionDiscarded: job.lateCompletionDiscarded,
+    discardedRenditionCount: job.discardedRenditionCount,
+    discardedOutputPrefix: job.discardedOutputPrefix,
+    // Durable stack identity (#1097). Written on every put so an update()
+    // round-trip never drops the value; absent (undefined) on jobs created
+    // outside a request and on documents written before #1097.
+    stackName: job.stackName,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt
   };
@@ -229,11 +256,24 @@ function fromDoc(doc: StoredDoc): Job {
     encoreInternalJobId: doc['encoreInternalJobId'] as string | undefined,
     profile: doc['profile'] as string | undefined,
     renditionAssetIds: doc['renditionAssetIds'] as string[] | undefined,
+    packagingId: doc['packagingId'] as string | undefined,
+    outputPrefix: doc['outputPrefix'] as string | undefined,
     encodeAttempts: doc['encodeAttempts'] as number | undefined,
     encodeAttemptLog: doc['encodeAttemptLog'] as EncodeAttempt[] | undefined,
     interrupted: doc['interrupted'] as boolean | undefined,
     interruptionReason: doc['interruptionReason'] as JobInterruptionReason | undefined,
     droppedByScaler: doc['droppedByScaler'] as boolean | undefined,
+    droppedThenRecovered: doc['droppedThenRecovered'] as boolean | undefined,
+    correctedDropError: doc['correctedDropError'] as string | undefined,
+    // #1226: absent on every job that never had a completion discarded after a
+    // cancel, which reads back as undefined exactly like the #1023 pair above.
+    lateCompletionDiscarded: doc['lateCompletionDiscarded'] as boolean | undefined,
+    discardedRenditionCount: doc['discardedRenditionCount'] as number | undefined,
+    discardedOutputPrefix: doc['discardedOutputPrefix'] as string | undefined,
+    // Durable stack identity (#1097). A document written before #1097 has no
+    // such field and reads back as undefined — the documented legacy case,
+    // which keeps the first-listed-stack behaviour.
+    stackName: doc['stackName'] as string | undefined,
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };

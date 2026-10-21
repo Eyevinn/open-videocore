@@ -23,7 +23,7 @@
 // never be overwritten by application code.
 
 import { z } from 'zod';
-import { ulid } from 'ulid';
+import { monotonicFactory } from 'ulid';
 import type { StoredDoc, StackCouch } from './couchdb.js';
 // Reuse the pre-existing coarse origin enum (ADR-005, issue #53) — do NOT
 // redefine it. PROVENANCE_ACTORS = ['user','system','ai'] as const at
@@ -34,6 +34,19 @@ import { PROVENANCE_ACTORS } from './asset-repo.js';
 // per-resource-type convention (e.g. 'collection' at
 // src/data/couch-collection-repo.ts:20).
 const RESOURCE_TYPE = 'audit-entry';
+
+// Monotonic ULID minter, shared by BOTH stores so same-process writes mint ids
+// in strict write order (issue #1000 review). `applyAuditQuery` sorts newest-first
+// by `at` and tiebreaks equal-`at` entries on the id (audit-repo.ts applyAuditQuery):
+// a plain `ulid()` randomises the id within a millisecond, so two entries written
+// in the same millisecond with the same `at` (e.g. an ingest-url job's
+// `job.submitted` and its terminal `job.completed`/`job.failed`, emitted back-to-back
+// via the fire-and-forget emitter) sort non-deterministically and the lifecycle can
+// render inverted. A monotonic factory increments the random component for calls at
+// the same timestamp, so the later write always gets the lexicographically-greater
+// id and the tiebreak resolves to true write order. Across differing timestamps the
+// ULID time prefix still dominates, so cross-millisecond ordering is unchanged.
+const auditUlid = monotonicFactory();
 
 // What kind of resource an entry is about. A closed enum so a bad targetType is
 // rejected at write time.
@@ -199,7 +212,7 @@ export class CouchAuditRepository implements AuditRepository, AuditRetentionRepo
   async record(input: RecordAuditInput): Promise<AuditEntry> {
     const parsed = RecordAuditInputSchema.parse(input);
     const entry: AuditEntry = {
-      id: ulid(),
+      id: auditUlid(),
       at: parsed.at ?? new Date().toISOString(),
       actor: parsed.actor,
       action: parsed.action,
@@ -315,7 +328,7 @@ export class InMemoryAuditRepository implements AuditRepository, AuditRetentionR
   async record(input: RecordAuditInput): Promise<AuditEntry> {
     const parsed = RecordAuditInputSchema.parse(input);
     const entry: AuditEntry = {
-      id: ulid(),
+      id: auditUlid(),
       at: parsed.at ?? new Date().toISOString(),
       actor: parsed.actor,
       action: parsed.action,

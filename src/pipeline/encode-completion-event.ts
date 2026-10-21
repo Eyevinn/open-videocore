@@ -45,10 +45,13 @@
 //     vocabulary in the repo (the only *-tier concept is STORAGE_TIERS,
 //     asset-repo.ts:123, which is unrelated); this module introduces the tier
 //     enum below, mirroring the const-array-enum convention of STORAGE_TIERS.
-//   - Output format / container: `EncoreOutput.format` (src/pipeline/
-//     encode-presets.ts:29, e.g. "mp4"/"fmp4") describes the intended container
-//     of a produced rung. Optional here because it is a preset-descriptor field and is
-//     not part of the CallbackRendition wire shape at completion.
+//   - Output format / container (e.g. "mp4"/"fmp4"): the container of a produced
+//     rung, as declared by the server-side profile that produced it. Optional
+//     here because it is a profile-level descriptor and is NOT part of the
+//     CallbackRendition wire shape at completion (CallbackRendition,
+//     src/pipeline/transcode.ts — label/width/height/objectKey/codec/bitrateBps).
+//     (The former `EncoreOutput.format` descriptor type was removed with the
+//     non-functional inline-ladder field in issue #1022.)
 //   - Existing lifecycle event precedent: the webhook `transcode.complete` event
 //     currently carries only `{ assetId, renditionCount }`
 //     (src/routes/internal.ts:571). THIS schema is the richer, billing-oriented
@@ -174,8 +177,8 @@ export const encodeCompletionEventSchema = z.object({
   height: z.number().int().positive().optional(),
   width: z.number().int().positive().optional(),
 
-  // Container/segment format of the output (EncoreOutput.format, encode-presets.
-  // ts:29, e.g. "mp4"/"fmp4"). OPTIONAL — a preset-level descriptor not carried
+  // Container/segment format of the output (e.g. "mp4"/"fmp4"), as declared by
+  // the server-side profile. OPTIONAL — a profile-level descriptor not carried
   // on the CallbackRendition completion wire shape.
   outputFormat: z.string().min(1).optional(),
 

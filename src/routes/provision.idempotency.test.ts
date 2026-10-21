@@ -24,6 +24,11 @@ const createInstance = vi.fn();
 const getInstance = vi.fn();
 const saveSecret = vi.fn();
 const waitForInstanceReady = vi.fn(async () => undefined);
+// Readiness waits now poll getInstanceHealth through the bounded shared helper
+// (src/services/instance-readiness.ts, issue #1038) instead of the SDK's
+// unbounded waitForInstanceReady. 'running' is the ready state
+// (@osaas/client-core@0.24.0 lib/core.d.ts:86, lib/core.js:347-349).
+const getInstanceHealth = vi.fn(async (..._args: unknown[]) => 'running');
 const getPortsForInstance = vi.fn(async () => []);
 
 vi.mock('@osaas/client-core', () => ({
@@ -34,6 +39,7 @@ vi.mock('@osaas/client-core', () => ({
     getPortsForInstance(...(args as [])),
   waitForInstanceReady: (...args: unknown[]) =>
     waitForInstanceReady(...(args as [])),
+  getInstanceHealth: (...args: unknown[]) => getInstanceHealth(...(args as [])),
   saveSecret: (...args: unknown[]) => saveSecret(...(args as [])),
   Context: class {}
 }));
@@ -98,7 +104,11 @@ async function buildApp(paramStore?: ParamStore) {
     prefix: '/api/v1/provision',
     osc,
     paramStore,
-    operationStore
+    operationStore,
+    // The bounded readiness wait sleeps BEFORE its first probe, as the SDK
+    // helper did (#1038). Collapse that cadence so these idempotency tests do
+    // not spend a second per backing service.
+    readyPollIntervalMs: 1
   });
   await app.ready();
   return app;
