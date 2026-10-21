@@ -58,6 +58,10 @@ export type AuditRetentionPurgeLoopOptions = {
   // /api/v1/retention/config takes effect without a restart, and so the sweep
   // is skipped entirely when retention is unset (0/disabled = indefinite).
   retentionMs(): number;
+  // Run one tick's sweep once per provisioned stack (issue #1098). Bound in
+  // main.ts to perStackSweepRunner (src/services/for-each-stack.ts); unset, the
+  // sweep runs exactly once, as before. Mirrors ArchivedAssetPurgeLoop.
+  forEachStack?(run: () => Promise<void>): Promise<void>;
   logger?: Logger;
 };
 
@@ -97,22 +101,30 @@ export class AuditRetentionPurgeLoop {
 
   // One tick: read the live retention window and run the sweep unless retention
   // is unset (0/disabled = indefinite retention), in which case the sweep is
-  // skipped entirely.
+  // skipped entirely. The window is instance-global, so it is read ONCE per tick
+  // and the same value applies to every stack swept below.
   async tick(): Promise<void> {
     const retentionMs = this.options.retentionMs();
     if (!Number.isFinite(retentionMs) || retentionMs <= 0) {
       return; // retention unset — never purge (skip the sweep entirely)
     }
-    const result = await purgeExpiredAuditEntries({
-      ...this.options.sweepDeps,
-      retentionMs
-    });
-    if (result.purged > 0) {
-      this.options.logger?.info?.(
-        '[audit-retention-purge] tick complete: scanned=%d purged=%d',
-        result.scanned,
-        result.purged
-      );
-    }
+    const runSweep = async (): Promise<void> => {
+      const result = await purgeExpiredAuditEntries({
+        ...this.options.sweepDeps,
+        retentionMs
+      });
+      if (result.purged > 0) {
+        this.options.logger?.info?.(
+          '[audit-retention-purge] tick complete: scanned=%d purged=%d',
+          result.scanned,
+          result.purged
+        );
+      }
+    };
+    // Once per provisioned stack when wired (issue #1098); otherwise exactly
+    // once, unchanged.
+    const perStack = this.options.forEachStack?.bind(this.options);
+    if (perStack) await perStack(runSweep);
+    else await runSweep();
   }
 }

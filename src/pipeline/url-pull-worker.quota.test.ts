@@ -47,6 +47,11 @@ function fakeStorage(): WorkspaceStorage {
   return {
     async putStream(_key: string, _src: Readable, opts: { totalBytes?: number }) {
       return { etag: 'e', bytesTransferred: opts.totalBytes ?? 0 };
+    },
+    // Called by the worker before each write and on terminal failure to clear
+    // an orphaned multipart upload (issue #1088); never anything to clear here.
+    async abortIncompleteMultipartUploads() {
+      return 0;
     }
   } as unknown as WorkspaceStorage;
 }

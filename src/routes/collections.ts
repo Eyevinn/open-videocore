@@ -12,6 +12,11 @@
 //   GET    /api/v1/collections/:id                   — get one, with resolved asset list
 //   PATCH  /api/v1/collections/:id                   — partial update of descriptive metadata (#560)
 //   DELETE /api/v1/collections/:id                   — delete a collection
+//                                                      (`?confirmMemberCount=N`
+//                                                       to delete a non-empty
+//                                                       one, #922; contract
+//                                                       documented in the route
+//                                                       schema, #925)
 //   PUT    /api/v1/collections/:id/assets/:assetId   — add an asset to a collection
 //   DELETE /api/v1/collections/:id/assets/:assetId   — remove an asset from a collection
 //
@@ -59,14 +64,55 @@ const deleteLockSchema = z.object({
 // existing `{ error, message? }` shape with the required `reason` enum and
 // `blockedBy` object. For the explicit-lock case reason is `delete_protected`
 // and both id arrays are empty.
+//
+// `memberCount` (issue #922) is an ADDITIVE, OPTIONAL field carried only on the
+// `member_of_collection` block: the number of asset ids the collection still
+// holds. It is the value a caller echoes back as `?confirmMemberCount=` to
+// delete the collection in one follow-up call. Every previously-emitted field
+// keeps its name, type and required-ness, so existing consumers of the 409 are
+// unaffected; the enum is deliberately NOT widened (a stale confirmation is the
+// same `member_of_collection` block, just with a different message).
 const deleteBlockedSchema = z.object({
-  error: z.literal('delete_blocked'),
-  message: z.string().optional(),
-  reason: z.enum(['referenced_by_job', 'member_of_collection', 'delete_protected']),
-  blockedBy: z.object({
-    jobIds: z.array(z.string()),
-    collectionIds: z.array(z.string())
-  })
+  error: z
+    .literal('delete_blocked')
+    .describe('Always `delete_blocked`. The single error code for every refused delete.'),
+  message: z
+    .string()
+    .optional()
+    .describe('Human-readable explanation. Do not branch on it — branch on `reason`.'),
+  reason: z
+    .enum(['referenced_by_job', 'member_of_collection', 'delete_protected'])
+    .describe(
+      'Machine-readable cause, and the only field a client should branch on. ' +
+        '`delete_protected` — an explicit delete lock is set on the collection; a HARD ' +
+        'block that neither `?force=true` nor `?confirmMemberCount=` can bypass, and is ' +
+        'lifted only by DELETE /api/v1/collections/{id}/lock. `member_of_collection` — ' +
+        'the collection still holds member assets; a SOFT block, resolved by re-issuing ' +
+        'the delete with `?confirmMemberCount=<memberCount>` (or `?force=true`). ' +
+        '`referenced_by_job` is part of the shared envelope and is not emitted on this route.'
+    ),
+  blockedBy: z
+    .object({
+      jobIds: z.array(z.string()).describe('Always empty on this route.'),
+      collectionIds: z
+        .array(z.string())
+        .describe(
+          'On `member_of_collection`, the collection’s own id (the reference that ' +
+            'blocks). Empty on `delete_protected`.'
+        )
+    })
+    .describe('The references that blocked the delete. Both arrays are empty on `delete_protected`.'),
+  memberCount: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe(
+      'Present ONLY on `member_of_collection`: the number of member assets the ' +
+        'collection currently holds. Echo this value back as ' +
+        '`?confirmMemberCount=<memberCount>` to delete the collection in one follow-up ' +
+        'call. Absent on `delete_protected`.'
+    )
 });
 
 // Descriptive metadata (issue #559), mirroring the asset `descriptive`
@@ -192,16 +238,24 @@ const createBodySchema = z.object({
   custom: z.record(z.unknown()).optional()
 });
 
-// PATCH /:id body (issue #560): a PARTIAL update of a collection's descriptive
-// metadata. Only description/tags/custom are editable here; every present key is
-// applied wholesale, an absent key leaves the current value untouched, and an
-// explicit empty value (`''`/`[]`/`{}`) clears the field. Membership (`assetIds`)
-// is deliberately NOT accepted — it stays on PUT/DELETE /:id/assets/:assetId —
-// and neither `name` nor `deleteLock` is editable through this path. `.strict()`
-// rejects any unknown key (including `assetIds`) with a 400 so callers cannot
-// smuggle a membership mutation through the metadata endpoint.
+// PATCH /:id body (issue #560): a PARTIAL update of a collection's name and
+// descriptive metadata. name/description/tags/custom are editable here; every
+// present key is applied wholesale, an absent key leaves the current value
+// untouched, and an explicit empty value (`''`/`[]`/`{}`) clears an optional
+// field. Membership (`assetIds`) is deliberately NOT accepted — it stays on
+// PUT/DELETE /:id/assets/:assetId — and `deleteLock` is not editable through
+// this path (PUT/DELETE /:id/lock). `.strict()` rejects any unknown key
+// (including `assetIds`) with a 400 so callers cannot smuggle a membership
+// mutation through the metadata endpoint.
 const updateBodySchema = z
   .object({
+    // Rename (issue #926). Same type/length rule as the asset rename on PATCH
+    // /api/v1/assets/:id (`name: z.string().min(1).max(256).optional()`,
+    // src/routes/assets.ts updateSchema) and as this router's own
+    // createBodySchema `name`, so create/rename/asset-rename cannot drift.
+    // `name` is required on a collection, so an empty string is rejected
+    // (min(1)) rather than treated as "clear".
+    name: z.string().min(1).max(256).optional(),
     description: z.string().optional(),
     tags: z.array(z.string()).optional(),
     custom: z.record(z.unknown()).optional()
@@ -268,12 +322,20 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
     // blocking reference is the collection's own id (it still holds members),
     // reported in `blockedBy.collectionIds`. Soft block — overridable by
     // `?force=true` at the route (ADR-020 decision 2).
+    //
+    // `memberCount` (issue #922) reports the collection's CURRENT member count
+    // so the caller can re-issue the delete as
+    // `?confirmMemberCount=<memberCount>`. It is the authoritative number on
+    // both paths — the plain in-use block and the stale-confirmation rejection —
+    // so a client that raced a membership change always gets the count it must
+    // confirm next.
     if (err instanceof CollectionInUseError) {
       return reply.code(409).send({
         error: 'delete_blocked',
         message: err.message,
         reason: 'member_of_collection',
-        blockedBy: { jobIds: [], collectionIds: [err.id] }
+        blockedBy: { jobIds: [], collectionIds: [err.id] },
+        memberCount: err.assetIds.length
       });
     }
     throw err;
@@ -347,9 +409,10 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
     }
   );
 
-  // Partial update of a collection's descriptive metadata (issue #560). PATCH
+  // Partial update of a collection's name and descriptive metadata (issue #560;
+  // `name` added in issue #926). PATCH
   // (not PUT) so callers send only the fields they intend to change; the body is
-  // `.strict()` so membership (`assetIds`), `name`, and `deleteLock` are all
+  // `.strict()` so membership (`assetIds`) and `deleteLock` are both
   // rejected (400) — membership stays on PUT/DELETE /:id/assets/:assetId. The
   // CouchDB backend routes this through the `_rev` merge-retry wrapper
   // (updateWithRetry, ADR-005 / issue #278), the same concurrency model the asset
@@ -385,13 +448,106 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
     {
 
       schema: {
+        // Operation-level docs for the confirmed-delete contract (issue #925).
+        // Authored HERE, on the route schema, because openapi.json is generated
+        // from the live Fastify/zod schemas (scripts/generate-openapi.sh) — the
+        // spec is never hand-edited, so this text is the single source for the
+        // published contract.
+        summary: 'Delete a collection',
+        description:
+          'Delete a collection. Member assets are never touched: membership lives inside ' +
+          'the collection document, so deleting it unlinks the members and nothing more.\n\n' +
+          'Deleting an EMPTY collection needs no extra parameter and answers `204`. An ' +
+          'unknown or foreign collection id is also a silent `204` (existence is never ' +
+          'leaked), so `404` is not emitted on this route.\n\n' +
+          'Deleting a NON-EMPTY collection is refused by default with `409 delete_blocked`, ' +
+          '`reason: "member_of_collection"`, carrying `memberCount` — the number of member ' +
+          'assets the collection currently holds. The confirm-then-delete flow is:\n\n' +
+          '1. `DELETE /api/v1/collections/{id}` → `409` with `reason: "member_of_collection"` ' +
+          'and e.g. `memberCount: 7`.\n' +
+          '2. Show the caller what they are about to unlink, then re-issue ' +
+          '`DELETE /api/v1/collections/{id}?confirmMemberCount=7` → `204`.\n\n' +
+          'The confirmation must match the CURRENT member count. If someone added or removed ' +
+          'members in between, the retry is refused with the same ' +
+          '`409 member_of_collection` carrying the new authoritative `memberCount` — never a ' +
+          'silent delete. Re-confirm with that value and retry. `?force=true` is the blind ' +
+          'alternative: it skips the count check entirely.\n\n' +
+          'A `409` with `reason: "delete_protected"` is a DIFFERENT and unrelated condition: ' +
+          'the collection carries an explicit delete lock. It is a hard block — neither ' +
+          '`?confirmMemberCount=` nor `?force=true` bypasses it, it carries NO `memberCount`, ' +
+          'and both `blockedBy` arrays are empty. The only way forward is to clear the lock ' +
+          'with `DELETE /api/v1/collections/{id}/lock` (then delete as normal). Branch on ' +
+          '`reason`, not on the status code or `message`.',
         params: z.object({ id: z.string() }),
         // `?force=true` (ADR-020 decision 2) overrides the SOFT
         // member_of_collection in-use block. It never defeats the HARD explicit
         // lock. `z.coerce.boolean()` matches the established force convention
         // (cf. profiles.ts POST /seed).
-        querystring: z.object({ force: z.coerce.boolean().optional() }),
-        response: { 204: z.null(), 404: errorSchema, 409: deleteBlockedSchema }
+        //
+        // `?confirmMemberCount=N` (issue #922, design decision for #854 option
+        // 1) is the explicit, non-blind way to delete a NON-EMPTY collection:
+        // the caller asserts how many members it believes the collection has,
+        // and the delete proceeds only if that matches the current count.
+        // Carried as a query param rather than a request body because DELETE
+        // bodies are unevenly supported across proxies and clients, and because
+        // the sibling override on this very route (`force`) is already a query
+        // param. Omitting it preserves the existing safe default exactly.
+        querystring: z.object({
+          force: z.coerce
+            .boolean()
+            .optional()
+            .describe(
+              'Blind override of the soft `member_of_collection` block: delete a non-empty ' +
+                'collection without asserting its member count. Prefer ' +
+                '`confirmMemberCount` — `force` deletes whatever is there, including ' +
+                'members added since you last read the collection. Never bypasses a ' +
+                '`delete_protected` lock.'
+            ),
+          confirmMemberCount: z.coerce
+            .number()
+            .int()
+            .nonnegative()
+            .optional()
+            .describe(
+              'Assert how many member assets the collection currently holds, to delete a ' +
+                'non-empty collection safely. Use the `memberCount` from the ' +
+                '`409 member_of_collection` response (or the length of `assetIds` from ' +
+                'GET /api/v1/collections/{id}). Matches the current count -> the delete ' +
+                'proceeds (`204`). Does not match -> `409 member_of_collection` with the ' +
+                'real `memberCount`; never a silent delete. Omit it to keep the safe ' +
+                'default (non-empty collections are refused).'
+            )
+        }),
+        // 400 covers the framework's own zod rejection of a malformed
+        // `confirmMemberCount` (non-numeric / negative / fractional), which
+        // serializes against the permissive `errorSchema` (see its comment).
+        //
+        // Response-level `.describe()` text (issue #925) surfaces in openapi.json
+        // as each response's `description`; errorSchema is cloned per-response by
+        // `.describe()` so the shared schema used by the other routes in this file
+        // is untouched.
+        response: {
+          204: z
+            .null()
+            .describe(
+              'Deleted. Also returned for an unknown or foreign collection id (delete is ' +
+                'idempotent and never leaks existence).'
+            ),
+          400: errorSchema.describe(
+            'Malformed query parameter — e.g. a `confirmMemberCount` that is not a ' +
+              'non-negative integer.'
+          ),
+          404: errorSchema.describe(
+            'Not emitted on this route; an unknown or foreign collection id answers 204.'
+          ),
+          409: deleteBlockedSchema.describe(
+            'Delete refused. Branch on `reason`: `member_of_collection` means the ' +
+              'collection still holds `memberCount` member assets — retry with ' +
+              '`?confirmMemberCount=<memberCount>`. `delete_protected` means an explicit ' +
+              'delete lock is set — clear it with DELETE /api/v1/collections/{id}/lock; ' +
+              'no confirmation or `?force=true` can bypass it.'
+          )
+        }
       }
     },
     async (request, reply) => {
@@ -404,16 +560,52 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
       if (existing?.deleteLock?.locked) {
         throw new CollectionDeleteProtectedError(request.params.id);
       }
+      // Explicit member-count confirmation (issue #922; design decision for
+      // #854, option 1). Runs AFTER the hard lock guard above and BEFORE the
+      // soft in-use block below, so the precedence delete_protected >
+      // member_of_collection is untouched: a locked collection still 409s
+      // `delete_protected` no matter what count is confirmed.
+      //
+      // Validated against the collection's CURRENT membership:
+      //   - matches  -> fall through and delete in this same call.
+      //   - mismatch -> 409 `member_of_collection` carrying the real count. A
+      //     stale confirmation means the caller is acting on a set it has not
+      //     seen (someone added/removed members since it read the collection),
+      //     so it must never resolve to a silent delete — not even alongside
+      //     `?force=true`, which is why this check is deliberately not gated on
+      //     `force`. Existing consumers send no confirmation at all and are
+      //     therefore unaffected by that ordering.
+      const confirmMemberCount = request.query.confirmMemberCount;
+      if (existing && confirmMemberCount !== undefined) {
+        if (confirmMemberCount !== existing.assetIds.length) {
+          throw new CollectionInUseError(
+            request.params.id,
+            existing.assetIds,
+            confirmMemberCount
+          );
+        }
+      }
       // Reference/usage check (issue #570): a collection still holding member
       // asset ids is IN USE and must not be silently torn down. This SOFT block
       // is overridable by `?force=true` (ADR-020 decision 2 — collection
-      // membership is a loose grouping). Runs only when the collection resolves,
-      // so it never leaks existence for an unknown/foreign id.
-      if (!request.query.force && existing && existing.assetIds.length > 0) {
+      // membership is a loose grouping) and, since #922, by a matching
+      // `?confirmMemberCount=` (validated immediately above). Absent BOTH, the
+      // safe default is unchanged: 409 `member_of_collection` with the count.
+      // Runs only when the collection resolves, so it never leaks existence for
+      // an unknown/foreign id.
+      const confirmed = confirmMemberCount !== undefined;
+      if (!request.query.force && !confirmed && existing && existing.assetIds.length > 0) {
         throw new CollectionInUseError(request.params.id, existing.assetIds);
       }
       // Delete is idempotent and never leaks existence across workspaces: an
       // unknown / foreign id is a silent no-op that still answers 204.
+      //
+      // Membership lives INSIDE the collection document as the flat `assetIds`
+      // list (collection-repo.ts:31 / couch-collection-repo.ts:172), and
+      // `delete()` removes only that document — there is no join table to sweep
+      // and no call into the asset repository on this path. Deleting a confirmed
+      // non-empty collection therefore unlinks its members and nothing more: the
+      // member assets themselves survive untouched, exactly as required.
       await repo.delete(request.params.id);
       // Audit: collection deleted (issue #564). Emitted ONLY when a collection
       // actually existed (resolved above), so an idempotent no-op on an unknown
@@ -426,7 +618,16 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
             action: 'collection.deleted',
             targetType: 'collection',
             targetId: existing.id,
-            detail: { name: existing.name }
+            // `memberCount` records how many memberships this delete dropped;
+            // `confirmedMemberCount` (issue #922) is present only when the
+            // caller explicitly confirmed the count, so the audit trail
+            // distinguishes a confirmed teardown of a non-empty collection from
+            // a plain empty-collection delete or a `?force=true` override.
+            detail: {
+              name: existing.name,
+              memberCount: existing.assetIds.length,
+              ...(confirmed ? { confirmedMemberCount: confirmMemberCount } : {})
+            }
           },
           request.log
         );

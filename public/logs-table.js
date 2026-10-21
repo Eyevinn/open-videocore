@@ -57,22 +57,72 @@
  * (This gap is logged as backend/OSC friction in the sibling agents repo at
  * docs/osc-feedback/incoming-logs-level-category-filter.md.)
  *
+ * COLUMN VISIBILITY (issue #960, lifted from the assets table's #959). The
+ * operator chooses which of the five declared columns are rendered. This is VIEW
+ * state and touches NO part of the request: buildLogsQuery() below reads only
+ * pageSize / cursor / sort / filters, none of which the chooser writes. Hiding
+ * Time does not stop the table ordering by `order=desc`, and hiding Message does
+ * not drop the `q` param — so which records match, in what order, and where the
+ * cursor sits are unchanged by definition, not by convention. The precedence rule
+ * on load (URL `logs.cols` -> this browser's stored default -> every declared
+ * column), the storage write and the chooser control all come from
+ * createColumnVisibility() in public/ops-ui-table.js; what is declared HERE is
+ * only what is logs-specific — LOGS_COLUMN_KEYS, the pinned Message column, and
+ * the lock rule in LOGS_REQUIRED_COLUMN_GROUPS.
+ *
  * SECURITY: mirrors app.js's XSS posture. Every dynamic value written into a cell
  * HTML string passes through escHtml() (imported from the shared primitive).
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * TWO EMPTY STATES (issue #997)
+ *
+ * `{ items: [], nextCursor: null }` is returned both when the log store has
+ * never been written to and when the operator's filters match nothing — and the
+ * tab used to render the SAME "no entries match the current filters" row for
+ * both, which reads as "your filter is too narrow" on a stack where nothing has
+ * ever reported. That is the ambiguity #822 fixed for the Search tab's format
+ * filter ("an empty page is indistinguishable from 'no assets match'"), and the
+ * fix follows #806's shape: say the real reason, but ONLY when it actually
+ * applies, so the ordinary state is untouched (public/app.js:2863-2873 renders
+ * its unconfigured-steps note only when something is genuinely unconfigured).
+ * The headline + detail-line + `data-empty` presentation mirrors the per-kind
+ * empty states in public/tracks-panel.js:344-351 / :374-384.
+ *
+ * NO BACKEND CHANGE. The distinction is derived from reads this endpoint already
+ * answers, not from a new field:
+ *   - An UNFILTERED FIRST PAGE (no from/to/q, no cursor) that returns zero items
+ *     is proof the store holds nothing. Retention here is count-based only —
+ *     records are evicted oldest-first at a cap (LOG_STORE_MAX_RECORDS,
+ *     src/services/log-store.ts:143 and :347; same contract for the durable
+ *     store, src/data/couch-log-repo.ts:157-164) — so eviction can never empty a
+ *     store that was written to. Empty therefore means never written.
+ *   - Any response carrying at least one item proves entries exist, so later
+ *     filtered-to-nothing pages fall back to the ordinary no-results message.
+ *   - A FILTERED or cursor-paged empty page proves nothing on its own and never
+ *     promotes the explanatory state by itself.
  */
 
 import {
+  createColumnVisibility,
   createOpsTable,
   escHtml,
   PAGING_CURSOR,
   SORT_ASC,
   SORT_DESC,
 } from './ops-ui-table.js';
+// columnKeysOf is imported from the column model (not the table primitive)
+// because that is where "the keys a column set declares" is defined; LOGS_COLUMN_KEYS
+// below is derived through it so the key list has one source (issue #960).
+import { columnKeysOf } from './table-columns.js';
 import {
   decodeTableState,
   applyTableState,
   SORT_DIR,
 } from './table-url-state.js';
+// Muted empty state for placeholder-less filter controls (issues #984, #983 AC2).
+// The class name is a CSS contract, so it is imported rather than restated — see
+// public/filter-unset.js.
+import { wireUnset } from './filter-unset.js';
 
 // ─── Contract-grounded constants (verified above) ────────────────────────────
 
@@ -97,12 +147,80 @@ export const LOG_ORDER = Object.freeze(['asc', 'desc']);
 // Used only for column presentation / a badge class; NOT a server filter.
 export const LOG_LEVELS = Object.freeze(['debug', 'info', 'warn', 'error']);
 
+// ─── Copy deck (issue #997) ──────────────────────────────────────────────────
+//
+// Exported so a test asserts against the shipped strings rather than a copy of
+// them (the public/tracks-panel.js TRACKS_COPY pattern). `data-empty` kinds are
+// part of this deck: they are what CSS and tests key the two states on.
+
+export const LOGS_COPY = Object.freeze({
+  /** Ordinary no-results state: entries exist, these filters match none of them. */
+  emptyFiltered: 'No log entries match the current filters.',
+  emptyFilteredKind: 'logs-filtered',
+
+  /**
+   * Nothing-has-ever-been-written state. Says the store is empty — NOT that the
+   * operator's filters are too narrow — and says what makes entries appear.
+   */
+  emptyNeverWritten: 'No log entries have been recorded yet.',
+  emptyNeverWrittenDetail:
+    'The log store on this stack has never received an entry, so this is an ' +
+    'empty history rather than one filtered down to nothing. Records appear ' +
+    'here as soon as a pipeline step (ingest, transcode, package) reports one — ' +
+    'if activity has already run and this stays empty, nothing is wired up to ' +
+    'write here yet.',
+  emptyNeverWrittenKind: 'logs-never-written',
+});
+
 // Per-table URL-state defaults. Natural order is newest-first (order=desc),
 // matching the endpoint default — the most useful default for operators.
+//
+// `cols` (issue #960) is deliberately left at the shared default of null
+// ("unspecified") rather than at the full column list: that is what lets the
+// encoder tell "this operator chose to show everything" from "this operator has
+// not chosen", and only the former belongs in a shared link.
 const URL_DEFAULTS = Object.freeze({
   sort: { field: SORT_KEY_TIMESTAMP, dir: SORT_DIR.desc },
   size: LOGS_PAGE_SIZE,
 });
+
+// ─── Column visibility contract (issue #960) ─────────────────────────────────
+
+// The declared column keys, in render order. Exported so consumers and tests name
+// the same vocabulary the `logs.cols` URL param and the stored preference use.
+//
+// DERIVED from buildColumns() rather than written out again (issue #960 review):
+// a hand-maintained copy is a second source of truth for the same list, and a
+// column added to buildColumns() without updating the copy — or renamed in only
+// one of the two — would drift silently, which is the exact failure this
+// vocabulary exists to prevent. Deriving it means the parity cannot be broken,
+// so there is no invariant left to assert.
+//
+// buildColumns() is defined further down the module; a `function` declaration is
+// hoisted, so calling it here is safe. It is called with an inert formatter
+// because only the KEYS are wanted: `fmtDate` is used solely inside a cell
+// renderer's closure, never while the column list is being built.
+export const LOGS_COLUMN_KEYS = Object.freeze(
+  columnKeysOf(buildColumns({ fmtDate: () => '' }))
+);
+
+// This table's OWN "cannot hide" rules, which are NOT the assets table's (issue
+// #960's first note — the primitive takes them as configuration for exactly this
+// reason). A log table has no Actions column and no name: a row is a sentence
+// with a place in a sequence, so the two rules are different in kind.
+//
+// 1. `message` is PINNED (`hideable: false`, declared on the column itself). It
+//    is the only column that carries what the log actually says; a log view
+//    without it is a list of times and levels that tells an operator nothing, and
+//    there is no second column that could stand in for it the way Slug can stand
+//    in for Name on an asset.
+// 2. At least one of Time / Seq stays visible. Both are required fields on the
+//    record, and between them they are how a line gets LOCATED — read against the
+//    time range filter, or cited by its stable `seq` when reporting it. Lose both
+//    and a matching line can be read but never pointed at.
+export const LOGS_REQUIRED_COLUMN_GROUPS = Object.freeze([
+  Object.freeze(['timestamp', 'seq']),
+]);
 
 // ─── Pure param builder (exported for unit testing; no DOM, no fetch) ─────────
 
@@ -153,6 +271,25 @@ function isBareDate(v) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(v).trim());
 }
 
+/**
+ * True when the request this snapshot produces narrows nothing: no time range, no
+ * message search, and no cursor — i.e. the newest page of the whole store.
+ *
+ * Such a request is the ONLY read from which "zero items" proves the store has
+ * never been written to (see TWO EMPTY STATES above). `order` is irrelevant: it
+ * reverses a page, it cannot hide records. Exported for unit testing.
+ *
+ * @param {object} snap  the primitive state snapshot (or the spliced effective one).
+ * @returns {boolean}
+ */
+export function isUnfilteredFirstPage(snap) {
+  const s = snap || {};
+  if (s.cursor != null && s.cursor !== '') return false;
+  const filters = s.filters || {};
+  const set = (v) => typeof v === 'string' && v.trim() !== '';
+  return !set(filters.from) && !set(filters.to) && !set(filters.q);
+}
+
 // ─── Sort <-> URL contract mappers ───────────────────────────────────────────
 
 function urlSortToInitialSort(sort) {
@@ -179,10 +316,16 @@ function tableSortToUrlSort(sort) {
 // cursor table: a new filter starts a fresh cursor walk). Initial values come
 // from the decoded URL state so a shared link reconstructs the controls.
 
+// The caption span carries `ops-filter-caption` so the bar's caption typography
+// (`.ops-table-filters .ops-filter-caption` in public/style.css, issue #983) can
+// be keyed off a named hook instead of "any span inside a filter label" — the
+// structural selector it replaced also caught the Assets hint spans
+// (`.form-hint.ops-filter-hint`) and uppercased whole help sentences.
 function labelledControl(className, labelText, control, ariaLabel) {
   const wrap = document.createElement('label');
   wrap.className = className;
   const span = document.createElement('span');
+  span.className = 'ops-filter-caption';
   span.textContent = labelText;
   if (ariaLabel) control.setAttribute('aria-label', ariaLabel);
   wrap.appendChild(span);
@@ -198,6 +341,14 @@ function dateFilterControl(name, labelText, initial) {
     input.addEventListener('change', function () {
       onChange(input.value);
     });
+    // An empty date box reads as unset here exactly as it does in the Jobs bar
+    // (issue #983 AC2 — the two bars must look the same, including when nothing
+    // is filtered). wireUnset() marks it now and on every change/input;
+    // `.ops-table-filters input[type='date'].is-unset` in public/style.css mutes
+    // the UA's yyyy-mm-dd hint. Logs has no <select> in its bar, so the date
+    // boxes are the only placeholder-less controls on this side — the Message box
+    // is covered by its native ::placeholder.
+    wireUnset(input);
     return labelledControl('ops-filter-' + name, labelText, input, labelText);
   };
 }
@@ -226,6 +377,11 @@ function searchFilterControl(initial) {
 // documents). Every dynamic value passes through escHtml. `level`/`category` are
 // OPTIONAL on the record (see contract note); their cells degrade to '—' when the
 // field is absent, so a record without them still renders cleanly.
+//
+// This function is the SINGLE source of the logs column vocabulary —
+// LOGS_COLUMN_KEYS above is derived from its output, so adding, renaming or
+// removing a column here updates the exported key list by construction and the
+// two cannot drift (issue #960 review).
 
 function buildColumns(renderCtx) {
   const fmtDate = renderCtx.fmtDate;
@@ -254,6 +410,10 @@ function buildColumns(renderCtx) {
     {
       key: 'message',
       label: 'Message',
+      // Pinned against the chooser (issue #960): see rule 1 in
+      // LOGS_REQUIRED_COLUMN_GROUPS above. The chooser disables this toggle and
+      // says why, rather than accepting a hide it would then have to repair.
+      hideable: false,
       render: (r) => '<span class="log-message">' + escHtml(r.message) + '</span>',
     },
     {
@@ -302,11 +462,40 @@ export function createLogsTable(deps) {
 
   const columns = buildColumns({ fmtDate });
 
+  // Column visibility (issue #960) via the shared primitive: it owns the
+  // precedence rule (URL `logs.cols` -> this browser's stored default -> every
+  // declared column), the storage write and the chooser control. This table
+  // supplies only what is ITS own — the column set, the pin/lock rules above, and
+  // the URL sync below.
+  const columnVisibility = createColumnVisibility({
+    ns: LOGS_NS,
+    columns,
+    urlCols: urlState.cols,
+    requireAtLeastOne: LOGS_REQUIRED_COLUMN_GROUPS,
+    label: 'Columns',
+    win,
+    // Mirror the choice into the URL so the view stays shareable. Deliberately
+    // syncUrl() and NOT reload(): the logs query is built from pageSize / cursor /
+    // sort / filters only, so the request would be byte-identical — re-issuing it
+    // would cost a round-trip, a loading flash, and (on a cursor table) a repaint
+    // of a page the operator is in the middle of reading.
+    onChange: function () {
+      syncUrl();
+    },
+  });
+
   const filters = [
     { name: 'from', control: dateFilterControl('from', 'From', initialFilters.from) },
     { name: 'to', control: dateFilterControl('to', 'To', initialFilters.to) },
     { name: 'q', control: searchFilterControl(initialFilters.q) },
   ];
+
+  // Which empty state the tab is in (issue #997). `null` = not answered yet: no
+  // unfiltered read has come back and no response has carried an item, so the
+  // honest fallback is the ordinary no-results message. Updated after every
+  // successful load; read (not copied) by the resolver below, so a repaint
+  // triggered by sort/paging chrome always shows the current answer.
+  let storeEmpty = null;
 
   const table = createOpsTable({
     caption: '',
@@ -317,7 +506,18 @@ export function createLogsTable(deps) {
     initialSort: urlSortToInitialSort(urlState.sort),
     initialFilters,
     rowKey: (r) => r && r.seq,
-    emptyText: 'No log entries match the current filters.',
+    emptyText: LOGS_COPY.emptyFiltered,
+    columnChooser: columnVisibility.chooser,
+    emptyState: function () {
+      if (storeEmpty === true) {
+        return {
+          text: LOGS_COPY.emptyNeverWritten,
+          detail: LOGS_COPY.emptyNeverWrittenDetail,
+          kind: LOGS_COPY.emptyNeverWrittenKind,
+        };
+      }
+      return { text: LOGS_COPY.emptyFiltered, kind: LOGS_COPY.emptyFilteredKind };
+    },
   });
 
   // Seed the initial cursor from the URL so a shared deep-linked page restores.
@@ -330,6 +530,37 @@ export function createLogsTable(deps) {
   let initialCursorApplied = false;
 
   let loading = false;
+
+  // The cursor the URL currently describes — i.e. the one the request in hand was
+  // made with. Tracked so syncUrl() can be called OUTSIDE a fetch (the column
+  // chooser does exactly that) without dropping the deep-linked page the operator
+  // is on.
+  let urlCursor = null;
+
+  // Mirror the current view into the URL (shared contract) so a refresh/share
+  // reproduces it. Replace (not push) — control changes already re-render and we
+  // do not want a history entry per keystroke or per column toggle.
+  //
+  // `cols` is passed on EVERY call, not only from the chooser: encodeTableState
+  // clears this namespace's params before rewriting them, so omitting it here
+  // would have the first load wipe a `logs.cols` the URL arrived with. It is null
+  // until a choice actually exists, which keeps a default view's URL clean.
+  function syncUrl() {
+    const snap = table.state.getState();
+    return applyTableState(
+      {
+        sort: tableSortToUrlSort(snap.sort),
+        q: snap.filters.q || '',
+        from: snap.filters.from || null,
+        to: snap.filters.to || null,
+        cursor: urlCursor,
+        size: snap.pageSize,
+        cols: columnVisibility.urlCols(),
+      },
+      LOGS_NS,
+      { defaults: URL_DEFAULTS, replace: true, win }
+    );
+  }
 
   async function reload() {
     if (loading) return;
@@ -346,20 +577,9 @@ export function createLogsTable(deps) {
     initialCursorApplied = true;
 
     // 3) Mirror the current interaction state into the URL (shared contract) so a
-    //    refresh/share reproduces the view. Replace (not push) — control changes
-    //    already re-render; we do not want a history entry per keystroke.
-    applyTableState(
-      {
-        sort: tableSortToUrlSort(snap.sort),
-        q: snap.filters.q || '',
-        from: snap.filters.from || null,
-        to: snap.filters.to || null,
-        cursor: effectiveSnap.cursor || null,
-        size: snap.pageSize,
-      },
-      LOGS_NS,
-      { defaults: URL_DEFAULTS, replace: true, win }
-    );
+    //    refresh/share reproduces the view.
+    urlCursor = effectiveSnap.cursor || null;
+    syncUrl();
 
     table.setStatus('loading');
     try {
@@ -370,6 +590,14 @@ export function createLogsTable(deps) {
       // primitive can enable/disable Next. No total exists in cursor mode.
       const nextCursor = res && res.nextCursor != null ? res.nextCursor : null;
       table.state.setPageInfo({ nextCursor });
+      // Classify the empty state BEFORE painting, so the row the primitive draws
+      // for this response already carries the right message (see TWO EMPTY
+      // STATES above for why only these two reads are conclusive).
+      if (items.length > 0) {
+        storeEmpty = false;
+      } else if (isUnfilteredFirstPage(effectiveSnap)) {
+        storeEmpty = true;
+      }
       table.setRows(items);
     } catch (err) {
       table.setStatus('error', 'Failed to load logs: ' + (err && err.message ? err.message : String(err)));
@@ -394,6 +622,10 @@ export function createLogsTable(deps) {
     destroy: table.destroy,
     // Exposed for tests/consumers that want to drive the primitive directly.
     state: table.state,
+    // Column visibility (issue #960), for consumers/tests that want to read or
+    // drive the chosen set without going through the chooser's DOM.
+    getVisibleColumns: table.getVisibleColumns,
+    setVisibleColumns: table.setVisibleColumns,
     _table: table,
   };
 }

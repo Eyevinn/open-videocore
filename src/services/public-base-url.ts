@@ -26,6 +26,8 @@
 // existing unset-fallbacks unchanged (CallbackUrl omitted; Encore falls back to
 // the remote default profiles index).
 
+import { normaliseStackName } from './request-stack-context.js';
+
 /**
  * Resolve this deployment's publicly-reachable base URL.
  *
@@ -54,6 +56,71 @@ export function resolvePublicBaseUrl(): string | undefined {
 // as a shared constant so main.ts and this resolver cannot drift.
 export const LOCAL_PROFILES_INDEX_PATH = '/api/v1/profiles/index.yml';
 
+// Path of the STACK-SCOPED form of the same index (issue #1164), served by
+// `GET /stacks/:stack/index.yml` on the profiles router
+// (src/routes/profiles.ts). Built here so the URL handed to Encore and the route
+// that serves it cannot drift.
+export function localProfilesIndexPathForStack(stackName: string): string {
+  return `/api/v1/profiles/stacks/${stackName}/index.yml`;
+}
+
+/**
+ * Rewrite a resolved profiles-index URL to the STACK-SCOPED form for `stackKey`
+ * (issue #1164), when — and only when — that URL is THIS app's own index.
+ *
+ * Why this exists: `profilesUrl` is handed to every scaler-spawned Encore
+ * instance (src/encore-scaler/instance-pool.ts:604-608) as a plain, header-less,
+ * tokenless GET, so the stack cannot travel in `X-Stack-Name`. Without the stack
+ * in the URL, every stack's Encore reads the FIRST listed stack's profile store
+ * (src/data/per-workspace-repos.ts:362-366 ->
+ * src/services/workspace-stack.ts `resolve()`, no-stackName branch) and a
+ * profile created against a non-first stack is invisible to that stack's own
+ * transcodes.
+ *
+ * Narrow by construction:
+ *   - Only a URL whose path ends with {@link LOCAL_PROFILES_INDEX_PATH} is
+ *     rewritten. That covers the derived `${PUBLIC_BASE_URL}` tier and an
+ *     `ENCORE_PROFILES_URL_OVERRIDE`/parameter-store value that points back at
+ *     this app's own index (including behind an ingress path prefix). An
+ *     EXTERNAL index (a bucket, the remote default seed index) is returned
+ *     unchanged: it is not served by this router and has no per-stack form.
+ *   - Only a syntactically valid stack name is scoped
+ *     ({@link normaliseStackName}). The scaler's loop key is the effective stack
+ *     identity a request resolved to, which on a single-stack env-override
+ *     deployment is a fixed deployment context rather than a stack name; such a
+ *     key leaves the URL unscoped, so that deployment's behaviour is unchanged.
+ *
+ * @param profilesIndexUrl the resolved index URL (from {@link resolveEncoreProfilesUrl}).
+ * @param stackKey the stack the spawned Encore instance belongs to.
+ * @returns the stack-scoped URL, or `profilesIndexUrl` unchanged.
+ */
+export function stackScopedProfilesIndexUrl(
+  profilesIndexUrl: string,
+  stackKey: string | undefined
+): string {
+  const stackName = normaliseStackName(stackKey);
+  if (!stackName) return profilesIndexUrl;
+  // Compare on the PATH only, so a query string or fragment can never decide
+  // this (same rule as isProfilesIndexUrl, src/encore-scaler/retry-policy.ts).
+  let pathname: string;
+  try {
+    pathname = new URL(profilesIndexUrl).pathname;
+  } catch {
+    pathname = profilesIndexUrl.split(/[?#]/)[0] ?? '';
+  }
+  if (!pathname.toLowerCase().endsWith(LOCAL_PROFILES_INDEX_PATH)) {
+    return profilesIndexUrl;
+  }
+  // Replace the final occurrence of the unscoped path with the scoped one,
+  // preserving any host and ingress path prefix ahead of it. Query/fragment on a
+  // profiles-index URL carries no meaning for Encore's fetch and is dropped with
+  // the replaced tail.
+  const cut = profilesIndexUrl.toLowerCase().lastIndexOf(LOCAL_PROFILES_INDEX_PATH);
+  return (
+    profilesIndexUrl.slice(0, cut) + localProfilesIndexPathForStack(stackName)
+  );
+}
+
 /**
  * Resolve the profiles-index URL handed to every scaler-spawned Encore instance
  * as its `profilesUrl`.
@@ -79,29 +146,104 @@ export const LOCAL_PROFILES_INDEX_PATH = '/api/v1/profiles/index.yml';
  *      index) used when none of the seams above is set. When the parameter-store
  *      value is absent this is byte-identical to the pre-#315 behaviour.
  *
+ * Since ADR-026 (issue #1207) a PUBLISHED object-store index URL is inserted
+ * ABOVE the derived local index as the new primary tier — see
+ * {@link resolveEncoreProfilesUrlWithOrigin}, which this function delegates to
+ * and whose doc comment carries the full, current tier table. This string-
+ * returning form is kept as-is so every existing call site and the whole
+ * `publishedIndexUrl`-less behaviour are unchanged.
+ *
  * @param defaultProfilesUrl the remote default index URL (from `ENCORE_PROFILES_URL`).
  * @param paramStoreProfilesUrl optional FULL profiles-index URL resolved at boot
  *   from the parameter store (issue #315); undefined/empty when unset.
+ * @param publishedIndexUrl optional URL of the object-store-published index
+ *   (ADR-026 D1/D2); supplied only when the publisher reports it in sync.
  * @returns the resolved profiles-index URL Encore instances should fetch.
  */
 export function resolveEncoreProfilesUrl(
   defaultProfilesUrl: string,
-  paramStoreProfilesUrl?: string
+  paramStoreProfilesUrl?: string,
+  publishedIndexUrl?: string
 ): string {
+  return resolveEncoreProfilesUrlWithOrigin(
+    defaultProfilesUrl,
+    paramStoreProfilesUrl,
+    publishedIndexUrl
+  ).url;
+}
+
+/**
+ * Where a resolved `profilesUrl` came from.
+ *
+ * ADR-026 D2 requires the resolver to REPORT the tier it chose rather than
+ * leaving the call site to re-derive it from `Boolean(publicBaseUrl)` — the
+ * boot probe's scope and its error wording both depend on which origin was
+ * actually selected (ADR-026 D4, issue #1209).
+ *
+ *   'object-store'   — the published object-store index (new PRIMARY, D1/D2 tier 2)
+ *   'override'       — ENCORE_PROFILES_URL_OVERRIDE (tier 1)
+ *   'app-path'       — derived `${PUBLIC_BASE_URL}${LOCAL_PROFILES_INDEX_PATH}` (tier 3)
+ *   'param-store'    — StackConfig.encoreProfilesUrl (tier 4, issue #315)
+ *   'remote-default' — the remote default seed index (tier 5)
+ */
+export type ProfilesUrlOrigin =
+  | 'override'
+  | 'object-store'
+  | 'app-path'
+  | 'param-store'
+  | 'remote-default';
+
+export type ResolvedProfilesUrl = {
+  url: string;
+  origin: ProfilesUrlOrigin;
+};
+
+/**
+ * {@link resolveEncoreProfilesUrl}, but also reporting WHICH tier won
+ * (ADR-026 D2).
+ *
+ * Tier order (ADR-026 D2 table):
+ *   1. `ENCORE_PROFILES_URL_OVERRIDE`                        — unchanged
+ *   2. the PUBLISHED object-store index URL                   — new primary
+ *   3. derived `${PUBLIC_BASE_URL}${LOCAL_PROFILES_INDEX_PATH}` — demoted to fallback
+ *   4. parameter-store `StackConfig.encoreProfilesUrl`        — unchanged
+ *   5. `defaultProfilesUrl` (remote default seed index)       — unchanged
+ *
+ * `publishedIndexUrl` is supplied by the caller ONLY when the publisher reports
+ * the index in sync (`publishProfileIndex` -> `ok: true`, see
+ * src/services/profile-index-publisher.ts). An absent value therefore means
+ * "no healthy published index", and every tier below behaves exactly as it did
+ * before ADR-026 — which is what keeps the env-override, local-dev and
+ * not-yet-re-provisioned deployments working unchanged (ADR-026 D2 reasons 1–3,
+ * §4 "Pre-existing stacks").
+ */
+export function resolveEncoreProfilesUrlWithOrigin(
+  defaultProfilesUrl: string,
+  paramStoreProfilesUrl?: string,
+  publishedIndexUrl?: string
+): ResolvedProfilesUrl {
   const directOverride = process.env['ENCORE_PROFILES_URL_OVERRIDE']?.replace(/\/+$/, '');
-  if (directOverride) return directOverride;
+  if (directOverride) return { url: directOverride, origin: 'override' };
+
+  // Tier 2 (ADR-026 D1/D2): the object-store-served index this app publishes
+  // itself. Primary because its reachability is a property this app configures
+  // and can read back (the anonymous-read GetObject policy, D3), unlike the
+  // orchestrator-level auth-gate exemption the app-path tier depends on and
+  // which no OSC contract can express (ADR-026 C3).
+  const published = publishedIndexUrl?.replace(/\/+$/, '');
+  if (published) return { url: published, origin: 'object-store' };
 
   const base = resolvePublicBaseUrl();
-  if (base) return `${base}${LOCAL_PROFILES_INDEX_PATH}`;
+  if (base) return { url: `${base}${LOCAL_PROFILES_INDEX_PATH}`, origin: 'app-path' };
 
-  // Tier 3 (issue #315): a full profiles-index URL persisted in the parameter
+  // Tier 4 (issue #315): a full profiles-index URL persisted in the parameter
   // store and resolved at boot. Used directly; normalised for trailing slashes.
   // An empty/undefined value is treated as unset so the fall-through below is
   // byte-identical to the pre-#315 behaviour (critical for catalog deploys).
   const fromParamStore = paramStoreProfilesUrl?.replace(/\/+$/, '');
-  if (fromParamStore) return fromParamStore;
+  if (fromParamStore) return { url: fromParamStore, origin: 'param-store' };
 
-  return defaultProfilesUrl;
+  return { url: defaultProfilesUrl, origin: 'remote-default' };
 }
 
 // StackConfig field name under which an operator-supplied full Encore

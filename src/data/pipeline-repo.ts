@@ -11,10 +11,35 @@
 
 import { monotonicFactory } from 'ulid';
 import type { PipelineStepName } from '../pipeline/pipelines.js';
+import type { StepErrorDetail } from '../pipeline/step-error-detail.js';
 
 const ulid = monotonicFactory();
 
-export type StepStatus = 'pending' | 'running' | 'done' | 'failed';
+// Terminal states are `done`, `failed` and `skipped`.
+//
+// `skipped` (issue #789) is distinct from `done`: the step did NOT run because
+// the OPTIONAL service instance it needs is not configured for this stack (see
+// the `subtitles` / `scene-detect` steps in routes/assets.ts). Reporting `done`
+// for that case made a no-op indistinguishable from a completed run. A skipped
+// step is NOT a failure — it settles the step and still lets the execution
+// complete (see `isStepComplete`) — and carries a human-readable `skipReason`.
+export type StepStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
+
+// Is a step settled in a way that does not hold the execution open or fail it?
+// `done` and `skipped` both qualify; `pending`/`running` do not, and `failed`
+// closes the execution out on the failure path instead. Used by every
+// execution-completion check (routes/assets.ts, routes/internal.ts,
+// pipeline/encore-callback-poller.ts) so an execution whose only unfinished
+// work is an unconfigured optional step still reports overall completion.
+export function isStepComplete(step: StepExecution): boolean {
+  return step.status === 'done' || step.status === 'skipped';
+}
+
+// Is a step in a terminal state (no further transition is expected)? Used by
+// cancellation so an already-settled step is not retroactively marked failed.
+export function isStepTerminal(step: StepExecution): boolean {
+  return step.status === 'done' || step.status === 'skipped' || step.status === 'failed';
+}
 
 export type StepExecution = {
   name: PipelineStepName;
@@ -22,6 +47,21 @@ export type StepExecution = {
   jobId?: string; // internal job repo ID (transcode steps)
   encoreJobId?: string; // Encore external job ID (transcode steps)
   error?: string;
+  // Machine-readable companion to `error` for the failure classes we can
+  // recognise (issue #1060). ADDITIVE and OPTIONAL in exactly the way
+  // `skipReason` below is: `error` keeps carrying the same free text it always
+  // did, the status enum is untouched, and a failure we cannot classify simply
+  // leaves this absent. Present today only for `source_read_failed` — a
+  // transcode whose SOURCE object could not be read (404/403/connection), where
+  // it carries the redacted source location, the HTTP status, and the
+  // transcoder job + asset ids so the caller does not have to open the
+  // transcoder job and then the bucket to find out the key is missing. Built by
+  // buildSourceReadErrorDetail (src/pipeline/encore-source-read-failure.ts).
+  errorDetail?: StepErrorDetail;
+  // Why a `skipped` step did not run (issue #789), e.g. the optional service
+  // instance for this stack is unconfigured. Only set when status is `skipped`;
+  // `error` stays reserved for genuine failures.
+  skipReason?: string;
   startedAt?: string;
   completedAt?: string;
   progress?: number; // 0-100, populated at read time from the linked job
@@ -193,7 +233,22 @@ export class InMemoryPipelineRepository implements PipelineRepository {
 function clone(execution: PipelineExecution): PipelineExecution {
   return {
     ...execution,
-    steps: execution.steps.map((s) => ({ ...s })),
+    // `errorDetail` (#1060) is the only nested object on a step, so it is copied
+    // explicitly — a shallow step spread would otherwise hand callers a
+    // reference into the store.
+    steps: execution.steps.map((s) => ({
+      ...s,
+      ...(s.errorDetail !== undefined
+        ? {
+            errorDetail: {
+              ...s.errorDetail,
+              ...(s.errorDetail.source !== undefined
+                ? { source: { ...s.errorDetail.source } }
+                : {})
+            }
+          }
+        : {})
+    })),
     ...(execution.resolvedOutputLocation !== undefined
       ? { resolvedOutputLocation: { ...execution.resolvedOutputLocation } }
       : {}),

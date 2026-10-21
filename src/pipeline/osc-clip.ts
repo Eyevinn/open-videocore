@@ -3,17 +3,29 @@
 //
 // The same service used for ffprobe (issue #6) and thumbnails (issue #7) runs
 // ffmpeg against a downloaded HTTPS source. For clips we seek to the window
-// start, stream-copy until the window end, and write the result to the clip's
-// presigned PUT URL. eyevinn-ffmpeg-s3 downloads the `-i` source URL before
-// running ffmpeg and uploads ffmpeg's output files back to S3, so the
-// destination is handed as a presigned PUT URL.
+// start, stream-copy until the window end, and write the result out.
 //
-// Input-level `-ss` before `-i` keeps the seek fast; `-to` bounds the output to
-// the window end (interpreted relative to the post-seek timeline). `-c copy`
-// stream-copies without re-encoding so the clip is produced quickly and without
-// quality loss. `-y` overwrites so re-runs are idempotent. We do one job per
-// clip request, then best-effort removeJob so spent ephemeral instances do not
-// accumulate (same lifecycle as osc-ffprobe.ts / osc-thumbnail.ts).
+// OUTPUT goes to an `s3://bucket/key` URI, NOT a presigned HTTPS PUT URL
+// (issue #786). ffmpeg's http protocol is read-only for output unless it is
+// explicitly driven with `-method PUT`, and even then an MP4 muxed to a
+// non-seekable target cannot rewrite its `moov` atom, so `-c copy` to a
+// presigned PUT URL produced a job that "succeeded" while writing nothing —
+// the caller got a `ready` child asset whose object answered NoSuchKey. This is
+// the same failure mode already fixed for thumbnails (issue #92) and for
+// export / re-wrap (issue #316); we follow the fix those made:
+// eyevinn-ffmpeg-s3 writes S3 output natively when handed AWS-compatible
+// credentials in the job body (`awsAccessKeyId`, `awsSecretAccessKey`,
+// `s3EndpointUrl` — the MinIO endpoint, per ADR-001), so ffmpeg muxes to a
+// seekable local file and the service uploads it. See
+// osc-rewrap.ts:rewrapCmdLine / osc-rewrap.ts:makeOscRewrapRunner.
+//
+// Input-level `-ss` before `-i` keeps the seek fast; `-to` (also an input
+// option here) bounds the read at the window end, so the clip covers
+// [startSeconds, endSeconds). `-c copy` stream-copies without re-encoding so
+// the clip is produced quickly and without quality loss. `-y` overwrites so
+// re-runs are idempotent. We do one job per clip request, then best-effort
+// removeJob so spent ephemeral instances do not accumulate (same lifecycle as
+// osc-ffprobe.ts / osc-thumbnail.ts).
 
 import {
   createJob,
@@ -25,11 +37,18 @@ import {
 } from '@osaas/client-core';
 import { FFPROBE_SERVICE_ID } from '../services/stack.js';
 import { pollOscJobUntilDone } from './osc-job-poll.js';
+import { captureJobLogs, OscJobError, oscJobLog, redactLogQueryStrings } from './osc-job-log.js';
 import type { ClipRunner } from './clip.js';
+
+// Re-exported so existing importers (and test/clip.test.ts) keep their clip-named
+// entry points. The implementations are shared with export / re-wrap — see
+// osc-job-log.ts (issue #944).
+export { redactLogQueryStrings };
+export { oscJobLog as oscClipJobLog };
 
 // Subset of the OSC SDK surface this runner needs. Declared structurally so the
 // real SDK functions satisfy it and tests can pass lightweight fakes (mirrors
-// OscJobApi in osc-ffprobe.ts / osc-thumbnail.ts).
+// OscJobApi in osc-rewrap.ts / osc-thumbnail.ts).
 export type OscJobApi = {
   context: Context;
   createJob: typeof createJob;
@@ -37,18 +56,64 @@ export type OscJobApi = {
 
   getLogsForInstance: typeof getLogsForInstance;
   removeJob: typeof removeJob;
+  // MinIO/S3 credentials + bucket for native S3 output. Passed in the job body
+  // so ffmpeg's output lands in `s3://bucket/key` (a presigned HTTPS PUT URL
+  // does not work as an ffmpeg output — see the file header, issue #786/#316).
+  s3Endpoint: string;
+  s3AccessKey: string;
+  s3SecretKey: string;
+  s3Bucket: string;
 };
 
+// The ONLY job statuses that mean the ffmpeg job finished successfully.
+// eyevinn-ffmpeg-s3 reports 'SuccessCriteriaMet'; 'Complete' is the generic SDK
+// value (and what osc-job-poll.ts synthesises when the instance has already been
+// reaped). Any OTHER value returned by the poller is treated as a FAILURE
+// (issue #786: checking only for two exact failure values let every other
+// terminal value pass as success).
+//
+// What this actually observes, verified against
+// osc-job-poll.ts:TERMINAL_STATUS/ACTIVE_STATUS: the poller only ever RETURNS a
+// value from its terminal set, so in practice this branch sees 'Failed', 'Error'
+// or 'Stopped'. A status the poller recognises as neither terminal nor active —
+// a value this service grew since — does not arrive here as a status at all: the
+// poller throws after a bounded grace window, and the catch below turns that
+// into the same failure. The allow-list is kept as the second line of defence so
+// a future terminal value added to the poller cannot become a silent success.
+const SUCCESS_STATUSES = new Set(['SuccessCriteriaMet', 'Complete']);
+
+// Error thrown when the ffmpeg job does not end in a known-good state.
+//
+// The captured ffmpeg log is carried as a PROPERTY (and as `cause`), never
+// concatenated into `message` (issue #786 round-2 review) — see
+// osc-job-log.ts:OscJobError for why. `message` is what routes/assets.ts sends
+// back in the 502 body; operators read the full text from the server log
+// (routes/assets.ts logs `oscJobLog` on the warn line).
+export class OscClipJobError extends OscJobError {
+  constructor(message: string, jobLog: string) {
+    super(message, jobLog);
+    this.name = 'OscClipJobError';
+  }
+}
+
+// Build the destination URI the ffmpeg job writes to. Mirrors the
+// `s3://bucket/<objectKey>` form used by osc-rewrap.ts:rewrapCmdLine; the `.mp4`
+// extension on the key selects the MP4 muxer.
+export function clipDestinationUri(bucket: string, objectKey: string): string {
+  return `s3://${bucket}/${objectKey}`;
+}
+
 // Build the ffmpeg command line that extracts [startSeconds, endSeconds) from
-// the source and writes it to the destination PUT URL. The `.mp4` URL forces
-// the MP4 muxer; `-c copy` avoids a re-encode.
+// the source and writes it to `destination` — an `s3://bucket/key` URI built by
+// clipDestinationUri, NOT a presigned PUT URL (issue #786). `-c copy` avoids a
+// re-encode; the destination key's `.mp4` extension forces the MP4 muxer.
 export function clipCmdLine(
   sourceUrl: string,
-  putUrl: string,
+  destination: string,
   startSeconds: number,
   endSeconds: number
 ): string {
-  return `-y -ss ${startSeconds} -to ${endSeconds} -i "${sourceUrl}" -c copy "${putUrl}"`;
+  return `-y -ss ${startSeconds} -to ${endSeconds} -i "${sourceUrl}" -c copy "${destination}"`;
 }
 
 // A unique, OSC-valid ephemeral job name. Lowercase alphanumeric, bounded
@@ -60,12 +125,15 @@ function clipJobName(): string {
 }
 
 // Construct the production ClipRunner. Each invocation creates one ephemeral
-// ffmpeg job that writes the clip, waits for completion, then best-effort
-// removes the job.
+// ffmpeg job that writes the clip to `s3://<bucket>/<outputKey>`, waits for
+// completion, and — on anything other than a known-good terminal status —
+// captures the job's logs before the instance is removed and throws an
+// OscClipJobError carrying them as data (server-side diagnostics only). The orchestrator (pipeline/clip.ts) additionally verifies the object
+// really landed, because a "successful" status is not proof of a written object.
 export function makeOscClipRunner(api: OscJobApi): ClipRunner {
   return async (
     sourceUrl: string,
-    putUrl: string,
+    outputKey: string,
     startSeconds: number,
     endSeconds: number
   ): Promise<void> => {
@@ -73,18 +141,48 @@ export function makeOscClipRunner(api: OscJobApi): ClipRunner {
     const name = clipJobName();
     await api.createJob(api.context, FFPROBE_SERVICE_ID, sat, {
       name,
-      cmdLineArgs: clipCmdLine(sourceUrl, putUrl, startSeconds, endSeconds)
+      cmdLineArgs: clipCmdLine(
+        sourceUrl,
+        clipDestinationUri(api.s3Bucket, outputKey),
+        startSeconds,
+        endSeconds
+      ),
+      awsAccessKeyId: api.s3AccessKey,
+      awsSecretAccessKey: api.s3SecretKey,
+      s3EndpointUrl: api.s3Endpoint
     });
+
+    // Resolve the outcome first, WITHOUT removing the job: the logs are only
+    // fetchable while the instance still exists.
+    let failure: string | undefined;
     try {
-      const _status = await pollOscJobUntilDone(api, FFPROBE_SERVICE_ID, name, sat);
-      if (_status === 'Failed' || _status === 'Error') throw new Error(`OSC job "${name}" failed with status "${_status}"`);
-      void _status;
-    } finally {
-      try {
-        await api.removeJob(api.context, FFPROBE_SERVICE_ID, name, sat);
-      } catch {
-        // ignore cleanup failure
+      // failFastOnUnknownStatus: POST /:id/clip awaits this runner, so a status
+      // the poller cannot classify must not hold the caller's connection open
+      // for the full 5-minute poll timeout. Opt-in per caller — the
+      // fire-and-forget ingest pipelines deliberately stay tolerant. See
+      // osc-job-poll.ts:PollOptions.
+      const status = await pollOscJobUntilDone(api, FFPROBE_SERVICE_ID, name, sat, {
+        failFastOnUnknownStatus: true
+      });
+      if (!SUCCESS_STATUSES.has(status)) {
+        failure = `OSC clip job "${name}" ended with non-success status "${status}"`;
       }
+    } catch (err) {
+      failure = `OSC clip job "${name}" did not complete: ${err instanceof Error ? err.message : String(err)}`;
+    }
+
+    const logs = failure ? await captureJobLogs(api, FFPROBE_SERVICE_ID, name, sat) : '';
+
+    try {
+      await api.removeJob(api.context, FFPROBE_SERVICE_ID, name, sat);
+    } catch {
+      // ignore cleanup failure
+    }
+
+    if (failure) {
+      // The log goes on the error as data, NOT into the message — see
+      // OscClipJobError.
+      throw new OscClipJobError(failure, logs);
     }
   };
 }

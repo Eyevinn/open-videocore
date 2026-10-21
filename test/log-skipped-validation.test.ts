@@ -160,7 +160,11 @@ describe('log skipped profileParams validation at transcode call site (issue #39
       url: `/api/v1/assets/${id}/transcode`,
       headers: { authorization: 'Bearer token-a' },
       // Deliberately unsorted keys so we can assert the logged set is sorted.
-      payload: { profile: 'not-in-store', profileParams: { zeta: '1', alpha: '2' } }
+      // No `profile` named -> the submit default ('program'), absent from this
+      // empty store, so the resolver reports not-found. A caller-NAMED profile
+      // absent from a reachable store is a 400 `unknown_profile` since issue
+      // #1022, so the not-found log branch is reached via the default.
+      payload: { profileParams: { zeta: '1', alpha: '2' } }
     });
 
     // Permissive behaviour unchanged: still accepted + submitted.
@@ -172,7 +176,7 @@ describe('log skipped profileParams validation at transcode call site (issue #39
     const line = lines[0];
     expect(line.level).toBe('info');
     expect(line.obj.reason).toBe('profile-not-found');
-    expect(line.obj.profileName).toBe('not-in-store');
+    expect(line.obj.profileName).toBe('program');
     expect(line.obj.unvalidatedKeys).toEqual(['alpha', 'zeta']);
     // profile-not-found is ordinary use -> no captured error attached.
     expect(line.obj.err).toBeUndefined();

@@ -35,6 +35,116 @@ import {
 
 const PAYLOAD_TTL_SECONDS = 86_400; // 24h, matches the dispatch-time UUID/URL keys.
 
+// #743: is an entry for `jobId` already sitting in this workspace's pending queue
+// (keys.queue) or transient inflight list (keys.inflight)? Both are Valkey lists of
+// JSON-serialized QueuedJob objects, each carrying a `jobId` field (types.ts:185-197).
+// A retry re-dispatch (decideRetry) must be idempotent: without this guard, a second
+// failure signal for a job whose retry is ALREADY queued (or being dispatched, hence
+// inflight) LPUSHes another copy, so one execution can accumulate far more than
+// MAX_ENCODE_ATTEMPTS entries (observed: 12 entries against a bound of 3).
+//
+// CONTRACT SOURCES VERIFIED (CLAUDE.md rule 7)
+//   - keys.queue / keys.inflight are Valkey lists (types.ts:206-207); QueuedJob has
+//     a `jobId` correlation id (types.ts:185-197).
+//   - Scan idiom (LRANGE 0 -1 + JSON.parse as QueuedJob + match parsed.jobId, ignore
+//     unparseable entries) mirrors the router's cancel path
+//     (encore-scaler-router.ts:136-148) and index.ts:104.
+async function hasQueuedOrInflightEntry(
+  redis: Redis,
+  workspaceId: string,
+  jobId: string
+): Promise<boolean> {
+  const [queued, inflight] = await Promise.all([
+    redis.lrange(keys.queue(workspaceId), 0, -1),
+    redis.lrange(keys.inflight(workspaceId), 0, -1)
+  ]);
+  for (const entry of [...queued, ...inflight]) {
+    try {
+      const parsed = JSON.parse(entry) as QueuedJob;
+      if (parsed.jobId === jobId) return true;
+    } catch {
+      // ignore unparseable entries — mirrors the router cancel scan
+    }
+  }
+  return false;
+}
+
+// #745: a best-effort canceler for the STILL-ACTIVE PRIOR Encore attempt of an
+// externalId, invoked immediately BEFORE that externalId is re-dispatched. Re-
+// dispatch (a #295 transport/IO retry, or a #514 scale-down re-enqueue) can
+// otherwise submit the same externalId while the previous attempt is still
+// IN_PROGRESS on another instance — producing concurrent encodes writing to the
+// same output (live evidence: one externalId IN_PROGRESS on three instances at
+// once). Cancelling the prior attempt first guarantees an externalId is never
+// active on more than one Encore instance simultaneously.
+//
+// The canceler receives the full Encore job URL recorded at dispatch time —
+// keys.jobEncoreUrl = `{instanceUrl}/encoreJobs/{uuid}` (src/encore-scaler/
+// scaler-loop.ts:962) — and must POST `{url}/cancel`.
+//
+// CONTRACT SOURCE VERIFIED (CLAUDE.md rule 7)
+//   - Encore cancel endpoint: POST {baseUrl}/encoreJobs/{jobId}/cancel — SVT
+//     Encore EncoreController.kt, mirrored by EncoreClient.cancel
+//     (src/pipeline/encore-client.ts:53-58, 142-161). Only NEW/QUEUED/IN_PROGRESS
+//     jobs are cancellable; 404 (already gone) / 409 (terminal) are idempotent
+//     no-ops, so calling this on EVERY re-dispatch path is safe.
+export type PriorAttemptCanceler = (encoreJobUrl: string) => Promise<void>;
+
+// Build a PriorAttemptCanceler that POSTs the Encore cancel endpoint for the
+// exact prior-attempt job URL, authenticating with a fresh service access token.
+// Matches makeHttpEncoreClient.cancel's contract handling (encore-client.ts:142-161)
+// but cancels by full per-instance URL (the prior attempt may live on a DIFFERENT
+// instance than the retry will land on, so a fixed baseUrl is not enough).
+export function makePriorAttemptCanceler(
+  getToken: () => Promise<string>,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch
+): PriorAttemptCanceler {
+  return async (encoreJobUrl: string): Promise<void> => {
+    const token = await getToken();
+    const res = await fetchImpl(`${encoreJobUrl.replace(/\/$/, '')}/cancel`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}` }
+    });
+    // Idempotent no-op: 404 = job already gone, 409 = terminal / non-cancellable.
+    if (res.status === 404 || res.status === 409) return;
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Encore prior-attempt cancellation failed: ${res.status} ${text}`.trim());
+    }
+  };
+}
+
+// #745: cancel the still-active PRIOR Encore attempt for `jobId` before its
+// re-dispatch, using the full job URL stored at dispatch time (keys.jobEncoreUrl).
+// MUST be called BEFORE that key is deleted by the re-queue path. Best-effort: a
+// failed/missing cancel must NEVER block the re-dispatch (reconcile()'s dropped-job
+// handling and the bounded-attempt cap remain the backstop), but it is logged so a
+// cancel that could not be delivered is diagnosable (issue #451 observability).
+async function cancelPriorActiveAttempt(
+  redis: Redis,
+  jobId: string,
+  cancelPrior: PriorAttemptCanceler | undefined
+): Promise<void> {
+  if (!cancelPrior) return;
+  let priorUrl: string | null = null;
+  try {
+    priorUrl = await redis.get(keys.jobEncoreUrl(jobId));
+  } catch {
+    priorUrl = null;
+  }
+  if (!priorUrl) return; // no recorded prior dispatch URL — nothing to cancel.
+  try {
+    await cancelPrior(priorUrl);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[encore-scaler] retry: failed to cancel prior active Encore attempt before ' +
+        `re-dispatch for ${jobId} (url=${priorUrl}); proceeding with re-dispatch:`,
+      err
+    );
+  }
+}
+
 // Record the original payload + first dispatch (attempt 1) at dispatch time.
 // Best-effort caller: a failure here must never block dispatch, so callers
 // should swallow. Stored with a 24h TTL so stale retry state self-expires.
@@ -80,7 +190,11 @@ export async function clearRetryState(redis: Redis, jobId: string): Promise<void
 export async function requeueInterruptedByScaleDown(
   redis: Redis,
   workspaceId: string,
-  jobId: string
+  jobId: string,
+  // #745: cancel any still-active prior Encore attempt for this externalId before
+  // the re-enqueue lands a fresh dispatch. Optional so non-scaler/test callers
+  // that cannot cancel keep working; the real scaler wires it from getToken.
+  cancelPrior?: PriorAttemptCanceler
 ): Promise<boolean> {
   const payloadRaw = await redis.get(keys.jobPayload(jobId));
   if (!payloadRaw) return false;
@@ -105,12 +219,21 @@ export async function requeueInterruptedByScaleDown(
     attempts: attemptsSoFar
   };
 
+  // #745: cancel the prior attempt (if still active on its now-scaled-away
+  // instance) BEFORE the jobEncoreUrl key is deleted below, so the re-enqueue
+  // cannot leave the same externalId running concurrently on two instances.
+  await cancelPriorActiveAttempt(redis, jobId, cancelPrior);
+
   // Keep the job non-terminal and drop the stale mapping to the scaled-away
   // instance BEFORE re-queuing, so it is never observed as settled/failed
   // between the interruption and the fresh dispatch.
   await redis.hset(keys.jobStatus(workspaceId), jobId, 'RUNNING');
   await redis.hdel(keys.jobInstance(workspaceId), jobId);
-  await redis.del(keys.jobUuid(jobId), keys.jobEncoreUrl(jobId));
+  // jobTerminalInstance is cleared alongside jobEncoreUrl (issue #739): both
+  // describe the PREVIOUS attempt's instance, and a re-dispatch invalidates them
+  // together. Leaving it would let packaging resolve a stale instance for a job
+  // that has since moved.
+  await redis.del(keys.jobUuid(jobId), keys.jobEncoreUrl(jobId), keys.jobTerminalInstance(jobId));
 
   await redis.lpush(keys.queue(workspaceId), JSON.stringify(requeued));
   return true;
@@ -123,6 +246,12 @@ export async function requeueInterruptedByScaleDown(
 // caller-facing encode-attempt log (finalizeEncodeAttempt) accepts.
 export type RetryDecision =
   | { action: 'retry'; attempt: number; failureClass: MessageFailureClass; backoffMs: number }
+  // #743: the job already has a retry entry queued or inflight, so re-dispatching
+  // again would create a duplicate queue entry. The caller MUST treat this exactly
+  // like 'retry' for settle purposes (the job stays non-terminal — a pending retry
+  // is in flight) but MUST NOT settle, finalize another encode attempt, or free a
+  // slot: no new dispatch happened, so there is nothing further to account for.
+  | { action: 'skip'; reason: 'already-pending'; failureClass: MessageFailureClass }
   | { action: 'settle'; reason: 'exhausted' | 'not-retryable'; failureClass: MessageFailureClass };
 
 // The gate. Given an observed Encore failure `message` for jobId, decide whether
@@ -133,13 +262,24 @@ export type RetryDecision =
 // hung/settled job while the retry is pending. The caller MUST NOT call
 // completeTranscode({ success:false }) in that case.
 //
+// On 'skip' (#743) an entry for this job was ALREADY queued/inflight, so this
+// function did NOT re-queue (avoiding a duplicate queue entry). The caller MUST
+// NOT settle and MUST NOT run completeTranscode — the pending retry stays in
+// flight — and it should not finalize another encode attempt or free a slot for
+// this duplicate signal, since no new dispatch occurred.
+//
 // On 'settle' the caller settles the job terminal exactly as before (this is the
 // pre-#295 behaviour) and should call clearRetryState afterwards.
 export async function decideRetry(
   redis: Redis,
   workspaceId: string,
   jobId: string,
-  failureMessage: string | undefined
+  failureMessage: string | undefined,
+  // #745: cancel any still-active prior Encore attempt for this externalId before
+  // the re-dispatch is queued. Optional so callers that cannot cancel (or tests)
+  // keep working; the callback poller and the reconcile drop path wire it from
+  // getToken. Only consulted on the 'retry' branch — a 'settle' never re-dispatches.
+  cancelPrior?: PriorAttemptCanceler
 ): Promise<RetryDecision> {
   const failureClass = classifyEncoreFailure(failureMessage);
 
@@ -175,6 +315,17 @@ export async function decideRetry(
     return { action: 'settle', reason: 'not-retryable', failureClass };
   }
 
+  // #743: make re-dispatch idempotent. If an entry for this jobId is ALREADY in
+  // the pending queue or the inflight list, its retry is already scheduled (or is
+  // mid-dispatch), so LPUSHing another copy would create a duplicate queue entry —
+  // the exact bug that let one execution accumulate 12 entries against a bound of
+  // MAX_ENCODE_ATTEMPTS. Skip the enqueue and every state mutation below (the
+  // pending entry already carries the correct payload/attempts). This check runs
+  // BEFORE any hset/hdel/del/lpush so a duplicate failure signal is a true no-op.
+  if (await hasQueuedOrInflightEntry(redis, workspaceId, jobId)) {
+    return { action: 'skip', reason: 'already-pending', failureClass };
+  }
+
   const nextAttempt = attemptsSoFar + 1;
   const backoffMs = backoffForAttempt(attemptsSoFar);
 
@@ -185,6 +336,13 @@ export async function decideRetry(
     notBefore: Date.now() + backoffMs,
     attempts: attemptsSoFar // carried so the loop persists nextAttempt on dispatch
   };
+
+  // #745: cancel the prior attempt (if it is still active on the instance that
+  // ran the failed run) BEFORE the jobEncoreUrl key is deleted below. A drop-
+  // detected "failure" can be a FALSE POSITIVE (the job is still IN_PROGRESS on
+  // its instance), so re-dispatching without cancelling first is exactly what
+  // produced the same externalId active on multiple instances at once.
+  await cancelPriorActiveAttempt(redis, jobId, cancelPrior);
 
   // Order matters: pin the caller-facing status to RUNNING and clear any stale
   // per-instance mapping BEFORE re-queuing, so the job is never observed as
@@ -203,7 +361,10 @@ export async function decideRetry(
   await redis.hdel(keys.jobInstance(workspaceId), jobId);
   await redis.del(
     keys.jobUuid(jobId),
-    keys.jobEncoreUrl(jobId)
+    keys.jobEncoreUrl(jobId),
+    // Issue #739: the terminal-instance mapping also describes the FAILED
+    // attempt's instance, so it is invalidated with the rest of them.
+    keys.jobTerminalInstance(jobId)
   );
 
   // Re-queue at the tail (FIFO) so the scaler loop re-dispatches it.

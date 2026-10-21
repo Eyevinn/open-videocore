@@ -17,11 +17,16 @@ import type { Redis } from 'ioredis';
 import type { Context } from '@osaas/client-core';
 import type { EncoreClient, EncoreSubmitInput, EncoreSubmitResult } from '../pipeline/encore-client.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
-import { EncoreScalerLoop } from './scaler-loop.js';
+import {
+  DEFAULT_ORPHAN_REAP_INTERVAL_MS,
+  EncoreScalerLoop
+} from './scaler-loop.js';
 import { makeScalingEncoreClient } from './index.js';
 import { destroyInstance, listInstances, reconcilePoolFromOsc } from './instance-pool.js';
 import { keys } from './types.js';
+import { valkeyConnectionId } from './valkey-connection-id.js';
 import type { DroppedJob, EncoreScalerConfig } from './types.js';
+import type { ScalerLogSink } from './scaler-log.js';
 
 export type WorkspaceEncoreScalerConfig = {
   redis: Redis;
@@ -39,11 +44,28 @@ export type WorkspaceEncoreScalerConfig = {
   // outbound callback-listener TLS-trust probe that gates first-job dispatch
   // (issue #463). Undefined uses the loop's built-in default.
   callbackTrustTimeoutMs?: number;
+  // Per-request bound (ms) forwarded to every per-workspace scaler loop for a
+  // single callback-trust probe request (issue #1171). Undefined uses the
+  // probe's built-in default (DEFAULT_PROBE_REQUEST_TIMEOUT_MS).
+  callbackProbeRequestTimeoutMs?: number;
   // Grace window (ms) forwarded to every per-workspace scaler loop for the
   // reconcile dropped-job diff (issue #708): a job the callback poller recorded
   // completing within this window is not re-raised as silently dropped.
   // Undefined uses the loop's built-in default (DEFAULT_RECONCILE_GRACE_MS).
   reconcileGraceMs?: number;
+  // #778: how often (ms) each per-workspace loop sweeps OSC for scaler-owned
+  // Encore instances with no pool record and destroys the ones that have stayed
+  // orphaned past the grace window. Undefined enables the sweep at
+  // DEFAULT_ORPHAN_REAP_INTERVAL_MS; set to 0 to disable it entirely.
+  orphanReapIntervalMs?: number;
+  // #778: how long (ms) an instance must be continuously observed orphaned
+  // before it is reaped. Undefined uses DEFAULT_ORPHAN_GRACE_MS (instance-pool).
+  orphanGraceMs?: number;
+  // #1071: bounded wait (ms) forwarded to every per-workspace loop for a freshly
+  // created OSC instance to report `running`. Must cover OSC provisioning a new
+  // worker node, not just a pod starting on an existing one. Undefined uses
+  // DEFAULT_SPAWN_READY_TIMEOUT_MS (instance-pool, 15 min).
+  spawnReadyTimeoutMs?: number;
   // Redis connection string forwarded to each spawned callback listener.
   redisUrl: string;
   // Optional per-stack Valkey resolver (issue #615). When supplied, called once
@@ -57,6 +79,14 @@ export type WorkspaceEncoreScalerConfig = {
   // falls back to the injected `redisUrl`/`redis` (unchanged single-Valkey
   // behaviour) rather than silently mis-routing.
   resolveRedisUrl?: (stackKey: string) => Promise<string | undefined>;
+  // Optional enumeration of the stacks that have been provisioned (issue #1074).
+  // Used ONLY by listStackConnections() below, so a read-only observer (GET
+  // /scaler/status) can cover a stack whose loop has not been created yet in this
+  // process — the case where a per-stack pool was invisible rather than reported
+  // empty. Returns the stack keys loops are keyed by (the same identity
+  // resolveRedisUrl is called with). When absent, listStackConnections() reports
+  // only the stacks this registry has already resolved a connection for.
+  listStackKeys?: () => Promise<string[]>;
   // Factory that opens a Valkey connection for a resolved per-stack URL (issue
   // #615). Injected (not `new IORedis` inline) so the registry stays free of a
   // hard ioredis dependency and tests can supply a fake connection. main.ts
@@ -78,6 +108,17 @@ export type WorkspaceEncoreScalerConfig = {
   // Forwarded to every spawned Encore instance as its `profilesUrl` so it loads
   // operator-managed profiles from this API's public index (issue #84).
   profilesUrl?: string;
+  // Optional per-stack rewrite of `profilesUrl` (issue #1164). When supplied,
+  // called with the loop key (the EFFECTIVE stack identity the transcode request
+  // resolved to) and preferred over the process-global `profilesUrl` above.
+  // Mirrors resolveS3Config / resolveRedisUrl: a spawned Encore instance fetches
+  // its profile index with a header-less, tokenless GET
+  // (instance-pool.ts:604-608), so the only way it can read the profiles of the
+  // stack it belongs to — rather than the first-listed stack's — is for the
+  // stack to be in the URL. Returns undefined when there is no per-stack form of
+  // the configured URL (an external index, or a loop key that is not a stack
+  // name), and the loop then uses `profilesUrl` unchanged.
+  resolveProfilesUrl?: (stackKey: string) => string | undefined;
   // Forwarded to every per-workspace scaler loop: invoked after a queued job is
   // dispatched to an Encore instance so the Job record can advance queued->running.
   onDispatched?: (encoreJobId: string) => Promise<void>;
@@ -103,6 +144,40 @@ export type WorkspaceEncoreScalerConfig = {
   // annotates the caller-facing Job with the recoverable interruption reason
   // (without changing its status).
   onJobInterrupted?: (encoreJobId: string, reason: 'interrupted_by_scaledown') => Promise<void>;
+  // Forwarded to every per-workspace scaler loop: the operational log store the
+  // loop appends its spawn/dispatch/reap/tick FAILURES to (issue #998), so they
+  // are visible through GET /api/v1/logs and the Logs tab instead of only in the
+  // container's stdout. main.ts passes the same store the pipeline-step producer
+  // (#995) writes to and the logs router reads. Unset => the loops log to
+  // `console.error` only, exactly as before.
+  logSink?: ScalerLogSink;
+};
+
+// How long a stack enumeration (listStackKeys) is reused before it is fetched
+// again (issue #1074). listStackConnections() is driven by GET /scaler/status,
+// which is deliberately unauthenticated, so without a window every status read
+// would be an external parameter-store call — one unauthenticated request
+// amplified into platform load. 30s is short enough that a freshly provisioned
+// stack shows up promptly (and its loop registers it immediately on first submit
+// regardless) and long enough that polling the endpoint costs nothing.
+const STACK_KEYS_CACHE_MS = 30_000;
+
+// One provisioned stack and the Valkey its scaler loop reads and writes (issue
+// #1074). Handed to read-only observers so they can query the SAME physical store
+// the loop uses instead of the process-global one.
+//
+// `redis` is undefined when the connection could not be resolved at all — the
+// stack is then reportable as UNOBSERVED (with `unobservedReason`) rather than
+// omitted, which is the whole point: "no instances in this pool" and "this pool
+// was never looked at" must not render identically.
+//
+// `connectionId` is the non-secret label from valkeyConnectionId() — never the
+// URL, because the status endpoint that consumes this is unauthenticated.
+export type ScalerStackConnection = {
+  stackKey: string;
+  connectionId?: string;
+  redis?: Redis;
+  unobservedReason?: string;
 };
 
 export class WorkspaceEncoreScalerRegistry implements EncoreClient {
@@ -121,9 +196,20 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     { redis: Redis; redisUrl: string; owned: boolean }
   >();
 
+  // Last stack enumeration and when it was taken (issue #1074). Bounds the
+  // external parameter-store reads an unauthenticated status poll can trigger,
+  // and doubles as the fallback when a later enumeration fails: reporting the
+  // previously known stacks beats reporting none.
+  private stackKeysCache?: { keys: string[]; at: number };
+
   constructor(private readonly config: WorkspaceEncoreScalerConfig) {}
 
   // Resolve (and cache) the Valkey connection + URL for a stack key (issue #615).
+  // Public: main.ts hands the per-stack connection to everything that reads
+  // scaler state for one stack outside a loop — the per-stack callback pollers,
+  // the packaging queue, the routes' job-instance / pin lookups and the
+  // reconcile drop hook's retry gate — so no consumer is left on the
+  // process-global connection by default.
   //
   // Mirrors how resolveS3Config resolves the MinIO endpoint per stack: the
   // resolveRedisUrl hook loads the stack's own StackConfig.redisUrl, and makeRedis
@@ -136,7 +222,19 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
   // no resolver/factory is wired, or the stack has no stored redisUrl, it falls
   // back to the injected process-global `redis`/`redisUrl` — the unchanged
   // single-Valkey behaviour used by env-override deployments and tests.
-  private async resolveStackRedis(
+  // The profile-index URL the instances spawned for `stackKey` must fetch
+  // (issue #1164). Delegates to the injected `resolveProfilesUrl` hook — the
+  // registry owns no URL conventions — and falls back to the process-global
+  // `profilesUrl` when the hook is absent or reports no per-stack form (an
+  // external index, or a loop key that is not a stack name). Never returns
+  // another stack's URL: the only two outcomes are "this stack's index" and
+  // "the configured index, unchanged".
+  private resolveLoopProfilesUrl(stackKey: string): string | undefined {
+    if (!this.config.resolveProfilesUrl) return this.config.profilesUrl;
+    return this.config.resolveProfilesUrl(stackKey) ?? this.config.profilesUrl;
+  }
+
+  async resolveStackRedis(
     stackKey: string
   ): Promise<{ redis: Redis; redisUrl: string }> {
     const cached = this.redisConnections.get(stackKey);
@@ -149,16 +247,15 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
 
     const perStackUrl = await this.config.resolveRedisUrl(stackKey);
     if (!perStackUrl) {
-      // The stack has no stored Valkey URL (e.g. the fixed deployment context of
-      // a single-stack env-override run, which is not itself a provisioned stack).
-      // Fall back to the injected connection rather than fabricating one.
-      const fallback = {
-        redis: this.config.redis,
-        redisUrl: this.config.redisUrl,
-        owned: false
-      };
-      this.redisConnections.set(stackKey, fallback);
-      return { redis: fallback.redis, redisUrl: fallback.redisUrl };
+      // The stack has no stored Valkey URL: the fixed deployment context of a
+      // single-stack env-override run (not itself a provisioned stack), or a
+      // stack still being provisioned whose config carries no redisUrl yet.
+      // Fall back to the injected connection rather than fabricating one, but
+      // do NOT cache it: a stack resolved mid-provision (a status read, a
+      // poller sync) would otherwise stay bound to the first stack's Valkey
+      // until the process restarted, with its loop, completions and packaging
+      // all on the wrong store.
+      return { redis: this.config.redis, redisUrl: this.config.redisUrl };
     }
 
     // If this stack's URL is identical to the process-global one, reuse the
@@ -183,6 +280,100 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     return { redis, redisUrl: perStackUrl };
   }
 
+  // The Valkey holding the scaler state of the stack an Encore job was
+  // dispatched on. Every scaler key is namespaced by the job's stack — the
+  // encoreJobId prefix (keys in types.ts) — and lives on THAT stack's Valkey
+  // (issue #615), so a reader of the job-instance / job-url / packaging-pin /
+  // retry keys must use this connection, never the process-global one, or it
+  // reads an empty namespace for every stack but the first. An undecodable id
+  // falls back to the injected connection.
+  async redisForEncoreJob(encoreJobId: string): Promise<Redis> {
+    const decoded = decodeEncoreJobId(encoreJobId);
+    if (!decoded) return this.config.redis;
+    return (await this.resolveStackRedis(decoded.workspaceId)).redis;
+  }
+
+  // Provisioned stack keys, cached for STACK_KEYS_CACHE_MS (issue #1074). Never
+  // throws: an enumeration failure yields the last known list, or an empty one,
+  // so listStackConnections() still reports the stacks this registry already
+  // holds connections for.
+  private async enumerateStackKeys(fresh = false): Promise<string[]> {
+    if (!this.config.listStackKeys) return [];
+    const cached = this.stackKeysCache;
+    if (!fresh && cached && Date.now() - cached.at < STACK_KEYS_CACHE_MS) return cached.keys;
+    try {
+      const keys = (await this.config.listStackKeys()).filter((key) => key.length > 0);
+      this.stackKeysCache = { keys, at: Date.now() };
+      return keys;
+    } catch {
+      // Parameter store unreachable: reuse the previous answer (stale beats
+      // blank) and retry on the next call rather than caching the failure.
+      return cached?.keys ?? [];
+    }
+  }
+
+  // Every stack this registry can observe, paired with the Valkey its loop uses
+  // (issue #1074).
+  //
+  // GET /scaler/status used to read the process-global connection only, so a pool
+  // living on a per-stack Valkey was ABSENT from the response rather than shown
+  // as empty, and a depth could be read from a different physical store than the
+  // loop evaluated. This is the accessor that lets the status route fan out over
+  // the same connections the loops actually use.
+  //
+  // The stack set is the union of:
+  //   - `listStackKeys()` (provisioned stacks, including ones with no loop in
+  //     this process yet — exactly the invisible case),
+  //   - the live loop keys, and
+  //   - the stack keys that already have a cached connection.
+  // so nothing already known is dropped if the enumeration hook is absent or
+  // fails.
+  //
+  // Resolution goes through resolveStackRedis(), NOT a re-implementation, so the
+  // observer is handed the identical connection object the loop uses. That can
+  // open a per-stack connection for a stack with no loop yet; it stays bounded by
+  // the number of provisioned stacks (the cache is keyed by stackKey), the clients
+  // are lazyConnect, and stopAll()/teardown() dispose the ones this registry owns.
+  // Resolved sequentially rather than in parallel so two concurrent observations
+  // cannot race the per-stack connection cache into opening duplicate sockets.
+  //
+  // `fresh` bypasses the enumeration cache. The unauthenticated status read
+  // keeps the cache; a caller reacting to a provision or deprovision (the
+  // per-stack callback-poller sync in main.ts) must see the stack that was just
+  // added or removed, not a list cached by a status poll seconds earlier.
+  async listStackConnections(
+    options: { fresh?: boolean } = {}
+  ): Promise<ScalerStackConnection[]> {
+    const stackKeys = new Set<string>();
+    for (const key of await this.enumerateStackKeys(options.fresh === true)) {
+      stackKeys.add(key);
+    }
+    for (const key of this.loops.keys()) stackKeys.add(key);
+    for (const key of this.redisConnections.keys()) stackKeys.add(key);
+
+    const connections: ScalerStackConnection[] = [];
+    for (const stackKey of stackKeys) {
+      try {
+        const { redis, redisUrl } = await this.resolveStackRedis(stackKey);
+        connections.push({
+          stackKey,
+          connectionId: valkeyConnectionId(redisUrl),
+          redis
+        });
+      } catch {
+        // No error text is carried out of here. The consumer of this list is the
+        // unauthenticated status endpoint, and a connection-open failure quotes
+        // the connection string it failed on. The SHAPE of the fault is reported;
+        // the detail stays in the server log.
+        connections.push({
+          stackKey,
+          unobservedReason: "this stack's Valkey connection could not be resolved"
+        });
+      }
+    }
+    return connections;
+  }
+
   // `workspaceId` here is the loop key: the EFFECTIVE stack identity the request
   // resolved to (issue #615), decoded from the encoreJobId contextId. The loop
   // cache and every per-stack coordinate (Encore pool, Valkey queue keys, MinIO
@@ -202,6 +393,12 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     // Valkey belonging to this stack, not the first-provisioned one.
     const { redis, redisUrl } = await this.resolveStackRedis(workspaceId);
 
+    // Point the instances this loop spawns at THIS stack's profile index (issue
+    // #1164), so a profile created on this stack is loadable by it regardless of
+    // the stack's position in the listing. Falls back to the process-global URL
+    // when there is no per-stack form.
+    const profilesUrl = this.resolveLoopProfilesUrl(workspaceId);
+
     const scalerConfig: EncoreScalerConfig = {
       workspaceId,
       maxInstances: this.config.maxInstances,
@@ -209,18 +406,35 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       maxQueuedJobs: this.config.maxQueuedJobs,
       idleTimeoutMs: this.config.idleTimeoutMs,
       callbackTrustTimeoutMs: this.config.callbackTrustTimeoutMs,
+      callbackProbeRequestTimeoutMs: this.config.callbackProbeRequestTimeoutMs,
       reconcileGraceMs: this.config.reconcileGraceMs,
+      // #778: enable the orphan sweep for every live loop. Instances that never
+      // made it into (or were lost from) the pool hash are invisible to every
+      // other teardown path, so without this they bill until an operator spots
+      // them by hand.
+      orphanReapIntervalMs:
+        this.config.orphanReapIntervalMs ?? DEFAULT_ORPHAN_REAP_INTERVAL_MS,
+      orphanGraceMs: this.config.orphanGraceMs,
+      // #1071: node provisioning can take minutes; a spawn must be allowed to
+      // wait for it rather than timing out and tearing the half-born instance
+      // down.
+      spawnReadyTimeoutMs: this.config.spawnReadyTimeoutMs,
       oscContext: this.config.oscContext,
       redis,
       redisUrl,
       getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
       s3Config,
-      profilesUrl: this.config.profilesUrl,
+      profilesUrl,
       onDispatched: this.config.onDispatched,
       onEncodeDispatched: this.config.onEncodeDispatched,
       reconcileFailedTranscodes: this.config.reconcileFailedTranscodes,
       onJobsDropped: this.config.onJobsDropped,
-      onJobInterrupted: this.config.onJobInterrupted
+      onJobInterrupted: this.config.onJobInterrupted,
+      // #998: the loop's own failures go to the operational log store as well as
+      // stdout. Passed to EVERY loop (there is one per stack), and each entry
+      // names its workspace, so a multi-stack deployment stays separable in one
+      // tail.
+      logSink: this.config.logSink
     };
 
     const loop = new EncoreScalerLoop(scalerConfig);
@@ -277,64 +491,138 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
   // instances kept running. In that case, reconcilePoolFromOsc() re-discovers
   // those instances from OSC and re-populates the pool so the loop can dispatch
   // to them instead of spawning fresh duplicates.
-  async resumeExistingWorkspaces(): Promise<void> {
-    // The restart discovery scan runs against the injected process-global
-    // connection (`this.config.redis` — the first-provisioned stack's Valkey).
-    // Once a workspaceId is discovered, resolveStackRedis() below re-binds it to
-    // its OWN per-stack Valkey for reconcile + the live loop (issue #615), so job
-    // routing is per-stack. A stack whose pool/queue keys live ONLY on a
-    // different physical Valkey is not discovered by this scan on restart, but is
-    // resumed lazily the moment a request/submit for it arrives (getOrCreate ->
-    // resolveStackRedis). Documented in
-    // docs/osc-feedback/incoming-issue615-per-stack-valkey-connection.md.
-    const [poolKeys, queueKeys] = await Promise.all([
-      this.config.redis.keys('encore:pool:*'),
-      this.config.redis.keys('encore:queue:*')
-    ]);
+  //
+  // ISOLATION (review follow-up on #804): each workspace is resumed inside its
+  // own try/catch. Since #804 `resolveS3Config` FAILS LOUD — it throws when no
+  // object-store endpoint is resolvable and no static fallback is configured
+  // (services/encore-s3-config.ts) — and `resolveStackRedis` / OSC calls can
+  // throw too. Without a per-iteration guard, one unresolvable stack early in
+  // the loop would abandon the resume for every remaining workspace, so a
+  // single broken stack could starve every healthy one of its scaler loop on
+  // restart. Log and continue instead: a stack that cannot be resumed here is
+  // still resumed lazily on its next request (getOrCreate).
+  //
+  // `log` mirrors teardownAll's injected-callback shape
+  // (workspace-registry.ts: `teardownAll(log?: (msg: string, err?: unknown) =>
+  // void)`) so the registry keeps no logger dependency of its own.
+  async resumeExistingWorkspaces(
+    log?: (msg: string, err?: unknown) => void
+  ): Promise<void> {
+    // The restart discovery scan covers EVERY stack's Valkey, not only the
+    // injected process-global connection (the first-provisioned stack's). Each
+    // stack's pool/queue keys live on its own Valkey (issue #615), so a scan of
+    // the first stack's store alone never found another stack's running pool:
+    // that stack came back with no loop — no reconcile, no idle scale-down, no
+    // dispatch of its queued jobs — until a request for it happened to arrive.
+    // Once a workspaceId is discovered, resolveStackRedis() below binds it to
+    // its own per-stack Valkey for reconcile + the live loop.
     const workspaceIdsWithPool = new Set<string>();
     const workspaceIds = new Set<string>();
-    for (const key of poolKeys) {
-      const id = key.slice('encore:pool:'.length);
-      if (id) { workspaceIds.add(id); workspaceIdsWithPool.add(id); }
-    }
-    for (const key of queueKeys) {
-      const id = key.slice('encore:queue:'.length);
-      if (id) workspaceIds.add(id);
+    for (const { redis, connectionId } of await this.distinctStackRedis(log)) {
+      let poolKeys: string[];
+      let queueKeys: string[];
+      try {
+        [poolKeys, queueKeys] = await Promise.all([
+          redis.keys('encore:pool:*'),
+          redis.keys('encore:queue:*')
+        ]);
+      } catch (err) {
+        log?.(
+          `encore-scaler: failed to scan Valkey ${connectionId} for pools/queues to ` +
+            'resume; continuing with the remaining connections',
+          err
+        );
+        continue;
+      }
+      for (const key of poolKeys) {
+        const id = key.slice('encore:pool:'.length);
+        if (id) { workspaceIds.add(id); workspaceIdsWithPool.add(id); }
+      }
+      for (const key of queueKeys) {
+        const id = key.slice('encore:queue:'.length);
+        if (id) workspaceIds.add(id);
+      }
     }
 
     for (const workspaceId of workspaceIds) {
-      // Reconcile from OSC when the pool is absent or empty — this re-discovers
-      // any instances that survived a Valkey wipe or unclean shutdown so the
-      // loop can dispatch to them rather than spawning duplicates.
-      if (!workspaceIdsWithPool.has(workspaceId)) {
-        let s3Config = this.config.s3Config;
-        if (this.config.resolveS3Config) {
-          s3Config = (await this.config.resolveS3Config(workspaceId)) ?? s3Config;
+      // Per-workspace guard: one unresumable stack must not starve the rest.
+      try {
+        // Reconcile from OSC when the pool is absent or empty — this re-discovers
+        // any instances that survived a Valkey wipe or unclean shutdown so the
+        // loop can dispatch to them rather than spawning duplicates.
+        if (!workspaceIdsWithPool.has(workspaceId)) {
+          let s3Config = this.config.s3Config;
+          if (this.config.resolveS3Config) {
+            // Throws (not undefined) when no endpoint is resolvable and no static
+            // fallback is set — see the fail-loud note on this method.
+            s3Config = (await this.config.resolveS3Config(workspaceId)) ?? s3Config;
+          }
+          // Re-populate the pool on the stack's OWN Valkey (issue #615): resolve the
+          // per-stack connection so the re-discovered instances are written to the
+          // physical Valkey this workspace's loop will read from, not the
+          // first-provisioned one.
+          const { redis, redisUrl } = await this.resolveStackRedis(workspaceId);
+          const scalerConfig = {
+            workspaceId,
+            maxInstances: this.config.maxInstances,
+            minInstances: this.config.minInstances,
+            idleTimeoutMs: this.config.idleTimeoutMs,
+            oscContext: this.config.oscContext,
+            redis,
+            redisUrl,
+            getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
+            s3Config,
+            // This stack's own profile index (issue #1164), same resolution as
+            // getOrCreate, so a re-discovered pool and a freshly created one
+            // never disagree about which stack's profiles its instances load.
+            profilesUrl: this.resolveLoopProfilesUrl(workspaceId),
+            onDispatched: this.config.onDispatched
+          };
+          await reconcilePoolFromOsc(scalerConfig).catch(() => {
+            // OSC unavailable at startup — skip; the loop will spawn fresh instances.
+          });
         }
-        // Re-populate the pool on the stack's OWN Valkey (issue #615): resolve the
-        // per-stack connection so the re-discovered instances are written to the
-        // physical Valkey this workspace's loop will read from, not the
-        // first-provisioned one.
-        const { redis, redisUrl } = await this.resolveStackRedis(workspaceId);
-        const scalerConfig = {
-          workspaceId,
-          maxInstances: this.config.maxInstances,
-          minInstances: this.config.minInstances,
-          idleTimeoutMs: this.config.idleTimeoutMs,
-          oscContext: this.config.oscContext,
-          redis,
-          redisUrl,
-          getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
-          s3Config,
-          profilesUrl: this.config.profilesUrl,
-          onDispatched: this.config.onDispatched
-        };
-        await reconcilePoolFromOsc(scalerConfig).catch(() => {
-          // OSC unavailable at startup — skip; the loop will spawn fresh instances.
+        await this.getOrCreate(workspaceId);
+      } catch (err) {
+        log?.(
+          `encore-scaler: failed to resume workspace ${workspaceId}; skipping it and ` +
+            'continuing with the remaining workspaces (it will be resumed lazily on its ' +
+            'next request)',
+          err
+        );
+      }
+    }
+  }
+
+  // Every physically distinct Valkey this registry can reach: the injected
+  // process-global connection plus one per provisioned stack with its own
+  // store, deduplicated by connectionId so a stack sharing the global Valkey is
+  // not scanned twice. Resolution failures are logged and skipped, never thrown.
+  private async distinctStackRedis(
+    log?: (msg: string, err?: unknown) => void
+  ): Promise<Array<{ redis: Redis; redisUrl: string; connectionId: string }>> {
+    const byConnection = new Map<string, { redis: Redis; redisUrl: string }>();
+    byConnection.set(valkeyConnectionId(this.config.redisUrl), {
+      redis: this.config.redis,
+      redisUrl: this.config.redisUrl
+    });
+    let connections: ScalerStackConnection[] = [];
+    try {
+      connections = await this.listStackConnections({ fresh: true });
+    } catch (err) {
+      log?.('encore-scaler: failed to enumerate stack Valkey connections to resume', err);
+    }
+    for (const connection of connections) {
+      if (!connection.redis || !connection.connectionId) continue;
+      if (!byConnection.has(connection.connectionId)) {
+        byConnection.set(connection.connectionId, {
+          redis: connection.redis,
+          redisUrl:
+            this.redisConnections.get(connection.stackKey)?.redisUrl ?? this.config.redisUrl
         });
       }
-      await this.getOrCreate(workspaceId);
     }
+    return [...byConnection].map(([connectionId, entry]) => ({ ...entry, connectionId }));
   }
 
   // Tear down a single workspace's scaler: stop its background loop and destroy
@@ -362,43 +650,91 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       this.loops.delete(workspaceId);
     }
 
-    // 2. Destroy every pooled instance. Reads directly from THIS stack's Valkey
-    //    (issue #615) so teardown works even for a pool that outlived its
-    //    in-memory loop (e.g. resumed by resumeExistingWorkspaces() but never
-    //    re-registered). A missing/empty pool yields an empty list — a clean
-    //    no-op. If Redis itself is unavailable the read rejects; swallow it so
-    //    teardown stays a no-op (there is nothing we can safely destroy without
-    //    the pool state), but still close the per-stack connection in step 3.
+    // 2. Destroy every pooled instance. Reads THIS stack's Valkey (issue #615)
+    //    so teardown works even for a pool that outlived its in-memory loop
+    //    (e.g. resumed by resumeExistingWorkspaces() but never re-registered),
+    //    AND the injected first-stack Valkey when that is a different store: a
+    //    stack resolved while its config had no Valkey URL yet used to be
+    //    bound to the first stack's Valkey, so its pool could live there, and
+    //    a stale copy of it would otherwise outlive the stack. On each store,
+    //    every pooled instance is destroyed and the stack's scaler keys are
+    //    purged. A missing/empty pool is a clean no-op. If a Valkey is
+    //    unavailable its read rejects; swallow it so teardown still handles
+    //    the other store and closes the per-stack connection in step 3.
     const { redis, redisUrl } = await this.resolveStackRedis(workspaceId);
-    let instances: Awaited<ReturnType<typeof listInstances>> = [];
-    try {
-      instances = await listInstances(redis, workspaceId);
-    } catch {
-      instances = [];
+    const stores: Array<{ redis: Redis; redisUrl: string }> = [{ redis, redisUrl }];
+    // Every other Valkey this registry knows: the stale copy can be on
+    // whichever stack's Valkey was the activation one when the fallback bound
+    // this stack to it, and that is not necessarily the current first stack.
+    const seen = new Set<Redis>([redis]);
+    for (const other of await this.distinctStackRedis()) {
+      if (seen.has(other.redis)) continue;
+      seen.add(other.redis);
+      stores.push({ redis: other.redis, redisUrl: other.redisUrl });
     }
+    for (const store of stores) {
+      let instances: Awaited<ReturnType<typeof listInstances>> = [];
+      try {
+        instances = await listInstances(store.redis, workspaceId);
+      } catch {
+        instances = [];
+      }
 
-    if (instances.length > 0) {
-      // destroyInstance() only reads oscContext, redis and workspaceId from the
-      // config (instance-pool.ts:171-198). Build a minimal correctly-typed config
-      // for this workspace; getToken is required by the type but unused on the
-      // teardown path.
-      const scalerConfig: EncoreScalerConfig = {
-        workspaceId,
-        maxInstances: this.config.maxInstances,
-        minInstances: this.config.minInstances,
-        idleTimeoutMs: this.config.idleTimeoutMs,
-        reconcileGraceMs: this.config.reconcileGraceMs,
-        oscContext: this.config.oscContext,
-        redis,
-        redisUrl,
-        getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
-        s3Config: this.config.s3Config,
-        profilesUrl: this.config.profilesUrl,
-        onDispatched: this.config.onDispatched
-      };
+      if (instances.length > 0) {
+        // destroyInstance() only reads oscContext, redis and workspaceId from
+        // the config (instance-pool.ts). Build a minimal correctly-typed config
+        // for this workspace on THIS store; getToken is required by the type
+        // but unused on the teardown path.
+        const scalerConfig: EncoreScalerConfig = {
+          workspaceId,
+          maxInstances: this.config.maxInstances,
+          minInstances: this.config.minInstances,
+          idleTimeoutMs: this.config.idleTimeoutMs,
+          reconcileGraceMs: this.config.reconcileGraceMs,
+          oscContext: this.config.oscContext,
+          redis: store.redis,
+          redisUrl: store.redisUrl,
+          getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
+          s3Config: this.config.s3Config,
+          profilesUrl: this.config.profilesUrl,
+          onDispatched: this.config.onDispatched
+        };
 
-      for (const inst of instances) {
-        await destroyInstance(inst.instanceId, scalerConfig);
+        for (const inst of instances) {
+          // #1213: one instance whose OSC removal genuinely failed must not
+          // abort the teardown of the others. destroyInstance tolerates an
+          // already-gone instance and an already-removed Valkey on its own, so
+          // anything that still escapes is a real per-instance failure: log it
+          // and carry on, so every other Encore instance and its paired
+          // callback listener is still released by this teardown.
+          try {
+            await destroyInstance(inst.instanceId, scalerConfig);
+          } catch (err) {
+            console.warn(
+              '[encore-scaler] teardown: failed to destroy instance %s (workspace=%s): %s',
+              inst.instanceId,
+              workspaceId,
+              err instanceof Error ? err.message : String(err)
+            );
+          }
+        }
+      }
+
+      // Purge the stack's remaining scaler keys on this store so a deprovisioned
+      // stack neither shows up in GET /scaler/status nor is resumed at the next
+      // boot. Best-effort: the stack's own Valkey is being deprovisioned anyway.
+      try {
+        await store.redis.del(
+          keys.pool(workspaceId),
+          keys.queue(workspaceId),
+          keys.inflight(workspaceId),
+          keys.jobInstance(workspaceId),
+          keys.jobStatus(workspaceId),
+          keys.orphanSeen(workspaceId),
+          keys.spawnFailure(workspaceId)
+        );
+      } catch {
+        // Unreachable store: nothing more to clean here.
       }
     }
 

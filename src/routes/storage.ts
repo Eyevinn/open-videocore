@@ -253,10 +253,11 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
   const currentWatchFolder = (): WatchFolderService | undefined =>
     opts.getWatchFolder?.() ?? opts.watchFolder;
 
-  // The deployment's workspace (tenant) id under which backend records are
-  // namespaced. Matches deriveWorkspaceId / STACK_CONFIG_NAMESPACE
-  // (provision.ts:329-331, workspace-stack.ts:343) so registration and the
-  // per-stack storage slots agree on the tenant boundary (ADR-017 D2 + C5).
+  // The namespace segment under which backend records are keyed: the
+  // deployment-wide constant STACK_CONFIG_NAMESPACE (workspace-stack.ts), the
+  // same one the provision route writes under and the resolver reads under
+  // (issue #804), so registration and the per-stack storage slots agree
+  // (ADR-017 D2 + C5).
   const workspaceId = STACK_CONFIG_NAMESPACE;
 
   app.setErrorHandler((err, _request, reply) => {

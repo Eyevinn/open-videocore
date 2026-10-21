@@ -32,7 +32,9 @@
 // probe is not wired or itself errors, the message degrades to "unknown" rather
 // than failing the sweep.
 
+import type { JobRepository } from '../data/job-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
+import { failPackageJob } from './package-job.js';
 
 // Default bound: a `package` step still `running` after this long is declared
 // failed. Generous by default so a genuinely slow packaging job is never cut off
@@ -54,6 +56,11 @@ type Logger = {
 
 export type ReconcileStalledPackagesDeps = {
   pipeline: PipelineRepository;
+  // The job repository, so the sweep also settles the step's `package` Job
+  // (issue #976) with the SAME diagnostic it writes onto the step. Without it a
+  // run this sweep failed left a `running` job behind with nothing explaining
+  // why. Optional: when absent the sweep behaves exactly as before.
+  jobs?: JobRepository;
   // Best-effort probe: does a packager instance currently exist to consume the
   // queued packaging job? Used ONLY to shape the diagnostic message so it names
   // the likely cause. Optional and never trusted for control flow: when absent
@@ -121,6 +128,17 @@ export async function reconcileStalledPackages(
         completedAt: new Date().toISOString()
       };
       await deps.pipeline.update(execution.id, { steps, status: 'failed' });
+      // Settle the step's `package` Job with the same reason (issue #976), so a
+      // run this sweep failed is explained in GET /api/v1/jobs and not only on
+      // the execution record. Resolved by the step's own jobId when present
+      // (stamped at enqueue), falling back to the asset's in-flight package job
+      // for runs started before the job record existed. Best-effort: never
+      // throws, so the sweep's per-execution guarantees are unchanged.
+      await failPackageJob(
+        { jobs: deps.jobs, logger: deps.logger },
+        { jobId: step.jobId, assetId: execution.assetId },
+        message
+      );
       failed += 1;
       deps.logger?.info?.(
         '[stalled-package-reconciler] failed stalled package step for execution %s (asset %s): %s',

@@ -13,6 +13,8 @@
 
 // ADR-003/#59: workspace guard removed (structural OSC isolation).
 import { ulid } from 'ulid';
+import { withinCreatedRange } from './created-range.js';
+import { currentDocumentStackName } from '../services/request-stack-context.js';
 
 // ---------------------------------------------------------------------------
 // Asset model + lifecycle
@@ -74,6 +76,16 @@ export type AssetReviewState = (typeof ASSET_REVIEW_STATES)[number];
 //                                          editorial need — while still barring
 //                                          direct approved -> rejected without a
 //                                          re-review step.
+//
+// RE-REVIEW PATHS, EXPLICITLY (issue #897): BOTH `approved` and `rejected`
+// return to `in-review`, and to NOTHING ELSE. Neither returns to `draft`:
+// `draft` is an ENTRY state only — once an asset has been submitted it can
+// never go back to `draft`, and no edge anywhere in the table targets `draft`.
+// There is also no direct `approved -> rejected` or `rejected -> approved`; a
+// verdict can only be changed by passing through `in-review` again. This table
+// is the single source of truth for the graph — `isValidReviewTransition()`
+// (the 422 gate) and `allowedReviewTransitions()` (what the API advertises)
+// both read it, so the enforced and the advertised graph cannot drift apart.
 const ALLOWED_REVIEW_TRANSITIONS: Record<AssetReviewState, readonly AssetReviewState[]> = {
   draft: ['in-review'],
   'in-review': ['approved', 'rejected'],
@@ -88,10 +100,35 @@ export function isValidReviewTransition(from: AssetReviewState, to: AssetReviewS
   return ALLOWED_REVIEW_TRANSITIONS[from].includes(to);
 }
 
+// The legal next review states from `from` (issue #897), read from the same
+// ALLOWED_REVIEW_TRANSITIONS table `isValidReviewTransition()` validates
+// against. Exposed so a client can offer only the moves the machine permits
+// instead of offering all four states and discovering the illegal ones as 422s
+// — and so that gating is never a client-side copy of this graph.
+//
+// `from` defaults to `draft` for assets that have no reviewState yet, matching
+// applyReviewState(). Returns a fresh array (the table itself is readonly and
+// must not escape) and deliberately EXCLUDES `from` itself: re-sending the
+// current state is accepted as an idempotent no-op (see above), but it is not a
+// move, so advertising it as a transition would put a button on the screen that
+// changes nothing.
+export function allowedReviewTransitions(from: AssetReviewState | undefined): AssetReviewState[] {
+  return [...ALLOWED_REVIEW_TRANSITIONS[from ?? 'draft']];
+}
+
 export type StatusTransition = {
   at: string; // ISO timestamp
   from: AssetStatus | null; // null for the initial creation entry
   to: AssetStatus;
+  // Why this transition happened, when the writer is a BACKGROUND settle rather
+  // than a user action (issue #1085). Two different failures both land an asset
+  // on `uploading -> failed` — a client upload abandoned past the 24h threshold
+  // (abandoned-upload-sweep.ts) and a URL pull whose worker process died
+  // (interrupted-ingest-reconciler.ts) — and the from/to pair alone cannot tell
+  // them apart, so an operator reading the history cannot tell whether to chase
+  // the client or the server. Optional and additive: user-driven transitions and
+  // every entry written before #1085 simply omit it.
+  reason?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -299,6 +336,22 @@ export type AudioTrack = {
   sampleRateHz: number;
 };
 
+// One video track within a container, as reported by ffprobe. The flat mirror
+// of the persisted `technical.video[]` entries (VideoTrackSchema,
+// asset-document.ts) — field names and optionality match that schema exactly:
+// `index`, `bitrateBps` and `frameRate` are optional because a probe may not
+// report them. Distinct from `TechnicalMetadata` below, which flattens only the
+// FIRST video track's four always-probed attributes alongside container-level
+// data; this array is the per-track view (issue #978).
+export type VideoTrack = {
+  index?: number;
+  codec: string;
+  width: number;
+  height: number;
+  bitrateBps?: number;
+  frameRate?: number;
+};
+
 // Technical metadata extracted from the stored object by an ephemeral ffprobe
 // job (issue #6). Populated asynchronously after ingest; null until the first
 // successful extraction (or after a failed extraction — see
@@ -312,6 +365,14 @@ export type TechnicalMetadata = {
   containerFormat: string;
   audioTracks: AudioTrack[];
   extractedAt: string; // ISO timestamp of when extraction completed
+  // Frames per second of the primary video stream (issue #1066), needed by
+  // frame-by-frame stepping. OPTIONAL: absent for a source with no video stream
+  // and for documents written before the probe reported it, so a legacy document
+  // still reads back.
+  frameRate?: number;
+  // The source's start timecode as reported by the probe, e.g. "01:00:00:00"
+  // (issue #1066). OPTIONAL: most sources carry none.
+  startTimecode?: string;
 };
 
 // One scene/shot boundary produced by the scene-detection pipeline (issue #115,
@@ -495,8 +556,27 @@ export type Asset = {
   //     documents without them remain valid (backward compatible).
   versionOfAssetId?: string;
   versionGroupId?: string;
-  // MinIO object key (workspace-local) for the asset payload, if any.
+  // Object key (workspace-local) for the asset payload, if any.
   objectKey?: string;
+  // Byte length of the object at `objectKey` AS RECORDED WHEN INGEST COMPLETED
+  // (issue #1059) — the pull worker's `bytesTransferred` on a URL pull, the
+  // upload route's `bytesTransferred` on a direct upload. Persisted in the
+  // document's existing `administrative.storage.sizeBytes` slot
+  // (asset-document.ts), which until now was always written as 0 and never read
+  // back.
+  //
+  // It exists so the pre-dispatch source readiness check can compare the size
+  // the object store reports NOW against the size we know we stored, and refuse
+  // a transcode whose source has been truncated or replaced — not just one whose
+  // source is missing (checkTranscodeSourceReadable, pipeline/source-readiness.ts).
+  //
+  // INVARIANT: the recorded size belongs to the recorded key. Any patch that
+  // changes `objectKey` without supplying a new size CLEARS this field (see
+  // update()/applyPatch()), so a relocated or replaced object can never be
+  // compared against a stale length. Optional: absent on assets ingested before
+  // #1059 and on paths that do not learn the size (e.g. a presigned-PUT
+  // completion), where the size comparison is simply skipped.
+  sourceSizeBytes?: number;
   // Append-only audit trail of every status change (issue #3 deliverable 5).
   statusHistory: StatusTransition[];
   // Technical metadata from the ffprobe extraction pipeline (issue #6).
@@ -505,6 +585,14 @@ export type Asset = {
   // Extraction never blocks the asset record, so both fields are optional.
   technicalMetadata?: TechnicalMetadata | null;
   technicalMetadataError?: string;
+  // Per-track video streams as probed, mirroring the persisted
+  // `technical.video[]` array (issue #978). Where `technicalMetadata` flattens
+  // the FIRST video track's four always-probed attributes, this carries every
+  // track with the optional `index` / `frameRate` the stored schema allows.
+  // Undefined until the first successful extraction; populated on read from the
+  // document (asset-document.ts `fromAssetDocument`), so it is a projection of
+  // persisted state rather than an independently writable field.
+  videoTracks?: VideoTrack[];
   // Streaming manifest URLs from the packaging pipeline (issue #9). Undefined
   // until packaging completes successfully; `packagingError` is set instead
   // when the last packaging attempt failed. Packaging never changes the
@@ -579,6 +667,23 @@ export type Asset = {
   //     (validated string, e.g. `[0:0_10:0)`), per ADR-008.
   tamsFlowIds?: string[];
   tamsTimerange?: string;
+  // The provisioned stack this asset was created against (issue #1097),
+  // captured from the ambient request stack context at create time
+  // (`currentDocumentStackName()`, src/services/request-stack-context.ts) and
+  // persisted in the ADR-005 `administrative` namespace (system-owned
+  // provenance, NOT editorial — see asset-document.ts).
+  //
+  // It matters most for an asset created OUTSIDE a job (direct upload,
+  // watch-folder): there is no Job record to carry the identity, so without
+  // this the fire-and-forget work that follows the upload (metadata
+  // extraction, thumbnails) has nothing durable to re-enter when the ambient
+  // context is gone — e.g. after a process restart.
+  //
+  // Optional and immutable: absent on every asset created before #1097 and on
+  // assets created outside a request, where an absent value keeps TODAY's
+  // behaviour (the first-listed stack). Not exposed on UpdateAssetInput — an
+  // asset's stack never changes.
+  stackName?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -606,6 +711,10 @@ export type CreateAssetInput = {
   // How the asset is entering the system (ADR-005). Defaults to 'upload'.
   sourceMethod?: AssetSourceMethod;
   originUri?: string;
+  // Explicit stack identity override (issue #1097). Normally omitted — the
+  // repository stamps `currentDocumentStackName()` — and supplied only by a
+  // caller that knows the stack while not running inside its context (tests).
+  stackName?: string;
 };
 
 // Mutable fields accepted by PATCH. `status` is validated against the state
@@ -614,7 +723,21 @@ export type UpdateAssetInput = {
   name?: string;
   description?: string;
   objectKey?: string;
+  // Byte length recorded at ingest completion (issue #1059). Written by the
+  // ingest paths that actually know the transferred length — the URL-pull worker
+  // and the streaming upload route — normally in the SAME patch that sets
+  // `objectKey`. Patching `objectKey` without it clears any previously recorded
+  // size, so the stored length always describes the stored key.
+  sourceSizeBytes?: number;
   status?: AssetStatus;
+  // Why this status change happened (issue #1085), recorded on the appended
+  // `statusHistory` entry. Written by BACKGROUND settles that need to be told
+  // apart in the history — the abandoned-upload sweep vs the interrupted-pull
+  // reconciler, which both write `uploading -> failed`. Ignored unless `status`
+  // is also present (there is no entry to annotate otherwise), and ignored on a
+  // same-status no-op move, which appends no entry. NOT exposed on the PATCH
+  // route: it names a system settle, not a user action.
+  statusReason?: string;
   // Version-chain linkage backfill (issue #118). Set only when a clip/export/
   // rewrap run with `asVersion` seeds a lineage on a source asset that had no
   // group yet, so the source joins its own chain. Not exposed on the PATCH
@@ -698,6 +821,12 @@ export type ListOptions = {
   // `versionGroupId` equals this value — used by the versions listing surface to
   // enumerate every version in a chain. Independent of `parentId`.
   versionGroupId?: string;
+  // Inclusive created-at range (issue #833), carried already normalised to
+  // canonical UTC instants by the route (src/data/created-range.ts). The filter
+  // is applied to the WHOLE result set before `limit`/`offset` are taken, so a
+  // range narrows every page and `total`, not just the page returned.
+  createdFrom?: string;
+  createdTo?: string;
 };
 
 export type ListResult = {
@@ -882,9 +1011,45 @@ export interface AssetRepository {
     id: string,
     input: AttachExternalIdInput
   ): Promise<Asset | undefined>;
+  // Detach an upstream external identifier from an asset (issue #867, ADR-019).
+  // The inverse of attachExternalId and the same kind of DEDICATED system write
+  // seam for `administrative.externalIdentifiers` — distinct from `update()`,
+  // whose UpdateAssetInput deliberately carries no `externalIdentifiers` field
+  // (asset-repo.ts:613-674), so the editorial patch path cannot reach this set.
+  // Without this seam a mistyped identifier attached via POST /:id/external-ids
+  // is permanent.
+  //
+  // IDEMPOTENT: removes every `{ namespace, id }` entry equal to `ref` and
+  // returns the updated asset. Detaching a pair the asset does NOT carry is a
+  // no-op that still returns the asset — the caller maps that to the same
+  // success status as a real removal, so retries are safe. Returns undefined
+  // ONLY when the asset id is unknown (mapped to 404 by the route).
+  //
+  // `(namespace, id)` uniqueness across the array is out of scope here (deferred
+  // to #577's enforcement work): the filter removes ALL equal entries, so an
+  // asset that accumulated a duplicate pair in advisory mode is left clean.
+  detachExternalId(id: string, ref: ExternalIdentifier): Promise<Asset | undefined>;
   list(opts?: ListOptions): Promise<ListResult>;
   search(query: string): Promise<Asset[]>;
   update(id: string, patch: UpdateAssetInput): Promise<Asset | undefined>;
+  // Upload-liveness heartbeat (issue #731, unblocks #726). Refreshes the
+  // `updatedAt` clock on an asset that is STILL `uploading`, so a legitimately
+  // slow-but-progressing upload (a multi-hour proxied stream, or a long series
+  // of multipart part transfers) is distinguishable from an abandoned one. This
+  // is the capability #726's stuck-upload sweep keys off to honour its "an
+  // upload still in progress is never settled, however long it takes" criterion:
+  // without it, `createdAt`/`updatedAt`/the `null -> uploading` transition are
+  // all frozen at creation and a live slow upload is indistinguishable from a
+  // dead one.
+  //
+  // DEDICATED write seam (mirrors setStorageTier/setRehydrateState): it bypasses
+  // update() so no editorial provenance is appended, and it NEVER touches
+  // lifecycle `status`/`statusHistory` — it only moves the `updatedAt` clock.
+  // Idempotent and side-effect-light: a NO-OP (returns the asset unchanged, no
+  // write) when the asset is not `uploading`, so it can never resurrect the
+  // liveness/purge clock of an already-settled record. Returns the asset
+  // (refreshed or unchanged), or undefined when the id is unknown.
+  touchUploadProgress(id: string): Promise<Asset | undefined>;
   // Transition the asset's editorial review state (issue #134). Validates the
   // move against the review state machine (throws InvalidReviewTransitionError
   // on an illegal move) and persists the new state. Returns the updated asset,
@@ -1080,21 +1245,31 @@ export function provenanceForPatch(patch: UpdateAssetInput, now: string): Proven
 // Apply a status change, validating the transition and appending to history.
 // Mutates and returns the passed-in arrays/values via a new object the caller
 // can persist. Throws InvalidStateTransitionError on an illegal move.
+// `reason` (issue #1085) is recorded on the appended entry when supplied and
+// omitted entirely when not, so a transition written without one is byte-
+// identical to pre-#1085 history.
 export function applyStatus(
   current: AssetStatus,
   next: AssetStatus,
   history: StatusTransition[],
-  now: string
+  now: string,
+  reason?: string
 ): { status: AssetStatus; statusHistory: StatusTransition[] } {
   if (!isValidTransition(current, next)) {
     throw new InvalidStateTransitionError(current, next);
   }
   if (current === next) {
+    // An idempotent no-op move appends nothing, so there is no entry to carry a
+    // reason either.
     return { status: current, statusHistory: history };
+  }
+  const entry: StatusTransition = { at: now, from: current, to: next };
+  if (reason !== undefined && reason !== '') {
+    entry.reason = reason;
   }
   return {
     status: next,
-    statusHistory: [...history, { at: now, from: current, to: next }]
+    statusHistory: [...history, entry]
   };
 }
 
@@ -1149,6 +1324,79 @@ export function resolveVersionLinkage(source: Asset): {
     versionGroupId,
     seedSourceGroup: source.versionGroupId === undefined
   };
+}
+
+// Canonical ordering of a version chain (issue #905, ADR-024): `createdAt`
+// ascending, ties broken by `id` ascending. This is the SAME comparator both
+// repository implementations already apply inside `listVersions`
+// (couch-asset-repo.ts and InMemoryAssetRepository) — it is lifted here so the
+// ordering is stated once and the current-version selector below cannot drift
+// from the order the endpoint actually returns. Ids are ULIDs, so the `id`
+// tiebreak is itself time-ordered and total: two chain members can never
+// compare equal.
+export function compareVersionOrder(a: Asset, b: Asset): number {
+  return a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
+}
+
+// Identify the CURRENT version of a chain (issue #905, ADR-024).
+//
+// The version chain carries no operator-set "promote to current" marker, so the
+// current version is derived server-side, deterministically, and returned as an
+// explicit `currentVersionId` field on the /versions response. Clients MUST read
+// that field rather than re-deriving it: "last element of the array" is NOT the
+// rule (archived, failed and in-flight members are all skipped while a usable
+// one exists — see the ladder below), and deriving it client-side would bake
+// today's heuristic into every consumer.
+//
+// The rule is a PREFERENCE LADDER over lifecycle `status` (ASSET_STATUSES,
+// line 29), newest-first by `compareVersionOrder` within the highest non-empty
+// tier:
+//   1. `ready` — the only status a consumer can actually dereference (bytes
+//      present, delivery/playback resolvable). This is the answer in every
+//      healthy lineage.
+//   2. in-flight (`uploading` | `processing`) — the lineage has no servable
+//      member yet. Used only as a fallback: a version asset is moved to
+//      `processing` BEFORE its encode runs (src/pipeline/clip.ts:158-167), so
+//      preferring tier 1 is what stops a half-produced output from displacing
+//      the `ready` predecessor it was cut from for the duration of the job.
+//   3. `failed` — an ingest/encode that could not complete. `failed` is
+//      explicitly NON-terminal (line 26-27): an asset can sit there
+//      indefinitely until someone retries or archives it, so it must never
+//      outrank a member that is actually usable.
+//   4. `archived` — this API's soft delete, so it ranks last: an entirely
+//      archived lineage still reports a well-defined head rather than omitting
+//      the field.
+//
+// Only tier 1 is a positive assertion of usability. When the answer comes from
+// tiers 2-4 the lineage has nothing servable at all, and the field degrades to
+// "the most recent member" so it stays non-optional and always resolvable.
+// Clients that need "can I play this right now" MUST check the named member's
+// own `status` — `currentVersionId` names the head of the lineage, it does not
+// promise `ready`.
+//
+// A single-member chain (an asset that has never been versioned) returns that
+// asset's own id, so `currentVersionId` is always present and always names a
+// member of `versions`. Returns undefined only for an empty list, which
+// `listVersions` never produces for an existing asset.
+export function currentVersionId(versions: readonly Asset[]): string | undefined {
+  if (versions.length === 0) {
+    return undefined;
+  }
+  const ordered = [...versions].sort(compareVersionOrder);
+  // Highest-priority tier first; within a tier the newest member wins.
+  const tiers: readonly ((a: Asset) => boolean)[] = [
+    (a) => a.status === 'ready',
+    (a) => a.status === 'uploading' || a.status === 'processing',
+    (a) => a.status === 'failed'
+  ];
+  for (const inTier of tiers) {
+    const members = ordered.filter(inTier);
+    if (members.length > 0) {
+      return members[members.length - 1].id;
+    }
+  }
+  // Every member is archived: fall back to the newest member overall.
+  return ordered[ordered.length - 1].id;
 }
 
 // Deduplicate a tag list while preserving first-seen order (issue #11).
@@ -1296,6 +1544,9 @@ export class InMemoryAssetRepository implements AssetRepository {
       sourceMethod: method,
       originUri: input.originUri,
       provenance: initialProvenance(now, method),
+      // Durable stack identity (issue #1097). Undefined outside a request,
+      // which preserves the previous default-stack behaviour.
+      stackName: input.stackName ?? currentDocumentStackName(),
       createdAt: now,
       updatedAt: now
     };
@@ -1415,6 +1666,33 @@ export class InMemoryAssetRepository implements AssetRepository {
     return { ...next };
   }
 
+  // Detach an external identifier (issue #867). Mirrors the CouchDB backend: the
+  // removal is a pure filter over the persisted set and is idempotent — when the
+  // asset does not carry the pair the stored record is returned untouched (no
+  // `updatedAt` bump), so a retried DELETE is a genuine no-op.
+  async detachExternalId(id: string, ref: ExternalIdentifier): Promise<Asset | undefined> {
+    const existing = this.store.get(id);
+    if (!existing || this.tombstones.has(id)) {
+      return undefined;
+    }
+    const before = existing.externalIdentifiers ?? [];
+    const remaining = before.filter((e) => !(e.namespace === ref.namespace && e.id === ref.id));
+    // Idempotent no-op: nothing matched, so the asset is unchanged.
+    if (remaining.length === before.length) {
+      return { ...existing };
+    }
+    const next: Asset = {
+      ...existing,
+      // Drop the field entirely once the set is empty, matching how #575 models
+      // "no external identifiers" (toAssetDocument attaches the block only when
+      // non-empty, asset-document.ts:504-506).
+      externalIdentifiers: remaining.length > 0 ? remaining : undefined,
+      updatedAt: new Date().toISOString()
+    };
+    this.store.set(id, next);
+    return { ...next };
+  }
+
   async list(opts: ListOptions = {}): Promise<ListResult> {
     const limit = clampLimit(opts.limit);
     const offset = Math.max(0, opts.offset ?? 0);
@@ -1427,6 +1705,11 @@ export class InMemoryAssetRepository implements AssetRepository {
     }
     if (opts.versionGroupId !== undefined) {
       all = all.filter((a) => a.versionGroupId === opts.versionGroupId);
+    }
+    // Created-at range (issue #833), applied BEFORE the slice below so it
+    // narrows the full set (and therefore `total`) rather than one page.
+    if (opts.createdFrom !== undefined || opts.createdTo !== undefined) {
+      all = all.filter((a) => withinCreatedRange(a.createdAt, opts));
     }
     all.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
     const items = all.slice(offset, offset + limit).map((a) => ({ ...a }));
@@ -1457,6 +1740,21 @@ export class InMemoryAssetRepository implements AssetRepository {
     if (patch.name !== undefined) next.name = patch.name;
     if (patch.description !== undefined) next.description = patch.description;
     if (patch.objectKey !== undefined) next.objectKey = patch.objectKey;
+    // Recorded ingest size (issue #1059). A new object key with no accompanying
+    // size invalidates whatever length we had recorded for the OLD key, so clear
+    // it rather than let the readiness check compare a fresh object against a
+    // stale length and refuse a perfectly good transcode.
+    if (patch.sourceSizeBytes !== undefined) {
+      // A non-positive size is the "nothing recorded" sentinel, not a real
+      // zero-length source — the same meaning the persisted document gives a
+      // stored `0` (fromAssetDocument, data/asset-document.ts). An ingest
+      // finalize that could not learn the length writes it to CLEAR whatever was
+      // recorded for the previous object under this (deterministic) key, so the
+      // readiness check falls back to presence only.
+      next.sourceSizeBytes = patch.sourceSizeBytes > 0 ? patch.sourceSizeBytes : undefined;
+    } else if (patch.objectKey !== undefined && patch.objectKey !== existing.objectKey) {
+      next.sourceSizeBytes = undefined;
+    }
     if (patch.technicalMetadata !== undefined) {
       next.technicalMetadata = patch.technicalMetadata;
       // A successful extraction clears any stale error.
@@ -1514,7 +1812,13 @@ export class InMemoryAssetRepository implements AssetRepository {
       next.versionGroupId = patch.versionGroupId;
     }
     if (patch.status !== undefined) {
-      const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
+      const applied = applyStatus(
+        existing.status,
+        patch.status,
+        existing.statusHistory,
+        now,
+        patch.statusReason
+      );
       next.status = applied.status;
       next.statusHistory = applied.statusHistory;
     }
@@ -1523,6 +1827,26 @@ export class InMemoryAssetRepository implements AssetRepository {
       next.provenance = [...(existing.provenance ?? []), ...entries];
     }
     this.store.set(key, next);
+    return { ...next };
+  }
+
+  // Upload-liveness heartbeat (issue #731, unblocks #726). Bumps ONLY
+  // `updatedAt` on a still-`uploading` asset; bypasses update() so no editorial
+  // provenance rides along and NEVER touches `status`/`statusHistory`. No-op
+  // (returns the asset unchanged, no write) for any non-`uploading` status, so a
+  // settled asset's clock can never be resurrected. Returns undefined when the
+  // id is unknown.
+  async touchUploadProgress(id: string): Promise<Asset | undefined> {
+    const existing = this.store.get(id);
+    if (!existing) {
+      return undefined;
+    }
+    if (existing.status !== 'uploading') {
+      return { ...existing };
+    }
+    const now = new Date().toISOString();
+    const next: Asset = { ...existing, updatedAt: now };
+    this.store.set(id, next);
     return { ...next };
   }
 

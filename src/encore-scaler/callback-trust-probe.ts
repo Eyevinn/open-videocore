@@ -28,21 +28,124 @@
 //   - EncoreInstanceRecord.callbackListenerUrl?: string — the paired listener's
 //     HTTP base URL, undefined until the listener is ready
 //     (src/encore-scaler/types.ts:88-89, set in instance-pool.ts:259).
-//   - The dispatch-time callback URI is `${callbackListenerUrl}/encoreCallback`
-//     (src/encore-scaler/scaler-loop.ts:272-273). We probe the ingress ORIGIN,
-//     not a specific route, so a 404 from the listener still proves the TLS
-//     trust path is established (the handshake completed).
+//   - The dispatch-time callback URI is
+//     `${inst.callbackListenerUrl.replace(/\/$/, '')}/encoreCallback`
+//     (src/encore-scaler/scaler-loop.ts, dispatch(): the `progressCallbackUri`
+//     assignment). The probe targets that EXACT URL — see the #814 note below
+//     for why probing the bare ingress origin was not enough.
 //   - Node global fetch + AbortSignal.timeout for the bounded wait: same
 //     fetch(...) usage the scaler already relies on in scaler-loop.ts:275 and
 //     reconcile() (scaler-loop.ts:214-220), with a bounded timeout added.
+//
+// HTTP STATUS IS PART OF THE ANSWER (issue #813)
+// ----------------------------------------------
+// A completed TLS handshake is necessary but NOT sufficient for the callback
+// path to be usable. If the listener ingress answers the probe with 401 or 403,
+// the transport is fine but the ingress is REJECTING requests — the progress/
+// completion POST Encore makes to `${callbackListenerUrl}/encoreCallback` will
+// fail the same way (the 401 observed in #811). Folding that into the trusted
+// case made the gate report readiness for a callback path that cannot work, so
+// 401/403 is now its own `callback-unusable` state: reachable, trusted at the
+// TLS layer, but not usable. Every other status (404/405 from a HEAD on `/`,
+// 5xx while the listener finishes booting) still means "trusted" — those prove
+// the handshake without proving anything about authorisation.
+//
+// PROBE THE CALLBACK PATH, NOT THE ORIGIN (issue #814)
+// ----------------------------------------------------
+// Grading 401/403 as unusable only helps if the URL we grade is the URL Encore
+// actually POSTs to. It was not: this probe used to rewrite the target to
+// `new URL(callbackListenerUrl).origin`, and on a freshly created listener the
+// origin starts answering BEFORE the callback path does. Measured live against
+// two throwaway `eyevinn-encore-callback-listener` instances created and
+// destroyed for this change (2026-09-26, tenant `oscaidev`), polling from
+// instance creation:
+//
+//   run A (diag814a)              run B (diag814b, ~1s resolution)
+//   t+25s origin 200,             t+29s GET /encoreCallback 401 (nginx HTML)
+//         /encoreCallback 401     t+30s origin 200, /encoreCallback 401
+//   t+41s origin 404 (Fastify),   t+43s origin 200, /encoreCallback 401
+//         POST /encoreCallback    t+44s origin 404 (Fastify),
+//         200                           GET /encoreCallback 404,
+//                                       POST /encoreCallback 200
+//
+// So for ~14s the origin answers 200 while `/encoreCallback` is still behind
+// the ingress auth wall. A 200 is not in CALLBACK_REJECTED_STATUSES, so the
+// origin-targeted probe returned 'trusted', `callbackTrustReady` was latched
+// (it is sticky), and the instance's first job was dispatched straight into the
+// 401 window — the failure reported in #811/#812. Targeting `/encoreCallback`
+// makes the 401/403 grading reachable in exactly that window.
+//
+// Two live facts this relies on, both verified rather than assumed:
+//   - In steady state `HEAD`/`GET /encoreCallback` returns Fastify's own 404
+//     (`{"message":"Route GET:/encoreCallback not found",...}`), NOT a 401 —
+//     checked unauthenticated on three warm instances on 2026-09-26. 404 is not
+//     a rejected status, so a healthy listener still grades as 'trusted'.
+//   - During the window the ingress verdict is method-independent: `GET`,
+//     `HEAD` and `POST` on `/encoreCallback` returned 401 together in run B and
+//     flipped together at t+44s. (#812's finding could only infer this and
+//     asked #814 to confirm it directly. Now confirmed.)
+//
+// The probe deliberately stays on HEAD. A POST would be graded identically but
+// would enqueue a synthetic progress callback into the listener's Redis queue.
+//
+// Why this is a mitigation and not a fix at the real layer: Encore cannot be
+// given a credential for this leg at all — see the #814 note in
+// docs/osc-feedback/incoming-callback-listener-ingress-auth-window-fresh-instance.md.
 
-// Result of a single probe attempt. `ok` means the TLS handshake to the ingress
-// completed (any HTTP status counts — even a 404 proves trust). `errorClass`
-// distinguishes a genuine trust/handshake failure (the #463 race) from a
-// plain timeout so the caller can surface a precise structured error.
+// Result of a single probe attempt.
+//   - state 'trusted'          — handshake completed AND the ingress did not
+//                                reject the request (`ok: true`).
+//   - state 'callback-unusable'— handshake completed but the ingress answered
+//                                401/403: the callback path is reachable and
+//                                rejecting requests, so Encore's callback POST
+//                                will fail too (issue #813).
+//   - state 'probe-failed'     — no HTTP response at all; `errorClass`
+//                                distinguishes a genuine trust/handshake
+//                                failure (the #463 race) from a plain timeout
+//                                or other connection error so the caller can
+//                                surface a precise structured error.
+//   - state 'ingress-auth-window'
+//                              — the UNAUTHENTICATED probe was rejected
+//                                401/403 but the SAME request carrying this
+//                                service's callback-listener service access
+//                                token got through the ingress (issue #1171).
+//                                That proves hostname, certificate and routing
+//                                are live and the rejection comes from the OSC
+//                                ingress's inbound auth wall still covering the
+//                                callback path, not from a standing policy or a
+//                                broken listener. Treated as retryable, which
+//                                is an INFERENCE, not a measurement: the only
+//                                thing measured is that the wall lifted after
+//                                ~14s on the two throwaway listeners in
+//                                #812/#814, while #1171 saw the unauthenticated
+//                                401 persist for ~62s on 4 of 4 instances. So
+//                                the caller re-probes for the whole bounded
+//                                wait instead of latching a verdict, and if the
+//                                wall outlasts the wait it dispatches anyway
+//                                (sweep-only completion) rather than
+//                                sidelining an instance that answered an
+//                                authenticated request.
 export type CallbackTrustProbeResult =
-  | { ok: true }
-  | { ok: false; errorClass: 'tls-trust' | 'timeout' | 'connection'; detail: string };
+  | { ok: true; state: 'trusted'; status: number }
+  | { ok: false; state: 'callback-unusable'; status: number; detail: string }
+  | {
+      ok: false;
+      state: 'ingress-auth-window';
+      status: number;
+      authenticatedStatus: number;
+      detail: string;
+    }
+  | {
+      ok: false;
+      state: 'probe-failed';
+      errorClass: 'tls-trust' | 'timeout' | 'connection';
+      detail: string;
+    };
+
+// HTTP statuses from the listener ingress that mean "callback path not usable"
+// rather than "trust confirmed" (issue #813). Kept narrow on purpose: only an
+// authentication/authorisation rejection proves the callback POST would fail.
+const CALLBACK_REJECTED_STATUSES = new Set([401, 403]);
 
 // Substrings that identify a certificate-trust / TLS-handshake failure — the
 // exact class of error the #463 race produces before the ingress cert is
@@ -87,54 +190,271 @@ function stringifyError(err: unknown): string {
 // Injectable fetch so tests can drive the handshake outcome without a network.
 export type FetchLike = (
   input: string,
-  init?: { method?: string; signal?: AbortSignal }
+  init?: {
+    method?: string;
+    signal?: AbortSignal;
+    headers?: Record<string, string>;
+  }
 ) => Promise<{ status: number }>;
 
-// Perform ONE bounded TLS-trust probe against the callback-listener ingress
-// origin. Resolves to { ok: true } if the HTTPS request completes a handshake
-// (any HTTP status), else classifies the failure. Never throws.
+// Per-REQUEST bound for a single probe HTTP request (issue #1171). Previously
+// the caller's cross-tick bounded-wait value (60s) doubled as the AbortSignal
+// window, so one hung request could occupy a whole tick for a minute and hold
+// up instance readiness / job assignment. A TLS handshake plus a HEAD against a
+// live ingress completes in well under a second (measured 0.05-0.08s against
+// warm listeners, 2026-10-14), so 5s is generous; the cross-tick deadline the
+// caller owns is what actually bounds the WAIT across re-probes.
+export const DEFAULT_PROBE_REQUEST_TIMEOUT_MS = 5_000;
+
+// Options for one probe attempt.
+//   - authToken        — the callback-listener service access token (SAT). Used
+//                        ONLY as a second, disambiguating attempt after an
+//                        unauthenticated 401/403, never on the first attempt:
+//                        the first attempt must stay credential-free because
+//                        that is exactly what Encore sends (#814).
+//   - refreshAuthToken — mints a FRESH SAT, bypassing (and clearing) whatever
+//                        cache the caller keeps. Called at most once per probe,
+//                        and only when the authenticated attempt was itself
+//                        rejected 401/403 — which is exactly what an EXPIRED
+//                        cached SAT looks like from here (#1171 review finding
+//                        A). A SAT minted by
+//                        `Context.getServiceAccessToken` is a JWT with a ~1h
+//                        `exp` and @osaas/client-core@0.24.0 does no renewal of
+//                        its own (`lib/context.js:58-60`:
+//                        `refreshServiceAccessToken` just mints a new one), so
+//                        a long-lived process MUST be able to re-mint or the
+//                        disambiguation silently stops working after an hour.
+//   - requestTimeoutMs — per-request AbortSignal window (#1171).
+export type CallbackProbeOptions = {
+  authToken?: string;
+  refreshAuthToken?: () => Promise<string | undefined>;
+  requestTimeoutMs?: number;
+};
+
+// Header the OSC ingress accepts for an authenticated request to a per-instance
+// hostname. Contract (CLAUDE.md rule 7): `@osaas/client-core@0.24.0`
+// `lib/core.js:86` sends every service-scoped call as `x-jwt: Bearer <SAT>`,
+// and verified live 2026-10-14 against
+// `oscaidev-ovc.eyevinn-encore-callback-listener.auto.prod-se.osaas.io`:
+// `GET /healthcheck` is 401 (nginx HTML) unauthenticated and 200
+// (`{"status":"up"}`) with `x-jwt: Bearer <SAT>`, where the SAT came from
+// `POST https://token.svc.prod.osaas.io/servicetoken` — i.e. the ingress auth
+// wall accepts exactly this header.
+const INGRESS_AUTH_HEADER = 'x-jwt';
+
+// The path Encore POSTs its progress callbacks to, appended to the paired
+// listener's base URL. Must stay byte-identical to the `progressCallbackUri`
+// the scaler injects at dispatch time (scaler-loop.ts), because the whole point
+// of the probe is to grade the URL Encore will actually use (#814).
+export const CALLBACK_PATH = '/encoreCallback';
+
+// Build the exact URL Encore will POST to (strip one trailing slash, append the
+// callback path). Used by BOTH the dispatch-time `progressCallbackUri`
+// injection and this probe, so the two can never drift apart — a probe of a
+// different URL than Encore uses is what #814 was about. Throws if
+// `callbackListenerUrl` is not a valid URL.
+export function buildCallbackUri(callbackListenerUrl: string): string {
+  // Parse for validation only — we keep the caller's base URL rather than
+  // reducing it to `origin`, so a listener published under a sub-path still
+  // resolves to the same URI the scaler injects.
+  new URL(callbackListenerUrl);
+  return `${callbackListenerUrl.replace(/\/$/, '')}${CALLBACK_PATH}`;
+}
+
+// Whether a bearer credential may be attached to a request to `target`
+// (#1171 review finding E). The SAT is a real bearer token for this tenant's
+// callback-listener subscription: sending it over anything but TLS would put it
+// on the wire in clear text, so a non-https target loses the disambiguating
+// attempt rather than leaking the credential. Every production listener URL is
+// https (OSC publishes per-instance ingresses on https only); plain-http values
+// show up in local/dev wiring, which is exactly where an accidental leak would
+// go unnoticed.
+function mayAttachBearerToken(target: string): boolean {
+  try {
+    return new URL(target).protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+// Second, disambiguating attempt at the same URL carrying the callback-listener
+// service access token (#1171). Returns the HTTP status, or undefined if the
+// authenticated attempt could not complete at all — in which case the caller
+// keeps the pessimistic verdict from the unauthenticated attempt. Never throws
+// and is bounded by the same per-request window.
+async function probeWithIngressToken(
+  target: string,
+  requestTimeoutMs: number,
+  fetchImpl: FetchLike,
+  authToken: string
+): Promise<number | undefined> {
+  try {
+    const res = await fetchImpl(target, {
+      method: 'HEAD',
+      signal: AbortSignal.timeout(requestTimeoutMs),
+      headers: { [INGRESS_AUTH_HEADER]: `Bearer ${authToken}` }
+    });
+    return res.status;
+  } catch {
+    return undefined;
+  }
+}
+
+// Perform ONE bounded trust/usability probe against the callback-listener's
+// `/encoreCallback` path — the exact URI Encore is told to POST to (#814).
+// Resolves to state 'trusted' when the HTTPS request completes a handshake and
+// the ingress did not reject it, 'callback-unusable' on a 401/403 (issue #813),
+// else classifies the transport failure. Never throws.
 export async function probeCallbackTrust(
   callbackListenerUrl: string,
   timeoutMs: number,
-  fetchImpl: FetchLike = fetch as unknown as FetchLike
+  fetchImpl: FetchLike = fetch as unknown as FetchLike,
+  options: CallbackProbeOptions = {}
 ): Promise<CallbackTrustProbeResult> {
-  let origin: string;
+  let target: string;
   try {
-    // Probe the ingress ORIGIN — the handshake is to the hostname, so the exact
-    // path is irrelevant; a 404 still proves the cert is trusted.
-    origin = new URL(callbackListenerUrl).origin;
+    target = buildCallbackUri(callbackListenerUrl);
   } catch {
     return {
       ok: false,
+      state: 'probe-failed',
       errorClass: 'connection',
       detail: `invalid callbackListenerUrl: ${callbackListenerUrl}`
     };
   }
 
+  // Per-request bound, independent of the caller's cross-tick bounded wait
+  // (#1171). It bounds EACH HTTP request this function makes, not the call as a
+  // whole: on the 401/403 path the probe makes up to two more requests (the
+  // authenticated attempt, and one retry after a token re-mint), so one call can
+  // take up to 3 × this bound — 15s with the 5s default (#1171 review finding
+  // D). That is still well inside the 60s cross-tick wait the caller owns, and
+  // the caller's value is a WAIT deadline it re-checks between ticks
+  // (scaler-loop.ts ensureCallbackTrust), not a hard per-tick cap. `Math.min`
+  // keeps a SINGLE request from ever outlasting that deadline.
+  const requestTimeoutMs = Math.min(
+    timeoutMs,
+    options.requestTimeoutMs ?? DEFAULT_PROBE_REQUEST_TIMEOUT_MS
+  );
+
   try {
-    // A HEAD keeps the probe cheap; we only need the handshake to complete.
-    await fetchImpl(origin, {
+    // A HEAD keeps the probe cheap and, unlike a POST, does not enqueue a
+    // synthetic progress callback: the listener has no GET/HEAD route for this
+    // path, so a healthy instance answers Fastify's own 404 (verified live,
+    // see the header note). We only need the handshake to complete and the
+    // ingress's answer to it.
+    const res = await fetchImpl(target, {
       method: 'HEAD',
-      signal: AbortSignal.timeout(timeoutMs)
+      signal: AbortSignal.timeout(requestTimeoutMs)
     });
-    // Any HTTP response — including 404/405 — means the TLS handshake succeeded
-    // and the ingress certificate is issued and trusted. Trust path confirmed.
-    return { ok: true };
+    // A 401/403 means the handshake succeeded but the ingress is rejecting
+    // requests on the callback path itself: Encore's callback POST to this
+    // exact URI will be rejected the same way, so the path is NOT usable
+    // (issue #813, aimed at the right URL by #814).
+    if (CALLBACK_REJECTED_STATUSES.has(res.status)) {
+      // #1171: a 401/403 on the UNAUTHENTICATED probe has two very different
+      // causes, and latching the pessimistic one on every instance is the bug.
+      // Ask the same URL again with this service's callback-listener SAT, which
+      // the OSC ingress auth wall accepts (see INGRESS_AUTH_HEADER):
+      //   - still 401/403  -> the rejection is not the ingress auth wall; the
+      //                       callback path really is closed (keeps #813).
+      //   - anything else  -> the wall let an authenticated request through, so
+      //                       hostname/cert/routing are live and the wall is
+      //                       simply still covering the callback path. That is
+      //                       the transient #812 window, which lifts on its own
+      //                       — report it as retryable, not as a verdict.
+      //
+      // "Still 401/403" has a third cause the first cut of this change missed:
+      // the SAT we just sent is EXPIRED (#1171 review finding A). The ingress
+      // answers an expired JWT exactly like a missing one, so before keeping the
+      // pessimistic verdict, re-mint once through `refreshAuthToken` (which
+      // clears the caller's cache) and retry. Bounded to a single retry, and
+      // only when the fresh token actually differs — otherwise the same
+      // credential would be replayed against the same wall.
+      if (options.authToken && mayAttachBearerToken(target)) {
+        let authenticated = await probeWithIngressToken(
+          target,
+          requestTimeoutMs,
+          fetchImpl,
+          options.authToken
+        );
+        if (
+          authenticated !== undefined &&
+          CALLBACK_REJECTED_STATUSES.has(authenticated) &&
+          options.refreshAuthToken
+        ) {
+          // try/catch, not `.catch(...)`: a provider that throws SYNCHRONOUSLY
+          // would otherwise escape into the outer handler and be misreported as
+          // a connection failure. This function never throws.
+          let refreshed: string | undefined;
+          try {
+            refreshed = await options.refreshAuthToken();
+          } catch {
+            refreshed = undefined;
+          }
+          if (refreshed && refreshed !== options.authToken) {
+            authenticated = await probeWithIngressToken(
+              target,
+              requestTimeoutMs,
+              fetchImpl,
+              refreshed
+            );
+          }
+        }
+        if (
+          authenticated !== undefined &&
+          !CALLBACK_REJECTED_STATUSES.has(authenticated)
+        ) {
+          return {
+            ok: false,
+            state: 'ingress-auth-window',
+            status: res.status,
+            authenticatedStatus: authenticated,
+            detail:
+              `callback-listener ingress answered HTTP ${res.status} unauthenticated but ` +
+              `HTTP ${authenticated} with the listener service access token for ${target} — ` +
+              'ingress and listener are live; the inbound auth wall still covers the callback path'
+          };
+        }
+      }
+      return {
+        ok: false,
+        state: 'callback-unusable',
+        status: res.status,
+        detail: `callback-listener ingress rejected the probe of ${target} with HTTP ${res.status} — the callback path is reachable but not usable`
+      };
+    }
+    // Any other HTTP response — including 404/405 — means the TLS handshake
+    // succeeded and the ingress certificate is issued and trusted, with nothing
+    // indicating the callback POST would be rejected. Trust path confirmed.
+    return { ok: true, state: 'trusted', status: res.status };
   } catch (err) {
     const detail = stringifyError(err);
     const isTimeout =
       err instanceof Error &&
       (err.name === 'TimeoutError' || err.name === 'AbortError');
     if (isTimeout) {
-      return { ok: false, errorClass: 'timeout', detail: `probe timed out after ${timeoutMs}ms` };
+      return {
+        ok: false,
+        state: 'probe-failed',
+        errorClass: 'timeout',
+        // The abort came from the PER-REQUEST bound, so that is the number to
+        // report (#1171 review finding B): interpolating the caller's
+        // cross-tick wait here claimed a 60s hang for a request that was cut
+        // off after 5s, which is the opposite of what an operator needs to see.
+        // The caller deadline is named separately so both are visible.
+        detail:
+          `probe request timed out after ${requestTimeoutMs}ms ` +
+          `(caller bounded wait ${timeoutMs}ms)`
+      };
     }
     const lower = detail.toLowerCase();
     if (TLS_TRUST_SIGNATURES.some((sig) => lower.includes(sig.toLowerCase()))) {
-      return { ok: false, errorClass: 'tls-trust', detail };
+      return { ok: false, state: 'probe-failed', errorClass: 'tls-trust', detail };
     }
     // Any other network error (DNS not yet resolving, connection refused while
     // the ingress spins up): still not ready for a first job, but not a cert
     // problem. Treated the same as a timeout for gating (retry next tick).
-    return { ok: false, errorClass: 'connection', detail };
+    return { ok: false, state: 'probe-failed', errorClass: 'connection', detail };
   }
 }

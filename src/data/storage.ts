@@ -55,11 +55,65 @@ export function deliveryUrlTtlSeconds(): number {
   return parsed;
 }
 
+// Default lifetime for a thumbnail-image URL handed back to a browser
+// (issue #800). A thumbnail URL is consumed immediately by an <img> tag, so the
+// window only has to cover page render — much shorter than a playback session,
+// which keeps the blast radius of a URL leaked through a referrer header,
+// browser history or a shared screenshot small. Override globally via
+// THUMBNAIL_URL_TTL_SECONDS.
+export const DEFAULT_THUMBNAIL_URL_TTL_SECONDS = 5 * 60; // 5 minutes
+
+// Resolve the configured thumbnail-URL TTL (12-factor: config via env). Falls
+// back to the 5-minute default when unset or invalid.
+export function thumbnailUrlTtlSeconds(): number {
+  const raw = process.env['THUMBNAIL_URL_TTL_SECONDS'];
+  if (!raw) {
+    return DEFAULT_THUMBNAIL_URL_TTL_SECONDS;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_THUMBNAIL_URL_TTL_SECONDS;
+  }
+  return parsed;
+}
+
+// Default gap between upload-liveness heartbeats on the proxied streaming
+// upload path (issue #731). While a slow-but-progressing PUT /:id/upload body
+// drains, the route touches the asset's `updatedAt` on this cadence so #726's
+// stuck-upload sweep can tell a live slow upload apart from an abandoned one.
+// Well below any realistic sweep threshold; override via
+// UPLOAD_LIVENESS_INTERVAL_MS (12-factor: config via env).
+export const DEFAULT_UPLOAD_LIVENESS_INTERVAL_MS = 30 * 1000; // 30 seconds
+
+// Resolve the configured upload-liveness heartbeat interval in milliseconds
+// (issue #731). Falls back to the 30-second default when unset or invalid.
+export function uploadLivenessIntervalMs(): number {
+  const raw = process.env['UPLOAD_LIVENESS_INTERVAL_MS'];
+  if (!raw) {
+    return DEFAULT_UPLOAD_LIVENESS_INTERVAL_MS;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_UPLOAD_LIVENESS_INTERVAL_MS;
+  }
+  return parsed;
+}
+
 // One part of a multipart upload, as reported by the client on completion.
 export type CompletedPart = {
   partNumber: number;
   etag: string;
 };
+
+// How many orphaned multipart uploads for one key `abortIncompleteMultipartUploads`
+// will clear in a single call (issue #1088). The lookup primitive only ever
+// returns the most recently initiated upload for a key, so clearing several
+// means calling it repeatedly; the bound stops a backend that keeps answering
+// with an upload we cannot actually abort from spinning forever. More than one
+// orphan for the same key means several earlier writes died mid-stream, which
+// is already an outlier — a bound of 10 is far above anything a retry loop can
+// produce (MAX_ATTEMPTS is 3, src/pipeline/url-pull-worker.ts:47).
+const MAX_INCOMPLETE_UPLOAD_ABORTS = 10;
 
 export class WorkspaceStorage {
   constructor(
@@ -177,6 +231,46 @@ export class WorkspaceStorage {
     await this.client.abortMultipartUpload(this.bucket, this.scopedKey(localKey), uploadId);
   }
 
+  // Discard every multipart upload still open for a key, returning how many
+  // were aborted (0 when the key has none). Issue #1088.
+  //
+  // Why a writer needs this: `putStream` below is a single putObject call, but
+  // for a body larger than the client's part size that call is a multipart
+  // upload, and a transfer that dies part-way leaves the upload open with its
+  // staged parts intact. The client does NOT start clean on the next write to
+  // the same key — it looks for an existing upload first and RESUMES it,
+  // comparing the staged part etags against the chunks it is about to send
+  // (node_modules/minio/dist/esm/internal/client.mjs:1445-1479). On that resume
+  // path it advances its part counter before using it in the part request
+  // (client.mjs:1480 vs :1486), so its numbering sits one off the numbering the
+  // server staged the parts under: a chunk that repeats the previous chunk's
+  // bytes matches the wrong staged part and gets "resumed" rather than
+  // uploaded, and the object is assembled from a duplicated or wrong-offset
+  // part. Clearing the upload before the next write removes the resume
+  // altogether, which is the fix that does not depend on an upstream release.
+  //
+  // Also reclaims the staged bytes, which would otherwise sit in the bucket
+  // until a lifecycle rule expired them.
+  //
+  // Lookup primitive: `findUploadId(bucket, key): Promise<string | undefined>`
+  // returns the uploadId of the most recently initiated upload for an exact key
+  // match, or undefined when there is none
+  // (node_modules/minio/dist/esm/internal/client.d.mts:259, implementation
+  // client.mjs:1143-1171) — hence the bounded loop rather than a single call.
+  async abortIncompleteMultipartUploads(localKey: string): Promise<number> {
+    const key = this.scopedKey(localKey);
+    let aborted = 0;
+    for (let i = 0; i < MAX_INCOMPLETE_UPLOAD_ABORTS; i++) {
+      const uploadId = await this.client.findUploadId(this.bucket, key);
+      if (!uploadId) {
+        break;
+      }
+      await this.abortMultipartUpload(key, uploadId);
+      aborted++;
+    }
+    return aborted;
+  }
+
   // Stream a source into MinIO without buffering the whole payload in memory
   // (issue #5 URL-pull ingest). Bytes flow source -> PassThrough -> MinIO
   // putObject. A byte counter on the PassThrough enforces maxBytes: if the
@@ -237,6 +331,44 @@ export class WorkspaceStorage {
         total += obj.size ?? 0;
       });
       stream.on('end', () => resolve(total));
+      stream.on('error', reject);
+    });
+  }
+
+  // Sum the sizes of every object under one key prefix, plus how many objects
+  // were counted (per-asset storage usage, issue #1242). Scoped sibling of
+  // `sumObjectSizes()` above: same recursive listObjectsV2 listing and the same
+  // `size` field on the object arm of the minio BucketItem union
+  // (node_modules/minio/dist/esm/internal/type.d.ts:83), but bounded to a
+  // prefix instead of the whole bucket — a packaged output set is one prefix
+  // (`<assetId>/<packagerJobId>/`), so the listing is O(objects-in-that-package)
+  // rather than O(bucket). Still a listing call, so it belongs on a read
+  // endpoint, never on a write hot path.
+  //
+  // The prefix is normalised exactly like every other key here (`scopedKey`:
+  // leading slashes stripped, `..` rejected). An empty result (nothing stored
+  // under the prefix) is reported as `{ objectCount: 0, totalBytes: 0 }`, not an
+  // error — the caller cannot distinguish a package that was deleted from one
+  // that never existed, and both genuinely occupy zero bytes.
+  async sumObjectSizesUnderPrefix(
+    prefix: string
+  ): Promise<{ objectCount: number; totalBytes: number }> {
+    const key = this.scopedKey(prefix);
+    const stream = this.client.listObjectsV2(this.bucket, key, true);
+    return await new Promise<{ objectCount: number; totalBytes: number }>((resolve, reject) => {
+      let objectCount = 0;
+      let totalBytes = 0;
+      stream.on('data', (obj) => {
+        // Recursive listings yield only object items (no prefix items), so
+        // every event is a real object; guard on `name` anyway so a prefix item
+        // from a non-recursive backend cannot inflate the count.
+        if (!obj.name) {
+          return;
+        }
+        objectCount++;
+        totalBytes += obj.size ?? 0;
+      });
+      stream.on('end', () => resolve({ objectCount, totalBytes }));
       stream.on('error', reject);
     });
   }

@@ -8,6 +8,7 @@
 // status, progress, and any terminal error.
 
 import type { MessageFailureClass } from '../encore-scaler/retry-policy.js';
+import { currentDocumentStackName } from '../services/request-stack-context.js';
 
 // ---------------------------------------------------------------------------
 // Job model + lifecycle
@@ -70,10 +71,18 @@ export function isActiveJobStatus(status: JobStatus): boolean {
   return ACTIVE_JOB_STATUSES.includes(status);
 }
 
-// The kind of work a job performs. URL-pull ingest (issue #5) and ABR
-// transcoding (issue #8) share one repository + one observability endpoint
-// (GET /api/v1/jobs/:id), distinguished by `jobType`.
-export const JOB_TYPES = ['ingest-url', 'transcode'] as const;
+// The kind of work a job performs. URL-pull ingest (issue #5), ABR transcoding
+// (issue #8) and CMAF packaging (issue #976) share one repository + one
+// observability endpoint (GET /api/v1/jobs/:id), distinguished by `jobType`.
+//
+// `package` (issue #976) is the step that produces the artifact the caller
+// actually consumes (the HLS/DASH manifests) and was, until now, the ONLY
+// pipeline step with no observable object: packaging wrote `packagingError` on
+// the asset and left `steps[].jobId` empty, so `GET /api/v1/jobs` returned
+// nothing for work that really ran. Adding the value here is additive — no
+// existing job changes type, and the value flows into the API response contract
+// through `z.enum(JOB_TYPES)` (src/routes/jobs.ts jobSchema.type).
+export const JOB_TYPES = ['ingest-url', 'transcode', 'package'] as const;
 export type JobType = (typeof JOB_TYPES)[number];
 
 // A Job is the unit of observability for any async pipeline. The shape is a
@@ -97,7 +106,10 @@ export type Job = {
   bytesTransferred: number;
   // Total expected size in bytes when known (from Content-Length / S3 stat).
   totalBytes?: number;
-  // Number of pull attempts made so far (retry tracking).
+  // Number of attempts made so far (retry tracking). Ingest jobs count URL-pull
+  // attempts; package jobs (issue #976) count enqueues onto the packager queue,
+  // so a re-enqueue of the same asset's packaging is distinguishable from a slow
+  // first run. Transcode jobs leave this at 0 and use `encodeAttempts` instead.
   attempts: number;
   // Terminal error message when status === 'failed'.
   error?: string;
@@ -111,6 +123,19 @@ export type Job = {
   profile?: string;
   // Child asset ids created for each produced rendition on completion.
   renditionAssetIds?: string[];
+  // --- Package-job fields (issue #976) ---
+  // The packaging correlation id carried through the packager queue message and
+  // echoed back on the packager's success callback (`packagingId(assetId)`,
+  // src/pipeline/packaging.ts). It is to a package job exactly what
+  // `encoreJobId` above is to a transcode job: the external handle the
+  // completion signal is correlated by.
+  packagingId?: string;
+  // The deterministic packaged-output prefix this job's CMAF/HLS/DASH objects
+  // are written under (`outputPrefix(assetId)`, src/pipeline/packaging.ts), so
+  // an operator can go from the job record to the produced objects without
+  // re-deriving the path. The ACTUAL, job-nested location reported by the
+  // packager is persisted separately on the asset (`packagedOutput`).
+  outputPrefix?: string;
   // --- Durable encode-attempt capture (ADR-012, #380) ---
   // Count of Encore dispatches for this transcode job; 1 on the first dispatch,
   // incremented on each transport-class re-dispatch. Distinct from `attempts`
@@ -151,6 +176,75 @@ export type Job = {
   // unconditional and must never be overridden. Cleared once a job settles to a
   // real terminal outcome (done, or a re-affirmed failure).
   droppedByScaler?: boolean;
+  // --- Durable stack identity (#1097) ---
+  // The provisioned stack this job was created against, captured from the
+  // request's ambient stack context at create time
+  // (`currentDocumentStackName()`, src/services/request-stack-context.ts). It is
+  // the DURABLE copy of an identity that otherwise lives only in
+  // AsyncLocalStorage, so work that outlives the request — the URL-pull worker,
+  // metadata extraction, a queue message drained after a process restart — can
+  // re-enter the same stack (`runWithPersistedStack`) and resolve the same
+  // repositories and object storage the request wrote to.
+  //
+  // Optional and immutable: absent on every job created before #1097 and on
+  // jobs created outside a request (boot wiring, sweeps, watch-folder), where
+  // there is no ambient stack to record. An absent value keeps TODAY's
+  // behaviour — the first-listed stack (`workspace-stack.ts resolve()`,
+  // no-stackName branch) — and the fallback is logged at debug level by the
+  // worker that takes it. Not present on UpdateJobInput: a job's stack never
+  // changes, so there is nothing to patch.
+  stackName?: string;
+  // --- Durable trace of a CORRECTED drop (#1023) ---
+  // True when this job was reported dropped by drop detection (#709) and a later
+  // genuine SUCCESSFUL completion corrected it to `done`. In other words: the
+  // drop was spurious. Set by completeTranscode's success write at the same
+  // moment `error` is cleared and `droppedByScaler` is reset, so the fact that a
+  // drop happened survives on the RECORD rather than only in an audit entry —
+  // the audit emitter is optional (`deps.audit`) and the callback poller does not
+  // pass one, so an audit-only trace would exist on some correction paths and not
+  // others. Modelled exactly like `interrupted`/`interruptionReason` above: an
+  // additive, OPTIONAL annotation that does NOT drive status (the job really is
+  // `done`), is absent (not false) on jobs that were never dropped, and is NOT
+  // cleared afterwards — a completed job that WAS once dropped still reflects
+  // that it recovered. This is what keeps a too-short reconcile grace period
+  // detectable after #1023 stopped a recovered job from carrying failure text.
+  droppedThenRecovered?: boolean;
+  // The drop-detection failure text that was cleared off `error` by the
+  // correction (#1023), present only when `droppedThenRecovered` is true. The
+  // reason half of the pair: `droppedThenRecovered` says a drop was corrected,
+  // this says what the drop claimed (e.g. the generic gone-from-active-set
+  // wording, or a cause Encore reported), which is the part that tells an
+  // operator WHY the job was inferred dropped.
+  correctedDropError?: string;
+  // --- Late completion on a CANCELLED job (#1226) ---
+  // True when an Encore completion arrived for this job AFTER it was cancelled
+  // and was therefore DISCARDED: `cancelled` is the one status with no outgoing
+  // transition (ALLOWED_JOB_TRANSITIONS below), so the cancel stands and the
+  // run's output is reclaimed instead of registered
+  // (src/pipeline/cancelled-transcode-completion.ts states the full rule).
+  // Modelled exactly like `droppedThenRecovered` above: an additive, OPTIONAL
+  // annotation that does NOT drive status (the job really is `cancelled`), is
+  // absent (not false) on every other job, and is never cleared. It is what
+  // explains a cancelled job with 0 renditions on the RECORD — the symptom
+  // #1226 was reported from was a log line reading `applied false
+  // renditionCount 0` with nothing durable to go on.
+  lateCompletionDiscarded?: boolean;
+  // How many renditions that discarded completion reported, present only when
+  // `lateCompletionDiscarded` is true. 0 when the completion carried no output
+  // document (the poller's Encore-unreachable fallback) — which does NOT mean
+  // nothing was written, hence the prefix below.
+  discardedRenditionCount?: number;
+  // The job's deterministic transcode output prefix
+  // (`transcodeOutputPrefix(assetId, jobId)`, src/pipeline/transcode.ts) whose
+  // objects the reclaim removed, present only when `lateCompletionDiscarded` is
+  // true. Recorded even when the removal itself failed, so an operator (or a
+  // later sweep) knows exactly which prefix to reclaim.
+  discardedOutputPrefix?: string;
+  // Both fields are INTERNAL to the record for now, exactly like
+  // `droppedByScaler` above: the response contract (jobSchema, src/routes/
+  // jobs.ts) deliberately does not carry the #709 drop-detection vocabulary, and
+  // what goes on the wire is the API design owner's call. Putting them on the
+  // wire is a separate, additive step; nothing here depends on it.
   createdAt: string;
   updatedAt: string;
 };
@@ -167,6 +261,16 @@ export type CreateJobInput = {
   encoreJobId?: string;
   encoreInternalJobId?: string;
   profile?: string;
+  // Package jobs only (issue #976). Mirrors how a transcode job carries its
+  // external correlation id at creation time.
+  packagingId?: string;
+  outputPrefix?: string;
+  // Explicit stack identity override (#1097). Normally omitted: the repository
+  // stamps `currentDocumentStackName()` so every caller records the stack it is
+  // actually serving without having to pass anything. Supplied only by a caller
+  // that already KNOWS the stack and is not running inside its context (tests,
+  // and any future re-driver that recreates a job on a named stack).
+  stackName?: string;
 };
 
 // Fields the worker may patch as it makes progress. id/workspace/createdAt are
@@ -182,6 +286,11 @@ export type UpdateJobInput = {
   encoreInternalJobId?: string;
   profile?: string;
   renditionAssetIds?: string[];
+  // Package-job fields (issue #976), patchable for the same reason the
+  // transcode correlation fields above are: they are written just after the
+  // record exists, from the enqueue path.
+  packagingId?: string;
+  outputPrefix?: string;
   // Durable encode-attempt fields (ADR-012, #380). Normally written via the
   // dedicated appendEncodeAttempt() path, but exposed here so a full record can
   // be patched (and so applyJobPatch carries them through unchanged).
@@ -199,6 +308,32 @@ export type UpdateJobInput = {
   // SUCCESSFUL callback corrects that conditional failure. Additive/optional so
   // existing callers are unaffected; carried through applyJobPatch unchanged.
   droppedByScaler?: boolean;
+  // Durable trace of a corrected drop (#1023). Written by completeTranscode's
+  // success write, in the SAME patch that clears `error` and `droppedByScaler`,
+  // so every correction path (the internal callback route, the callback poller)
+  // and both repository backends record it without needing an audit emitter.
+  droppedThenRecovered?: boolean;
+  correctedDropError?: string;
+  // Late completion on a CANCELLED job (#1226). Written by the reclaim
+  // (src/pipeline/cancelled-transcode-completion.ts) in ONE patch that carries
+  // no `status`, so the job stays `cancelled` and no transition is attempted.
+  // Additive/optional, carried through applyJobPatch unchanged.
+  lateCompletionDiscarded?: boolean;
+  discardedRenditionCount?: number;
+  discardedOutputPrefix?: string;
+  // Explicit REMOVAL of `error` (#1023). Every other field here is patched by
+  // presence (`!== undefined`), which by construction cannot express "unset this
+  // field": passing `error: undefined` is indistinguishable from not patching
+  // `error` at all, so a failure string written earlier in a job's life could
+  // never be taken back off the record. That is exactly the residue #709 left —
+  // a job corrected from a conditional drop-detection `failed` to `done` kept
+  // the drop's failure text forever (see completeTranscode's success write in
+  // src/pipeline/transcode.ts). This flag is the explicit clear: when true,
+  // applyJobPatch DELETES `error` from the resulting record, so the job reads
+  // exactly as one that never failed. Takes precedence over `error` in the same
+  // patch (a caller asking to clear and set at once is a bug; clearing wins so
+  // the record can never end up terminal-successful WITH a failure string).
+  clearError?: boolean;
 };
 
 // A conditional-drop `failed` state (#709) is reversible ONLY by a SUCCESSFUL
@@ -327,11 +462,29 @@ export function applyJobPatch(existing: IngestJob, patch: UpdateJobInput, now: s
   if (patch.encoreInternalJobId !== undefined) next.encoreInternalJobId = patch.encoreInternalJobId;
   if (patch.profile !== undefined) next.profile = patch.profile;
   if (patch.renditionAssetIds !== undefined) next.renditionAssetIds = patch.renditionAssetIds;
+  if (patch.packagingId !== undefined) next.packagingId = patch.packagingId;
+  if (patch.outputPrefix !== undefined) next.outputPrefix = patch.outputPrefix;
   if (patch.encodeAttempts !== undefined) next.encodeAttempts = patch.encodeAttempts;
   if (patch.encodeAttemptLog !== undefined) next.encodeAttemptLog = patch.encodeAttemptLog;
   if (patch.interrupted !== undefined) next.interrupted = patch.interrupted;
   if (patch.interruptionReason !== undefined) next.interruptionReason = patch.interruptionReason;
   if (patch.droppedByScaler !== undefined) next.droppedByScaler = patch.droppedByScaler;
+  if (patch.droppedThenRecovered !== undefined) next.droppedThenRecovered = patch.droppedThenRecovered;
+  if (patch.correctedDropError !== undefined) next.correctedDropError = patch.correctedDropError;
+  // #1226: durable trace of a discarded late completion on a cancelled job.
+  if (patch.lateCompletionDiscarded !== undefined)
+    next.lateCompletionDiscarded = patch.lateCompletionDiscarded;
+  if (patch.discardedRenditionCount !== undefined)
+    next.discardedRenditionCount = patch.discardedRenditionCount;
+  if (patch.discardedOutputPrefix !== undefined)
+    next.discardedOutputPrefix = patch.discardedOutputPrefix;
+  // #1023: explicit clear, applied LAST so it beats a same-patch `error` write.
+  // `delete` (not `= undefined`) so the field is genuinely absent: the CouchDB
+  // backend serialises the whole record (couch-job-repo.ts toDoc), where an
+  // absent key is dropped by JSON serialisation, and the in-memory backend hands
+  // the object straight back — both then read as a job with no `error` at all,
+  // which is what "filtering jobs by has-an-error" needs.
+  if (patch.clearError === true) delete next.error;
   return next;
 }
 
@@ -428,6 +581,12 @@ export class InMemoryJobRepository implements JobRepository {
       attempts: 0,
       encoreJobId: input.encoreJobId,
       profile: input.profile,
+      packagingId: input.packagingId,
+      outputPrefix: input.outputPrefix,
+      // Durable stack identity (#1097): the stack this job is being created
+      // against. Undefined outside a request, which preserves the previous
+      // default-stack behaviour on boot/sweep paths.
+      stackName: input.stackName ?? currentDocumentStackName(),
       createdAt: now,
       updatedAt: now
     };

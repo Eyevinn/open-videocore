@@ -230,6 +230,26 @@ the existing `X-Stack-Name` trusted-header pattern the app already relies on
 it; off OSC any equivalent proxy can. open-videocore reads roles the same way in
 both environments and needs no OSC-specific identity API.
 
+**Scope note on `X-Stack-Name` (issue #1058).** That sibling header's reach grew
+when the data plane started honouring it. Until #1058 it selected only the
+transcode CONTROL plane (which Encore instance a job is created against, #615);
+the data plane was pinned to the first-listed stack. It now also selects which
+stack's **documents and object bytes** an authenticated caller reads and writes,
+via the request-scoped stack identity established in `src/main.ts`'s `onRequest`
+hook and read by every `PerWorkspace*` repository
+(`src/data/per-workspace-repos.ts`) and by the object-storage factory. There is
+deliberately **no per-stack authorisation check**: this rests on ADR-020's
+"one deployed open-videocore instance is one tenant" decision, so stacks 2..N
+belong to the same tenant as stack 1 and the header partitions one tenant's own
+storage rather than crossing a trust boundary. Two consequences follow for the
+enforcement issue. First, the header must be stripped and re-injected at the
+trust boundary on the same terms as `X-OVC-Role` above — a client that can forge
+it picks its own stack. Second, if the deployment model ever becomes
+multi-tenant, `X-Stack-Name` becomes a tenant selector and needs a real
+authorisation check, not just trust in the fronting layer; this ADR's role matrix
+does not cover it today. No SSRF surface is added either way: stack endpoints
+come from the OSC parameter store, never from the header.
+
 ---
 
 ## Consequences

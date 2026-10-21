@@ -25,11 +25,13 @@ import {
   filterJobs,
   sortJobs,
   pageJobs,
+  renderAssetCell,
   JOB_STATUSES,
   JOBS_NS,
   JOBS_PAGE_SIZE,
   JOBS_WORKING_SET_MAX,
 } from '../public/jobs-table.js';
+import { COPY_ID_BTN_CLASS } from '../public/copy-id.js';
 
 // A small deterministic fixture spanning statuses + dates.
 function makeJobs() {
@@ -79,6 +81,18 @@ describe('filterJobs', () => {
     expect(filterJobs(makeJobs(), { q: 'JOB-3' }).map((j) => j.id)).toEqual(['job-3']);
     // asset-a is shared by job-1 and job-3.
     expect(filterJobs(makeJobs(), { q: 'asset-a' }).map((j) => j.id)).toEqual(['job-1', 'job-3']);
+  });
+
+  it('text search also matches the asset NAME, tolerating rows without one (#988)', () => {
+    // Once the Asset column shows a name, searching that name has to work —
+    // otherwise the one value the operator can actually read is unsearchable.
+    const jobs = makeJobs();
+    jobs[0] = { ...jobs[0], assetName: 'Opening keynote' };
+    jobs[2] = { ...jobs[2], assetName: 'Opening keynote' };
+    // jobs[1], [3], [4] have NO assetName (deleted asset / unresolved) and must
+    // not throw or match.
+    expect(filterJobs(jobs, { q: 'opening KEY' }).map((j) => j.id)).toEqual(['job-1', 'job-3']);
+    expect(filterJobs(jobs, { q: 'nothing-matches-this' })).toEqual([]);
   });
 
   it('combines status + range + search (AND semantics)', () => {
@@ -245,3 +259,315 @@ describe('createJobsTable composition', () => {
     expect(() => createJobsTable({} as never)).toThrow(/apiFetch/);
   });
 });
+
+// ─── the Asset column names the asset (issue #988) ───────────────────────────
+//
+// Contract grounding for the fields read here:
+//   - `assetId`   string, ALWAYS present — jobSchema, src/routes/jobs.ts:54
+//   - `assetName` string, OPTIONAL — src/routes/jobs.ts:62; the route resolves
+//     it with `.catch(() => undefined)` (mirroring src/routes/pipelines.ts:98),
+//     so a deleted asset arrives as a row with an id and no name. Every
+//     assertion below therefore covers both shapes.
+
+describe('renderAssetCell', () => {
+  function html(job: unknown) {
+    const el = document.createElement('div');
+    el.innerHTML = renderAssetCell(job as never);
+    return el;
+  }
+
+  it('leads with the asset name and keeps the ULID beneath it', () => {
+    const el = html({ assetId: '01J8Z3K4M5N6P7Q8R9S0T1V2W3', assetName: 'Opening keynote' });
+    expect(el.querySelector('.job-asset-name')?.textContent).toBe('Opening keynote');
+    // The ULID is still on screen IN FULL — it is the value the API accepts.
+    expect(el.querySelector('.job-asset-id')?.textContent).toContain('01J8Z3K4M5N6P7Q8R9S0T1V2W3');
+  });
+
+  it('falls back to the ULID when the asset resolved no name (deleted asset)', () => {
+    const el = html({ assetId: '01J8Z3K4M5N6P7Q8R9S0T1V2W3' });
+    expect(el.textContent).toContain('01J8Z3K4M5N6P7Q8R9S0T1V2W3');
+    // No empty name element left behind above it.
+    expect(el.querySelector('.job-asset-name')).toBeNull();
+  });
+
+  it('offers a click-to-copy affordance for the ULID in both shapes', () => {
+    const named = html({ assetId: '01J8Z3K4M5N6P7Q8R9S0T1V2W3', assetName: 'Opening keynote' });
+    const bare = html({ assetId: '01J8Z3K4M5N6P7Q8R9S0T1V2W3' });
+    for (const el of [named, bare]) {
+      const btn = el.querySelector<HTMLButtonElement>('.' + COPY_ID_BTN_CLASS);
+      expect(btn).not.toBeNull();
+      expect(btn?.dataset.copyId).toBe('01J8Z3K4M5N6P7Q8R9S0T1V2W3');
+      // Accessible name distinguishes this row's control from every other row's.
+      expect(btn?.getAttribute('aria-label')).toBe('Copy asset id 01J8Z3K4M5N6P7Q8R9S0T1V2W3');
+    }
+  });
+
+  it('renders an em-dash when the job references no asset at all', () => {
+    expect(html({}).textContent).toBe('—');
+    expect(html(null).textContent).toBe('—');
+  });
+
+  it('escapes a hostile asset name (no raw markup reaches the cell)', () => {
+    const el = html({ assetId: 'asset-x', assetName: '<img src=x onerror=alert(1)>' });
+    expect(el.querySelector('img')).toBeNull();
+    expect(el.querySelector('.job-asset-name')?.textContent).toBe('<img src=x onerror=alert(1)>');
+  });
+});
+
+describe('the Asset column in a rendered table', () => {
+  it('shows names where they resolved and the ULID where they did not', async () => {
+    const items = [
+      { id: 'job-1', type: 'transcode', status: 'running', assetId: '01J8Z3K4M5N6P7Q8R9S0T1V2W3', assetName: 'Opening keynote', progress: 10, createdAt: '2026-01-02T10:00:00.000Z', updatedAt: '2026-01-02T10:00:00.000Z' },
+      // Asset deleted: the row still lists, identified by its ULID.
+      { id: 'job-2', type: 'transcode', status: 'done', assetId: '01J8Z3K4M5N6P7Q8R9S0T1V2W4', progress: 100, createdAt: '2026-01-01T10:00:00.000Z', updatedAt: '2026-01-01T11:00:00.000Z' },
+    ];
+    const table = createJobsTable({ apiFetch: vi.fn().mockResolvedValue({ items, total: 2 }), win: null });
+    document.body.appendChild(table.el);
+    await table.refresh();
+
+    const headers = Array.from(table.el.querySelectorAll('thead th')).map((th) => th.textContent?.trim());
+    expect(headers).toContain('Asset');
+
+    const rows = Array.from(table.el.querySelectorAll('tbody tr[data-row-key]'));
+    expect(rows).toHaveLength(2);
+    const cellOf = (tr: Element) => tr.querySelectorAll('td')[3];
+    expect(cellOf(rows[0]).querySelector('.job-asset-name')?.textContent).toBe('Opening keynote');
+    expect(cellOf(rows[0]).textContent).toContain('01J8Z3K4M5N6P7Q8R9S0T1V2W3');
+    expect(cellOf(rows[1]).querySelector('.job-asset-name')).toBeNull();
+    expect(cellOf(rows[1]).textContent).toContain('01J8Z3K4M5N6P7Q8R9S0T1V2W4');
+  });
+
+  it('copying an asset id does not also open the row detail panel', async () => {
+    const onSelect = vi.fn();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const items = [
+      { id: 'job-1', type: 'transcode', status: 'running', assetId: '01J8Z3K4M5N6P7Q8R9S0T1V2W3', assetName: 'Opening keynote', progress: 10, createdAt: '2026-01-02T10:00:00.000Z', updatedAt: '2026-01-02T10:00:00.000Z' },
+    ];
+    vi.stubGlobal('navigator', { clipboard: { writeText } });
+    const table = createJobsTable({
+      apiFetch: vi.fn().mockResolvedValue({ items, total: 1 }),
+      onSelect,
+      win: null,
+    });
+    document.body.appendChild(table.el);
+    await table.refresh();
+
+    const btn = table.el.querySelector<HTMLButtonElement>('.' + COPY_ID_BTN_CLASS)!;
+    btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    expect(writeText).toHaveBeenCalledWith('01J8Z3K4M5N6P7Q8R9S0T1V2W3');
+    expect(onSelect).not.toHaveBeenCalled();
+
+    // The row itself still opens the panel when clicked anywhere else.
+    table.el.querySelector<HTMLElement>('tbody tr[data-row-key]')!.click();
+    expect(onSelect).toHaveBeenCalledWith('job-1');
+  });
+});
+
+// ─── unset filter controls look unset (issue #984) ────────────────────────────
+//
+// Contract grounding for the markers asserted here:
+//   - class names: public/jobs-table.js statusFilterControl() -> 'ops-filter-select',
+//     dateInput() -> 'ops-filter-date', searchControl() -> 'ops-filter-search'
+//   - the muted colour token: public/style.css :root -> `--text-muted: #94a3b8`
+//     (line 6; the only muted text token in the sheet)
+//   - the paint rules keyed off the marker: public/style.css
+//     `.ops-filter-select.is-unset, .ops-filter-date.is-unset { color: var(--text-muted) }`
+// happy-dom does not do layout or cascade resolution, so the assertions below
+// verify the DOM seam (the .is-unset marker on empty vs. filled controls), not the
+// resolved pixel colour. The search box needs no marker — it carries a native
+// placeholder, muted by `.ops-filter-search::placeholder`.
+
+describe('unset filter controls are marked muted', () => {
+  function controls(el: HTMLElement) {
+    return {
+      select: el.querySelector<HTMLSelectElement>('.ops-filter-select')!,
+      from: el.querySelector<HTMLInputElement>('#jobs-filter-from')!,
+      to: el.querySelector<HTMLInputElement>('#jobs-filter-to')!,
+      search: el.querySelector<HTMLInputElement>('.ops-filter-search')!,
+    };
+  }
+
+  it('marks the select and both date inputs unset on first render', () => {
+    const table = createJobsTable({
+      apiFetch: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+      win: null,
+    });
+    document.body.appendChild(table.el);
+    const c = controls(table.el);
+    expect(c.select.value).toBe('');
+    expect(c.select.classList.contains('is-unset')).toBe(true);
+    expect(c.from.classList.contains('is-unset')).toBe(true);
+    expect(c.to.classList.contains('is-unset')).toBe(true);
+    // The search box renders its own empty state via the native placeholder,
+    // which the stylesheet paints with the same --text-muted token.
+    expect(c.search.placeholder).toBe('Job id, asset id, or asset name');
+    expect(c.search.value).toBe('');
+  });
+
+  it('does NOT mark controls unset when the URL state already carries values', () => {
+    const win = {
+      location: {
+        search: '?jobs.status=running&jobs.from=2026-01-02&jobs.to=2026-01-04&jobs.q=asset-a',
+        pathname: '/',
+        hash: '',
+      },
+      history: { replaceState: vi.fn(), pushState: vi.fn(), state: null },
+    } as unknown as Window;
+    const table = createJobsTable({
+      apiFetch: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+      win,
+    });
+    document.body.appendChild(table.el);
+    const c = controls(table.el);
+    expect(c.select.value).toBe('running');
+    expect(c.select.classList.contains('is-unset')).toBe(false);
+    expect(c.from.value).toBe('2026-01-02');
+    expect(c.from.classList.contains('is-unset')).toBe(false);
+    expect(c.to.value).toBe('2026-01-04');
+    expect(c.to.classList.contains('is-unset')).toBe(false);
+    expect(c.search.value).toBe('asset-a');
+  });
+
+  it('drops the marker when a value is chosen and restores it when cleared', () => {
+    const table = createJobsTable({
+      apiFetch: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+      win: null,
+    });
+    document.body.appendChild(table.el);
+    const c = controls(table.el);
+
+    c.select.value = 'failed';
+    c.select.dispatchEvent(new Event('change'));
+    expect(c.select.classList.contains('is-unset')).toBe(false);
+
+    c.from.value = '2026-01-02';
+    c.from.dispatchEvent(new Event('change'));
+    expect(c.from.classList.contains('is-unset')).toBe(false);
+
+    c.to.value = '2026-01-04';
+    c.to.dispatchEvent(new Event('change'));
+    expect(c.to.classList.contains('is-unset')).toBe(false);
+
+    // Back to "All statuses" / cleared dates => muted again.
+    c.select.value = '';
+    c.select.dispatchEvent(new Event('change'));
+    expect(c.select.classList.contains('is-unset')).toBe(true);
+
+    c.from.value = '';
+    c.from.dispatchEvent(new Event('change'));
+    expect(c.from.classList.contains('is-unset')).toBe(true);
+
+    c.to.value = '';
+    c.to.dispatchEvent(new Event('input'));
+    expect(c.to.classList.contains('is-unset')).toBe(true);
+  });
+
+  it('keeps the placeholder option muted in the open list while real statuses stay full strength', () => {
+    // The paint lives in public/style.css:
+    //   .ops-filter-select option           { color: var(--text) }
+    //   .ops-filter-select option[value=''] { color: var(--text-muted) }
+    // The DOM contract those rules key off is the empty-valued placeholder entry
+    // being first, with every other option carrying a non-empty value.
+    const table = createJobsTable({
+      apiFetch: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+      win: null,
+    });
+    document.body.appendChild(table.el);
+    const opts = Array.from(controls(table.el).select.options);
+    expect(opts[0].value).toBe('');
+    expect(opts[0].textContent).toBe('All statuses');
+    expect(opts.slice(1).every((o) => o.value !== '')).toBe(true);
+  });
+});
+
+// ─── The Jobs bar is typeset by the SAME rules as the other bars (issue #983) ──
+//
+// The Assets side of this already resolves against the real sheet
+// (test/assets-tag-metadata-filters.test.ts:369-381, withStylesheet()); the Jobs
+// bar had no equivalent, so the re-typeset that issue #983 performs on it was
+// unpinned. These assertions reuse that harness here.
+//
+// CONTRACT GROUNDING — every marker below was read off its source, not assumed:
+//   - the caption hook: `label.className = 'ops-filter-label'` in labelled(),
+//     public/jobs-table.js:252. Jobs captions are bare <label>s (no caption
+//     <span>), which is exactly why the shared rule has to name BOTH hooks.
+//   - the control hooks: `sel.className = 'ops-filter-select'`
+//     (statusFilterControl), `input.className = 'ops-filter-date'`
+//     (dateInput, public/jobs-table.js:308), `input.className =
+//     'ops-filter-search'` (searchControl) — and the bar they sit in,
+//     `filterBar.className = 'ops-table-filters'` (public/ops-ui-table.js:414),
+//     which every selector below is scoped to.
+//   - the rules, public/style.css:3050-3053 and :3075-3078:
+//     `.ops-table-filters .ops-filter-label, .ops-table-filters .ops-filter-caption
+//      { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em }`
+//     `.ops-table-filters select, .ops-table-filters input
+//      { font: inherit; font-size: 13px; padding: 5px 8px }`
+//
+// The defect this guards: the Jobs controls sit in a `.ops-filter-slot-inner`
+// div and so inherited the bar's 14px, while the Assets/Logs controls sit inside
+// their 12px caption <label> — two tabs' worth of visibly different control text.
+// `font: inherit` alone does not converge them; the explicit 13px does. Anything
+// that drops that declaration, or re-keys the caption rule off a structure the
+// Jobs bar does not have, fails here.
+describe('the Jobs filter bar resolves against the real stylesheet', () => {
+  const STYLESHEET = readFileSync(resolve(process.cwd(), 'public/style.css'), 'utf8');
+
+  function withStylesheet(): () => void {
+    const style = document.createElement('style');
+    style.textContent = STYLESHEET;
+    document.head.appendChild(style);
+    return () => style.remove();
+  }
+
+  function mountStyled() {
+    const drop = withStylesheet();
+    const table = createJobsTable({
+      apiFetch: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+      win: null,
+    });
+    document.body.appendChild(table.el);
+    return { table, drop };
+  }
+
+  it('typesets the Jobs captions at the bar caption size, uppercased', () => {
+    const { table, drop } = mountStyled();
+    try {
+      const captions = table.el.querySelectorAll<HTMLElement>('.ops-table-filters .ops-filter-label');
+      // Status + From + To + Search — a caption per control, none of them a span.
+      expect(captions.length).toBeGreaterThanOrEqual(3);
+      for (const caption of captions) {
+        expect(caption.tagName).toBe('LABEL');
+        const s = getComputedStyle(caption);
+        expect(s.fontSize).toBe('11px');
+        expect(s.textTransform).toBe('uppercase');
+      }
+    } finally {
+      drop();
+    }
+  });
+
+  it('typesets every Jobs select/date/search control at one 13px size', () => {
+    const { table, drop } = mountStyled();
+    try {
+      const select = table.el.querySelector<HTMLElement>('.ops-filter-select')!;
+      const from = table.el.querySelector<HTMLElement>('#jobs-filter-from')!;
+      const to = table.el.querySelector<HTMLElement>('#jobs-filter-to')!;
+      const search = table.el.querySelector<HTMLElement>('.ops-filter-search')!;
+      for (const control of [select, from, to, search]) {
+        expect(control).toBeTruthy();
+        // Each control must really be inside the filter bar, or the scoped rule
+        // above would not apply to it and the size below would be a coincidence.
+        expect(control.closest('.ops-table-filters')).toBeTruthy();
+        expect(getComputedStyle(control).fontSize).toBe('13px');
+      }
+    } finally {
+      drop();
+    }
+  });
+});
+
+// Appended with the describe block above: ESM imports are hoisted, so this sits
+// next to the test that needs it rather than disturbing the import block at the
+// top of this file.
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';

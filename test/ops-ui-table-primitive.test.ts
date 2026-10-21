@@ -363,6 +363,36 @@ describe('shared table states', () => {
     expect(pagination.style.display).toBe('none');
   });
 
+  // issue #997 — a table whose empty row has more than one meaning supplies a
+  // resolver; every table that does not keeps the plain emptyText row above.
+  it('resolves the empty row through emptyState when one is configured', () => {
+    const table = mount({
+      emptyText: 'Nothing here.',
+      emptyState: () => ({ text: 'Never written to.', detail: 'Why it is empty.', kind: 'never-written' }),
+    });
+    table.setRows([]);
+    const cell = table.el.querySelector('tr.ops-table-empty td')!;
+    expect(cell.getAttribute('data-empty')).toBe('never-written');
+    expect(cell.firstChild?.textContent).toBe('Never written to.');
+    const detail = cell.querySelector('.ops-table-empty-detail')!;
+    expect(detail.textContent).toBe('Why it is empty.');
+  });
+
+  it('falls back to emptyText when the resolver supplies no text, and re-resolves per paint', () => {
+    let kind = 'first';
+    const table = mount({
+      emptyText: 'Nothing here.',
+      emptyState: () => ({ kind }),
+    });
+    table.setRows([]);
+    expect(table.el.querySelector('tr.ops-table-empty td')!.textContent).toBe('Nothing here.');
+    expect(table.el.querySelector('tr.ops-table-empty td')!.getAttribute('data-empty')).toBe('first');
+    // A later paint re-reads the resolver rather than a value captured at mount.
+    kind = 'second';
+    table.setRows([]);
+    expect(table.el.querySelector('tr.ops-table-empty td')!.getAttribute('data-empty')).toBe('second');
+  });
+
   it('renders one row per item with escaped default cells and custom render()', () => {
     const table = mount({
       columns: [

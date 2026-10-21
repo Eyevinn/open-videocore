@@ -56,7 +56,24 @@ export type StackConfig = {
   // connections for 'ready'. Optional for back-compat: configs written before
   // this field existed have no `status` and MUST be read as 'ready' so already
   // provisioned live stacks keep working (see isReadyStack).
-  status?: 'provisioning' | 'ready' | 'failed';
+  //
+  // TEARDOWN states (issue #1210). A stack whose DELETE is running or left
+  // services behind MUST stay in the listing — its stored config is the only
+  // record of what is still to remove — but it must not read as a live stack:
+  //   'deleting'      — a teardown is in flight for this stack.
+  //   'delete_failed' — a teardown finished with at least one service NOT
+  //                     removed (StackTeardownResult.status === 'failed'); the
+  //                     entry is deliberately retained so a retried DELETE can
+  //                     re-read services[] and finish the job.
+  // Both are non-ready, so isReadyStack (and therefore the resolver) skips
+  // them exactly like 'provisioning'/'failed'. The entry is only deleted once
+  // every service is confirmed gone.
+  status?:
+    | 'provisioning'
+    | 'ready'
+    | 'failed'
+    | 'deleting'
+    | 'delete_failed';
   minioEndpoint: string;
   // CouchDB host/URL only — no embedded password.
   couchdbUrl: string;
@@ -80,6 +97,30 @@ export type StackConfig = {
   // existed have no value here and MUST still load without error, and an unset
   // value falls through to the remote default index (byte-identical to today).
   encoreProfilesUrl?: string;
+  // The object store's PER-STACK access key id (issue #1094). NON-SECRET: an
+  // identifier, like a username — the same classification the #212 external
+  // credential mapping gives `accessKeyId`
+  // (services/external-storage-credentials.ts:33). The matching SECRET access
+  // key is NEVER stored here (nor anywhere else at rest): it is derived from
+  // this id plus the deployment seed by resolveObjectStoreCredential
+  // (services/object-store-credentials.ts) and persisted as an OSC secret for
+  // the services that consume it by reference.
+  //
+  // Optional for back-compat, mirroring `status?` / the fields above: a stack
+  // provisioned BEFORE #1094 carries no value here, and its absence is the
+  // signal to use the legacy process-global `admin` + deployment-password
+  // credential (removed, with the stacks migrated, by #1096). Present means the
+  // stack's object store was created with its own credential.
+  objectStoreAccessKeyId?: string;
+  // The Valkey queue key this stack's on-demand packager consumes. Every
+  // packager listens on the same shared Valkey, so a packager provisioned for a
+  // non-first stack gets its own key (packagerQueueForStack) — otherwise any
+  // stack's packager could pop another stack's job and read the wrong object
+  // store. Recorded when the packager is created so producers enqueue onto
+  // exactly the key it was built with. Optional for back-compat: a packager
+  // provisioned before this field existed consumes the shared default key, and
+  // an unset value keeps enqueueing there.
+  packagerQueue?: string;
   // Per-role storage backend metadata (issue #211). Optional for back-compat:
   // configs written before this field existed have no `storage`, in which case
   // both roles are the default per-stack MinIO backend (sourceBucket /
@@ -98,7 +139,10 @@ export type StackConfig = {
 // Back-compat: a missing `status` (config written before issue #106) is treated
 // as 'ready' so existing live stacks keep resolving. Only 'ready' (or absent)
 // stacks are connected; 'provisioning'/'failed' are skipped by the resolver but
-// remain readable for deprovision cleanup (they still carry services[]).
+// remain readable for deprovision cleanup (they still carry services[]). The
+// teardown states 'deleting'/'delete_failed' (issue #1210) are skipped for the
+// same reason and for the same purpose: the entry survives so a retried DELETE
+// still knows which services are left.
 export function isReadyStack(config: StackConfig): boolean {
   return config.status === undefined || config.status === 'ready';
 }
@@ -317,6 +361,32 @@ function backoffDelay(attempt: number, cfg: Required<ParamStoreRetryConfig>): nu
 
 const realSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
+
+// Page size requested from the config service's list endpoint, and the ONLY
+// bound on how much of the key space a single list call can observe.
+//
+// 100 is not an arbitrary choice: it is the schema maximum the service enforces
+// on `limit`. Contract verified (CLAUDE.md rule 7) against the service's own
+// source — Eyevinn/app-config-svc, `src/api_config.ts` on `main`
+// (commit c1538c0e88), route `GET /config` registered under the `/api/v1`
+// prefix:
+//
+//   PageQuery = Type.Object({
+//     match:  Type.Optional(Type.String()),
+//     offset: Type.Optional(Type.Number({ minimum: 0 })),
+//     limit:  Type.Optional(Type.Number({ minimum: 1, maximum: 100 }))   // ← cap
+//   })
+//   ConfigObjectList = { offset: number; limit: number; total: number;
+//                        items: ConfigObject[]; skippedKeys?: number }
+//   ConfigObject     = { key: string; value: string; secret?: boolean }
+//
+// Requesting more than 100 is rejected by schema validation, so a store holding
+// more than 100 keys CANNOT be enumerated by one call. The service does accept
+// an `offset`, so a paginating consumer is possible — this client does not
+// paginate today, which is why every caller of a list method must treat a full
+// page as "possibly truncated". See
+// docs/osc-feedback/incoming-issue804-config-svc-list-pagination.md.
+export const CONFIG_LIST_PAGE_LIMIT = 100 as const;
 
 // HTTP-backed parameter store client for eyevinn-app-config-svc.
 //
@@ -556,15 +626,17 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
 
     async listStackNames(workspaceId) {
       const prefix = `openvideocore/${workspaceId}/`;
-      // The app-config-svc list endpoint returns { items: [{ key, value }], total }
-      // with a configurable limit. We fetch up to 100 to cover realistic use.
+      // The app-config-svc list endpoint returns { offset, limit, total, items }
+      // (ConfigObjectList). CONFIG_LIST_PAGE_LIMIT is the schema maximum for
+      // `limit`, so this single page is also the most one call can observe; a
+      // store holding more keys than that is silently truncated here.
       // This GET is the stack-resolver refresh round-trip (issue #421): wrap it
       // in bounded retry-with-backoff so a boot-time TLS blip or timeout does not
       // turn into a full storage outage for the instance.
       return withRetry('listStackNames', async () => {
         const h = await buildHeaders();
         const res = await withTimeout((signal) =>
-          doFetch(`${base}/api/v1/config?limit=100`, { method: 'GET', headers: h, signal })
+          doFetch(`${base}/api/v1/config?limit=${CONFIG_LIST_PAGE_LIMIT}`, { method: 'GET', headers: h, signal })
         );
         if (!res.ok) {
           const text = await res.text().catch(() => '');
@@ -595,7 +667,7 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
 //   POST   /api/v1/config          { key, value }  → 200
 //   GET    /api/v1/config/{key}    → 200 { key, value } | 404
 //   DELETE /api/v1/config/{key}    → 200 | 404
-//   GET    /api/v1/config?limit=N  → 200 { items: [{ key, value }] }
+//   GET    /api/v1/config?limit=N  → 200 { offset, limit, total, items: [{ key, value }] }
 // SECURITY: callers MUST NOT write secret material here — same discipline as the
 // StackConfig path (assertNoCredentials). The registry writes only non-secret
 // records; the access key + secret go to OSC secrets via saveSecret.
@@ -603,7 +675,15 @@ export interface ConfigKvStore {
   set(key: string, value: string): Promise<void>;
   get(key: string): Promise<string | undefined>;
   delete(key: string): Promise<void>;
-  // List all { key, value } pairs whose key begins with `prefix`.
+  // List { key, value } pairs whose key begins with `prefix`.
+  //
+  // BOUNDED, NOT EXHAUSTIVE. The implementation fetches a single page of at
+  // most CONFIG_LIST_PAGE_LIMIT entries (the service's schema maximum for
+  // `limit`) and filters by prefix client-side, so the result is a subset, not
+  // a guaranteed-complete enumeration. Callers that draw a conclusion from an
+  // EMPTY result ("nothing matches") must account for truncation: a returned
+  // count equal to CONFIG_LIST_PAGE_LIMIT means the page was full and matches
+  // may have been cut off. See scanStaleNamespacedStacks in workspace-stack.ts.
   listByPrefix(prefix: string): Promise<Array<{ key: string; value: string }>>;
 }
 
@@ -684,7 +764,7 @@ export function makeHttpConfigKvStore(config: HttpParamStoreConfig): ConfigKvSto
     async listByPrefix(prefix) {
       const h = await buildHeaders();
       const res = await withTimeout((signal) =>
-        doFetch(`${base}/api/v1/config?limit=100`, { method: 'GET', headers: h, signal })
+        doFetch(`${base}/api/v1/config?limit=${CONFIG_LIST_PAGE_LIMIT}`, { method: 'GET', headers: h, signal })
       );
       if (!res.ok) {
         const text = await res.text().catch(() => '');
@@ -694,6 +774,144 @@ export function makeHttpConfigKvStore(config: HttpParamStoreConfig): ConfigKvSto
       return (body.items ?? [])
         .filter((item) => item.key.startsWith(prefix) && typeof item.value === 'string')
         .map((item) => ({ key: item.key, value: item.value as string }));
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Scaler runtime config (issue #1077 — write side; issue #1078 — boot read side)
+// ---------------------------------------------------------------------------
+//
+// PATCH /api/v1/scaler/config used to mutate only module-scope values in
+// routes/scaler.ts, so an operator's change was lost on the next restart. The
+// values are now persisted here, and this block is the CONTRACT the boot-load
+// side (#1078) reads. Do not change the key or the value shape without changing
+// both sides.
+//
+// SCOPE: instance-global, NOT per-stack and NOT per-workspace. The scaler pool
+// ceiling/idle timeout are deployment-wide (main.ts reads them once from
+// ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS at main.ts:887,897 and the
+// WorkspaceEncoreScalerRegistry applies them across every workspace via
+// setMaxInstances/setIdleTimeoutMs), and the scaler config route is deliberately
+// unauthenticated — it has no workspace or stack name in scope. They are
+// therefore NOT fields on StackConfig (which is keyed per workspace+stack by
+// stackConfigKey) but one dedicated key, written through the same
+// eyevinn-app-config-svc HTTP contract via ConfigKvStore.
+//
+// KEY: `openvideocore/scalerconfig` — ONE segment after the shared
+// `openvideocore/` prefix. That is deliberate: the stale-namespace scan in
+// services/workspace-stack.ts (scanStaleNamespacedStacks, `segments.length !== 2`)
+// only considers two-segment keys as candidate stack configs, so a single-segment
+// key can never be mistaken for one and needs no entry in
+// RESERVED_KEY_SEGMENTS.
+//
+// VALUE: a JSON object carrying ALL THREE fields, always written as a complete
+// snapshot (never a partial patch), so one read yields a complete config:
+//   {"maxInstances":3,"minInstances":0,"idleTimeoutMs":300000}
+// Non-secret by construction: three integers, no credentials, nothing
+// workspace-identifying.
+export const SCALER_CONFIG_KEY = 'openvideocore/scalerconfig' as const;
+
+// The persisted scaler runtime config. Every field is REQUIRED in the stored
+// blob — the writer always sends a full snapshot (see SCALER_CONFIG_KEY), so the
+// reader never has to merge a partial record.
+export type ScalerRuntimeConfig = {
+  // Upper bound on Encore instances per workspace pool.
+  maxInstances: number;
+  // Instances kept warm (0 = scale to zero when idle).
+  minInstances: number;
+  // Idle time in ms before an idle instance is torn down.
+  idleTimeoutMs: number;
+};
+
+// The authoritative range of each scaler config field, in ONE place so the
+// three readers of it cannot drift:
+//   - routes/scaler.ts `scalerConfigSchema` — request validation (400) AND, via
+//     `scalerConfigResponseSchema`, the 200 response schema of GET/PATCH
+//     /api/v1/scaler/config, so a value outside these bounds cannot be
+//     SERIALIZED either: it fails response validation (500).
+//   - services/scaler-boot-config.ts `resolveScalerBootConfig` — clamps a
+//     persisted record into these bounds at boot (#1078 review finding 8), so a
+//     record written under older/looser bounds cannot make the config endpoint
+//     unserializable or push the scaler loops past the documented ceiling.
+//   - this file's `parseScalerRuntimeConfig`, which deliberately does NOT apply
+//     them (see below).
+export const SCALER_CONFIG_BOUNDS = {
+  maxInstances: { min: 1, max: 20 },
+  minInstances: { min: 0, max: 10 },
+  // Lower bound only: a near-zero idle timeout thrashes the spawn/destroy cycle.
+  idleTimeoutMs: { min: 10_000 }
+} as const;
+
+// Parse a stored scaler-config blob, returning undefined for anything that is
+// not a usable config so a caller (boot load, #1078) can fall back to its env
+// defaults instead of throwing.
+//
+// The check is STRUCTURAL plus a minimal sanity floor, NOT the full range check
+// in SCALER_CONFIG_BOUNDS above, which is applied at WRITE time by the route.
+// Re-applying the full range here would mean that tightening a bound later
+// silently discards a previously-valid persisted value at boot — so the reader
+// only rejects values that are not usable integers at all, and the boot path
+// CLAMPS what it reads into the bounds (resolveScalerBootConfig) instead of
+// dropping the whole record.
+export function parseScalerRuntimeConfig(raw: string): ScalerRuntimeConfig | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return undefined;
+  const record = parsed as Record<string, unknown>;
+  const asInt = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isInteger(value) ? value : undefined;
+  const maxInstances = asInt(record['maxInstances']);
+  const minInstances = asInt(record['minInstances']);
+  const idleTimeoutMs = asInt(record['idleTimeoutMs']);
+  if (maxInstances === undefined || minInstances === undefined || idleTimeoutMs === undefined) {
+    return undefined;
+  }
+  // Sanity floor only: a pool cap below 1 could never run a job, and negative
+  // warm-instance / idle values are nonsense rather than policy.
+  if (maxInstances < 1 || minInstances < 0 || idleTimeoutMs < 0) return undefined;
+  return { maxInstances, minInstances, idleTimeoutMs };
+}
+
+// Durable store for the instance-global scaler runtime config. Narrow on
+// purpose: the PATCH route only needs `save`, and the boot path (#1078) only
+// needs `load`, so each side can be tested with a one-method stub.
+export interface ScalerConfigStore {
+  // Persist a COMPLETE config snapshot. Rejects (throws) when the write did not
+  // land durably — the PATCH route turns that into a non-2xx and leaves the live
+  // values untouched, so the API never reports a value it did not persist.
+  save(config: ScalerRuntimeConfig): Promise<void>;
+  // Read the persisted config, or undefined when nothing is stored (or the
+  // stored blob is unusable — see parseScalerRuntimeConfig).
+  load(): Promise<ScalerRuntimeConfig | undefined>;
+}
+
+// Build a ScalerConfigStore over the generic ConfigKvStore (same
+// eyevinn-app-config-svc HTTP contract as every other persisted record). Mirrors
+// the ParamStoreBackendRecordStore idiom in services/storage-backend-registry.ts
+// (`this.kv.set(key, JSON.stringify(record))`): a JSON blob under one key, and a
+// failed write propagates as a thrown error from ConfigKvStore.set
+// (param-store.ts `config kv write failed: <status> <body>`).
+export function makeScalerConfigStore(kv: ConfigKvStore): ScalerConfigStore {
+  return {
+    async save(config) {
+      // Normalised to exactly the three contract fields so no extra key can
+      // leak into the stored blob from a caller's wider object.
+      const snapshot: ScalerRuntimeConfig = {
+        maxInstances: config.maxInstances,
+        minInstances: config.minInstances,
+        idleTimeoutMs: config.idleTimeoutMs
+      };
+      await kv.set(SCALER_CONFIG_KEY, JSON.stringify(snapshot));
+    },
+    async load() {
+      const raw = await kv.get(SCALER_CONFIG_KEY);
+      if (!raw) return undefined;
+      return parseScalerRuntimeConfig(raw);
     }
   };
 }
@@ -796,6 +1014,12 @@ export interface OscInstanceApi {
     sat: string,
     body: Record<string, unknown>
   ): Promise<{ name?: string }>;
+  // Readiness wait for an instance this module just created. NOT
+  // @osaas/client-core's waitForInstanceReady: main.ts fulfils this with the
+  // bounded waitForInstanceReadyBounded (src/services/instance-readiness.ts,
+  // issue #1055), so a Valkey that never reports `running` gives up at a
+  // deadline instead of hanging the startup bootstrap forever. The rejection is
+  // caught by the warn-and-continue handler at the end of ensureParameterStore.
   waitForInstanceReady(serviceId: string, name: string): Promise<void>;
   getPortsForInstance(
     serviceId: string,

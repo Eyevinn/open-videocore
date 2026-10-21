@@ -23,7 +23,13 @@
 // Encore resolves s3:// URIs against AWS S3 and gets a 404.
 export type EncoreS3Config = {
   endpoint: string;     // full URL, e.g. https://oscaidev-jonas.minio-minio.auto.prod-se.osaas.io
-  accessKeyId: string;  // MinIO root user (always "admin" in OSC stacks)
+  // The object store's access key id FOR THE RESOLVED STACK (issue #1094),
+  // produced by resolveEncoreS3Config from that stack's stored config — per
+  // stack, no longer a deployment-wide root user. A stack provisioned before
+  // #1094 still resolves to the legacy root user until #1096 migrates it.
+  accessKeyId: string;
+  // SECRET. Goes into the spawned instance's create body (instance-pool.ts) and
+  // nowhere else — never a log line, never an API response.
   secretAccessKey: string;
   region?: string;      // S3 region string — MinIO ignores it but Encore requires a value
 };
@@ -39,6 +45,38 @@ export type EncoreS3Config = {
 export type DroppedJob = {
   encoreJobId: string;
   reason?: string;
+};
+
+// #1071: the last scale-up for a workspace that could not create an instance.
+//
+// spawnInstance() retries transient OSC errors and then throws; before this the
+// throw was only ever logged, so GET /scaler/status could not tell "the pool is
+// at maxInstances" apart from "OSC is refusing to create the instance" — both
+// present as a pool that stops growing with jobs still queued. One record per
+// WORKSPACE, not per instance: the thing that failed is the workspace's
+// scale-up, and there is no instance to hang it off.
+//   - at:                  epoch ms the failure was recorded.
+//   - attempts:            TOTAL createInstance calls the failed spawn made,
+//                          summed over BOTH services it creates — the Encore
+//                          instance and its paired callback listener, each with
+//                          its own maxAttempts loop. It is NOT the attempt number
+//                          of a single loop and may exceed maxAttempts (an Encore
+//                          create that succeeded on try 2 followed by three failed
+//                          listener creates reports 5). Read it as "how much work
+//                          this spawn burned before giving up".
+//   - consecutiveFailures: how many spawns in a row have failed, carried
+//                          forward across records and reset by a success, so a
+//                          transient blip is distinguishable from a scaler that
+//                          has been unable to grow for an hour.
+//   - message:             the error text, REDACTED (src/encore-scaler/
+//                          spawn-failure.ts redactSpawnFailureMessage) — it is
+//                          served over HTTP, and OSC error text can echo the
+//                          credentials/URLs/token the spawn request carried.
+export type SpawnFailureRecord = {
+  at: number;
+  attempts: number;
+  consecutiveFailures: number;
+  message: string;
 };
 
 export type EncoreScalerConfig = {
@@ -64,6 +102,14 @@ export type EncoreScalerConfig = {
   // job. On timeout the instance is quarantined from job assignment rather than
   // dispatched to. Default 60_000; override via ENCORE_CALLBACK_TRUST_TIMEOUT_MS.
   callbackTrustTimeoutMs?: number;
+  // Per-REQUEST bound (ms) for a single callback-trust probe HTTP request
+  // (issue #1171). Distinct from callbackTrustTimeoutMs, which is the
+  // cross-tick bounded WAIT: before this existed the 60s wait value doubled as
+  // the per-request AbortSignal window, so one hung probe could hold a tick —
+  // and therefore instance readiness and job assignment — for a full minute.
+  // Default DEFAULT_PROBE_REQUEST_TIMEOUT_MS (5_000); override via
+  // ENCORE_CALLBACK_PROBE_TIMEOUT_MS.
+  callbackProbeRequestTimeoutMs?: number;
   // #708: grace window (ms) during which reconcile() will NOT re-raise a job as
   // silently dropped if the callback poller recorded its completion very
   // recently (keys.jobCompletionSeen). Closes the narrow race where reconcile
@@ -72,6 +118,45 @@ export type EncoreScalerConfig = {
   // Default DEFAULT_RECONCILE_GRACE_MS (10_000); override via
   // ENCORE_RECONCILE_GRACE_MS.
   reconcileGraceMs?: number;
+  // #778: how often (ms) the tick sweeps OSC for scaler-owned Encore instances
+  // that have NO pool record at all — instances orphaned by a spawn that died
+  // between createInstance and the pool write, a wiped Valkey, or a deleted
+  // deployment. Nothing else can ever tear those down: every teardown path
+  // (scale-down, teardown()) iterates the pool hash, so an instance missing
+  // from it bills forever. Unset or <= 0 disables the sweep (the default for
+  // tests and any caller that has not opted in); the registry wires
+  // DEFAULT_ORPHAN_REAP_INTERVAL_MS in production.
+  orphanReapIntervalMs?: number;
+  // #778 (review finding 4): bound (ms) on how long spawnInstance waits for an
+  // OSC instance to report `running`. @osaas/client-core's waitForInstanceReady
+  // polls getInstanceHealth in a `while` loop with NO timeout and no abort
+  // (lib/core.js:343-353, v0.24.0), so without this a spawn can hang forever
+  // while holding a live,
+  // billing OSC instance that has no pool record — the very state the orphan
+  // reaper's grace window is supposed to be able to outlast. Unset uses
+  // DEFAULT_SPAWN_READY_TIMEOUT_MS.
+  //
+  // #1071: this budget must cover NODE provisioning, not just pod start. OSC may
+  // have to bring up a whole new worker node to place the instance (which is also
+  // why createInstance can answer 504 while the work continues behind the
+  // gateway), and that takes minutes. The default was raised to 15 minutes
+  // accordingly; a deployment on a cluster with spare capacity can lower it with
+  // ENCORE_SPAWN_READY_TIMEOUT_MS. On timeout the spawn no longer destroys the
+  // instance: it records it as a PENDING pool entry (EncoreInstanceRecord
+  // .pendingReadySince) that the next tick waits on, which counts against
+  // maxInstances and carries its own destroy deadline — this same budget again.
+  spawnReadyTimeoutMs?: number;
+  // #778 (review round 2): how often (ms) that bounded wait re-checks
+  // getInstanceHealth. The scaler owns the poll loop instead of racing a timer
+  // against waitForInstanceReady, because the SDK helper exposes no abort and
+  // would keep polling forever after we stopped waiting. Unset uses
+  // DEFAULT_SPAWN_READY_POLL_INTERVAL_MS (1s, the SDK's own cadence).
+  spawnReadyPollIntervalMs?: number;
+  // #778: how long (ms) an instance must have been continuously observed as
+  // orphaned before the reaper destroys it. Guards a spawn in progress, which
+  // holds a live OSC instance with no pool record for as long as
+  // waitForInstanceReady takes. Unset uses DEFAULT_ORPHAN_GRACE_MS.
+  orphanGraceMs?: number;
   // Redis connection string, passed to each paired callback listener so it can
   // put completion messages on the packaging queue.
   redisUrl: string;
@@ -141,6 +226,35 @@ export type EncoreScalerConfig = {
   // externalId (same id onDispatched/onJobsDropped resolve by). Best-effort: the
   // scaler swallows a thrown hook so a repo hiccup never blocks the re-enqueue.
   onJobInterrupted?: (encoreJobId: string, reason: 'interrupted_by_scaledown') => Promise<void>;
+  // Operational log store the control loop appends its spawn/dispatch/reap/tick
+  // FAILURES to (issue #998, parent #985). Before this the loop reported those
+  // failures with `console.error` only — visible in the container's stdout and
+  // nowhere else, so the one subsystem with no API/UI visibility stayed invisible
+  // exactly when an operator needed it.
+  //
+  // Narrowed to the single write method (`ScalerLogSink.append`,
+  // src/encore-scaler/scaler-log.ts) so the loop can never reach the store's
+  // read/pagination surface. Satisfied by the in-memory `LogStore`, the durable
+  // `CouchLogStore` (#996) and the stack-delegating `PerWorkspaceLogStore` that
+  // main.ts registers — the SAME instance GET /api/v1/logs reads and the
+  // pipeline-step producer (#995) writes to.
+  //
+  // Optional, and emission is a no-op when unset: tests and embedders that have
+  // not wired a store behave exactly as before. Every append is fire-and-forget
+  // and never throws (see logScalerEvent), and the existing `console.error` at
+  // each call site is kept, so this is purely additive.
+  //
+  // Two obligations on whoever wires this (#998 review):
+  //   - A STACK-DELEGATING sink must use the `ScalerLogContext.workspaceId`
+  //     passed to `append()`, not the ambient request stack: the loop runs on a
+  //     `setInterval` with no request context, so a sink that resolves the
+  //     ambient stack writes every workspace's failures to the default one.
+  //     main.ts wraps its PerWorkspaceLogStore accordingly.
+  //   - Appends are already RATE-LIMITED per (workspace, phase) by the loop
+  //     (ScalerLogThrottle), so a sink does not need its own throttle — and
+  //     must not assume one entry per failure: an entry can report collapsed
+  //     repeats.
+  logSink?: import('./scaler-log.js').ScalerLogSink;
 };
 
 export type EncoreInstanceRecord = {
@@ -171,8 +285,33 @@ export type EncoreInstanceRecord = {
   // assignment and NOT dispatched to. Records the epoch-ms the quarantine was
   // applied so the condition is queryable rather than silently retried forever.
   callbackTrustQuarantinedAt?: number;
+  // Set when the trust probe kept getting an authorisation rejection (HTTP
+  // 401/403) from the paired callback-listener ingress for the whole bounded
+  // wait (issue #813). The TLS trust path is fine but the callback path is NOT
+  // usable: Encore's progress/completion POST will be rejected the same way, so
+  // this instance's jobs are completed by the terminal-job reconciliation sweep
+  // (src/pipeline/encore-callback-poller.ts sweepTerminalJobs) instead of by
+  // callbacks. This is a DEGRADED state, explicitly distinct from
+  // `callbackTrustReady` (callback path confirmed working): the instance is
+  // still dispatched to — halting the pool would be worse than sweep-only
+  // completion — but the condition is persisted (and logged) so an operator or
+  // an alert can see it. `callbackPathUnusableStatus` records the rejecting
+  // status for triage.
+  callbackPathUnusableAt?: number;
+  callbackPathUnusableStatus?: number;
   activeJobs: number; // jobs currently running on this instance
   lastIdleAt: number; // epoch ms when activeJobs last reached 0
+  // Epoch ms at which this instance entered the pool ready to take work (#778).
+  // The idle clock's FALLBACK basis: `lastIdleAt` only advances when a job
+  // COMPLETES (encore-callback-poller.ts:320, routes/internal.ts:194), so an
+  // instance that is spawned and never dispatched a job has no completion to
+  // key off. Recording readiness explicitly means "never dispatched" is idle
+  // from the moment it became ready and the existing idleTimeoutMs applies to
+  // it like any other idle instance. Optional so records written by an earlier
+  // version (or hand-repaired out of band) still load; the scale-down path
+  // fails CLOSED when neither timestamp is a usable number — see
+  // resolveIdleSince() in scaler-loop.ts.
+  readyAt?: number;
   // Set when scale-down has selected this instance for teardown but it still
   // has real in-flight work (issue #513, drain-don't-kill). A draining instance
   // is removed from routing (never dispatched a new job) and is only torn down
@@ -180,6 +319,51 @@ export type EncoreInstanceRecord = {
   // ever killing an instance with a genuine in-flight transcode when the tracked
   // activeJobs count has diverged from the instance's real IN_PROGRESS state.
   draining?: boolean;
+  // #1071: epoch ms at which a spawn gave up waiting for this instance to report
+  // `running` and left it ALIVE rather than destroying it. The instance exists on
+  // OSC and is probably still coming up (node provisioning), so it is tracked
+  // here as a PENDING pool entry instead of being thrown away or leaked:
+  //   - it counts towards maxInstances, so repeated readiness timeouts cannot
+  //     pile up uncapped behind a cap computed from this hash;
+  //   - the next tick waits on it (resolvePendingSpawns) rather than spawning a
+  //     sibling for the node that is already being provisioned;
+  //   - it is NEVER dispatched to while this is set — it has never reported
+  //     healthy;
+  //   - and it has a deadline: resolvePendingSpawns promotes it the moment OSC
+  //     reports `running`, and destroys it once this timestamp is older than the
+  //     readiness budget with OSC still not reporting `running` (an instance OSC
+  //     says is not running cannot be mid-transcode), so the billing leak is
+  //     bounded rather than left to the orphan sweep's conservative refusal to
+  //     act on an unconfirmable instance.
+  // Absent on every normal record.
+  pendingReadySince?: number;
+  // #1109: back-off bookkeeping for the ONE piece of work resolvePendingSpawns
+  // does on a pending record — creating (or adopting) the paired callback
+  // listener the timed-out spawn never got to. Only ever set while
+  // `pendingReadySince` is set, and cleared the moment the listener exists.
+  //
+  // Without these the resolver re-attempted the create on EVERY tick until the
+  // readiness deadline: ~90 createInstance calls per stuck instance at a 10s
+  // tick and a 15-minute budget, with no distinction between a 500 that will
+  // pass and a 422 that never will. The spawn path has always classified its
+  // own create failures (spawnPooledInstance, instance-pool.ts) — these fields
+  // give the resolver, which retries ACROSS ticks rather than inside one call,
+  // somewhere to keep the same decision between ticks.
+  //
+  // How many listener creates the resolver has attempted for this instance.
+  // Drives the exponential back-off interval.
+  listenerCreateAttempts?: number;
+  // Epoch ms before which the resolver must not attempt another listener
+  // create. Set after a RETRYABLE failure (5xx/408/429/transport, or a "name
+  // already taken" the follow-up getInstance could not confirm).
+  listenerCreateNextAttemptAt?: number;
+  // Epoch ms at which a listener create failed PERMANENTLY (a rejected body, a
+  // bad token, an exhausted quota — anything isTransientOscError calls
+  // non-transient). No further create is attempted for this instance: it stays
+  // pending, is never dispatched to, and is destroyed on its normal deadline so
+  // a clean spawn can replace it. Recorded rather than inferred so the
+  // condition is visible on the record instead of being a silent stall.
+  listenerCreateBlockedAt?: number;
 };
 
 export type QueuedJob = {
@@ -221,6 +405,17 @@ export const keys = {
   // depending on the instance still being in the pool — the scaler may have
   // already torn down the instance by the time the transcode callback arrives.
   jobEncoreUrl: (encoreJobId: string) => `encore:job-url:${encoreJobId}`,
+  // The instance a job ran on, retained AFTER the job goes terminal (issue
+  // #739). `jobInstance` is the live mapping and is hdel'd the moment a
+  // transcode succeeds (encore-callback-poller.ts) so the finished job stops
+  // being a drop candidate — but two things still need to know which instance
+  // ran it once it is terminal: the packaging pin/unpin (#525 pt.2) and the
+  // package-only pipeline, which dispatches packaging for a transcode that
+  // completed minutes-to-hours ago. Written by the poller from the same read it
+  // uses for `terminalInstanceId`, immediately before the hdel, with the same
+  // 24h TTL as `jobEncoreUrl` so URL and instance stay resolvable for the same
+  // window. Keyed by our encoreJobId (externalId, globally unique).
+  jobTerminalInstance: (encoreJobId: string) => `encore:job-terminal-instance:${encoreJobId}`,
   // Original Encore job payload, stored at dispatch time with a 24h TTL so a
   // transport-class failure can be re-dispatched (#295) without the caller
   // re-submitting. Keyed by our externalId (encoreJobId), which is globally
@@ -240,6 +435,21 @@ export const keys = {
   // over the grace window so the key self-expires; the poller also deletes it on
   // the same completion path once the decrement is durably applied.
   jobCompletionSeen: (encoreJobId: string) => `encore:job-completion-seen:${encoreJobId}`,
+  // #769 review finding 4: how many CONSECUTIVE reconcile passes have classified
+  // this job as dropped while pool visibility was PARTIAL (at least one pool
+  // instance unreachable, unparseable, or returning a truncated active page).
+  // Stored as a decimal string keyed by our externalId (encoreJobId, globally
+  // unique like jobUuid/jobCompletionSeen), with a PX TTL so an abandoned
+  // counter self-expires rather than leaking a field forever.
+  //
+  // A drop decided on a partial view of the pool cannot distinguish "gone" from
+  // "running on the instance we could not read" — the exact false-drop class
+  // #769 exists to fix. reconcile() therefore withholds such a drop until this
+  // counter reaches PARTIAL_VISIBILITY_DROP_PASSES, and deletes the key the
+  // moment the job is seen active anywhere or the drop finally lands. A
+  // full-visibility pass never consults it.
+  partialVisibilityDropPasses: (encoreJobId: string) =>
+    `encore:partial-visibility-drop:${encoreJobId}`,
   // #525 pt.2: set of encoreJobIds (externalIds) whose packaging has been
   // handed off but not yet confirmed complete, keyed per Encore instance. The
   // scaler's teardown eligibility check treats a non-empty set here as real
@@ -248,5 +458,20 @@ export const keys = {
   // (minInstances:0, short idleTimeoutMs) before the packager has had a
   // chance to GET that instance's /encoreJobs/{uuid} endpoint. See
   // src/encore-scaler/packaging-pin.ts.
-  pendingPackaging: (instanceId: string) => `encore:pending-packaging:${instanceId}`
+  pendingPackaging: (instanceId: string) => `encore:pending-packaging:${instanceId}`,
+  // #778: hash of orphan-candidate instanceId -> epoch ms (string) of the FIRST
+  // sweep that saw a scaler-owned Encore instance running on OSC with no pool
+  // record. The orphan reaper only destroys an instance that is still orphaned
+  // after the grace window, so an instance mid-spawn (created on OSC, pool
+  // record not yet written — instance-pool.ts spawnInstance) is never reaped
+  // out from under the spawn that is still in progress. Entries are deleted as
+  // soon as the instance is adopted into the pool, reaped, or disappears.
+  orphanSeen: (workspaceId: string) => `encore:orphan-seen:${workspaceId}`,
+  // #1071: JSON SpawnFailureRecord for the workspace's most recent failed
+  // scale-up, written by spawnInstance's failure path (instance-pool.ts) and
+  // read by GET /scaler/status (routes/scaler.ts) so a scaler that cannot grow
+  // is distinguishable from one that is simply at its cap. Cleared on the next
+  // successful spawn; given a PX TTL (SPAWN_FAILURE_TTL_MS) so a record nothing
+  // ever clears self-expires instead of reporting ancient history forever.
+  spawnFailure: (workspaceId: string) => `encore:spawn-failure:${workspaceId}`
 };

@@ -158,6 +158,38 @@ class FakeRedis {
     const end = stop === -1 ? l.length - 1 : stop;
     return l.slice(start, end + 1);
   }
+  async llen(key: string): Promise<number> {
+    return this.lists.get(key)?.length ?? 0;
+  }
+  // ioredis RPOPLPUSH: atomically pop the tail of `src` and LPUSH it to the head
+  // of `dst`, returning the moved element (null when `src` is empty). Head is
+  // index 0 here (lpush unshifts), so the tail is the last element.
+  async rpoplpush(src: string, dst: string): Promise<string | null> {
+    const s = this.lists.get(src) ?? [];
+    const val = s.pop();
+    this.lists.set(src, s);
+    if (val === undefined) return null;
+    const d = this.lists.get(dst) ?? [];
+    d.unshift(val);
+    this.lists.set(dst, d);
+    return val;
+  }
+  // ioredis LREM with count > 0 removes up to `count` matching elements scanning
+  // from head to tail. The scaler loop always calls it as `lrem(list, 1, val)`.
+  async lrem(key: string, count: number, val: string): Promise<number> {
+    const l = this.lists.get(key) ?? [];
+    let removed = 0;
+    const out: string[] = [];
+    for (const item of l) {
+      if (item === val && (count === 0 || removed < count)) {
+        removed++;
+        continue;
+      }
+      out.push(item);
+    }
+    this.lists.set(key, out);
+    return removed;
+  }
 }
 
 function asRedis(f: FakeRedis): Redis {
@@ -245,6 +277,20 @@ describe('decideRetry (#295 re-dispatch gate)', () => {
     expect(await redis.lrange(keys.queue(WS), 0, -1)).toHaveLength(0);
   });
 
+  // Simulate the scaler loop draining the re-queued entry off keys.queue and
+  // dispatching it — RPOPLPUSH queue->inflight then LREM inflight once the POST
+  // lands — exactly as scaler-loop.ts:253-283 does. After this the entry has left
+  // BOTH lists, which is precisely why the #743 idempotency guard does NOT trip on
+  // the next genuine failure signal in production: a real Encore failure only
+  // arrives AFTER the retry has been dispatched and drained. The lifecycle test
+  // must model that drain, otherwise the queued-but-not-yet-dispatched entry makes
+  // the guard (correctly) report `already-pending` and short-circuit the retry.
+  async function drainDispatch(): Promise<void> {
+    const claimed = await redis.rpoplpush(keys.queue(WS), keys.inflight(WS));
+    if (claimed === null) throw new Error('expected a queued retry entry to drain');
+    await redis.lrem(keys.inflight(WS), 1, claimed);
+  }
+
   it('full bounded lifecycle: retries up to the bound then fails clearly', async () => {
     // Attempt 1 dispatched.
     await recordDispatch(asRedis(redis), EXTERNAL_ID, PAYLOAD, 1);
@@ -252,12 +298,16 @@ describe('decideRetry (#295 re-dispatch gate)', () => {
     // Failure 1 (attempt 1) -> retry (schedules attempt 2).
     let d = await decideRetry(asRedis(redis), WS, EXTERNAL_ID, TRANSPORT_MSG);
     expect(d.action).toBe('retry');
-    // Simulate the loop dispatching the re-queued job as attempt 2.
+    // The loop drains the re-queued entry off the queue and dispatches it as
+    // attempt 2 — mirroring real dispatch flow, so the next failure signal sees
+    // an EMPTY queue (guard does not trip) rather than the stale queued entry.
+    await drainDispatch();
     await recordDispatch(asRedis(redis), EXTERNAL_ID, PAYLOAD, 2);
 
     // Failure 2 (attempt 2) -> retry (schedules attempt 3, the last allowed).
     d = await decideRetry(asRedis(redis), WS, EXTERNAL_ID, TRANSPORT_MSG);
     expect(d.action).toBe('retry');
+    await drainDispatch();
     await recordDispatch(asRedis(redis), EXTERNAL_ID, PAYLOAD, 3);
 
     // Failure 3 (attempt 3 == MAX) -> settle exhausted, fail clearly.
@@ -274,6 +324,78 @@ describe('decideRetry (#295 re-dispatch gate)', () => {
     expect(decision.action).toBe('settle');
     if (decision.action !== 'settle') throw new Error('unreachable');
     expect(decision.reason).toBe('not-retryable');
+  });
+
+  // -------------------------------------------------------------------------
+  // #743 acceptance criterion: "a retry with an entry already queued produces
+  // no additional queue entry." decideRetry must be idempotent — a duplicate
+  // failure signal for a job whose retry is already queued (or mid-dispatch,
+  // hence inflight) must be a no-op, NOT a second LPUSH. The guard is
+  // hasQueuedOrInflightEntry (retry-store.ts:52-70), consulted before every
+  // state mutation (retry-store.ts:231-233).
+  // -------------------------------------------------------------------------
+
+  function queuedEntry(): string {
+    const entry: QueuedJob = {
+      jobId: EXTERNAL_ID,
+      payload: PAYLOAD,
+      enqueuedAt: Date.now(),
+      notBefore: Date.now() + 60_000,
+      attempts: 1
+    };
+    return JSON.stringify(entry);
+  }
+
+  it('#743: entry already in keys.queue -> skip/already-pending, no duplicate LPUSH', async () => {
+    await recordDispatch(asRedis(redis), EXTERNAL_ID, PAYLOAD, 1);
+    // A retry for this job is already sitting in the pending queue.
+    await redis.lpush(keys.queue(WS), queuedEntry());
+    const before = await redis.llen(keys.queue(WS));
+    expect(before).toBe(1);
+
+    const decision = await decideRetry(asRedis(redis), WS, EXTERNAL_ID, TRANSPORT_MSG);
+    expect(decision.action).toBe('skip');
+    if (decision.action !== 'skip') throw new Error('unreachable');
+    expect(decision.reason).toBe('already-pending');
+    expect(decision.failureClass).toBe('transport');
+
+    // The queue length is UNCHANGED — no second entry was pushed (the exact bug
+    // #743 fixes: one execution accumulating far more than MAX_ENCODE_ATTEMPTS).
+    expect(await redis.llen(keys.queue(WS))).toBe(before);
+  });
+
+  it('#743: entry already in keys.inflight (mid-dispatch) -> skip/already-pending, queue untouched', async () => {
+    await recordDispatch(asRedis(redis), EXTERNAL_ID, PAYLOAD, 1);
+    // The retry has been claimed by the loop and is transiently on the inflight
+    // list (RPOPLPUSH'd, not yet LREM'd) — still counts as pending.
+    await redis.lpush(keys.inflight(WS), queuedEntry());
+    expect(await redis.llen(keys.queue(WS))).toBe(0);
+
+    const decision = await decideRetry(asRedis(redis), WS, EXTERNAL_ID, TRANSPORT_MSG);
+    expect(decision.action).toBe('skip');
+    if (decision.action !== 'skip') throw new Error('unreachable');
+    expect(decision.reason).toBe('already-pending');
+
+    // No entry was LPUSHed onto the queue for the duplicate signal.
+    expect(await redis.llen(keys.queue(WS))).toBe(0);
+  });
+
+  it('#743: an unparseable queue entry is ignored by the guard -> retry still dispatches', async () => {
+    await recordDispatch(asRedis(redis), EXTERNAL_ID, PAYLOAD, 1);
+    // A non-JSON entry (or one for a different job) must NOT be mistaken for this
+    // job's pending retry — hasQueuedOrInflightEntry's catch branch (retry-store.ts:65-67)
+    // swallows the parse error and keeps scanning, so the guard does not trip.
+    await redis.lpush(keys.queue(WS), 'not-json{');
+    await redis.lpush(keys.queue(WS), JSON.stringify({ jobId: `${WS}__other`, payload: {} }));
+
+    const decision = await decideRetry(asRedis(redis), WS, EXTERNAL_ID, TRANSPORT_MSG);
+    expect(decision.action).toBe('retry');
+    if (decision.action !== 'retry') throw new Error('unreachable');
+    expect(decision.attempt).toBe(2);
+
+    // The guard did not match the junk entries, so a genuine retry WAS enqueued:
+    // the two seeded entries plus the new one.
+    expect(await redis.llen(keys.queue(WS))).toBe(3);
   });
 });
 

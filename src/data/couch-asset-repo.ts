@@ -28,6 +28,7 @@ import {
   type AssetStatus,
   type AttachExternalIdInput,
   type CreateAssetInput,
+  type ExternalIdentifier,
   type ListOptions,
   type ListResult,
   type RehydratePhase,
@@ -66,6 +67,7 @@ import {
   toTombstoneDocument
 } from './asset-tombstone.js';
 import { updateWithRetry, type StoredDoc, type StackCouch } from './couchdb.js';
+import { currentDocumentStackName } from '../services/request-stack-context.js';
 
 const RESOURCE_TYPE = 'asset';
 
@@ -111,6 +113,11 @@ export class CouchAssetRepository implements AssetRepository {
       sourceMethod: method,
       originUri: input.originUri,
       provenance: initialProvenance(now, method),
+      // Durable stack identity (issue #1097): the stack this asset is being
+      // created against, so post-upload work (metadata extraction, thumbnails)
+      // can re-enter it even with no ambient context. Undefined outside a
+      // request, which preserves the previous default-stack behaviour.
+      stackName: input.stackName ?? currentDocumentStackName(),
       createdAt: now,
       updatedAt: now
     };
@@ -257,6 +264,51 @@ export class CouchAssetRepository implements AssetRepository {
     return written ? updated : undefined;
   }
 
+  // Detach an external identifier (issue #867, ADR-019). The inverse of
+  // attachExternalId above and the same kind of DEDICATED system write path for
+  // `administrative.externalIdentifiers` — update() never touches the set. The
+  // read-modify-write is routed through updateWithRetry (src/data/couchdb.ts) for
+  // the same concurrent-write safety as every other dedicated write seam
+  // (issues #278/#279/#281); the patch is pure and re-runs safely per attempt.
+  //
+  // IDEMPOTENT: the removal is a filter over the persisted array, so detaching a
+  // pair the asset does not carry writes the document back unchanged and still
+  // reports success. No uniqueness gate is involved (that is #577's concern on
+  // the attach side only) — ALL entries equal to `ref` are removed, so a
+  // duplicate accumulated in advisory mode is cleared too. Returns undefined
+  // only when the id is unknown.
+  async detachExternalId(id: string, ref: ExternalIdentifier): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const preflight = await couch.get(id);
+    if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    let updated: Asset | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      const existing = fromDoc(current);
+      const before = existing.externalIdentifiers ?? [];
+      const remaining = before.filter((e) => !(e.namespace === ref.namespace && e.id === ref.id));
+      // Idempotent no-op: nothing matched, so the document is written back as-is
+      // (no `updatedAt` bump) and the route still reports success.
+      if (remaining.length === before.length) {
+        updated = existing;
+        return toDoc(existing);
+      }
+      const next: Asset = {
+        ...existing,
+        // An empty set is persisted as an ABSENT `administrative.externalIdentifiers`
+        // block, matching #575's round-trip model (asset-document.ts:504-506 only
+        // attaches the block when non-empty, and fromDoc maps absent/empty back to
+        // undefined at asset-document.ts:712-715).
+        externalIdentifiers: remaining.length > 0 ? remaining : undefined,
+        updatedAt: new Date().toISOString()
+      };
+      updated = next;
+      return toDoc(next);
+    });
+    return written ? updated : undefined;
+  }
+
   async list(opts: ListOptions = {}): Promise<ListResult> {
     const couch = this.couchFor();
     const limit = clampLimit(opts.limit);
@@ -333,6 +385,17 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.name !== undefined) next.name = patch.name;
     if (patch.description !== undefined) next.description = patch.description;
     if (patch.objectKey !== undefined) next.objectKey = patch.objectKey;
+    // Recorded ingest size (issue #1059) — same invariant as the in-memory repo
+    // (data/asset-repo.ts): the size describes the key, so a key change with no
+    // new size clears it.
+    if (patch.sourceSizeBytes !== undefined) {
+      // Non-positive == "nothing recorded" (same sentinel as the in-memory repo
+      // and as a stored `0` read back by fromAssetDocument), so a finalize that
+      // could not learn the length clears a stale one.
+      next.sourceSizeBytes = patch.sourceSizeBytes > 0 ? patch.sourceSizeBytes : undefined;
+    } else if (patch.objectKey !== undefined && patch.objectKey !== existing.objectKey) {
+      next.sourceSizeBytes = undefined;
+    }
     if (patch.technicalMetadata !== undefined) {
       next.technicalMetadata = patch.technicalMetadata;
       if (patch.technicalMetadata !== null) {
@@ -388,7 +451,16 @@ export class CouchAssetRepository implements AssetRepository {
       next.versionGroupId = patch.versionGroupId;
     }
     if (patch.status !== undefined) {
-      const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
+      // `patch.statusReason` (issue #1085) annotates the appended history entry
+      // so a background settle says WHY — see UpdateAssetInput.statusReason,
+      // src/data/asset-repo.ts.
+      const applied = applyStatus(
+        existing.status,
+        patch.status,
+        existing.statusHistory,
+        now,
+        patch.statusReason
+      );
       next.status = applied.status;
       next.statusHistory = applied.statusHistory;
     }
@@ -507,6 +579,44 @@ export class CouchAssetRepository implements AssetRepository {
           ? beginRehydrate(existing.storageTiering, byteClass, now)
           : completeRehydrate(existing.storageTiering, byteClass);
       const next: Asset = { ...existing, storageTiering: tiering, updatedAt: now };
+      updated = next;
+      return toDoc(next);
+    });
+    return written ? updated : undefined;
+  }
+
+  // Upload-liveness heartbeat (issue #731, unblocks #726). Refreshes ONLY the
+  // `updatedAt` clock on a still-`uploading` asset so a slow-but-progressing
+  // upload is distinguishable from an abandoned one. Distinct from update() (no
+  // editorial provenance) and — like the tier seams — NEVER touches lifecycle
+  // `status`/`statusHistory`. A non-`uploading` asset is a NO-OP: the preflight
+  // status guard short-circuits before any write, so a settled record's clock is
+  // never resurrected. Routed through updateWithRetry for the same conflict-retry
+  // safety as the other read-modify-write paths; the patchFn re-checks status
+  // under the loop so a concurrent settle that lands between preflight and write
+  // is honoured (the doc is written back unchanged). Returns undefined when the
+  // id is unknown.
+  async touchUploadProgress(id: string): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const preflight = await couch.get(id);
+    if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    // Cheap guard on the preflight read: skip the write entirely for the common
+    // non-uploading case so a heartbeat against a settled asset costs no put.
+    if (fromDoc(preflight).status !== 'uploading') {
+      return fromDoc(preflight);
+    }
+    let updated: Asset | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      const existing = fromDoc(current);
+      // Re-check under the retry loop: a concurrent transition may have settled
+      // the asset since preflight. If so, keep its clock as-is (no resurrection)
+      // and write the doc back unchanged; otherwise bump `updatedAt`.
+      const next: Asset =
+        existing.status === 'uploading'
+          ? { ...existing, updatedAt: new Date().toISOString() }
+          : existing;
       updated = next;
       return toDoc(next);
     });
@@ -644,6 +754,41 @@ function buildSelector(opts: ListOptions): Record<string, unknown> {
   if (opts.versionGroupId !== undefined) {
     // Mirror of structural.versionGroupId for indexable Mango filtering (#118).
     selector['versionGroupId'] = opts.versionGroupId;
+  }
+  // Created-at range (issue #833), pushed DOWN into Mango rather than applied to
+  // the fetched page. `list()` paginates in the database (limit/skip) and counts
+  // with the same selector, so filtering after the fetch would only ever narrow
+  // the page in hand and leave `total` wrong — the range has to be part of the
+  // selector for it to hold across every page.
+  //
+  // CONTRACT (verified, not assumed) — Apache CouchDB 3.5 documentation,
+  // `ddocs/mango.rst`:
+  //   - "Condition Operators" table: `$gte` = "The field is greater than or
+  //     equal to the argument", `$lte` = "The field is less than or equal to
+  //     the argument", both taking "Any JSON" as the argument, so a string
+  //     bound is valid ("Strict type matching is used" — both sides are
+  //     strings here).
+  //   - `find/subfields`: dot notation addresses a nested field, which is how
+  //     `structural.tams.*` is already pushed down in couch-search-repo.ts.
+  //   - Note under "Condition Operators": the field "must exist in the document
+  //     for the selector to match". `administrative.createdAt` is REQUIRED by
+  //     AssetDocumentSchema (asset-document.ts), so it exists on every asset
+  //     document and nothing is silently dropped.
+  // The bound arrives normalised to the canonical `new Date().toISOString()`
+  // shape (created-range.ts) — identical fixed-width form to the stored value —
+  // so the comparison is between equally-shaped strings and orders
+  // chronologically. There is deliberately no top-level `createdAt` mirror
+  // added here: documents written before this change carry no such mirror, and
+  // filtering on one would silently exclude every pre-existing asset.
+  if (opts.createdFrom !== undefined || opts.createdTo !== undefined) {
+    const range: Record<string, string> = {};
+    if (opts.createdFrom !== undefined) {
+      range['$gte'] = opts.createdFrom;
+    }
+    if (opts.createdTo !== undefined) {
+      range['$lte'] = opts.createdTo;
+    }
+    selector['administrative.createdAt'] = range;
   }
   return selector;
 }
