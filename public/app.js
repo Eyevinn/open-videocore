@@ -2298,6 +2298,15 @@ function setupTabs() {
 // and row actions can trigger a reload.
 let assetsTable = null;
 
+// The cause-identifying upload failure message this tab renders (issue #749)
+// now lives in public/upload.js as describeUploadFailure(err), imported above.
+// #749 asked for the CAUSE instead of a bare "Upload failed: HTTP <status>";
+// #771/#772 generalised that to a shared cause enum mirroring the server's
+// `cause` field (src/routes/upload-failure-cause.ts `uploadFailureCauseSchema`),
+// which also covers the tiers #749 could not see — the presigned/multipart PUTs
+// that go browser -> object storage, and the proxy's own non-JSON 413. The
+// local status->message map that used to sit here was folded into that module.
+
 async function renderAssetsTab(container) {
   // Layout: full-height table on the left, detail side panel on the right (hidden initially).
   const layout = document.createElement('div');
