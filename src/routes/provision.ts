@@ -34,7 +34,8 @@ import {
   type StorageBackendConfig,
   NonRetryableParamStoreError,
   isReadyStack,
-  stripCredentials
+  stripCredentials,
+  LEGACY_STACK_CREATED_AT
 } from '../services/param-store.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 // Re-enter the just-provisioned stack when seeding its profile store (issue
@@ -639,6 +640,38 @@ async function redisUrlFrom(
 // failure therefore leaves nothing to read back and every storage endpoint
 // reports "object storage is not configured for this stack".
 //
+// Decide the `createdAt` a provision write should persist, or undefined to omit
+// the field entirely (issue #1165 review, blocking finding 2).
+//
+// Exported because this one decision is the whole of the "a retried provision
+// must not move the default stack" guarantee, and it is worth testing directly
+// rather than only through a full provision run.
+//
+// The three cases, in precedence:
+//   1. An instant is already recorded for this stack (read at pre-flight, or
+//      re-read immediately before the write) — carry it forward verbatim. This
+//      is what keeps a retry in the same listing position.
+//   2. No instant recorded and the store DEFINITIVELY has no record for this
+//      stack (`storedRecordKnownAbsent`, set only when a completed read
+//      returned a 404 miss) — stamp this run's instant. The stack is new, so
+//      appending it last is correct.
+//   3. No instant recorded and we could not establish whether a record exists
+//      (the pre-flight threw and was swallowed so provisioning could continue)
+//      — write NOTHING. `undefined` here means "omit `createdAt`", which leaves
+//      the stack unstamped and ordered with the legacy stacks. That is strictly
+//      better than stamping "now": a fresh stamp on an existing stack rewrites
+//      its position to the end of the listing, and since the listing has no
+//      status filter, a stack that is still provisioning can land at element 0
+//      and become the no-X-Stack-Name default.
+export function decideStackCreatedAt(input: {
+  recordedCreatedAt?: string;
+  storedRecordKnownAbsent: boolean;
+  provisionStartedAt: string;
+}): string | undefined {
+  if (input.recordedCreatedAt !== undefined) return input.recordedCreatedAt;
+  return input.storedRecordKnownAbsent ? input.provisionStartedAt : undefined;
+}
+
 // This helper AWAITS the write and RETRIES a bounded number of times on
 // transient failure. If every attempt fails it RE-THROWS so the caller marks
 // the provision operation `failed` rather than `done` — the failure is surfaced
@@ -1002,6 +1035,86 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         };
         let objectStorePlan: ObjectStoreCredentialPlan = legacyObjectStorePlan;
 
+        // The stack's creation instant (issue #1165), decided ONCE for this
+        // provision run and reused by every write below — the 'provisioning'
+        // marker, the final 'ready' config and the partial 'failed' config — so
+        // all three agree and a retried provision does not re-stamp the stack to
+        // "now" and shuffle it to the end of the listing.
+        //
+        // Seeded from the EXISTING stored config when there is one (a retry, or
+        // a 'provisioning'/'failed' record from an earlier attempt), so the
+        // original instant survives. `undefined` here means "no stored stack
+        // yet", and the writes below stamp it with stackCreatedAtFor().
+        let existingCreatedAt: string | undefined;
+        const provisionStartedAt = new Date().toISOString();
+
+        // Whether we actually KNOW there is no stored record (issue #1165
+        // review, blocking finding 2).
+        //
+        // `existingCreatedAt === undefined` conflates two very different
+        // states: "the store definitively has no record for this stack" (a 404
+        // on the exact key) and "we could not find out" (the pre-flight threw
+        // and the failure was swallowed to keep provisioning, or the read
+        // returned a spurious miss). Stamping a fresh instant is only correct in
+        // the first case. In the second, a retry of a stack that IS already
+        // stored would rewrite its record with "now", move it to the end of the
+        // listing, and — because listStackNames has no status filter — a
+        // not-yet-ready stack can be element 0 and become the no-header
+        // default. So an ambiguous read stamps NOTHING: the write omits
+        // `createdAt` and the stack stays unstamped, which orders it with the
+        // legacy stacks and is recoverable by the next successful write.
+        let storedRecordKnownAbsent = false;
+
+        // The value to persist on this write, or undefined to omit the field.
+        // Kept a function (rather than a precomputed constant) so a write that
+        // happens after the pre-flight read still picks up whatever the read
+        // found, including the re-read performed just before the final write.
+        const stackCreatedAtFor = (): string | undefined =>
+          decideStackCreatedAt({
+            recordedCreatedAt: existingCreatedAt,
+            storedRecordKnownAbsent,
+            provisionStartedAt
+          });
+
+        // Spread helper so every write site states the same thing: carry the
+        // recorded instant, stamp a new one only for a definitively new stack,
+        // and otherwise write no `createdAt` at all (the field is optional for
+        // exactly this back-compat reason, param-store.ts `createdAt?`).
+        const createdAtPatch = (): { createdAt?: string } => {
+          const createdAt = stackCreatedAtFor();
+          return createdAt === undefined ? {} : { createdAt };
+        };
+
+        // Re-read the persisted record immediately before a final write (issue
+        // #1165 review, blocking finding 2). The pre-flight read happens long
+        // before provisioning finishes; between the two, a concurrent attempt or
+        // a marker write may have recorded the instant this run failed to see.
+        // Re-reading makes the LAST writer carry forward whatever is actually
+        // stored instead of trusting a stale (or never-populated) local value.
+        //
+        // Read failures here are non-fatal and deliberately do not change
+        // `storedRecordKnownAbsent`: a failed re-read is ambiguous, so it must
+        // not license a fresh stamp.
+        const refreshExistingCreatedAt = async (): Promise<void> => {
+          if (!paramStore) return;
+          try {
+            const persisted = await paramStore.loadStackConfig(
+              STACK_CONFIG_NAMESPACE,
+              name
+            );
+            if (persisted?.createdAt !== undefined) {
+              existingCreatedAt = persisted.createdAt;
+            }
+          } catch (err) {
+            app.log.warn(
+              { err, name },
+              'could not re-read the stored stack config before the final ' +
+                'write; preserving whatever creation instant this run already ' +
+                'observed rather than re-stamping (issue #1165)'
+            );
+          }
+        };
+
         // Reset the plan to the legacy credential when the per-stack access key
         // id could NOT be persisted (issue #1094 review, blocking finding 3).
         //
@@ -1040,10 +1153,65 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             try {
               const wsId = STACK_CONFIG_NAMESPACE;
               const existing = await paramStore.loadStackConfig(wsId, name);
+              // Carry a previously recorded creation instant forward (issue
+              // #1165) so a retried provision keeps this stack's position in the
+              // listing instead of being re-stamped to "now" and jumping to the
+              // end. Read before the converge-and-return below so it is set on
+              // every path that reaches a write.
+              existingCreatedAt = existing?.createdAt;
+              // The read COMPLETED, so its answer is authoritative: a miss here
+              // is the store's definitive 404 on this exact key (loadStackConfig
+              // returns undefined only for a 404) and this stack may be stamped
+              // with a fresh instant. Anything that throws instead leaves this
+              // false and suppresses the stamp (issue #1165 review, finding 2).
+              // A SPURIOUS 404 is indistinguishable from a real one here, which
+              // is why refreshExistingCreatedAt() re-reads before the final
+              // write and lets the persisted value win.
+              storedRecordKnownAbsent = existing === undefined;
               // A completed stack: converge, return its coordinates, create
               // nothing. isReadyStack treats a legacy status-less config as
               // ready (param-store.ts:102).
               if (existing && isReadyStack(existing)) {
+                // BACKFILL (issue #1165 review, blocking finding 1). This early
+                // return is the path every already-provisioned stack takes
+                // forever, so without a write here a stack created before
+                // creation times were recorded would never acquire an ordering
+                // key — it would be re-derived from absence on every single
+                // listing. Stamp the explicit legacy marker instead.
+                //
+                // LEGACY_STACK_CREATED_AT, not "now": this run did not create
+                // the stack and has no way to learn when it was created (the
+                // config service stores no creation metadata — ConfigObject =
+                // { key, value, secret? }), so recording "now" would be a false
+                // instant that also moves the stack to the END of the listing
+                // and changes the default. The marker sorts exactly where
+                // absence sorted, so the backfill is order-preserving by
+                // construction.
+                //
+                // Best-effort: a failed backfill must not turn a converging,
+                // idempotent provision of a healthy stack into an error. The
+                // stack simply stays unstamped and the next converge retries.
+                if (existing.createdAt === undefined) {
+                  try {
+                    await paramStore.storeStackConfig(wsId, name, {
+                      ...existing,
+                      createdAt: LEGACY_STACK_CREATED_AT
+                    });
+                    app.log.info(
+                      { name, createdAt: LEGACY_STACK_CREATED_AT },
+                      'backfilled the stack ordering key for a stack ' +
+                        'provisioned before creation times were recorded; ' +
+                        'its listing position is unchanged (issue #1165)'
+                    );
+                  } catch (backfillErr) {
+                    app.log.warn(
+                      { err: backfillErr, name },
+                      'could not backfill the stack ordering key; the stack ' +
+                        'remains unstamped and keeps its current listing ' +
+                        'position (issue #1165)'
+                    );
+                  }
+                }
                 ops.update(op.id, {
                   status: 'done',
                   completedAt: Date.now(),
@@ -1138,6 +1306,13 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               try {
                 await paramStore.storeStackConfig(wsId, name, {
                   status: 'provisioning',
+                  // Creation instant (issue #1165). The marker is normally the
+                  // first write that creates this stack's key, so this is where
+                  // the stack's position in the listing is fixed. Omitted
+                  // entirely when the pre-flight could not establish that the
+                  // stack is new, so a retry cannot re-stamp an existing stack
+                  // and move the default (review finding 2).
+                  ...createdAtPatch(),
                   minioEndpoint: '',
                   couchdbUrl: '',
                   redisUrl: '',
@@ -1764,8 +1939,20 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // 'failed'-status partial here — the OSC instances remain and a retry of
         // the provision (idempotent) can re-attempt the write.
         if (paramStore) {
+          // Re-read the persisted record first (issue #1165 review, finding 2):
+          // this write is the one that makes the stack live and listable, so it
+          // must carry the instant that is ACTUALLY stored — not a stale local
+          // value from a pre-flight that may have failed or missed spuriously.
+          await refreshExistingCreatedAt();
           const stackConfig: StackConfig = {
             status: 'ready',
+            // Creation instant (issue #1165) — the same value the
+            // 'provisioning' marker carried, preserved across the status
+            // transition so the stack keeps its place in the listing. If the
+            // marker write failed and the stack is definitively new, this write
+            // creates the key and stamps it; if this run never established that
+            // the stack is new, no instant is written at all.
+            ...createdAtPatch(),
             minioEndpoint,
             couchdbUrl: stripCredentials(couchdbUrl),
             redisUrl,
@@ -1980,8 +2167,19 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           if (paramStore && provisioned.length > 0) {
             try {
               const workspaceId = STACK_CONFIG_NAMESPACE;
+              // Re-read before the partial write too (issue #1165 review,
+              // finding 2). This is the write a FAILED run leaves behind, so it
+              // is the one a later retry reads back; rewriting it with a fresh
+              // instant is exactly how a retried provision moved the stack to
+              // the end of the listing.
+              await refreshExistingCreatedAt();
               await paramStore.storeStackConfig(workspaceId, name, {
                 status: 'failed',
+                // Preserve the creation instant on the partial write (issue
+                // #1165), for the same reason the per-stack access key id is
+                // preserved below: a retry must read back the original value
+                // rather than re-stamping and reordering the listing.
+                ...createdAtPatch(),
                 minioEndpoint: '',
                 couchdbUrl: '',
                 redisUrl: '',
@@ -2071,14 +2269,48 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   );
 
   // GET /api/v1/provision — list all stack names provisioned for this workspace.
-  //   200  array of stack name strings
+  //   200  array of stack name strings, in CREATION ORDER (issue #1165):
+  //        oldest stack first, newly provisioned stacks appended LAST. Element
+  //        [0] is the workspace DEFAULT stack — the stack a request with no
+  //        X-Stack-Name header resolves to (WorkspaceStackResolver.resolve /
+  //        resolveStackName / resolveStackConfig all take names[0]) and the one
+  //        whose profile index the transcoder reads. Provisioning another stack
+  //        therefore does NOT change the default. The order comes from
+  //        ParamStore.listStackNames' contract (param-store.ts), not from this
+  //        route, so this listing and the resolver can never disagree.
   //   501  parameter store not configured
   app.get(
     '/',
     {
       schema: {
+        description:
+          'List the stacks provisioned on this deployment. Order is part of ' +
+          'the contract: stacks are returned in creation order — the oldest ' +
+          'stack first, each newly provisioned stack appended last. The first ' +
+          'element is the default stack: a request that sends no X-Stack-Name ' +
+          'header is routed to it, and it is the stack whose transcode profile ' +
+          'index is served as the deployment default. Provisioning or ' +
+          'deprovisioning another stack never changes which stack is first, ' +
+          'and a new stack never appears in the middle of this list. Stacks ' +
+          'provisioned before this deployment began recording creation times ' +
+          'carry no recorded creation time: they sort before every stack ' +
+          'created after it, ordered among themselves by name. A deployment ' +
+          'that had exactly one such stack therefore keeps it as the default, ' +
+          'but a deployment that had several has no stored record of their ' +
+          'original order, so its default may change once — to the ' +
+          'name-first of them — when it starts recording creation times. Set ' +
+          'the DEFAULT_STACK_NAME environment variable to pin a specific ' +
+          'stack as the default; a pinned stack is returned first regardless ' +
+          'of creation order, and the pin is ignored if no stack of that name ' +
+          'is provisioned.',
         response: {
-          200: z.array(z.string()),
+          200: z
+            .array(z.string())
+            .describe(
+              'Provisioned stack names in creation order, oldest first. ' +
+                'Element 0 is the default stack for requests without an ' +
+                'X-Stack-Name header.'
+            ),
           501: notConfiguredSchema
         }
       }
@@ -2089,6 +2321,8 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       }
       try {
         const workspaceId = STACK_CONFIG_NAMESPACE;
+        // Creation-ordered by contract (ParamStore.listStackNames,
+        // param-store.ts) — passed through verbatim, never re-sorted here.
         const names = await opts.paramStore.listStackNames(workspaceId);
         return reply.send(names);
       } catch (err) {
