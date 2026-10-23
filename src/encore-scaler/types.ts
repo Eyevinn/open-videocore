@@ -179,6 +179,16 @@ export type EncoreScalerConfig = {
   // operator-managed profiles in CouchDB (issue #84). When unset the Encore
   // instance uses its service default.
   profilesUrl?: string;
+  // Multipart part size, in BYTES, every spawned instance uploads its outputs
+  // with (issue #1221). Set on the instance-create body as the service's
+  // `s3MultipartMinPartsize` option. The service's own default (100 MB) makes a
+  // single multi-GB output upload fail deterministically with a connection-pool
+  // acquisition timeout, so the scaler always sends a value; see
+  // src/encore-scaler/upload-part-size.ts for the mechanism, the bounds and the
+  // contract sources. Unset => the option is omitted and the instance keeps the
+  // service default (the pre-#1221 behaviour, kept for tests and for any caller
+  // that has not opted in; main.ts always resolves one).
+  uploadPartSizeBytes?: number;
   // Invoked after a queued job is successfully dispatched to an Encore instance
   // (after the Redis mapping/status writes). The scaler has no job repository of
   // its own, so main.ts wires this up to advance the corresponding Job from
