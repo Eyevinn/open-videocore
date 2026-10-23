@@ -1357,11 +1357,24 @@ const outputBucket = process.env['MINIO_PACKAGED_BUCKET'] ?? 'openvideocore-pack
 // the same value the transcode submit paths resolve for `outputBucket`
 // (src/routes/assets.ts). Returns undefined when the stack has no object
 // storage, in which case the discard is still recorded durably on the job.
-const resolveTranscodeOutputStorage = async (): Promise<WorkspaceStorage | undefined> => {
+//
+// #1044 widened it to take an optional bucket so the SAME binding also serves
+// the superseded-output delete path (a re-run removing the generation it just
+// replaced). `bucket` omitted keeps the #1226 meaning — this stack's own output
+// bucket — so a rendition recorded as a plain key and the packaged subfolder
+// both resolve there; an explicit bucket covers a rendition recorded as
+// `s3://<other-bucket>/<key>` (the same per-bucket handling the archived-asset
+// purge sweep does via `storageForBucket`). A function with an optional
+// parameter still satisfies the zero-argument `resolveOutputStorage` contract,
+// so the #1226 call sites are untouched.
+const resolveStackObjectStorage = async (
+  bucket?: string
+): Promise<WorkspaceStorage | undefined> => {
   const conns = await stackResolver.resolve(currentRequestStackName());
   if (!conns.storageClient) return undefined;
-  return new WorkspaceStorage(conns.storageClient, conns.packagedBucket);
+  return new WorkspaceStorage(conns.storageClient, bucket ?? conns.packagedBucket);
 };
+const resolveTranscodeOutputStorage = resolveStackObjectStorage;
 
 // S3 reader for URL-pull ingest of s3:// sources (issue #5). This reads the
 // source object via a MinIO client. With per-workspace stacks the worker runs
@@ -2022,7 +2035,13 @@ function activateScaler(redisUrl: string): void {
     // and the packager's success/failure callbacks each append one entry to the
     // SAME store GET /api/v1/logs reads (`logStore` above) — durable since
     // issue #996.
-    pipelineLog: logStore
+    pipelineLog: logStore,
+    // #1044: a packaging re-run writes a NEW per-run subfolder beside the
+    // previous one (ADR-011), so once the asset is confirmed repointed at it the
+    // superseded subfolder is removed through this handle. Invoked only when the
+    // asset already carried a different packaged prefix.
+    resolveStorage: resolveStackObjectStorage,
+    logWarn: (detail) => app.log.warn(detail)
   });
 
   // On-demand packager provisioning (epic #226, issue #244). The packager is no

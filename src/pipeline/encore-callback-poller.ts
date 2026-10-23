@@ -41,6 +41,7 @@ import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js
 import { completeTranscode, type CallbackRendition } from './transcode.js';
 // #1226: object-storage surface for reclaiming a cancelled job's late output.
 import type { CancelledJobOutputStorage } from './cancelled-transcode-completion.js';
+import type { SupersededOutputStorage } from './superseded-output.js';
 import type { PipelineLogSink } from '../services/pipeline-log.js';
 import { dispatchTranscodeCompletionEvents } from './transcode-completion-events.js';
 // #1060: structured source-read failure detail for the failed `transcode` step.
@@ -229,7 +230,15 @@ export type PollerDeps = {
   // the handle is for THAT stack's packaged/output bucket. Optional: absent =>
   // the discard is still recorded durably on the job and the objects are left
   // for an operator, exactly as the rule's own fallback describes.
-  resolveTranscodeOutputStorage?: () => Promise<CancelledJobOutputStorage | undefined>;
+  //
+  // #1044 widened the signature with an optional bucket so the SAME binding also
+  // serves the superseded-output delete path below (a successful RE-RUN removing
+  // the renditions of the generation it replaced). Omitting the bucket keeps the
+  // #1226 meaning — the stack's own output bucket; an explicit bucket covers a
+  // rendition recorded as `s3://<other-bucket>/<key>`.
+  resolveTranscodeOutputStorage?: (
+    bucket?: string
+  ) => Promise<(CancelledJobOutputStorage & SupersededOutputStorage) | undefined>;
   logger: Logger;
 };
 
@@ -810,6 +819,10 @@ async function handleMessageInStack(deps: PollerDeps, raw: string): Promise<void
       // CANCELLED before this completion arrived. Resolved lazily inside the
       // rule, so a normal completion never builds a storage handle.
       resolveOutputStorage: deps.resolveTranscodeOutputStorage,
+      // #1044: delete the renditions this run SUPERSEDED, after the asset is
+      // confirmed repointed at the new ones. This is the path a normal re-run
+      // settles through, so it is the one that stops new orphans.
+      resolveSupersededStorage: deps.resolveTranscodeOutputStorage,
       // #1226: a completion for a job the user had cancelled. Log the reclaim
       // explicitly — the symptom this issue was reported from was the summary
       // line at the end of this function saying only `applied false

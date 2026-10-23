@@ -97,6 +97,19 @@ async function findActivePackageJob(
   return active.find((j) => j.type === 'package');
 }
 
+// The asset's in-flight package job, if any — the SAME lookup the settle helpers
+// below use, exported so the packager-callback run-identity guard (#1044 review,
+// MAJOR 3) can ask "is a packaging run actually in flight for this asset?"
+// without a second spelling of the active-job narrowing. Best-effort like every
+// other function here: a repository error is reported and reported as "unknown"
+// by the caller rather than thrown.
+export async function inFlightPackageJob(
+  jobs: JobRepository,
+  assetId: string
+): Promise<Job | undefined> {
+  return findActivePackageJob(jobs, assetId);
+}
+
 // Create (or re-attempt) the `package` Job for an asset at enqueue time, and
 // stamp its id onto the execution's running `package` step. Returns the job id,
 // or undefined when no job repository is wired / the write failed.
