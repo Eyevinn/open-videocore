@@ -14,6 +14,7 @@ import {
   withDependencyTimeout
 } from './dependency-timeout.js';
 import { assertUnderJobThroughputCap } from './job-throughput-cap.js';
+import { markJobCancelled } from './job-cancellation.js';
 
 export { EncoreScalerLoop } from './scaler-loop.js';
 export { encoreScalerRouter } from './encore-scaler-router.js';
@@ -94,6 +95,15 @@ export function makeScalingEncoreClient(config: EncoreScalerConfig): EncoreClien
       // single entry) leaves orphaned duplicates that the loop would later
       // dispatch with nobody listening for completion (#746).
 
+      // (0) #1225: record the cancellation FIRST — monotonic tombstone plus the
+      // terminal status — so the cancel sticks even if the Encore leg below
+      // throws (it did: a non-idempotent error status throws out of this method
+      // before step 3 ever ran, and routes/jobs.ts swallows that error, leaving
+      // the job reading RUNNING to scale-down recovery). The scaler's re-enqueue
+      // paths consult the tombstone, so from here on the job can no longer be
+      // dispatched or re-enqueued — see job-cancellation.ts.
+      await markJobCancelled(redis, workspaceId, encoreJobId);
+
       // (1) Drain EVERY buffered queue entry for this job. Reading the list once
       // and issuing `lrem(..., 0, entry)` per DISTINCT matching entry value
       // removes all occurrences (queue entries differ by `enqueuedAt`, so
@@ -149,7 +159,10 @@ export function makeScalingEncoreClient(config: EncoreScalerConfig): EncoreClien
         }
       }
 
-      // (3) Record the terminal CANCELLED status so getJobStatus reports 'failed'.
+      // (3) Re-assert the terminal CANCELLED status so getJobStatus reports
+      // 'failed'. Step 0 already wrote it; this keeps the write that callers (and
+      // the existing #746 tests) expect at the END of the cancel, after the
+      // drain + Encore cancel, in case anything in between re-pinned the status.
       await redis.hset(keys.jobStatus(workspaceId), encoreJobId, 'CANCELLED');
     }
   };
