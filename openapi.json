@@ -445,7 +445,9 @@
                         "provisioning",
                         "ready",
                         "failed",
-                        "degraded"
+                        "degraded",
+                        "deleting",
+                        "delete_failed"
                       ]
                     },
                     "reason": {
@@ -456,6 +458,8 @@
                           "enum": [
                             "stack_provisioning",
                             "stack_provisioning_failed",
+                            "stack_deleting",
+                            "stack_delete_failed",
                             "core_capability_missing",
                             "packaging_capability_missing"
                           ]
@@ -8120,6 +8124,175 @@
                   "required": [
                     "files",
                     "fileGroups"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/assets/{id}/storage-usage": {
+      "get": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "assetId": {
+                      "type": "string"
+                    },
+                    "totalBytes": {
+                      "type": "number"
+                    },
+                    "complete": {
+                      "type": "boolean"
+                    },
+                    "renditions": {
+                      "type": "object",
+                      "properties": {
+                        "count": {
+                          "type": "number"
+                        },
+                        "countedCount": {
+                          "type": "number"
+                        },
+                        "bytes": {
+                          "type": "number"
+                        },
+                        "items": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "id": {
+                                "type": "string"
+                              },
+                              "label": {
+                                "type": "string"
+                              },
+                              "objectKey": {
+                                "type": "string"
+                              },
+                              "bucket": {
+                                "type": "string"
+                              },
+                              "sizeBytes": {
+                                "type": "number",
+                                "nullable": true
+                              },
+                              "counted": {
+                                "type": "boolean"
+                              }
+                            },
+                            "required": [
+                              "id",
+                              "objectKey",
+                              "sizeBytes",
+                              "counted"
+                            ],
+                            "additionalProperties": false
+                          }
+                        }
+                      },
+                      "required": [
+                        "count",
+                        "countedCount",
+                        "bytes",
+                        "items"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "packagedOutput": {
+                      "type": "object",
+                      "properties": {
+                        "bucket": {
+                          "type": "string"
+                        },
+                        "prefix": {
+                          "type": "string"
+                        },
+                        "objectCount": {
+                          "type": "number"
+                        },
+                        "bytes": {
+                          "type": "number"
+                        }
+                      },
+                      "required": [
+                        "bucket",
+                        "prefix",
+                        "objectCount",
+                        "bytes"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    }
+                  },
+                  "required": [
+                    "assetId",
+                    "totalBytes",
+                    "complete",
+                    "renditions",
+                    "packagedOutput"
                   ],
                   "additionalProperties": false
                 }
@@ -21402,14 +21575,14 @@
                     },
                     "maxInstances": {
                       "type": "number",
-                      "description": "Instance cap per workspace pool in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been accepted since startup, otherwise ENCORE_MAX_INSTANCES from boot. A PATCHed value is persisted but is not reloaded at boot, so this reverts to the environment value on restart. Reported even when scalerActive is false."
+                      "description": "Instance cap per workspace pool in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been accepted since startup, otherwise the boot value \u2014 the persisted snapshot from an earlier PATCH when one is stored and readable, else ENCORE_MAX_INSTANCES (#1078). Reported even when scalerActive is false."
                     },
                     "jobsPerInstance": {
                       "type": "number"
                     },
                     "idleTimeoutMs": {
                       "type": "number",
-                      "description": "Idle teardown timeout (ms) in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been accepted since startup, otherwise ENCORE_IDLE_TIMEOUT_MS from boot. A PATCHed value is persisted but is not reloaded at boot, so this reverts to the environment value on restart."
+                      "description": "Idle teardown timeout (ms) in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been accepted since startup, otherwise the boot value \u2014 the persisted snapshot from an earlier PATCH when one is stored and readable, else ENCORE_IDLE_TIMEOUT_MS (#1078)."
                     },
                     "scalerActive": {
                       "type": "boolean"
@@ -21493,7 +21666,7 @@
         "tags": [
           "admin"
         ],
-        "description": "Change the auto-scaler settings of the process serving this request. `maxInstances` and `idleTimeoutMs` take effect on the next scaler tick, with no restart.\n\n**Storage.** The values are written to the parameter store first and applied second, as one complete snapshot of all three fields, so a 200 always means \"saved AND applied\". A deployment with no parameter store configured gets a 501 and nothing is applied; a store that rejects the write or cannot be reached gets a 503 and nothing is applied, so `GET /api/v1/scaler/config` still reports the previous values. The live copy is per process and is not pushed to other replicas.\n\n**Precedence.** The most recent PATCH accepted by this process wins. Until one arrives, the values read at boot from `ENCORE_MAX_INSTANCES` (default 3) and `ENCORE_IDLE_TIMEOUT_MS` (default 300000) apply. So the order is: runtime PATCH, else environment.\n\n**Restart.** The stored record survives a restart, but it is not read back at boot yet, so a restarted process serves the environment values again until the PATCH is re-sent. Treat a PATCH as durable but not self-restoring.\n\n**Reset to the environment default.** There is no reset endpoint and no sentinel value. PATCH the environment values back explicitly, which overwrites the stored snapshot; restarting reverts the live values but leaves the stored record in place. `GET /api/v1/scaler/config` shows what is in force, and `sources` says per field whether the value came from a PATCH on this process or from the environment (#1079) \u2014 note that PATCHing an environment value back still reports `source: \"runtime\"`, because `sources` reports who set the value, not whether the number changed; only a restart puts a field back to `source: \"env\"`.\n\n**Caveats.** `minInstances` is recorded, persisted and echoed back but is not applied to the running scaler loops (see the field description). A PATCH sent while `GET /api/v1/scaler/status` reports `scalerActive: false` is accepted and reported back, but is not carried into the scaler that later activates against a newly provisioned stack \u2014 that activation uses the environment values, so re-send the PATCH afterwards.",
+        "description": "Change the auto-scaler settings of the process serving this request. `maxInstances` and `idleTimeoutMs` take effect on the next scaler tick, with no restart.\n\n**Storage.** The values are written to the parameter store first and applied second, as one complete snapshot of all three fields, so a 200 always means \"saved AND applied\". A deployment with no parameter store configured gets a 501 and nothing is applied; a store that rejects the write or cannot be reached gets a 503 and nothing is applied, so `GET /api/v1/scaler/config` still reports the previous values. The live copy is per process and is not pushed to other replicas.\n\n**Precedence.** Three layers, in order: the most recent PATCH accepted by this process, else the persisted snapshot this process read from the parameter store at boot (#1078), else the environment values read at boot \u2014 `ENCORE_MAX_INSTANCES` (default 3) and `ENCORE_IDLE_TIMEOUT_MS` (default 300000). So the environment applies to a deployment never configured through this endpoint, or to a boot where the stored record was absent or unreadable.\n\n**Restart.** The stored record survives a restart AND is read back at boot (#1078), so a restarted process serves the persisted values \u2014 for the config endpoint and for the scaler loops \u2014 without the PATCH being re-sent. If the parameter store cannot be read at boot the process starts on the environment values instead and logs a warning naming the reason, so a restored value must never be assumed without checking `sources`.\n\n**Reset to the environment default.** There is no reset endpoint and no sentinel value. PATCH the environment values back explicitly, which overwrites the stored snapshot \u2014 and now that boot restores that snapshot (#1078), that is the only way back to the environment values: restarting no longer undoes a PATCH. `GET /api/v1/scaler/config` shows what is in force, and `sources` says per field whether the value was set through PATCH \u2014 on this process, or on an earlier one and restored at boot \u2014 or came from the environment (#1079). Note that PATCHing an environment value back still reports `source: \"runtime\"`, because `sources` reports who set the value, not whether the number changed; a field reports `source: \"env\"` again only on a process that booted with no usable stored record.\n\n**Caveats.** `minInstances` is recorded, persisted and echoed back but is not applied to the running scaler loops (see the field description). A PATCH sent while `GET /api/v1/scaler/status` reports `scalerActive: false` is accepted and reported back, but is not carried into the scaler that later activates against a newly provisioned stack \u2014 that activation uses the values this process resolved at boot (the persisted snapshot when one was loaded, else the environment values), so re-send the PATCH afterwards.",
         "requestBody": {
           "required": true,
           "content": {
@@ -21511,7 +21684,7 @@
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 10,
-                    "description": "Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded \u2014 persisted and reported back here \u2014 and is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart."
+                    "description": "Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields a PATCH to this one is only recorded \u2014 persisted and reported back here \u2014 and is NOT fanned out to the already-running scaler loops, which keep enforcing the floor they were created with. The persisted value IS applied at the next boot (#1078), where it takes precedence over ENCORE_MIN_INSTANCES, so a PATCH here takes effect on the running loops only after a restart."
                   },
                   "idleTimeoutMs": {
                     "type": "integer",
@@ -21526,7 +21699,7 @@
         },
         "responses": {
           "200": {
-            "description": "The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, but nothing re-reads that record at boot yet, so after a restart this reports the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values again until the PATCH is re-sent.",
+            "description": "The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, and is read back at boot (#1078), so a restarted process serves the persisted values and reports them with `source: \"runtime\"`. The ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values apply only to a deployment never configured through this endpoint, or when the parameter store could not be read at boot (logged with the reason).",
             "content": {
               "application/json": {
                 "schema": {
@@ -21542,7 +21715,7 @@
                       "type": "integer",
                       "minimum": 0,
                       "maximum": 10,
-                      "description": "Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded \u2014 persisted and reported back here \u2014 and is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart."
+                      "description": "Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields a PATCH to this one is only recorded \u2014 persisted and reported back here \u2014 and is NOT fanned out to the already-running scaler loops, which keep enforcing the floor they were created with. The persisted value IS applied at the next boot (#1078), where it takes precedence over ENCORE_MIN_INSTANCES, so a PATCH here takes effect on the running loops only after a restart."
                     },
                     "idleTimeoutMs": {
                       "type": "integer",
@@ -21594,7 +21767,7 @@
                             "source"
                           ],
                           "additionalProperties": false,
-                          "description": "Provenance of `minInstances`, with one caveat specific to this field: `source: \"env\"` means the built-in default 0 this process started with, NOT the value of ENCORE_MIN_INSTANCES. That variable is read only by the scaler loops and never reaches this endpoint, so a deployment running with ENCORE_MIN_INSTANCES=2 still reports `minInstances: 0` with `source: \"env\"` here until a PATCH sets it. `source: \"runtime\"` has its usual meaning \u2014 set by PATCH /config on this process \u2014 but note that even then the value is only recorded and echoed, not applied to the running scaler loops (see the `minInstances` field description). Read-only and server-asserted."
+                          "description": "Provenance of `minInstances`, with one caveat specific to this field: `source: \"env\"` means the warm floor this process booted with from ENCORE_MIN_INSTANCES (0 when unset). `source: \"runtime\"` means the value was set by PATCH /config \u2014 on this process, or on an earlier one and restored from the parameter store at boot (#1078), in which case `updatedAt` is absent because the stored record carries no timestamp. Note that a PATCH on the RUNNING process is only recorded and echoed, not applied to the live scaler loops, whereas a value restored at boot is applied (see the `minInstances` field description). Read-only and server-asserted."
                         },
                         "idleTimeoutMs": {
                           "type": "object",
@@ -21635,7 +21808,7 @@
                     "sources"
                   ],
                   "additionalProperties": false,
-                  "description": "The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, but nothing re-reads that record at boot yet, so after a restart this reports the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values again until the PATCH is re-sent."
+                  "description": "The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, and is read back at boot (#1078), so a restarted process serves the persisted values and reports them with `source: \"runtime\"`. The ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values apply only to a deployment never configured through this endpoint, or when the parameter store could not be read at boot (logged with the reason)."
                 }
               }
             }
@@ -21691,10 +21864,10 @@
         "tags": [
           "admin"
         ],
-        "description": "Report the auto-scaler settings this process is using. These are the live values: the most recent `PATCH /api/v1/scaler/config` if one has been accepted since startup, otherwise the boot values from `ENCORE_MAX_INSTANCES` and `ENCORE_IDLE_TIMEOUT_MS`. A PATCHed value is persisted in the parameter store, but that record is not read back at boot yet, so after a restart this reports the environment values again. This endpoint reads the live copy only \u2014 it never reads the store, so it cannot be used to check what is persisted. `sources` says, per field, whether the value is the deployment's environment value or was set through PATCH on this process (#1079). `minInstances` is reported from this endpoint's own record and is not the floor the scaler loops enforce (see the field description).",
+        "description": "Report the auto-scaler settings this process is using. These are the live values: the most recent `PATCH /api/v1/scaler/config` if one has been accepted since startup, otherwise the boot values \u2014 the persisted snapshot of an earlier PATCH when the parameter store holds a readable one (#1078), else `ENCORE_MAX_INSTANCES` and `ENCORE_IDLE_TIMEOUT_MS`. This endpoint reads the live copy only \u2014 it never reads the store, so it cannot be used to check what is persisted. `sources` says, per field, whether the value is the deployment's environment value or was set through PATCH on this process (#1079). `minInstances` is reported from this endpoint's own record and is not the floor the scaler loops enforce (see the field description).",
         "responses": {
           "200": {
-            "description": "The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, but nothing re-reads that record at boot yet, so after a restart this reports the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values again until the PATCH is re-sent.",
+            "description": "The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, and is read back at boot (#1078), so a restarted process serves the persisted values and reports them with `source: \"runtime\"`. The ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values apply only to a deployment never configured through this endpoint, or when the parameter store could not be read at boot (logged with the reason).",
             "content": {
               "application/json": {
                 "schema": {
@@ -21710,7 +21883,7 @@
                       "type": "integer",
                       "minimum": 0,
                       "maximum": 10,
-                      "description": "Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded \u2014 persisted and reported back here \u2014 and is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart."
+                      "description": "Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields a PATCH to this one is only recorded \u2014 persisted and reported back here \u2014 and is NOT fanned out to the already-running scaler loops, which keep enforcing the floor they were created with. The persisted value IS applied at the next boot (#1078), where it takes precedence over ENCORE_MIN_INSTANCES, so a PATCH here takes effect on the running loops only after a restart."
                     },
                     "idleTimeoutMs": {
                       "type": "integer",
@@ -21762,7 +21935,7 @@
                             "source"
                           ],
                           "additionalProperties": false,
-                          "description": "Provenance of `minInstances`, with one caveat specific to this field: `source: \"env\"` means the built-in default 0 this process started with, NOT the value of ENCORE_MIN_INSTANCES. That variable is read only by the scaler loops and never reaches this endpoint, so a deployment running with ENCORE_MIN_INSTANCES=2 still reports `minInstances: 0` with `source: \"env\"` here until a PATCH sets it. `source: \"runtime\"` has its usual meaning \u2014 set by PATCH /config on this process \u2014 but note that even then the value is only recorded and echoed, not applied to the running scaler loops (see the `minInstances` field description). Read-only and server-asserted."
+                          "description": "Provenance of `minInstances`, with one caveat specific to this field: `source: \"env\"` means the warm floor this process booted with from ENCORE_MIN_INSTANCES (0 when unset). `source: \"runtime\"` means the value was set by PATCH /config \u2014 on this process, or on an earlier one and restored from the parameter store at boot (#1078), in which case `updatedAt` is absent because the stored record carries no timestamp. Note that a PATCH on the RUNNING process is only recorded and echoed, not applied to the live scaler loops, whereas a value restored at boot is applied (see the `minInstances` field description). Read-only and server-asserted."
                         },
                         "idleTimeoutMs": {
                           "type": "object",
@@ -21803,7 +21976,7 @@
                     "sources"
                   ],
                   "additionalProperties": false,
-                  "description": "The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, but nothing re-reads that record at boot yet, so after a restart this reports the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values again until the PATCH is re-sent."
+                  "description": "The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, and is read back at boot (#1078), so a restarted process serves the persisted values and reports them with `source: \"runtime\"`. The ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values apply only to a deployment never configured through this endpoint, or when the parameter store could not be read at boot (logged with the reason)."
                 }
               }
             }

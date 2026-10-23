@@ -1928,6 +1928,40 @@ Field notes- name — Canonical editorial title of the asset. Set on ingest via 
 - sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
+  GET /api/v1/assets/{id}/storage-usage
+
+  Parameters
+Name | In | Type | Required
+id | path | string | required
+  Response
+Response 200 (application/json)
+{
+  "assetId": "string",
+  "totalBytes": 0,
+  "complete": true,
+  "renditions": {
+    "count": 0,
+    "countedCount": 0,
+    "bytes": 0,
+    "items": [
+      {
+        "id": "string",
+        "objectKey": "string",
+        "sizeBytes": 0,
+        "counted": true,
+        "label": "string",
+        "bucket": "string"
+      }
+    ]
+  },
+  "packagedOutput": {
+    "bucket": "string",
+    "prefix": "string",
+    "objectCount": 0,
+    "bytes": 0
+  }
+}
+
   GET /api/v1/assets/{id}/stream/{*}
 
   Proxy-stream a packaged HLS/DASH manifest or media segment.
@@ -2650,12 +2684,12 @@ Auto-scaler
 
   GET /api/v1/scaler/config
 
-  Get the auto-scaler configuration in force in the serving process: the most recent runtime `PATCH` if one has been accepted since startup, otherwise the boot-time values from `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS`. It reads the live copy, never the parameter store, and does not say which of the two sources a value came from.
+  Get the auto-scaler configuration in force in the serving process: the most recent runtime `PATCH` if one has been accepted since startup, otherwise the boot values — the persisted snapshot when the parameter store holds a readable one, else `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS`. It reads the live copy, never the parameter store; `sources` says per field whether a value is the deployment's environment value or an operator value (set by `PATCH` on this process, or restored at boot).
 
-  Report the auto-scaler settings this process is using. These are the live values: the most recent PATCH /api/v1/scaler/config if one has been accepted since startup, otherwise the boot values from ENCORE_MAX_INSTANCES and ENCORE_IDLE_TIMEOUT_MS. A PATCHed value is persisted in the parameter store, but that record is not read back at boot yet, so after a restart this reports the environment values again. This endpoint reads the live copy only — it never reads the store, so it cannot be used to check what is persisted. sources says, per field, whether the value is the deployment's environment value or was set through PATCH on this process (#1079). minInstances is reported from this endpoint's own record and is not the floor the scaler loops enforce (see the field description).
+  Report the auto-scaler settings this process is using. These are the live values: the most recent PATCH /api/v1/scaler/config if one has been accepted since startup, otherwise the boot values — the persisted snapshot of an earlier PATCH when the parameter store holds a readable one (#1078), else ENCORE_MAX_INSTANCES and ENCORE_IDLE_TIMEOUT_MS. This endpoint reads the live copy only — it never reads the store, so it cannot be used to check what is persisted. sources says, per field, whether the value is the deployment's environment value or was set through PATCH on this process (#1079). minInstances is reported from this endpoint's own record and is not the floor the scaler loops enforce (see the field description).
 
   Response
-The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, but nothing re-reads that record at boot yet, so after a restart this reports the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values again until the PATCH is re-sent.
+The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, and is read back at boot (#1078), so a restarted process serves the persisted values and reports them with source: "runtime". The ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values apply only to a deployment never configured through this endpoint, or when the parameter store could not be read at boot (logged with the reason).
 Response 200 (application/json)
 {
   "maxInstances": 0,
@@ -2677,20 +2711,20 @@ Response 200 (application/json)
   }
 }
 Field notes- maxInstances — Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset).
-- minInstances — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded — persisted and reported back here — and is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart.
+- minInstances — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields a PATCH to this one is only recorded — persisted and reported back here — and is NOT fanned out to the already-running scaler loops, which keep enforcing the floor they were created with. The persisted value IS applied at the next boot (#1078), where it takes precedence over ENCORE_MIN_INSTANCES, so a PATCH here takes effect on the running loops only after a restart.
 - idleTimeoutMs — Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset).
 - sources — Where each config value in this response came from (#1079).
 
   PATCH /api/v1/scaler/config
 
-  Update auto-scaler configuration at runtime. `maxInstances` and `idleTimeoutMs` take effect on the next scaler tick with no restart; `minInstances` is persisted and echoed back but not applied to the running scaler (change the warm floor via `ENCORE_MIN_INSTANCES` and a restart). The values are written to the parameter store before they are applied, so a `200` means saved and applied — `501` when no parameter store is configured and `503` when the write fails, with nothing applied in either case. The stored record is not reloaded at boot yet, so a restart reverts to `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS` until the `PATCH` is re-sent. There is no reset endpoint: send the environment values back explicitly.
+  Update auto-scaler configuration at runtime. `maxInstances` and `idleTimeoutMs` take effect on the next scaler tick with no restart; `minInstances` is persisted and echoed back but not applied to the already-running scaler — the persisted value is applied at the next boot, ahead of `ENCORE_MIN_INSTANCES`. The values are written to the parameter store before they are applied, so a `200` means saved and applied — `501` when no parameter store is configured and `503` when the write fails, with nothing applied in either case. The stored record is reloaded at boot, so a restart serves the persisted values; `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS` apply to a deployment never configured through the API, or to a boot where the store could not be read (warn-logged with the reason). There is no reset endpoint: send the environment values back explicitly.
 
   Change the auto-scaler settings of the process serving this request. maxInstances and idleTimeoutMs take effect on the next scaler tick, with no restart.
 **Storage.** The values are written to the parameter store first and applied second, as one complete snapshot of all three fields, so a 200 always means "saved AND applied". A deployment with no parameter store configured gets a 501 and nothing is applied; a store that rejects the write or cannot be reached gets a 503 and nothing is applied, so GET /api/v1/scaler/config still reports the previous values. The live copy is per process and is not pushed to other replicas.
-**Precedence.** The most recent PATCH accepted by this process wins. Until one arrives, the values read at boot from ENCORE_MAX_INSTANCES (default 3) and ENCORE_IDLE_TIMEOUT_MS (default 300000) apply. So the order is: runtime PATCH, else environment.
-**Restart.** The stored record survives a restart, but it is not read back at boot yet, so a restarted process serves the environment values again until the PATCH is re-sent. Treat a PATCH as durable but not self-restoring.
-**Reset to the environment default.** There is no reset endpoint and no sentinel value. PATCH the environment values back explicitly, which overwrites the stored snapshot; restarting reverts the live values but leaves the stored record in place. GET /api/v1/scaler/config shows what is in force, and sources says per field whether the value came from a PATCH on this process or from the environment (#1079) — note that PATCHing an environment value back still reports source: "runtime", because sources reports who set the value, not whether the number changed; only a restart puts a field back to source: "env".
-**Caveats.** minInstances is recorded, persisted and echoed back but is not applied to the running scaler loops (see the field description). A PATCH sent while GET /api/v1/scaler/status reports scalerActive: false is accepted and reported back, but is not carried into the scaler that later activates against a newly provisioned stack — that activation uses the environment values, so re-send the PATCH afterwards.
+**Precedence.** Three layers, in order: the most recent PATCH accepted by this process, else the persisted snapshot this process read from the parameter store at boot (#1078), else the environment values read at boot — ENCORE_MAX_INSTANCES (default 3) and ENCORE_IDLE_TIMEOUT_MS (default 300000). So the environment applies to a deployment never configured through this endpoint, or to a boot where the stored record was absent or unreadable.
+**Restart.** The stored record survives a restart AND is read back at boot (#1078), so a restarted process serves the persisted values — for the config endpoint and for the scaler loops — without the PATCH being re-sent. If the parameter store cannot be read at boot the process starts on the environment values instead and logs a warning naming the reason, so a restored value must never be assumed without checking sources.
+**Reset to the environment default.** There is no reset endpoint and no sentinel value. PATCH the environment values back explicitly, which overwrites the stored snapshot — and now that boot restores that snapshot (#1078), that is the only way back to the environment values: restarting no longer undoes a PATCH. GET /api/v1/scaler/config shows what is in force, and sources says per field whether the value was set through PATCH — on this process, or on an earlier one and restored at boot — or came from the environment (#1079). Note that PATCHing an environment value back still reports source: "runtime", because sources reports who set the value, not whether the number changed; a field reports source: "env" again only on a process that booted with no usable stored record.
+**Caveats.** minInstances is recorded, persisted and echoed back but is not applied to the running scaler loops (see the field description). A PATCH sent while GET /api/v1/scaler/status reports scalerActive: false is accepted and reported back, but is not carried into the scaler that later activates against a newly provisioned stack — that activation uses the values this process resolved at boot (the persisted snapshot when one was loaded, else the environment values), so re-send the PATCH afterwards.
 
   Request
 Request body (application/json)
@@ -2700,11 +2734,11 @@ Request body (application/json)
   "idleTimeoutMs": 0
 }
 Field notes- maxInstances — Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset).
-- minInstances — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded — persisted and reported back here — and is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart.
+- minInstances — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields a PATCH to this one is only recorded — persisted and reported back here — and is NOT fanned out to the already-running scaler loops, which keep enforcing the floor they were created with. The persisted value IS applied at the next boot (#1078), where it takes precedence over ENCORE_MIN_INSTANCES, so a PATCH here takes effect on the running loops only after a restart.
 - idleTimeoutMs — Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset).
 
   Response
-The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, but nothing re-reads that record at boot yet, so after a restart this reports the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values again until the PATCH is re-sent.
+The auto-scaler configuration this process is using right now. A value set by PATCH is written durably to the parameter store before it is applied, and is read back at boot (#1078), so a restarted process serves the persisted values and reports them with source: "runtime". The ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values apply only to a deployment never configured through this endpoint, or when the parameter store could not be read at boot (logged with the reason).
 Response 200 (application/json)
 {
   "maxInstances": 0,
@@ -2726,7 +2760,7 @@ Response 200 (application/json)
   }
 }
 Field notes- maxInstances — Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset).
-- minInstances — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded — persisted and reported back here — and is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart.
+- minInstances — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields a PATCH to this one is only recorded — persisted and reported back here — and is NOT fanned out to the already-running scaler loops, which keep enforcing the floor they were created with. The persisted value IS applied at the next boot (#1078), where it takes precedence over ENCORE_MIN_INSTANCES, so a PATCH here takes effect on the running loops only after a restart.
 - idleTimeoutMs — Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset).
 - sources — Where each config value in this response came from (#1079).
 
@@ -2788,8 +2822,8 @@ Response 200 (application/json)
     }
   }
 }
-Field notes- maxInstances — Instance cap per workspace pool in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been accepted since startup, otherwise ENCORE_MAX_INSTANCES from boot. A PATCHed value is persisted but is not reloaded at boot, so this reverts to the environment value on restart. Reported even when scalerActive is false.
-- idleTimeoutMs — Idle teardown timeout (ms) in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been accepted since startup, otherwise ENCORE_IDLE_TIMEOUT_MS from boot. A PATCHed value is persisted but is not reloaded at boot, so this reverts to the environment value on restart.
+Field notes- maxInstances — Instance cap per workspace pool in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been accepted since startup, otherwise the boot value — the persisted snapshot from an earlier PATCH when one is stored and readable, else ENCORE_MAX_INSTANCES (#1078). Reported even when scalerActive is false.
+- idleTimeoutMs — Idle teardown timeout (ms) in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been accepted since startup, otherwise the boot value — the persisted snapshot from an earlier PATCH when one is stored and readable, else ENCORE_IDLE_TIMEOUT_MS (#1078).
 - sources — Where the config values in this response came from (#1079). Covers the values this endpoint reports that an operator can change; see GET /config for the full set, including minInstances.
 
 ---
@@ -3785,7 +3819,7 @@ URL: https://videocore.pages.osaas.io/api-reference.html
 
 API reference
 
-Every endpoint, grouped by resource, generated straight from the committed openapi.json (121 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
+Every endpoint, grouped by resource, generated straight from the committed openapi.json (122 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
 
 Health2
 Liveness probes.
@@ -3795,7 +3829,7 @@ Optional services4
 Discover and provision add-on OSC services for a workspace.
 Profiles10
 Transcoding profiles served to the transcoder via the public, unauthenticated index.yml endpoint.
-Assets52
+Assets53
 Asset lifecycle, ingest, upload, transcode, package, thumbnails, tracks, tags, delivery.
 Jobs3
 Background job status for asynchronous asset operations.
@@ -4206,9 +4240,9 @@ curl -X PATCH https://<your-instance>/api/v1/scaler/config \
 
 This changes maxInstances and idleTimeoutMs from the next scaler tick, with no restart.
 
-Runtime config is saved, but not reloaded at boot. The values are written to the parameter store first and applied to the serving process second, so a 200 means both: you get a 501 if no parameter store is configured and a 503 if the write fails, and in both cases nothing is applied. Precedence at runtime is two layers: the most recent accepted PATCH wins, otherwise the boot-time environment value. Nothing reads the stored record at boot yet, so a restart or redeploy goes back to ENCORE_MAX_INSTANCES and ENCORE_IDLE_TIMEOUT_MS until the PATCH is re-sent, and the applied value only ever reaches the replica that answered the request. There is no reset endpoint — send the environment values back explicitly, which overwrites the stored snapshot. For a change that must take effect everywhere after a restart, set the environment variable and redeploy.
+Runtime config is saved and reloaded at boot. The values are written to the parameter store first and applied to the serving process second, so a 200 means both: you get a 501 if no parameter store is configured and a 503 if the write fails, and in both cases nothing is applied. Precedence is three layers: the most recent accepted PATCH wins, otherwise the snapshot loaded from the parameter store at boot, otherwise the environment value. So a restart or redeploy keeps a persisted change — for the config endpoint and for the scaler loops — and falls back to ENCORE_MAX_INSTANCES and ENCORE_IDLE_TIMEOUT_MS only when nothing is stored or the store could not be read at boot (warn-logged with the reason). The applied value of a live PATCH still only reaches the replica that answered the request. There is no reset endpoint — send the environment values back explicitly, which overwrites the stored snapshot. For a change that must take effect everywhere after a restart, set the environment variable and redeploy.
 
-The warm floor is the exception: set ENCORE_MIN_INSTANCES to 1 or more (and restart) for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. A minInstances sent to the config endpoint is validated, persisted and echoed back, but the running scaler keeps enforcing the floor it read at boot. See GET /api/v1/scaler/status for the pool's live state and the Auto-scaler reference for every field.
+The warm floor is the exception: set ENCORE_MIN_INSTANCES to 1 or more (and restart) for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. A minInstances sent to the config endpoint is validated, persisted and echoed back, but the already-running scaler keeps enforcing the floor it read at boot; the persisted floor is applied at the next boot, ahead of the variable, so changing the enforced floor through the API takes one restart. See GET /api/v1/scaler/status for the pool's live state and the Auto-scaler reference for every field.
 
 Optional services
 
@@ -4562,9 +4596,9 @@ On Open Source Cloud only the settings exposed by the service's deploy form are 
     MINIO_ROOT_PASSWORD | Yes | Yes | Deployment-level object-store credential material. Each provisioned stack gets its own object-store access key id and secret derived from this value, so a credential issued for one stack cannot read or write another stack's buckets. Use a high-entropy value (at least 32 characters, which is what reliably reaches the ~112-bit floor the API enforces — generated, not chosen, e.g. openssl rand -base64 32): the per-stack isolation holds only while this value is expensive to guess, and below that strength newly provisioned stacks keep the deployment-wide credential instead (logged as an error at startup and per affected stack; set ALLOW_SHARED_OBJECT_STORE_CREDENTIAL=true to acknowledge that deliberately and downgrade the startup line to a warning). A stack provisioned by an older build also keeps its original deployment-wide credential until it is migrated. Treat it as a root secret; rotating it invalidates the derived credentials of already-provisioned stacks.
     COUCHDB_ADMIN_PASSWORD | Yes | Yes | Admin password used when provisioning the metadata store.
     PORT | No | No | HTTP port (default 3000). Fixed by the platform on OSC; self-hosted only.
-    ENCORE_MAX_INSTANCES | No | Yes | Max transcoder instances the auto-scaler may run per workspace (default 3). Can be changed at runtime with PATCH /api/v1/scaler/config; that change is persisted but is not reloaded at boot, so a restart reverts to this value until the PATCH is re-sent. See Operating a workspace.
-    ENCORE_MIN_INSTANCES | No | Yes | Warm floor of transcoder instances kept running even when idle (default 0 — scale to zero). The only way to change the floor the scaler enforces: a minInstances sent to the runtime config endpoint is persisted and echoed back but not applied. See Operating a workspace.
-    ENCORE_IDLE_TIMEOUT_MS | No | Yes | Idle time before a transcoder instance is torn down (default 300000). Can be changed at runtime with PATCH /api/v1/scaler/config, with the same persisted-but-not-reloaded-at-boot caveat.
+    ENCORE_MAX_INSTANCES | No | Yes | Max transcoder instances the auto-scaler may run per workspace (default 3). Can be changed at runtime with PATCH /api/v1/scaler/config; that change is persisted and reloaded at boot, so this value applies to a deployment never configured through the API. See Operating a workspace.
+    ENCORE_MIN_INSTANCES | No | Yes | Warm floor of transcoder instances kept running even when idle (default 0 — scale to zero). A minInstances sent to the runtime config endpoint is not applied to the already-running scaler, but it is persisted and reloaded at boot with precedence over this variable — so changing the enforced floor through the API takes one restart, and this variable is the floor for a deployment never configured through the API. See Operating a workspace.
+    ENCORE_IDLE_TIMEOUT_MS | No | Yes | Idle time before a transcoder instance is torn down (default 300000). Can be changed at runtime with PATCH /api/v1/scaler/config; like ENCORE_MAX_INSTANCES that change is persisted and reloaded at boot, so after a restart the persisted value wins and this variable is the value for a deployment never configured through the API.
     PUBLIC_BASE_URL | No | No | Publicly-reachable base URL of this instance, used to build the profile index URL handed to each transcoder. Self-hosted only — not configurable on Open Source Cloud (the OSC deploy form exposes no field for it, and OSC injects no self-URL). Left unset on OSC, transcoders fall back to the remote default profiles index.
 
 ---
@@ -4631,7 +4665,7 @@ Example prompts for driving open-videocore from an AI agent — send a large fil
 
 Reference
 
-Looking for one endpoint's exact parameters or response shape? The API reference covers all 121 endpoints, generated from the committed openapi.json.
+Looking for one endpoint's exact parameters or response shape? The API reference covers all 122 endpoints, generated from the committed openapi.json.
 
   Introduction
 What open-videocore is and how it's put together.
