@@ -189,10 +189,10 @@ import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
 import {
   resolvePublicBaseUrl,
   resolveEncoreProfilesUrlWithOrigin,
-  resolveEncoreProfilesUrlFromParamStore,
-  stackScopedProfilesIndexUrl
+  resolveEncoreProfilesUrlFromParamStore
 } from './services/public-base-url.js';
 import { makeStackScopedProfileIndexPublisher } from './services/profile-index-publisher.js';
+import { makePerStackProfilesUrlResolver } from './services/per-stack-profiles-url.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
 import { Client as MinioClient } from 'minio';
@@ -1245,9 +1245,17 @@ const publishedProfilesIndexUrl = publishedProfilesIndex.ok
 // awaited (see paramStore above). Undefined when there is no store, no stack, or
 // the field is unset — in which case resolveEncoreProfilesUrl falls through to
 // the remote default, byte-identical to pre-#315 behaviour.
+//
+// Read even when a PUBLISHED index exists (issue #1271): the published URL is
+// the DEFAULT stack's, and the per-stack resolver below re-runs this same tier
+// chain for each stack. A stack that cannot publish to its own bucket must be
+// able to fall through to tier 4 for THIS deployment rather than skipping
+// straight to the remote default seed index — so the value has to be resolved
+// at boot, where the parameter store is awaited. The two env-var tiers above
+// still short-circuit it: they outrank tier 4 for every stack alike.
 const paramStoreProfilesUrl =
-  publishedProfilesIndexUrl || publicBaseUrl || process.env['ENCORE_PROFILES_URL_OVERRIDE']
-    ? undefined // a higher tier (override / published object-store index / app path) wins; skip the param-store read entirely
+  publicBaseUrl || process.env['ENCORE_PROFILES_URL_OVERRIDE']
+    ? undefined // a higher tier (override / app path) wins for every stack; skip the param-store read entirely
     : await resolveEncoreProfilesUrlFromParamStore({
         paramStore,
         namespace: STACK_CONFIG_NAMESPACE,
@@ -1576,18 +1584,32 @@ function activateScaler(redisUrl: string): void {
     // Point each spawned Encore instance at our own public profile index so it
     // loads the operator-managed profiles from CouchDB (issue #84).
     profilesUrl: encoreScalerProfilesUrl,
-    // …and point it at THAT STACK's profile index (issue #1164). The scaler's
-    // loop key is the EFFECTIVE stack identity the transcode request resolved to
-    // (issue #615), and a spawned instance fetches its profilesUrl with a
-    // header-less, tokenless GET — so unless the stack is in the URL, every
-    // stack's Encore reads the FIRST listed stack's profile store and a profile
-    // created against a non-first stack cannot be used by the stack it was
-    // created on. Rewrites ONLY this app's own index URL and ONLY for a
-    // syntactically valid stack name (see stackScopedProfilesIndexUrl), so an
-    // external index and the single-stack/env-override deployments keep the
-    // process-global URL unchanged.
-    resolveProfilesUrl: (stackKey: string) =>
-      stackScopedProfilesIndexUrl(encoreScalerProfilesUrl, stackKey),
+    // …and point it at THAT STACK's profile index (issue #1164), resolved from
+    // the stack itself on EVERY boot (issue #1271). The scaler's loop key is the
+    // EFFECTIVE stack identity the transcode request resolved to (issue #615),
+    // and a spawned instance fetches its profilesUrl with a header-less,
+    // tokenless GET — so unless the stack is in the URL, every stack's Encore
+    // reads the FIRST listed stack's profile store and a profile created against
+    // a non-first stack cannot be used by the stack it was created on.
+    //
+    // Rewriting the process-global `encoreScalerProfilesUrl` was only ever
+    // sufficient while that URL was the app-path form: once the boot-time
+    // publish into the DEFAULT stack's bucket succeeds (which is what a RESTART
+    // changes — on a fresh instance no bucket exists yet), the global URL is the
+    // default stack's bucket index and has no stack-scoped rewrite, so every
+    // stack inherited it (#1271). The resolver below re-runs the whole ADR-026
+    // tier chain per stack with THAT stack's own published index as tier 2, and
+    // returns undefined for a loop key that is not a stack name — leaving the
+    // single-stack/env-override deployments on the process-global URL unchanged.
+    resolveProfilesUrl: makePerStackProfilesUrlResolver({
+      defaultProfilesUrl: encoreProfilesUrl,
+      ...(paramStoreProfilesUrl ? { paramStoreProfilesUrl } : {}),
+      // The stack-scoped publisher already wired above: ONE stack name selects
+      // both the bucket written to and the profile store read from, so a
+      // per-stack resolution can never mix two stacks' scopes (#1207 BLOCKING 1).
+      publishForStack: (stackName: string) => publishProfileIndexToObjectStore(stackName),
+      log: app.log
+    }),
     // Local-dev fallback only: ENCORE_S3_ENDPOINT is used verbatim for all
     // workspaces when set. On OSC this is unset and resolveS3Config below
     // resolves the MinIO endpoint per workspace from the parameter store.
