@@ -118,7 +118,14 @@ export type WorkspaceEncoreScalerConfig = {
   // stack to be in the URL. Returns undefined when there is no per-stack form of
   // the configured URL (an external index, or a loop key that is not a stack
   // name), and the loop then uses `profilesUrl` unchanged.
-  resolveProfilesUrl?: (stackKey: string) => string | undefined;
+  //
+  // May be ASYNC (issue #1271): since ADR-026 the primary tier is the index
+  // published into the STACK's OWN object-store bucket, and both resolving that
+  // stack's endpoint and publishing to it are I/O. Awaited at loop creation,
+  // exactly like resolveS3Config / resolveRedisUrl, so the URL is derived from
+  // the named stack on EVERY boot rather than inherited from whichever stack
+  // happened to be listed first when the process started.
+  resolveProfilesUrl?: (stackKey: string) => string | undefined | Promise<string | undefined>;
   // Forwarded to every per-workspace scaler loop: invoked after a queued job is
   // dispatched to an Encore instance so the Job record can advance queued->running.
   onDispatched?: (encoreJobId: string) => Promise<void>;
@@ -229,9 +236,18 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
   // external index, or a loop key that is not a stack name). Never returns
   // another stack's URL: the only two outcomes are "this stack's index" and
   // "the configured index, unchanged".
-  private resolveLoopProfilesUrl(stackKey: string): string | undefined {
+  //
+  // Awaited (issue #1271): the hook resolves the stack's own published
+  // object-store index, which is I/O. A hook failure must not stop a loop from
+  // being created — the process-global URL is the documented fallback — so a
+  // rejection degrades to it rather than propagating.
+  private async resolveLoopProfilesUrl(stackKey: string): Promise<string | undefined> {
     if (!this.config.resolveProfilesUrl) return this.config.profilesUrl;
-    return this.config.resolveProfilesUrl(stackKey) ?? this.config.profilesUrl;
+    try {
+      return (await this.config.resolveProfilesUrl(stackKey)) ?? this.config.profilesUrl;
+    } catch {
+      return this.config.profilesUrl;
+    }
   }
 
   async resolveStackRedis(
@@ -397,7 +413,7 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     // #1164), so a profile created on this stack is loadable by it regardless of
     // the stack's position in the listing. Falls back to the process-global URL
     // when there is no per-stack form.
-    const profilesUrl = this.resolveLoopProfilesUrl(workspaceId);
+    const profilesUrl = await this.resolveLoopProfilesUrl(workspaceId);
 
     const scalerConfig: EncoreScalerConfig = {
       workspaceId,
@@ -575,7 +591,7 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
             // This stack's own profile index (issue #1164), same resolution as
             // getOrCreate, so a re-discovered pool and a freshly created one
             // never disagree about which stack's profiles its instances load.
-            profilesUrl: this.resolveLoopProfilesUrl(workspaceId),
+            profilesUrl: await this.resolveLoopProfilesUrl(workspaceId),
             onDispatched: this.config.onDispatched
           };
           await reconcilePoolFromOsc(scalerConfig).catch(() => {
