@@ -3854,3 +3854,65 @@ td[data-empty='logs-never-written'] .ops-table-empty-detail {
   margin-top: 2px;
   word-break: break-word;
 }
+
+/* ─── Profile YAML inline detail row (issue #832) ────────────────────────────
+   View YAML expands a row directly beneath the clicked profile instead of
+   writing into one shared container below the whole table. The <pre> is a
+   bounded, focusable scroll region so a 240-line profile cannot push the
+   remaining rows out of reach, and keyboard users can still scroll it
+   (WCAG 2.1 SC 2.1.1). Focus rings are kept, never `outline: none`
+   (SC 2.4.7). */
+.pf-row-expanded > td {
+  border-bottom-color: transparent;
+}
+
+.pf-yaml-row > .pf-yaml-cell {
+  padding: 0 12px 12px;
+  background: var(--bg);
+}
+
+.pf-yaml-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 0;
+}
+
+.pf-yaml-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.pf-yaml-collapse-btn {
+  font-size: 12px;
+  padding: 3px 8px;
+}
+
+.pf-yaml-pre {
+  /* max-height is set inline from PROFILE_YAML_MAX_HEIGHT so the bound has one
+     source of truth shared with the script. */
+  overflow: auto;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+}
+
+.pf-yaml-pre:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.pf-yaml-error {
+  margin-top: 0;
+}
