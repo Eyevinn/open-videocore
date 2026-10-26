@@ -2830,12 +2830,113 @@ body.detail-standalone main {
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
+  /* Issue #828: the strip now carries the stack label AND the build indicator
+     side by side, so it is a flex row rather than a single text node. */
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
-/* Collapse the strip entirely when there is no stack context to show, so a
-   detached window truly has no chrome above the pane. */
+/* Collapse the strip entirely when there is nothing to show, so a detached
+   window truly has no chrome above the pane. Issue #828 note: this now only
+   fires if BOTH the stack label and the build indicator are absent from the
+   markup — the build indicator always renders something (a version or
+   "build unknown"), so in practice the strip stays, which is the point: a
+   pop-out screenshot must identify the build. */
 .detail-standalone-context:empty {
   display: none;
+}
+
+/* ─── Running-build indicator (issue #828) ──────────────────────────────────
+   Used in the main header and in the detached-detail context strip. Deliberately
+   low-contrast-but-AA: --text-muted on --surface, at 12px, so it reads as
+   chrome without competing with the stack selector, while still clearing the
+   4.5:1 WCAG 2.1 AA ratio for normal text. */
+.build-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  min-width: 0;
+  /* Positioning context for the click-to-reveal details panel below. */
+  position: relative;
+}
+
+.build-indicator-toggle {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  max-width: 100%;
+}
+
+.build-indicator-toggle:hover {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+/* Keep a visible focus indicator (WCAG 2.4.7) — never outline: none. */
+.build-indicator-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.build-indicator-prefix {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+  /* Subdued, but still WCAG 2.1 AA for normal-size text. This is a 10px label,
+     so it needs the full 4.5:1 — not the 3:1 large-text allowance. Measured
+     against --surface (#1a1d27): --text-muted (#94a3b8) at this alpha composites
+     to ~#768294 → 5.6:1. The previous 0.75 landed at ~4.3:1, which fails 1.4.3.
+     Do not lower this without re-measuring. */
+  opacity: 0.9;
+}
+
+.build-indicator-value {
+  /* A git-describe string is an identifier — monospace so an operator can read
+     the SHA suffix off a screenshot without transcription errors. */
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The unknown state must not be mistaken for a real version. */
+.build-indicator-unknown {
+  font-style: italic;
+  font-family: inherit;
+  color: var(--warning);
+}
+
+.build-indicator-details {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 40;
+  margin-top: 4px;
+  padding: 8px 10px;
+  max-width: min(420px, calc(100vw - 24px));
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text);
+  /* formatBuildDetails() returns newline-separated lines; keep them. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 body.detail-standalone .assets-side {

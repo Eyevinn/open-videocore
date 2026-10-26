@@ -28,6 +28,10 @@ import {
   getActiveStack,
   DETAIL_POLL_INTERVAL_MS,
 } from './app.js';
+// Running-build indicator (issue #828). This window has its own realm and its
+// own ?stack= target, so it fetches /health and logs its own single line rather
+// than inheriting anything from the opener.
+import { initBuildIndicator } from './build-info.js';
 
 function getParam(name) {
   return new URLSearchParams(window.location.search).get(name);
@@ -192,5 +196,15 @@ function boot() {
   tick();
   pollTimer = setInterval(tick, DETAIL_POLL_INTERVAL_MS);
 }
+
+// Issue #828: the build indicator is mounted OUTSIDE boot()'s guard. A window
+// opened with bad/missing type+id params still shows "Not available" chrome, and
+// an operator screenshotting that error must still be able to say which build
+// produced it — so the indicator and its console line are not conditional on
+// the params being valid.
+initBuildIndicator({
+  mount: document.getElementById('build-indicator'),
+  stack: activeStack,
+});
 
 boot();
