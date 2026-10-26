@@ -2894,7 +2894,12 @@ body.detail-standalone main {
   text-transform: uppercase;
   letter-spacing: 0.06em;
   font-size: 10px;
-  opacity: 0.75;
+  /* Subdued, but still WCAG 2.1 AA for normal-size text. This is a 10px label,
+     so it needs the full 4.5:1 — not the 3:1 large-text allowance. Measured
+     against --surface (#1a1d27): --text-muted (#94a3b8) at this alpha composites
+     to ~#768294 → 5.6:1. The previous 0.75 landed at ~4.3:1, which fails 1.4.3.
+     Do not lower this without re-measuring. */
+  opacity: 0.9;
 }
 
 .build-indicator-value {
