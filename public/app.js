@@ -36,6 +36,10 @@ import { applyThumbnail } from './thumbnail-url.js';
 // button; slugs are shown under their own "Slug" header. Contract grounding for
 // which value each endpoint accepts lives in public/copy-id.js.
 import { copyableIdCellHtml, slugCellHtml, wireCopyIdButtons } from './copy-id.js';
+// Running-build indicator (issue #828). Reads the build identity of the live
+// deployment from GET /health and renders it in the header. Contract grounding
+// for the /health `build` object lives in public/build-info.js.
+import { initBuildIndicator } from './build-info.js';
 // Shared detail-panel primitives (issue #963): the collapsed "Raw" disclosure
 // that holds the full server record, and the copyable field value built on the
 // copy-id.js control. Factored out because the pipeline-execution detail view
@@ -9410,5 +9414,19 @@ export {
 if (typeof window !== 'undefined' && window.__OPS_MAIN__ === true && document.querySelector('.tab-bar')) {
   setupTabs();
   switchTab(localStorage.getItem(TAB_KEY) || 'assets');
-  initStackSelector();
+  // Surface the running build (issue #828) only AFTER the stack selector has
+  // settled: initStackSelector may be the thing that picks the active stack
+  // (it defaults to the first provisioned one when nothing is stored), and the
+  // single console line must name the stack the UI actually ended up pointed
+  // at, not the empty value it started with. The indicator render itself does
+  // not depend on the stack, so a selector failure must not suppress it —
+  // hence the catch, not a bare chain.
+  initStackSelector()
+    .catch(function () { /* selector failure is reported by initStackSelector itself */ })
+    .then(function () {
+      return initBuildIndicator({
+        mount: document.getElementById('build-indicator'),
+        stack: getActiveStack(),
+      });
+    });
 }
