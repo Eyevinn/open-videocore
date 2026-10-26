@@ -2606,6 +2606,12 @@ tbody tr.coll-row.row-selected {
   margin-top: 4px;
 }
 
+/* Each pill is a <button> that filters the executions list (issue #831), so it
+   has to shed the global filled-accent button skin and keep the pill look. The
+   three states are deliberately different KINDS of change, not three shades of
+   one: rest = surface fill, hover = tinted fill + accent border, pressed =
+   stronger fill + solid accent ring + a visible ✓ (so the active filter is not
+   signalled by colour alone — WCAG 1.4.1). */
 .pipeline-catalog-pill {
   display: flex;
   align-items: baseline;
@@ -2614,17 +2620,58 @@ tbody tr.coll-row.row-selected {
   border: 1px solid var(--border);
   border-radius: 20px;
   padding: 5px 12px;
-  cursor: default;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text);
+  text-align: left;
+  white-space: nowrap;
 }
 
 .pipeline-catalog-pill:hover {
   border-color: var(--accent);
+  /* Explicit: the global `button:hover` rule would otherwise flood the pill
+     with the solid accent fill reserved for primary actions. */
+  background: rgba(99, 102, 241, 0.08);
+}
+
+/* Keyboard reachability (issue #831): the pills are in the tab order, so the
+   focus ring must be visible and must not be confused with the pressed fill. */
+.pipeline-catalog-pill:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The pressed (filtering) state. */
+.pipeline-catalog-pill.is-active,
+.pipeline-catalog-pill.is-active:hover {
+  background: rgba(99, 102, 241, 0.22);
+  border-color: var(--accent);
+  border-style: solid;
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+/* The ✓ exists in the markup for every pill (so turning the filter on does not
+   reflow the strip) but only shows on the active one. */
+.pipeline-catalog-pill-mark {
+  font-size: 11px;
+  color: var(--accent);
+  visibility: hidden;
+}
+
+.pipeline-catalog-pill.is-active .pipeline-catalog-pill-mark {
+  visibility: visible;
 }
 
 .pipeline-catalog-pill-name {
   font-size: 13px;
   font-weight: 500;
   color: var(--text);
+}
+
+.pipeline-catalog-pill.is-active .pipeline-catalog-pill-name {
+  font-weight: 600;
 }
 
 .pipeline-catalog-pill-id {
@@ -2635,7 +2682,10 @@ tbody tr.coll-row.row-selected {
 
 /* A pipeline whose every step is an optional service the active stack has not
    configured (issue #790). Dimmed, with a dashed border so it reads as
-   "unavailable" rather than merely low-contrast. */
+   "unavailable" rather than merely low-contrast. It stays FILTERABLE (issue
+   #831) — "has this stack ever run it?" is a fair question about an
+   unconfigured pipeline — so it is dimmed, never disabled, and it lifts to full
+   strength while it is the active filter. */
 .pipeline-catalog-pill.is-unavailable {
   border-style: dashed;
   opacity: 0.6;
@@ -2643,6 +2693,11 @@ tbody tr.coll-row.row-selected {
 
 .pipeline-catalog-pill.is-unavailable:hover {
   border-color: var(--border);
+  background: rgba(99, 102, 241, 0.08);
+}
+
+.pipeline-catalog-pill.is-unavailable.is-active {
+  opacity: 0.9;
 }
 
 .pipeline-catalog-pill-note {
@@ -2670,6 +2725,46 @@ tbody tr.coll-row.row-selected {
 .mb12 { margin-bottom: 12px; }
 .mt16 { margin-top: 16px; }
 .mt24 { margin-top: 24px; }
+
+/* Filter status line above the executions list (issue #831). Names the filter
+   in force and how much of the loaded page it shows, and holds the explicit
+   "Show all pipelines" escape hatch — so clearing the filter never depends on
+   knowing that the active pill toggles. */
+.pipeline-exec-filter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-height: 24px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.pipeline-exec-filter.is-filtered .pipeline-exec-filter-text {
+  color: var(--text);
+}
+
+button.pipeline-exec-filter-clear {
+  font-size: 12px;
+  padding: 4px 10px;
+}
+
+/* Filtered to a pipeline with no runs in the loaded page: an explanation, not a
+   blank panel (issue #831). */
+.pipeline-exec-empty {
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-top: 12px;
+  text-align: center;
+}
+
+.pipeline-exec-empty-title {
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
+}
 
 /* Pipeline execution list */
 .pipeline-exec-list {
