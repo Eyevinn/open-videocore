@@ -62,6 +62,11 @@ import { renderAttemptHistory } from './job-attempts.js';
 // public/lock-state.js (#894) and public/lock-detail.js; the contract grounding
 // for PUT/DELETE /assets/{id}/lock is in the latter's header.
 import { mountDeleteProtection } from './lock-detail.js';
+// Pipelines-tab catalog filter (issue #831). The active pipeline filter on the
+// executions list is written to / read from the URL through the SAME shared
+// URL-state contract every ops table already uses (public/table-url-state.js,
+// issues #368/#373) rather than a second, tab-local query-param parser.
+import { encodeTableState } from './table-url-state.js';
 
 // Blocked-archive explanation (issue #896), implementing
 // docs/ux/asset-lock-state-spec.md §5. Classifies the 409 from
@@ -8434,6 +8439,145 @@ function optionalServiceNames(steps) {
     .join(', ');
 }
 
+// ─── Catalog pill filter on the executions list (issue #831) ─────────────────
+//
+// The catalog strip used to render each pipeline as an inert <span> that still
+// highlighted on hover and showed a tooltip — an affordance with nothing behind
+// it. Each pill is now a toggle button that narrows the executions list below to
+// that pipeline.
+//
+// CONTRACT (CLAUDE.md rule 7). The narrowing is CLIENT-SIDE on purpose:
+// GET /api/v1/pipelines/ accepts exactly three query params — `status`
+// (running|done|failed), `limit` (1..200) and `offset` (>=0) — per its
+// querystring schema at src/routes/pipelines.ts:105-109 and
+// openapi.json .paths["/api/v1/pipelines/"].get.parameters (this spec declares
+// no operationId for the op; it is keyed by path + method). There is no
+// pipeline-name parameter, so the pill filters the page this tab already
+// fetched rather than sending a key the route would reject. The field it
+// filters on, `pipelineName`, is a REQUIRED string on every item
+// (pipelineExecutionSchema, src/routes/pipelines.ts:54-63; the generated 200
+// lists it in `required` with `additionalProperties: false`), so the comparison
+// below can never silently miss a row for want of a field.
+//
+// Because the filter is applied to a bounded page, an "empty" result means
+// "none in the N most recent executions", and the empty state says exactly that
+// rather than claiming the pipeline has never run.
+var EXEC_LIST_LIMIT = 50;
+
+// URL-state namespace for the executions list. table-url-state.js emits
+// `pipelines.<key>` params for this namespace.
+var PIPELINES_NS = 'pipelines';
+// The shared URL-state contract has a FIXED key schema (sort/status/q/tags/meta/
+// from/to/page/cursor/size/cols — public/table-url-state.js:72-84) with no
+// "which pipeline" member, and encodeTableState() deletes only those fixed keys
+// within the namespace (table-url-state.js:452-453). So this one extra key is
+// written alongside them under the same namespace and survives the re-encode —
+// the same way the audit table carries its own filter keys
+// (public/audit-table.js:144-150, 574-579). The shared mechanism is reused, not
+// forked.
+var PIPELINE_FILTER_KEY = 'pipeline';
+var PIPELINE_FILTER_PARAM = PIPELINES_NS + '.' + PIPELINE_FILTER_KEY;
+// Shared-contract defaults for this list: no sort control, and a page size equal
+// to the limit the tab actually requests.
+var PIPELINES_URL_DEFAULTS = Object.freeze({ sort: null, size: EXEC_LIST_LIMIT });
+
+// Coerce a raw `pipelines.pipeline` value into a usable filter, or null for
+// "show all". Tolerant by design, like every other param in the shared contract:
+// the value must name a pipeline in PIPELINE_CATALOG, because a filter with no
+// pill to light up would leave the operator looking at an empty list with no
+// visible control to clear. Anything else degrades to "all".
+function normalizePipelineFilter(raw) {
+  if (typeof raw !== 'string') return null;
+  var name = raw.trim();
+  if (!name) return null;
+  var known = PIPELINE_CATALOG.some(function(p) { return p.name === name; });
+  return known ? name : null;
+}
+
+// Read the active pipeline filter from the live URL. SSR/test-safe: an absent
+// window yields "all".
+function readPipelineFilterFromUrl(win) {
+  var w = win || (typeof window !== 'undefined' ? window : undefined);
+  var search = w && w.location ? w.location.search : '';
+  var params = new URLSearchParams(search || '');
+  return normalizePipelineFilter(params.get(PIPELINE_FILTER_PARAM));
+}
+
+// Reflect the active filter in the URL without reloading, preserving the path,
+// the hash, and every param that belongs to another namespace. Mirrors
+// audit-table.js's extra-key sync: encodeTableState() rebuilds this namespace's
+// shared keys (and clears stale ones) on top of the current search, then the
+// catalog key is set or deleted. Returns the applied relative URL, or '' when
+// there is no history to write (SSR / sandboxed).
+function applyPipelineFilterToUrl(name, win) {
+  var w = win || (typeof window !== 'undefined' ? window : undefined);
+  if (!w || !w.location || !w.history) return '';
+  var loc = w.location;
+  var params = encodeTableState(
+    { size: EXEC_LIST_LIMIT },
+    PIPELINES_NS,
+    PIPELINES_URL_DEFAULTS,
+    new URLSearchParams(loc.search || '')
+  );
+  if (name) params.set(PIPELINE_FILTER_PARAM, name);
+  else params.delete(PIPELINE_FILTER_PARAM);
+  var qs = params.toString();
+  var relative = (loc.pathname || '') + (qs ? '?' + qs : '') + (loc.hash || '');
+  try {
+    w.history.replaceState(w.history.state == null ? null : w.history.state, '', relative);
+  } catch (e) {
+    return '';
+  }
+  return relative;
+}
+
+// Narrow a fetched page of executions to one pipeline. `null`/'' means "all".
+function filterExecutionsByPipeline(items, name) {
+  var list = Array.isArray(items) ? items : [];
+  if (!name) return list;
+  return list.filter(function(exec) {
+    return !!exec && exec.pipelineName === name;
+  });
+}
+
+// The human label for a pipeline name, falling back to the name itself for a
+// pipeline the catalog does not describe.
+function pipelineLabel(name) {
+  var entry = PIPELINE_CATALOG.filter(function(p) { return p.name === name; })[0];
+  return entry ? entry.label : String(name || '');
+}
+
+// Text for the filter status line above the list. Announced via role="status",
+// so it names the filter AND the count rather than relying on the pill's colour.
+function pipelineFilterSummary(name, shown, total) {
+  if (!name) return 'Showing all ' + total + ' loaded execution' + (total === 1 ? '' : 's') + '.';
+  return 'Showing ' + shown + ' of ' + total + ' loaded execution' +
+    (total === 1 ? '' : 's') + ' for ' + pipelineLabel(name) + '.';
+}
+
+// The explanatory empty state for a filter that matches nothing (acceptance
+// criterion: must not look broken). An unconfigured pipeline stays filterable,
+// so this also explains WHY a stack that never provisioned the optional service
+// has no runs for it — reusing the same notConfiguredText() wording the pill
+// tooltip and the run-pipeline picker already use.
+function pipelineFilterEmptyText(name, availability) {
+  var entry = PIPELINE_CATALOG.filter(function(p) { return p.name === name; })[0];
+  var lines = ['No executions for this pipeline.'];
+  var detail = 'Nothing in the ' + EXEC_LIST_LIMIT +
+    ' most recent executions ran ' + pipelineLabel(name) + '.';
+  if (entry) {
+    var blocked = unconfiguredOptionalSteps(entry, availability || {});
+    if (blocked.length > 0) {
+      detail += ' ' + notConfiguredText(blocked) +
+        (isPipelineUnavailable(entry, availability || {})
+          ? ', so it cannot run here yet.'
+          : ', so that step is skipped when it does run.');
+    }
+  }
+  lines.push(detail);
+  return lines;
+}
+
 var EXEC_STATUS_CLASS = {
   running: 'status-processing',
   done: 'status-ready',
@@ -8552,24 +8696,51 @@ async function renderPipelinesTab(container) {
   // ── Compact catalog strip ──
   // Optional steps the ACTIVE stack has not configured are marked here too
   // (issue #790), so the catalog and the asset detail picker tell the same story.
+  //
+  // Each pill is a real <button type="button"> (issue #831): it filters the
+  // executions list below, so it must be in the tab order and activatable with
+  // Enter/Space, which a <span> with a click handler is not. It is a TOGGLE —
+  // `aria-pressed` carries the on/off state to assistive tech, and pressing the
+  // active pill again clears the filter.
+  //
+  // An unconfigured (`is-unavailable`) pipeline stays filterable and is NOT
+  // disabled: "this stack never ran it" is exactly the question an operator asks
+  // about such a pipeline, and the empty state answers it.
   var stepAvailability = await loadOptionalStepAvailability();
+  // The filter in force. Restored from the URL so a deep link / reload lands on
+  // the same view (see readPipelineFilterFromUrl).
+  var activeFilter = readPipelineFilterFromUrl();
   var catalogBar = document.createElement('div');
   catalogBar.className = 'pipeline-catalog-bar';
+  // Labelled as a group so a screen reader announces what these seven buttons
+  // are for before reading them.
+  catalogBar.setAttribute('role', 'group');
+  catalogBar.setAttribute('aria-label', 'Filter executions by pipeline');
   PIPELINE_CATALOG.forEach(function(pipeline) {
-    var pill = document.createElement('span');
+    var pill = document.createElement('button');
+    pill.type = 'button';
     var blocked = unconfiguredOptionalSteps(pipeline, stepAvailability);
     var unavailable = isPipelineUnavailable(pipeline, stepAvailability);
     pill.className = 'pipeline-catalog-pill' + (unavailable ? ' is-unavailable' : '');
+    pill.dataset.pipeline = pipeline.name;
     pill.title = pipeline.description + '\nSteps: ' + pipeline.steps.join(' → ') +
       (blocked.length > 0
         ? '\n' + notConfiguredText(blocked) + (unavailable ? '.' : ', so that step is skipped.')
         : '');
     pill.innerHTML =
+      // The active marker is a glyph, not just a colour change, so the pressed
+      // state is not carried by colour alone (WCAG 1.4.1). It is aria-hidden
+      // because `aria-pressed` already says this to assistive tech.
+      '<span class="pipeline-catalog-pill-mark" aria-hidden="true">✓</span>' +
       '<span class="pipeline-catalog-pill-name">' + escHtml(pipeline.label) + '</span>' +
       '<span class="pipeline-catalog-pill-id">' + escHtml(pipeline.name) + '</span>' +
       (unavailable
         ? '<span class="pipeline-catalog-pill-note">not configured</span>'
         : '');
+    pill.addEventListener('click', function() {
+      // Toggle: the active pill clears the filter, any other pill replaces it.
+      setPipelineFilter(activeFilter === pipeline.name ? null : pipeline.name);
+    });
     catalogBar.appendChild(pill);
   });
   wrap.appendChild(catalogBar);
@@ -8580,6 +8751,24 @@ async function renderPipelinesTab(container) {
   execHeader.textContent = 'Pipeline Executions';
   wrap.appendChild(execHeader);
 
+  // Filter status line: says which filter is in force and how much of the
+  // loaded page it shows, and carries the explicit "Show all" escape hatch so
+  // clearing the filter does not depend on remembering that the active pill
+  // toggles. role="status" so the change is announced without stealing focus.
+  var filterBar = document.createElement('div');
+  filterBar.className = 'pipeline-exec-filter';
+  var filterText = document.createElement('span');
+  filterText.className = 'pipeline-exec-filter-text';
+  filterText.setAttribute('role', 'status');
+  filterBar.appendChild(filterText);
+  var clearBtn = document.createElement('button');
+  clearBtn.type = 'button';
+  clearBtn.className = 'btn-ghost pipeline-exec-filter-clear';
+  clearBtn.textContent = 'Show all pipelines';
+  clearBtn.addEventListener('click', function() { clearFilterAndRestoreFocus(); });
+  filterBar.appendChild(clearBtn);
+  wrap.appendChild(filterBar);
+
   var execList = document.createElement('div');
   execList.className = 'pipeline-exec-list';
   execList.textContent = 'Loading…';
@@ -8588,20 +8777,82 @@ async function renderPipelinesTab(container) {
   container.appendChild(wrap);
 
   var pollTimer = null;
+  // The last page fetched from GET /api/v1/pipelines/, kept so switching the
+  // filter re-renders from memory — no refetch, no reload.
+  var loadedItems = [];
+
+  // Paint the pills' pressed state to match `activeFilter`.
+  function paintPills() {
+    catalogBar.querySelectorAll('.pipeline-catalog-pill').forEach(function(pill) {
+      var on = pill.dataset.pipeline === activeFilter;
+      pill.classList.toggle('is-active', on);
+      pill.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+  }
+
+  // Render the executions list for the filter in force, from `loadedItems`.
+  function renderExecList() {
+    var shown = filterExecutionsByPipeline(loadedItems, activeFilter);
+    execList.innerHTML = '';
+    if (loadedItems.length === 0) {
+      execList.textContent = 'No pipeline executions yet.';
+    } else if (shown.length === 0) {
+      // Filtered to nothing: explain it rather than leaving a blank panel.
+      var empty = document.createElement('div');
+      empty.className = 'pipeline-exec-empty';
+      pipelineFilterEmptyText(activeFilter, stepAvailability).forEach(function(line, i) {
+        var p = document.createElement('div');
+        p.className = i === 0 ? 'pipeline-exec-empty-title' : 'text-muted';
+        p.textContent = line;
+        empty.appendChild(p);
+      });
+      var showAll = document.createElement('button');
+      showAll.type = 'button';
+      showAll.className = 'btn-ghost mt12';
+      showAll.textContent = 'Show all pipelines';
+      showAll.addEventListener('click', function() { clearFilterAndRestoreFocus(); });
+      empty.appendChild(showAll);
+      execList.appendChild(empty);
+    } else {
+      shown.forEach(function(exec) {
+        execList.appendChild(renderExecutionRow(exec));
+      });
+    }
+    filterText.textContent = pipelineFilterSummary(activeFilter, shown.length, loadedItems.length);
+    // The clear control only exists while there is something to clear.
+    clearBtn.hidden = !activeFilter;
+    filterBar.classList.toggle('is-filtered', !!activeFilter);
+  }
+
+  // The one place the filter changes: update state, URL, pills and list.
+  function setPipelineFilter(name) {
+    activeFilter = normalizePipelineFilter(name);
+    applyPipelineFilterToUrl(activeFilter);
+    paintPills();
+    renderExecList();
+  }
+
+  // Clearing the filter destroys the control that did it — the status line's
+  // button hides, and the empty state's button is re-rendered away — so a
+  // keyboard user would be dropped on <body> mid-task. Hand focus back to the
+  // pill that was just unpressed, which is still there and is the control that
+  // would re-apply the filter.
+  function clearFilterAndRestoreFocus() {
+    var cleared = activeFilter;
+    setPipelineFilter(null);
+    if (!cleared) return;
+    var target = catalogBar.querySelector('[data-pipeline="' + cssEscape(cleared) + '"]');
+    if (target && typeof target.focus === 'function') target.focus();
+  }
 
   async function loadExecutions() {
     try {
-      var data = await apiFetch('/pipelines?limit=50');
+      var data = await apiFetch('/pipelines?limit=' + EXEC_LIST_LIMIT);
       var items = (data && data.items) ? data.items : [];
-      execList.innerHTML = '';
-      if (items.length === 0) {
-        execList.textContent = 'No pipeline executions yet.';
-      } else {
-        items.forEach(function(exec) {
-          execList.appendChild(renderExecutionRow(exec));
-        });
-      }
-      // Poll while any execution is running.
+      loadedItems = items;
+      renderExecList();
+      // Poll while any execution is running — judged on the whole fetched page,
+      // not the filtered view, so a filter can never silence the poll.
       var anyRunning = items.some(function(e) { return e.status === 'running'; });
       if (anyRunning) {
         pollTimer = setTimeout(loadExecutions, 5000);
@@ -8611,6 +8862,14 @@ async function renderPipelinesTab(container) {
     }
   }
 
+  // Paint the restored filter BEFORE the first fetch resolves, so a deep-linked
+  // view never flashes an unfiltered strip or an orphaned clear button.
+  paintPills();
+  clearBtn.hidden = !activeFilter;
+  filterBar.classList.toggle('is-filtered', !!activeFilter);
+  filterText.textContent = activeFilter
+    ? 'Loading executions for ' + pipelineLabel(activeFilter) + '…'
+    : '';
   await loadExecutions();
 
   // Stop polling when the tab is replaced.
@@ -9346,6 +9605,21 @@ export {
   // agrees with the backend's BUILT_IN_PIPELINES / PIPELINE_DESCRIPTIONS
   // (issue #739) — the pipeline picker and the execute enum must not drift.
   PIPELINE_CATALOG,
+  // Catalog pill filter on the pipelines tab (issue #831). Exported so a
+  // DOM/unit test can drive the REAL renderer — the pills are buttons, the
+  // click narrows the list, the URL carries the choice under the shared
+  // table-url-state namespace, and a filter that matches nothing explains
+  // itself — plus the pure helpers, without standing up a server.
+  renderPipelinesTab,
+  normalizePipelineFilter,
+  readPipelineFilterFromUrl,
+  applyPipelineFilterToUrl,
+  filterExecutionsByPipeline,
+  pipelineFilterSummary,
+  pipelineFilterEmptyText,
+  PIPELINES_NS,
+  PIPELINE_FILTER_PARAM,
+  EXEC_LIST_LIMIT,
   // Search-tab format filter (issue #822). Exported so a DOM/unit test can
   // drive the real Search tab against a stubbed fetch and assert the field's
   // own placeholder is a value the API can match.
