@@ -1955,8 +1955,35 @@ pre.code-block {
   display: none;
 }
 
-.storage-backend-field.has-error input {
+.storage-backend-field.has-error input,
+.storage-backend-field.has-error select {
   border-color: var(--danger);
+}
+
+/* Optional registration fields: role / publicBaseUrl / sessionToken
+   (issue #870). Grouped in a <fieldset> so the set reads as one block of
+   extras; the legend carries the group name for AT as well as sighted users. */
+.storage-backend-optional-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0;
+  padding: 12px 14px 14px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+}
+
+.storage-backend-optional-group > legend {
+  padding: 0 6px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.storage-backend-optional-field .form-hint {
+  max-width: 62ch;
+  line-height: 1.45;
 }
 
 .storage-backend-form-actions {
