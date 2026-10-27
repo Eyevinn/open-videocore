@@ -6146,6 +6146,228 @@ const SEARCH_SCOPE_HINT =
   'Full-text search across the whole workspace: assets and collections both match on ' +
   'name, description and tags. Container format matches assets only.';
 
+// ─── Search-tab metadata filter (issue #850) ─────────────────────────────────
+//
+// Free-form operator metadata is filterable on the search endpoint, but the tab
+// offered no field for it. Contract grounding (verified, per CLAUDE.md rule 7):
+//   - GET /api/v1/search/ — src/routes/search.ts, router doc block (the
+//     "Free-form operator metadata (issue #12)" paragraph at the head of the
+//     file): the params are `metadata.<key>=<value>`, e.g.
+//     `?metadata.genre=documentary&metadata.language=sv`.
+//   - `extractMetadataFilter` (src/routes/search.ts:255-270) is what actually
+//     reads them: it walks EVERY query key, keeps the ones prefixed
+//     `metadata.`, drops the prefix, skips a bare `metadata.` with an empty
+//     field name, and — critically — collapses a repeated param to its FIRST
+//     value (`Array.isArray(value) ? value[0] : value`). So one key carries one
+//     value; the serialiser below uses URLSearchParams.set, never append, so a
+//     duplicated key cannot ship a value the server will silently ignore.
+//   - Any number of pairs combine, and combine with the other filters: the
+//     extracted object is passed straight through as `metadata` alongside `q`,
+//     `tags`, `mimeType`, `status` and the rest in the single `repo.search({…})`
+//     call (src/routes/search.ts:377-394).
+//   - Matching is EXACT on both key and value — src/data/search-repo.ts:393-397
+//     rejects the asset unless `md[key] === value` for every pair, with `md` the
+//     asset's own `metadata` object. No casefolding, no substring, no prefix. The
+//     copy below says so, because a field that reads like free text here would
+//     return "no results" for an asset the operator can see has the value.
+//   - These params are NOT in openapi.json's parameter list for
+//     "/api/v1/search/" (verified: its `get.parameters[]` holds only q, tags,
+//     mimeType, status, from, to, tamsFlowId, tamsTimerange, page, pageSize) —
+//     a free-form key cannot be enumerated in a static spec. The route source
+//     cited above is therefore the contract of record for the param NAME.
+//   - There is no endpoint that lists which metadata keys exist, so the field is
+//     a plain key input, not a picker.
+const SEARCH_METADATA_LEGEND = 'Metadata (exact match)';
+const SEARCH_METADATA_HINT =
+  'Key and value must match exactly, including case — "genre" does not match "Genre", ' +
+  'and "doc" does not match "documentary". Use the key as stored, without a ' +
+  '"metadata." prefix. Every pair must match, on top of the filters above.';
+const SEARCH_METADATA_KEY_LABEL = 'Key';
+const SEARCH_METADATA_VALUE_LABEL = 'Exact value';
+const SEARCH_METADATA_KEY_PLACEHOLDER = 'genre';
+const SEARCH_METADATA_VALUE_PLACEHOLDER = 'documentary';
+const SEARCH_METADATA_ADD_LABEL = 'Add metadata filter';
+const SEARCH_METADATA_REMOVE_LABEL = 'Remove';
+
+// Serialise operator metadata pairs onto a search query string as
+// `metadata.<key>=<value>`, per extractMetadataFilter above. Returns `params`.
+//
+// Skips a pair whose key is empty (the server drops a bare `metadata.` anyway)
+// and a pair whose value is empty, so an untouched or half-filled row widens
+// nothing: `metadata.<key>=` would be an exact-match filter for the empty
+// string, which is a different search, not an absent one. Both sides are
+// trimmed, matching how this tab already reads q/tags/mimeType — a value
+// surrounded by whitespace is a typo, not an exact match the operator meant.
+// `set` (not `append`) because a repeated key would reach the server as an
+// array and lose everything after the first value.
+function appendMetadataFilterParams(params, pairs) {
+  (pairs || []).forEach(function(pair) {
+    const key = pair && pair.key != null ? String(pair.key).trim() : '';
+    const value = pair && pair.value != null ? String(pair.value).trim() : '';
+    if (!key || !value) return;
+    params.set('metadata.' + key, value);
+  });
+  return params;
+}
+
+// Read the metadata rows currently in the Search tab, in DOM order. Serialising
+// is left to appendMetadataFilterParams so the skip rules live in one place.
+function readSearchMetadataPairs(section) {
+  const rows = section ? section.querySelectorAll('.search-md-row') : [];
+  return [].map.call(rows, function(row) {
+    const keyInput = row.querySelector('.search-md-key');
+    const valueInput = row.querySelector('.search-md-value');
+    return {
+      key: keyInput ? keyInput.value : '',
+      value: valueInput ? valueInput.value : '',
+    };
+  });
+}
+
+// Unique ids for the per-row label/input pairs, so each input keeps a real
+// <label for> rather than a placeholder standing in for one.
+let searchMetadataRowSeq = 0;
+
+// One key/value row. `onRemove` is called with the row element after it is
+// detached, so the caller can keep the group non-empty and move focus.
+function searchMetadataRow(onRemove) {
+  const n = ++searchMetadataRowSeq;
+  const keyId = 'search-md-key-' + n;
+  const valueId = 'search-md-value-' + n;
+
+  const row = document.createElement('div');
+  row.className = 'form-row search-md-row';
+
+  function field(id, labelText, placeholder, inputClass) {
+    const wrap = document.createElement('div');
+    wrap.className = 'form-field grow';
+    const label = document.createElement('label');
+    label.setAttribute('for', id);
+    label.textContent = labelText;
+    // The visible word is short and repeats down the column; the row number is
+    // announced but not drawn, so every input still has a UNIQUE name.
+    const ordinal = document.createElement('span');
+    ordinal.className = 'visually-hidden';
+    ordinal.textContent = ' (metadata filter ' + n + ')';
+    label.appendChild(ordinal);
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.id = id;
+    input.className = inputClass;
+    input.placeholder = placeholder;
+    wrap.appendChild(label);
+    wrap.appendChild(input);
+    return { wrap: wrap, input: input };
+  }
+
+  const keyField = field(
+    keyId,
+    SEARCH_METADATA_KEY_LABEL,
+    SEARCH_METADATA_KEY_PLACEHOLDER,
+    'search-md-key'
+  );
+  const valueField = field(
+    valueId,
+    SEARCH_METADATA_VALUE_LABEL,
+    SEARCH_METADATA_VALUE_PLACEHOLDER,
+    'search-md-value'
+  );
+  row.appendChild(keyField.wrap);
+  row.appendChild(valueField.wrap);
+
+  const removeWrap = document.createElement('div');
+  removeWrap.className = 'form-field search-md-remove-field';
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'btn-sm search-md-remove';
+  remove.textContent = SEARCH_METADATA_REMOVE_LABEL;
+  // "Remove" alone is ambiguous once there are three of them.
+  remove.setAttribute('aria-label', 'Remove metadata filter ' + n);
+  remove.addEventListener('click', function() {
+    row.remove();
+    if (onRemove) onRemove(row);
+  });
+  removeWrap.appendChild(remove);
+  row.appendChild(removeWrap);
+
+  return { row: row, keyInput: keyField.input, valueInput: valueField.input, removeBtn: remove };
+}
+
+// The whole metadata group: a real fieldset/legend so the pairs are announced as
+// one control rather than a loose run of text boxes, the exact-match hint wired
+// with aria-describedby, the rows, and the add control. Mirrors the
+// fieldset/legend shape public/external-ids.js already uses for its two-field
+// form. Inserted into `section` before `beforeEl` (or appended when it is
+// absent) and returned.
+function renderSearchMetadataFilter(section, beforeEl) {
+  const fieldset = document.createElement('fieldset');
+  fieldset.className = 'search-md-fieldset';
+  fieldset.id = 'search-md';
+
+  const legend = document.createElement('legend');
+  legend.className = 'search-md-legend';
+  legend.textContent = SEARCH_METADATA_LEGEND;
+  fieldset.appendChild(legend);
+
+  const hint = document.createElement('div');
+  hint.className = 'form-hint';
+  hint.id = 'search-md-hint';
+  hint.textContent = SEARCH_METADATA_HINT;
+  fieldset.appendChild(hint);
+  fieldset.setAttribute('aria-describedby', 'search-md-hint');
+
+  const rows = document.createElement('div');
+  rows.className = 'search-md-rows';
+  rows.id = 'search-md-rows';
+  fieldset.appendChild(rows);
+
+  // Add/remove are a visual change with no text of their own, so the count is
+  // also stated for a screen reader.
+  const status = document.createElement('div');
+  status.className = 'visually-hidden';
+  status.id = 'search-md-status';
+  status.setAttribute('aria-live', 'polite');
+
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.className = 'btn-sm search-md-add';
+  addBtn.id = 'search-md-add';
+  addBtn.textContent = SEARCH_METADATA_ADD_LABEL;
+
+  function announce(text) {
+    status.textContent = text + ' ' + rows.children.length + ' metadata filters.';
+  }
+
+  function addRow(options) {
+    const built = searchMetadataRow(function() {
+      // Never leave the group empty: a removed last row comes back blank, so the
+      // field stays discoverable and a blank row still serialises to nothing.
+      if (rows.children.length === 0) {
+        addRow({ focus: true, announce: false });
+        announce('Metadata filter cleared.');
+        return;
+      }
+      const next = rows.querySelector('.search-md-key');
+      if (next && next.focus) next.focus();
+      announce('Metadata filter removed.');
+    });
+    rows.appendChild(built.row);
+    if (options && options.focus && built.keyInput.focus) built.keyInput.focus();
+    if (!options || options.announce !== false) announce('Metadata filter added.');
+    return built;
+  }
+
+  addBtn.addEventListener('click', function() { addRow({ focus: true }); });
+
+  // One empty row up front, so the filter is visible without a click.
+  addRow({ announce: false });
+
+  fieldset.appendChild(addBtn);
+  fieldset.appendChild(status);
+  section.insertBefore(fieldset, beforeEl || null);
+  return fieldset;
+}
+
 // Why this tab exists alongside the Assets tab's filter box (issue #948). The
 // two surfaces look alike now that both take structured filters, so the copy
 // has to carry the distinction. #913 above named the scope; this intro says why
@@ -6208,6 +6430,12 @@ async function renderSearchTab(container) {
   ].join('');
   container.appendChild(section);
 
+  // Repeatable `metadata.<key>=<value>` pairs (issue #850), built with the DOM
+  // API rather than appended to the markup above because the rows are added and
+  // removed at runtime. Inserted between the filter row and the results so the
+  // results stay last.
+  renderSearchMetadataFilter(section, section.querySelector('#search-results'));
+
   section.querySelector('#search-btn').addEventListener('click', async function() {
     const q = section.querySelector('#search-q').value.trim();
     const tags = section.querySelector('#search-tags').value.trim();
@@ -6221,6 +6449,9 @@ async function renderSearchTab(container) {
     if (q) params.set('q', q);
     if (tags) params.set('tags', tags);
     if (mime) params.set('mimeType', mime);
+    // Each filled pair becomes one `metadata.<key>=<value>`; blank rows and
+    // half-filled rows emit nothing (issue #850).
+    appendMetadataFilterParams(params, readSearchMetadataPairs(section));
 
     try {
       const res = await apiFetch('/search?' + params.toString());
@@ -9779,6 +10010,14 @@ export {
   SEARCH_TAB_TITLE,
   SEARCH_SECTION_TITLE,
   SEARCH_SCOPE_HINT,
+  // Search-tab metadata filter (issue #850). The serialiser is exported on its
+  // own so the skip rules (empty key, empty value, repeated key) can be pinned
+  // without driving the DOM, and the copy constants so a test can assert the
+  // wording does not promise partial matching the backend will not do.
+  appendMetadataFilterParams,
+  readSearchMetadataPairs,
+  SEARCH_METADATA_LEGEND,
+  SEARCH_METADATA_HINT,
   // NOTE (issue #948): SEARCH_TAB_INTRO is deliberately NOT exported. The
   // "states it returns collections" acceptance criterion is already pinned by
   // the #913 assertions on SEARCH_SECTION_TITLE / SEARCH_SCOPE_HINT above; the
