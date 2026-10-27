@@ -6251,6 +6251,165 @@ const WEBHOOK_EVENTS = ['asset.ready', 'transcode.complete', 'package.complete',
 
 // ─── PROFILES TAB ────────────────────────────────────────────────────────────
 
+// ─── Profile YAML inline detail row (issue #832) ─────────────────────────────
+//
+// View YAML used to render into one shared `#pf-yaml-view` container below the
+// whole table, so with a full profile list the output landed off-screen and the
+// button read as dead; a second click silently replaced the first profile and
+// nothing could close the panel. The YAML now renders as an expanding detail
+// row inserted directly beneath the clicked profile row.
+//
+// Contract grounding (verified, per CLAUDE.md rule 7):
+//   - GET /api/v1/profiles — openapi.json .paths["/api/v1/profiles/"].get, 200
+//     body `{ profiles: string[], items: { name, yaml, runnable, createdAt,
+//     updatedAt }[] }` (all five item fields required). The table reads
+//     `items[].name` / `items[].updatedAt`.
+//   - GET /api/v1/profiles/{name} — openapi.json
+//     .paths["/api/v1/profiles/{name}"].get, 200 body
+//     `{ name, yaml, runnable, createdAt, updatedAt }`, 404 `{ error, message? }`.
+//     The detail row reads `name` and `yaml` from that 200 body.
+//   The spec carries no operationId for either operation (both are
+//   `operationId: null` in openapi.json), so the path + method above is the
+//   identifying reference.
+
+/** Max height of the bounded YAML scroll region, so a 242-line profile cannot
+ *  push the remaining table rows out of reach. */
+const PROFILE_YAML_MAX_HEIGHT = '18rem';
+
+let profileYamlRowSeq = 0;
+
+// The shell every detail row shares: a full-width cell titled with the profile
+// name and carrying its own Collapse button, so the panel can be closed from
+// where it is read and not only from the button that opened it. Returns the
+// `<tr>` and the cell its body goes into.
+function profileYamlRowShell(name, colSpan, onCollapse) {
+  const tr = document.createElement('tr');
+  tr.className = 'pf-yaml-row';
+  tr.id = 'pf-yaml-row-' + (++profileYamlRowSeq);
+  const td = document.createElement('td');
+  td.colSpan = colSpan > 0 ? colSpan : 1;
+  td.className = 'pf-yaml-cell';
+
+  const head = document.createElement('div');
+  head.className = 'pf-yaml-head';
+  const heading = document.createElement('span');
+  heading.className = 'pf-yaml-title';
+  // textContent throughout — a profile name is operator-supplied too.
+  heading.textContent = 'YAML — ' + name;
+  head.appendChild(heading);
+  const collapseBtn = document.createElement('button');
+  collapseBtn.type = 'button';
+  collapseBtn.className = 'btn-ghost pf-yaml-collapse-btn';
+  collapseBtn.textContent = 'Collapse';
+  collapseBtn.setAttribute('aria-label', 'Collapse YAML for ' + name);
+  collapseBtn.addEventListener('click', function() {
+    if (typeof onCollapse === 'function') onCollapse();
+  });
+  head.appendChild(collapseBtn);
+  td.appendChild(head);
+
+  tr.appendChild(td);
+  return { row: tr, body: td };
+}
+
+// Builds the `<tr>` that carries one profile's YAML, spanning the full table
+// width.
+function createProfileYamlDetailRow(profile, colSpan, onCollapse) {
+  const name = (profile && profile.name) || '';
+  const shell = profileYamlRowShell(name, colSpan, onCollapse);
+
+  const pre = document.createElement('pre');
+  pre.className = 'pf-yaml-pre';
+  pre.style.maxHeight = PROFILE_YAML_MAX_HEIGHT;
+  // Focusable + named so the bounded scroll region is reachable and scrollable
+  // by keyboard alone (WCAG 2.1 SC 2.1.1).
+  pre.tabIndex = 0;
+  pre.setAttribute('role', 'region');
+  pre.setAttribute('aria-label', 'YAML for profile ' + name);
+  // textContent — never innerHTML — so YAML content cannot inject markup.
+  pre.textContent = (profile && profile.yaml) || '';
+  shell.body.appendChild(pre);
+
+  return shell.row;
+}
+
+// Builds the detail row shown when the per-profile fetch fails. Same inline
+// placement as a successful expand, so the failure is seen where it happened
+// instead of in a container the operator has to scroll to find.
+function createProfileYamlErrorRow(name, message, colSpan, onCollapse) {
+  const shell = profileYamlRowShell(name, colSpan, onCollapse);
+  shell.row.classList.add('pf-yaml-row-error');
+
+  const err = document.createElement('div');
+  err.className = 'msg msg-error pf-yaml-error';
+  err.setAttribute('role', 'alert');
+  err.textContent = 'Could not load YAML for "' + name + '": ' + message;
+  shell.body.appendChild(err);
+
+  return shell.row;
+}
+
+// Wires every `.pf-view-btn` in a rendered profiles table as a disclosure for
+// its own row. Each row toggles independently: expanding a second profile never
+// discards the first. `loadProfileYaml(name)` resolves the profile document
+// (GET /api/v1/profiles/{name}); it is a parameter so a DOM test can drive the
+// real toggle without a network call.
+function wireProfileYamlToggles(tableWrap, loadProfileYaml) {
+  const colSpan = tableWrap.querySelectorAll('thead th').length || 1;
+  tableWrap.querySelectorAll('.pf-view-btn').forEach(function(btn) {
+    const name = btn.dataset.name || '';
+    btn.setAttribute('aria-expanded', 'false');
+    let detailRow = null;
+
+    function collapse() {
+      if (detailRow && detailRow.parentNode) detailRow.remove();
+      detailRow = null;
+      const row = btn.closest('tr');
+      if (row) row.classList.remove('pf-row-expanded');
+      btn.setAttribute('aria-expanded', 'false');
+      btn.removeAttribute('aria-controls');
+      btn.textContent = 'View YAML';
+      btn.setAttribute('aria-label', 'View YAML for ' + name);
+    }
+
+    function expand(newRow) {
+      const row = btn.closest('tr');
+      detailRow = newRow;
+      if (row && row.parentNode) {
+        row.parentNode.insertBefore(newRow, row.nextSibling);
+        row.classList.add('pf-row-expanded');
+      }
+      btn.setAttribute('aria-expanded', 'true');
+      btn.setAttribute('aria-controls', newRow.id);
+      btn.textContent = 'Hide YAML';
+      btn.setAttribute('aria-label', 'Hide YAML for ' + name);
+    }
+
+    btn.setAttribute('aria-label', 'View YAML for ' + name);
+    btn.addEventListener('click', async function() {
+      if (btn.dataset.pfLoading === '1') return;
+      if (btn.getAttribute('aria-expanded') === 'true') {
+        collapse();
+        return;
+      }
+      btn.dataset.pfLoading = '1';
+      const restoreLabel = btn.textContent;
+      btn.textContent = 'Loading…';
+      btn.setAttribute('aria-busy', 'true');
+      try {
+        const p = await loadProfileYaml(name);
+        expand(createProfileYamlDetailRow(p || { name: name }, colSpan, collapse));
+      } catch (err) {
+        expand(createProfileYamlErrorRow(name, err && err.message ? err.message : String(err), colSpan, collapse));
+      } finally {
+        delete btn.dataset.pfLoading;
+        btn.removeAttribute('aria-busy');
+        if (btn.getAttribute('aria-expanded') !== 'true') btn.textContent = restoreLabel;
+      }
+    });
+  });
+}
+
 // Encore transcoding profiles (issue #84). Profiles are persisted in CouchDB
 // and served to Encore via the public GET /api/v1/profiles/index.yml. This tab
 // lets an operator list profiles, view their YAML, create new ones, seed the
@@ -6294,7 +6453,6 @@ async function renderProfilesTab(container) {
     '</div>',
     '<div id="pf-bootstrap-msg"></div>',
     '<div id="pf-list-wrap"></div>',
-    '<div id="pf-yaml-view"></div>',
   ].join('');
   container.appendChild(listSection);
 
@@ -6321,7 +6479,7 @@ async function renderProfilesTab(container) {
       return;
     }
     const rows = items.map(function(p) {
-      return '<tr>' +
+      return '<tr class="pf-row" data-name="' + escHtml(p.name) + '">' +
         '<td class="cell-id">' + escHtml(p.name) + '</td>' +
         '<td>' + escHtml(fmtDate(p.updatedAt)) + '</td>' +
         '<td>' +
@@ -6338,29 +6496,11 @@ async function renderProfilesTab(container) {
       '</table>';
     wrap.appendChild(tableWrap);
 
-    tableWrap.querySelectorAll('.pf-view-btn').forEach(function(btn) {
-      btn.addEventListener('click', async function() {
-        const view = listSection.querySelector('#pf-yaml-view');
-        view.innerHTML = '';
-        try {
-          const p = await apiFetch('/profiles/' + encodeURIComponent(btn.dataset.name));
-          const box = document.createElement('div');
-          box.className = 'section';
-          const pre = document.createElement('pre');
-          pre.style.whiteSpace = 'pre-wrap';
-          pre.style.fontFamily = 'monospace';
-          // textContent — never innerHTML — so YAML content cannot inject markup.
-          pre.textContent = p.yaml || '';
-          const head = document.createElement('div');
-          head.className = 'section-title';
-          head.textContent = 'YAML — ' + p.name;
-          box.appendChild(head);
-          box.appendChild(pre);
-          view.appendChild(box);
-        } catch (err) {
-          showMsg(view, 'Error: ' + err.message, 'error');
-        }
-      });
+    // View YAML is a per-row disclosure (issue #832): the YAML lands in a row
+    // directly beneath the profile that was clicked, each row toggles on its
+    // own, and the content sits in a bounded scroll region.
+    wireProfileYamlToggles(tableWrap, function(name) {
+      return apiFetch('/profiles/' + encodeURIComponent(name));
     });
 
     tableWrap.querySelectorAll('.pf-delete-btn').forEach(function(btn) {
@@ -6404,7 +6544,8 @@ async function renderProfilesTab(container) {
         if (!ok) return;
         try {
           await apiFetch('/profiles/' + encodeURIComponent(btn.dataset.name), { method: 'DELETE' });
-          listSection.querySelector('#pf-yaml-view').innerHTML = '';
+          // Any open YAML detail rows live inside the table body, so the
+          // reload below replaces them; there is no separate panel to clear.
           loadProfiles();
         } catch (err) {
           reportActionFailure(err, {
@@ -9460,6 +9601,13 @@ export {
   // apiFetch() against a gated router, catching future drift between the gate
   // and the UI's credential handling alongside test/workspace-acl.test.ts.
   apiFetch,
+  // Per-row profile YAML disclosure (issue #832). Exported so a DOM/unit test
+  // can drive the REAL toggle wiring and row builders — the same code path the
+  // Profiles tab uses — against a stubbed GET /profiles/{name} loader.
+  wireProfileYamlToggles,
+  createProfileYamlDetailRow,
+  createProfileYamlErrorRow,
+  PROFILE_YAML_MAX_HEIGHT,
   isAssetWedged,
   filterWedgedAssets,
   renderAssetDetailBody,
