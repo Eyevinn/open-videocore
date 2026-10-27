@@ -1802,7 +1802,7 @@ Response 200 (application/json)
 
   Purge an archived asset on demand (IRREVERSIBLE)
 
-  Permanently destroy ONE already-archived asset: its stored objects (source, renditions, packaged output, subtitles, thumbnails) are removed and its document is replaced by a tombstone. This is IRREVERSIBLE — the asset cannot be restored afterwards, and reads of its id return 410 Gone from then on. The asset must already be archived (archive it first with DELETE /api/v1/assets/{id}), and a delete-locked asset is refused with 409 delete_blocked / delete_protected just as archiving is. Independent of the global archived-asset retention window (GET /api/v1/retention/config): purging one asset here changes no policy and affects no other asset. The purge is recorded in the audit log (GET /api/v1/audit) as asset.purged.
+  Permanently destroy ONE already-archived asset: its stored objects (source, renditions, packaged output, subtitles, thumbnails) are removed and its document is replaced by a tombstone. This is IRREVERSIBLE — the asset cannot be restored afterwards, and reads of its id return 410 Gone from then on. The asset must already be archived (archive it first with DELETE /api/v1/assets/{id}), and a delete-locked asset is refused with 409 delete_blocked / delete_protected just as archiving is. The same integrity blocks DELETE /api/v1/assets/{id} applies are enforced here: 409 delete_blocked / referenced_by_job while an active job still names the asset as its source, and 409 has_children while it still has a live (non-archived) child — purge the children first so no child is left pointing at a tombstone. A purge destroys only bytes no other asset references: if any object of this asset (source, rendition, subtitle, thumbnail) is also referenced by another asset, the purge is refused with 409 shared_objects and nothing is removed. Independent of the global archived-asset retention window (GET /api/v1/retention/config): purging one asset here changes no policy and affects no other asset. The purge is recorded in the audit log (GET /api/v1/audit) as asset.purged.
 
   Parameters
 Name | In | Type | Required
@@ -4278,6 +4278,8 @@ Request
 curl https://<your-instance>/api/v1/retention/config
 
 Restore an asset within that window with POST /api/v1/assets/{id}/restore. Full shape in the Retention reference.
+
+To destroy one archived asset now, without widening the window for everything else, call DELETE /api/v1/assets/{id}/purge. It is irreversible: the asset's stored objects are removed, its document is replaced by a tombstone, and reads of its id return 410 Gone from then on — there is no restore afterwards.
 
 ---
 

@@ -701,6 +701,7 @@ ${renderCurlBlock('Request', 'curl -X POST https://<your-instance>/api/v1/option
 <p>Deleted assets are soft-deleted and recoverable within a configurable window:</p>
 ${renderCurlBlock('Request', 'curl https://<your-instance>/api/v1/retention/config')}
 <p>Restore an asset within that window with ${refEx('POST', '/api/v1/assets/{id}/restore')}. Full shape in the <a href="ref-retention.html">Retention reference</a>.</p>
+<p>To destroy one archived asset now, without widening the window for everything else, call ${refEx('DELETE', '/api/v1/assets/{id}/purge')}. It is irreversible: the asset's stored objects are removed, its document is replaced by a tombstone, and reads of its id return <code>410 Gone</code> from then on — there is no restore afterwards.</p>
 `
 };
 

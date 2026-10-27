@@ -1844,6 +1844,64 @@ export function parseS3Uri(uri: string): { bucket: string; key: string } | null 
   return { bucket: match[1], key: match[2] };
 }
 
+// Every stored object an asset's purge would REMOVE, as `bucket\u0000key` identities
+// (issue #837 review). `objectKey` is a client-settable field on POST /assets and
+// PATCH /assets/:id, so two documents can point at the SAME bytes; the purge
+// route uses these sets to refuse destroying bytes another document still
+// references. A plain key lives in `sourceBucket`; an `s3://bucket/key` rendition
+// lives in that bucket (parseS3Uri) — the same bucket resolution
+// `purgeArchivedAsset` itself applies (src/pipeline/archived-asset-purge-sweep.ts).
+// The packaged-output prefix is NOT included: it is derived from the asset id
+// (outputPrefix(asset.id), src/pipeline/packaging.ts) and so cannot be aimed at
+// another asset.
+function purgeableObjectIdentities(asset: Asset, sourceBucket: string): Set<string> {
+  const ids = new Set<string>();
+  const add = (rawKey: string | undefined): void => {
+    if (!rawKey) return;
+    const s3 = parseS3Uri(rawKey);
+    ids.add(s3 ? `${s3.bucket}\u0000${s3.key}` : `${sourceBucket}\u0000${rawKey}`);
+  };
+  add(asset.objectKey);
+  for (const rendition of asset.renditions ?? []) add(rendition.objectKey);
+  for (const track of asset.subtitleTracks ?? []) add(track.objectKey);
+  for (const thumb of asset.thumbnails ?? []) add(thumb);
+  return ids;
+}
+
+// Find a DIFFERENT live asset document that references any of the objects this
+// purge would destroy (issue #837 review). Pages `list()` over the workspace's
+// assets (tombstones are excluded from `list()` by construction — the in-memory
+// repo drops the document and the Couch repo filters on `resourceType`), so the
+// answer covers every still-restorable document, archived ones included.
+// Returns the first collision found, or undefined when the bytes are unshared.
+async function findSharedObjectOwner(
+  repo: AssetRepository,
+  asset: Asset,
+  sourceBucket: string
+): Promise<{ assetId: string; bucket: string; key: string } | undefined> {
+  const mine = purgeableObjectIdentities(asset, sourceBucket);
+  if (mine.size === 0) {
+    return undefined;
+  }
+  let offset = 0;
+  for (;;) {
+    const page = await repo.list({ limit: MAX_LIMIT, offset });
+    for (const other of page.items) {
+      if (other.id === asset.id) continue;
+      for (const identity of purgeableObjectIdentities(other, sourceBucket)) {
+        if (mine.has(identity)) {
+          const [bucket, key] = identity.split('\u0000');
+          return { assetId: other.id, bucket, key };
+        }
+      }
+    }
+    if (page.items.length < MAX_LIMIT) break;
+    offset += page.items.length;
+    if (offset >= page.total) break;
+  }
+  return undefined;
+}
+
 // The publicly reachable origin of THIS API up to (and including) the assets
 // router mount point, e.g. `https://api.example/api/v1/assets`. Used to build
 // proxy delivery URLs (issue #201). Prefers the configured PUBLIC_BASE_URL
@@ -7479,6 +7537,22 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //         unlock via DELETE /:id/lock first.
   //   409 — `not_archived`: the asset is in any other lifecycle state. Archive it
   //         with DELETE /:id first.
+  //   409 — `delete_blocked` / `referenced_by_job`: an active (pending/queued/
+  //         running) job still names this asset as its source, exactly as
+  //         DELETE /:id refuses (ADR-020 decision 1). Archiving does not cancel
+  //         jobs, so an archived asset can still be referenced.
+  //   409 — `has_children`: the asset still has a LIVE (non-archived) child.
+  //         The same block DELETE /:id enforces and the route equivalent of the
+  //         sweep's child-ordering deferral (anyLiveChild) — without it an
+  //         archived parent could be purged out from under a live child, leaving
+  //         the child pointing at a tombstone. Purge the children first.
+  //   409 — `shared_objects`: one of the objects this purge would remove is also
+  //         referenced by another live asset document. THE INVARIANT: a purge
+  //         only ever destroys bytes no other live asset references. Needed
+  //         because `objectKey` is client-settable (POST /assets, PATCH
+  //         /assets/:id — accepted even while archived), so a document can be
+  //         aimed at another asset's bytes; the delete-lock guard above protects
+  //         the locked document, this one protects its bytes.
   //   501 — the resolved repository exposes no purge-to-tombstone write path, so
   //         this deployment cannot record the purge (same `not_configured`
   //         convention as the other capability-gated routes here).
@@ -7494,7 +7568,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           'tombstone. This is IRREVERSIBLE — the asset cannot be restored afterwards, and reads of ' +
           'its id return 410 Gone from then on. The asset must already be `archived` (archive it ' +
           'first with `DELETE /api/v1/assets/{id}`), and a delete-locked asset is refused with 409 ' +
-          '`delete_blocked` / `delete_protected` just as archiving is. Independent of the global ' +
+          '`delete_blocked` / `delete_protected` just as archiving is. The same integrity blocks ' +
+          '`DELETE /api/v1/assets/{id}` applies are enforced here: 409 `delete_blocked` / ' +
+          '`referenced_by_job` while an active job still names the asset as its source, and 409 ' +
+          '`has_children` while it still has a live (non-archived) child — purge the children ' +
+          'first so no child is left pointing at a tombstone. A purge destroys only bytes no other ' +
+          'asset references: if any object of this asset (source, rendition, subtitle, thumbnail) ' +
+          'is also referenced by another asset, the purge is refused with 409 `shared_objects` and ' +
+          'nothing is removed. Independent of the global ' +
           'archived-asset retention window (`GET /api/v1/retention/config`): purging one asset here ' +
           'changes no policy and affects no other asset. The purge is recorded in the audit log ' +
           '(`GET /api/v1/audit`) as `asset.purged`.',
@@ -7544,11 +7625,78 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         });
       }
 
+      // In-flight job reference, the SAME hard block DELETE /:id applies (ADR-020
+      // decision 1, issue #569). An asset can be archived while a job that names
+      // it as source is still pending/queued/running — archiving does not cancel
+      // jobs — so destroying its bytes here would corrupt that in-flight
+      // pipeline. Same `delete_blocked` / `referenced_by_job` envelope, naming
+      // the blocking job ids; no force override exists on this route.
+      const activeJobs = await jobs.findActiveByAssetId(id);
+      if (activeJobs.length > 0) {
+        throw new ReferencedByJobError(
+          id,
+          activeJobs.map((j) => j.id)
+        );
+      }
+
+      // Live-child block, the SAME check DELETE /:id applies and the route
+      // equivalent of the sweep's child-ordering deferral (anyLiveChild,
+      // src/pipeline/archived-asset-purge-sweep.ts). An archived PARENT with a
+      // live child must not be purged: the child would be left pointing at a
+      // tombstone. `countChildren` counts only non-archived children (both the
+      // in-memory and Couch repos exclude `archived`), which is exactly the
+      // sweep's "live child" notion — an archived child is itself purgeable and
+      // never blocks. Where the sweep DEFERS (and retries on a later tick), the
+      // on-demand route REFUSES with the pre-existing `has_children` envelope:
+      // purge the children first.
+      const childCount = await repo.countChildren(id);
+      if (childCount > 0) {
+        throw new HasChildrenError(id);
+      }
+
+      // The source bucket this purge's plain keys resolve in — resolved ONCE and
+      // passed to both the ownership guard below and purgeArchivedAsset, so the
+      // bytes checked are the bytes removed.
+      const purgeSourceBucket =
+        request.connections?.sourceBucket ?? opts.sourceBucket ?? DEFAULT_SOURCE_BUCKET;
+
+      // OBJECT-OWNERSHIP INVARIANT (issue #837 review): a purge only ever
+      // destroys bytes that NO other live asset document references.
+      //
+      // Why this guard has to exist: `objectKey` is a client-settable field on
+      // POST /api/v1/assets and PATCH /api/v1/assets/{id}, and PATCH is accepted
+      // on an already-archived asset. Without this check a caller could aim
+      // their own archived asset (or a decoy) at another asset's source or
+      // rendition key — including a key belonging to a delete-locked asset — and
+      // destroy those bytes from here. The delete-lock guard above protects the
+      // locked DOCUMENT; only this guard protects its BYTES.
+      //
+      // `objectKey` stays client-settable (ingest, the objectkey backfill and the
+      // re-point flows all depend on writing it), so ownership is verified at
+      // purge time instead: every object this purge would remove — source,
+      // renditions (plain or `s3://bucket/key`), subtitles, thumbnails — is
+      // compared, per bucket, against every other live document's objects. Any
+      // overlap is refused with 409 `shared_objects` naming the other asset, and
+      // nothing is removed. The packaged-output prefix is exempt by construction:
+      // it is derived from the asset id (outputPrefix), not from a client field.
+      const sharedWith = await findSharedObjectOwner(repo, existing, purgeSourceBucket);
+      if (sharedWith) {
+        return reply.code(409).send({
+          error: 'shared_objects',
+          message:
+            `asset ${id} cannot be purged: its stored object ` +
+            `${sharedWith.key} (bucket ${sharedWith.bucket}) is also referenced by ` +
+            `asset ${sharedWith.assetId}, so destroying it would remove bytes that ` +
+            'asset still points at'
+        });
+      }
+
       // Resolve the doc-replace write path. Preference order: the injected
       // callback, then the resolved stack's CONCRETE repo
-      // (request.connections.assets), then opts.repository — because
-      // purgeToTombstone is not on the AssetRepository interface and the
-      // per-stack proxy does not forward it (src/data/per-workspace-repos.ts).
+      // (request.connections.assets), falling back to the router's own
+      // `repo` — because purgeToTombstone is not on the AssetRepository
+      // interface and the per-stack proxy does not forward it
+      // (src/data/per-workspace-repos.ts).
       type PurgeCapable = {
         purgeToTombstone?: (assetId: string) => Promise<string | undefined> | boolean;
       };
@@ -7581,8 +7729,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         {
           purge,
           storageForBucket,
-          sourceBucket:
-            request.connections?.sourceBucket ?? opts.sourceBucket ?? DEFAULT_SOURCE_BUCKET,
+          sourceBucket: purgeSourceBucket,
           // Adapter onto the request logger. The sweep logs printf-style
           // ('… %s: %o', id, err); here the format string becomes the message and
           // its arguments ride along as structured context, so a best-effort
