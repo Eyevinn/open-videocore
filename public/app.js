@@ -3349,12 +3349,18 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     // No auth header needed, so use a plain fetch rather than apiFetch.
     // Fall back to the known-good 'program' profile if the fetch fails or is empty.
     var encodeProfiles = ['program'];
+    // Declared SpEL parameters per profile, derived from the `items[].yaml` the
+    // SAME list response carries (issue #869). Empty object = nothing in the
+    // picker is parametrised, which is also what an older deployment or a stub
+    // without `items` yields.
+    var profileParams = {};
     try {
       const profilesResp = await fetch('/api/v1/profiles');
       if (profilesResp.ok) {
         const profilesData = await profilesResp.json();
         if (profilesData && Array.isArray(profilesData.profiles) && profilesData.profiles.length > 0) {
           encodeProfiles = profilesData.profiles;
+          profileParams = profileParamsIndex(profilesData.items);
         } else {
           console.warn('GET /profiles returned no profiles; falling back to default ["program"]');
         }
@@ -3412,7 +3418,14 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       pipelineOptions,
       '</select>',
       '<select id="profile-select" class="input" title="Encode profile (for pipelines with a transcode step)">',
-      encodeProfiles.map(function(p) { return '<option value="' + escHtml(p) + '">' + escHtml(p) + '</option>'; }).join(''),
+      // A parametrised profile is marked in the option itself (issue #869), so
+      // the operator can tell there is something to set BEFORE running. The
+      // value stays the bare profile name — that is what `profile` carries.
+      encodeProfiles.map(function(p) {
+        return '<option value="' + escHtml(p) + '"' +
+          ' title="' + escHtml(profileOptionTitle(p, profileParams[p])) + '">' +
+          escHtml(profileOptionLabel(p, profileParams[p])) + '</option>';
+      }).join(''),
       '</select>',
       '<button id="btn-run-pipeline" class="btn-ghost">Run Pipeline</button>',
     ].join('');
@@ -3451,11 +3464,39 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       }
     }
 
+    // Host for the selected profile's parameter form (issue #869). Sits under
+    // the run row so the fields read as belonging to the profile above them.
+    const profileParamsDiv = document.createElement('div');
+    profileParamsDiv.id = 'profile-params-area';
+    body.appendChild(profileParamsDiv);
+
+    // Draw (or clear) the parameter form for whatever is selected now. Nothing
+    // is drawn when the pipeline has no transcode step, or when the chosen
+    // profile declares no params — so the control is unchanged for every
+    // non-parametrised profile.
+    function updateProfileParams() {
+      var hasTranscode = ENCODE_PIPELINES.indexOf(pipelineSel.value) !== -1;
+      var params = hasTranscode ? profileParams[profileSel.value] : null;
+      var wanted = params && params.length > 0 ? profileSel.value : '';
+      // Idempotent for an unchanged selection: the run handler calls this from
+      // its `finally`, and a rejected run must not throw away the values that
+      // caused the rejection — nor the inline message explaining them.
+      if (profileParamsDiv.dataset.paramsProfile === wanted) return;
+      profileParamsDiv.dataset.paramsProfile = wanted;
+      var fieldset = renderProfileParamsForm(profileParamsDiv, profileSel.value, params);
+      // The hint only exists while the form does, so the picker points at it
+      // only then — a dangling aria-describedby would reference nothing.
+      if (fieldset) profileSel.setAttribute('aria-describedby', 'profile-params-hint');
+      else profileSel.removeAttribute('aria-describedby');
+    }
+
     function updateProfileVisibility() {
       var hasTranscode = ENCODE_PIPELINES.indexOf(pipelineSel.value) !== -1;
       profileSel.style.display = hasTranscode ? '' : 'none';
+      updateProfileParams();
     }
     pipelineSel.addEventListener('change', updateProfileVisibility);
+    profileSel.addEventListener('change', updateProfileParams);
     updateProfileVisibility();
 
     // Action buttons — static labels, no dynamic content
@@ -3528,6 +3569,19 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       var hasTranscode = ENCODE_PIPELINES.indexOf(pipeline) !== -1;
       var body2 = { pipeline: pipeline };
       if (hasTranscode) body2.profile = profileSel.value;
+      // Parametrised profile overrides (issue #869). Flat string map, top-level
+      // sibling of `profile` (openapi.json
+      // .paths["/api/v1/assets/{id}/execute"].post.requestBody; schema source
+      // src/routes/assets.ts:433/376). Only EDITED fields are collected, and the
+      // key is omitted entirely when nothing was edited — so a run with no edits
+      // posts the same body as before and the profile's own defaults apply.
+      var paramInputs = profileParamsDiv.querySelectorAll('.profile-param-input');
+      var paramsError = profileParamsDiv.querySelector('#profile-params-error');
+      if (paramsError) paramsError.textContent = '';
+      if (hasTranscode) {
+        var editedParams = collectProfileParams(profileParamsDiv);
+        if (Object.keys(editedParams).length > 0) body2.profileParams = editedParams;
+      }
 
       // Loading state: disable the button (and selects) and show progress so the
       // user gets immediate feedback that the dispatch is in flight.
@@ -3535,6 +3589,7 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       runBtn.disabled = true;
       pipelineSel.disabled = true;
       profileSel.disabled = true;
+      [].forEach.call(paramInputs, function(input) { input.disabled = true; });
       runBtn.textContent = 'Running…';
       showMsg(actionMsg, 'Queuing pipeline…', 'info');
 
@@ -3552,10 +3607,19 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
         actionMsg.innerHTML = '';
         // err.message carries the API error detail (apiFetch extracts body.error/message).
         showMsg(actionMsg, 'Error: ' + err.message, 'error');
+        // A rejected parameter key is a problem with the fields, so the server's
+        // own sentence — which names the accepted key set for this profile
+        // (src/pipeline/profile-params.ts:132-138, surfaced as the 400
+        // `unknown_profile_params` body `message`) — is repeated next to them.
+        // role="alert" on that element announces it without moving focus.
+        if (paramsError && err.body && err.body.error === 'unknown_profile_params') {
+          paramsError.textContent = err.message;
+        }
       } finally {
         runBtn.disabled = false;
         pipelineSel.disabled = false;
         profileSel.disabled = false;
+        [].forEach.call(paramInputs, function(input) { input.disabled = false; });
         runBtn.textContent = prevLabel;
         updateProfileVisibility();
       }
@@ -8767,6 +8831,219 @@ var ENCODE_PIPELINES = PIPELINE_CATALOG
   .filter(function(p) { return p.steps.indexOf('transcode') !== -1; })
   .map(function(p) { return p.name; });
 
+// ─── Parametrised transcode profiles (issue #869) ────────────────────────────
+//
+// A profile can expose knobs: its YAML references `profileParams` through SpEL,
+// e.g. `crf: #{profileParams['crf']?:23}`. Until now the run control could only
+// name a profile, so a parametrised profile could only ever run with its
+// built-in defaults even though the API has accepted overrides since #287/#288.
+//
+// CONTRACT, read before this call was written (CLAUDE.md rule 7) — from this
+// repo's own route source and generated spec, never from the issue text:
+//   - POST /api/v1/assets/{id}/execute — openapi.json
+//     .paths["/api/v1/assets/{id}/execute"].post.requestBody: an object with
+//     `required: ["pipeline"]`, `additionalProperties: false`, and the optional
+//     siblings `profile` (string, minLength 1) and
+//     `profileParams: { type: 'object', additionalProperties: { type: 'string' } }`.
+//     So profileParams is a TOP-LEVEL FLAT STRING MAP alongside `profile` — not
+//     nested under it, and every value must be a string. Source of truth:
+//     `profileParams: profileParamsSchema.optional()` on the execute body
+//     (src/routes/assets.ts:433) over
+//     `const profileParamsSchema = z.record(z.string(), z.string())`
+//     (src/routes/assets.ts:376). The spec assigns this operation no
+//     operationId; it is keyed by path + method. The run control already posts
+//     to this exact route, so no new endpoint is introduced here.
+//   - 400 `unknown_profile_params` — a key the chosen profile does not declare
+//     is rejected at submit time with a message naming the accepted set
+//     (src/routes/assets.ts:5695-5760 -> validateProfileParams,
+//     src/pipeline/profile-params.ts:95-141). apiFetch prefers `body.message`
+//     (app.js:573), so that sentence is what the operator reads.
+//   - GET /api/v1/profiles — 200 `{ profiles: string[], items: [{ name, yaml,
+//     runnable, createdAt, updatedAt }] }` (listResponseSchema,
+//     src/routes/profiles.ts:121-124, items built at :173). `items[].yaml` is
+//     the same document the Profiles tab's View YAML button renders AND the one
+//     the server derives the accepted key set from, so the picker reads the
+//     declared params straight off the list response it already fetches: no
+//     extra request, and no second source of truth to drift.
+//
+// The key set is DERIVED from the YAML, never hardcoded. The regex below is the
+// client-side twin of SPEL_PROFILE_PARAM_REF (src/pipeline/profile-params.ts:43)
+// — Spring Expression Language map indexing, single OR double quotes — so the
+// form offers exactly the keys the server will accept, and nothing else.
+var PROFILE_PARAM_REF = /profileParams\[\s*(?:'([^']+)'|"([^"]+)")\s*\]/g;
+
+// The same reference WITH its SpEL Elvis default (`?:`), which is where the
+// declared default lives: `?:23`, `?:"medium"`, `?:'expr:not(mod(n,96))'`. The
+// quoted branches win over the bare one so a default containing `:` or `(` is
+// captured whole; the bare branch stops at the closing `}` of the `#{…}` block.
+var PROFILE_PARAM_DEFAULT_REF =
+  /profileParams\[\s*(?:'([^']+)'|"([^"]+)")\s*\]\s*\?:\s*(?:'([^']*)'|"([^"]*)"|([^}\s]*))/g;
+
+// Extract the parameters a profile YAML declares, in first-appearance order, as
+// `[{ key, defaultValue }]`. `defaultValue` is the declared SpEL default with
+// its quotes stripped, or '' when the reference carries none (the profile then
+// has no default to prefill — the field stays empty and is only sent if typed
+// into). Keys are de-duplicated: the same param is usually referenced several
+// times in one ladder (suffix + the encoder option it feeds). A profile that
+// references none returns [] — i.e. "not parametrised".
+function declaredProfileParams(profileYaml) {
+  if (!profileYaml) return [];
+  const yaml = String(profileYaml);
+  const defaults = {};
+  for (const match of yaml.matchAll(PROFILE_PARAM_DEFAULT_REF)) {
+    const key = match[1] || match[2];
+    if (!key || Object.prototype.hasOwnProperty.call(defaults, key)) continue;
+    // The first default the document states for a key is the one shown; a
+    // well-formed profile repeats the same default at every reference.
+    const value = match[3] !== undefined ? match[3]
+      : match[4] !== undefined ? match[4]
+      : (match[5] || '');
+    defaults[key] = value;
+  }
+  const params = [];
+  const seen = {};
+  for (const match of yaml.matchAll(PROFILE_PARAM_REF)) {
+    const key = match[1] || match[2];
+    if (!key || seen[key]) continue;
+    seen[key] = true;
+    params.push({
+      key: key,
+      defaultValue: Object.prototype.hasOwnProperty.call(defaults, key) ? defaults[key] : '',
+    });
+  }
+  return params;
+}
+
+// Build a `name -> [{ key, defaultValue }]` index from the `items` of the
+// profiles list response. Only parametrised profiles get an entry, so a lookup
+// miss means "this profile takes no params". Tolerates a response without
+// `items` (an older deployment, or a stubbed fetch): the picker then simply
+// marks nothing, which is the pre-#869 behaviour.
+function profileParamsIndex(items) {
+  const index = {};
+  (Array.isArray(items) ? items : []).forEach(function(item) {
+    if (!item || typeof item.name !== 'string') return;
+    const params = declaredProfileParams(item.yaml);
+    if (params.length > 0) index[item.name] = params;
+  });
+  return index;
+}
+
+// How a parametrised profile reads in the picker. The option VALUE stays the
+// bare profile name (that is what `profile` carries on the wire); only the
+// label is annotated, so the operator can see there is something to set before
+// running rather than discovering it in the output filename.
+function profileOptionLabel(name, params) {
+  if (!params || params.length === 0) return name;
+  return name + ' — ' + params.length + (params.length === 1 ? ' parameter' : ' parameters');
+}
+
+// The option's tooltip: which keys this profile declares, and what happens if
+// you leave them alone.
+function profileOptionTitle(name, params) {
+  if (!params || params.length === 0) {
+    return 'Encode profile (for pipelines with a transcode step)';
+  }
+  return 'Parametrised profile. Declares: ' +
+    params.map(function(p) { return p.key; }).join(', ') +
+    '. Each parameter keeps the profile’s own default unless you change it.';
+}
+
+var PROFILE_PARAMS_LEGEND = 'Profile parameters';
+var PROFILE_PARAMS_HINT =
+  'Prefilled with the defaults the profile declares. Only the values you change ' +
+  'are sent; anything you leave as-is stays on the profile’s own default. Clear a ' +
+  'field to fall back to its default.';
+
+// Render the parameter form for the selected profile into `hostEl`, replacing
+// whatever was there. `params` is the output of declaredProfileParams(); an
+// empty list renders nothing at all, so a non-parametrised profile looks exactly
+// as it did before #869. Returns the fieldset, or null when nothing was drawn.
+//
+// A real fieldset/legend (the shape renderSearchMetadataFilter and
+// public/external-ids.js already use) so the fields are announced as one group,
+// each input keeps a `<label for>`, and the hint is wired with aria-describedby.
+function renderProfileParamsForm(hostEl, profileName, params) {
+  if (!hostEl) return null;
+  hostEl.innerHTML = '';
+  if (!params || params.length === 0) return null;
+
+  const fieldset = document.createElement('fieldset');
+  fieldset.className = 'profile-params-fieldset';
+  fieldset.id = 'profile-params';
+
+  const legend = document.createElement('legend');
+  legend.className = 'profile-params-legend';
+  // Name the profile in the legend: the form's contents change with the picker,
+  // so the group has to say which profile it is describing.
+  legend.textContent = PROFILE_PARAMS_LEGEND + ' — ' + profileName;
+  fieldset.appendChild(legend);
+
+  const hint = document.createElement('div');
+  hint.className = 'form-hint';
+  hint.id = 'profile-params-hint';
+  hint.textContent = PROFILE_PARAMS_HINT;
+  fieldset.appendChild(hint);
+  fieldset.setAttribute('aria-describedby', 'profile-params-hint');
+
+  const row = document.createElement('div');
+  row.className = 'form-row profile-params-row';
+  params.forEach(function(param) {
+    const id = 'profile-param-' + param.key;
+    const wrap = document.createElement('div');
+    wrap.className = 'form-field grow';
+    const label = document.createElement('label');
+    label.setAttribute('for', id);
+    // Profile YAML is operator-supplied, so the key is set as text, never HTML.
+    label.textContent = param.key;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.id = id;
+    input.className = 'input profile-param-input';
+    input.dataset.paramKey = param.key;
+    // The declared default is both the starting value and the baseline the
+    // submit compares against, so an untouched field sends nothing.
+    input.dataset.paramDefault = param.defaultValue;
+    input.value = param.defaultValue;
+    if (param.defaultValue) input.placeholder = param.defaultValue;
+    wrap.appendChild(label);
+    wrap.appendChild(input);
+    row.appendChild(wrap);
+  });
+  fieldset.appendChild(row);
+
+  // Where the API's own 400 `unknown_profile_params` message lands — next to the
+  // fields it is about, not only in the page-level action message.
+  const error = document.createElement('div');
+  error.className = 'form-error profile-params-error';
+  error.id = 'profile-params-error';
+  error.setAttribute('role', 'alert');
+  fieldset.appendChild(error);
+
+  hostEl.appendChild(fieldset);
+  return fieldset;
+}
+
+// Read the form into the flat string map the execute body takes. ONLY edited
+// values travel: a field still holding its declared default (or cleared) is
+// omitted so the profile's own default applies server-side — which keeps a run
+// with no edits byte-identical to the pre-#869 request. Values are trimmed;
+// each lands as a single encoder token, so stray whitespace is never intended.
+function collectProfileParams(hostEl) {
+  const params = {};
+  if (!hostEl) return params;
+  const inputs = hostEl.querySelectorAll('.profile-param-input');
+  [].forEach.call(inputs, function(input) {
+    const key = input.dataset.paramKey;
+    if (!key) return;
+    const value = String(input.value == null ? '' : input.value).trim();
+    if (value === '') return;
+    if (value === String(input.dataset.paramDefault == null ? '' : input.dataset.paramDefault)) return;
+    params[key] = value;
+  });
+  return params;
+}
+
 var STEP_ICONS = {
   'extract-metadata': '🔬',
   'thumbnail': '🖼',
@@ -10123,6 +10400,19 @@ export {
   setupTabs,
   auditTabWiring,
   reportTabWiring,
+  // Parametrised transcode profiles in the run control (issue #869). Exported so
+  // a DOM/unit test can drive the REAL extraction, picker marking, form builder
+  // and submit-time collection — the same code path renderAssetDetailBody uses —
+  // against the profile YAML shape the server derives its accepted key set from,
+  // without standing up a server.
+  declaredProfileParams,
+  profileParamsIndex,
+  profileOptionLabel,
+  profileOptionTitle,
+  renderProfileParamsForm,
+  collectProfileParams,
+  PROFILE_PARAMS_LEGEND,
+  PROFILE_PARAMS_HINT,
   // Remaining-retention-window text for the restore action (issue #891).
   // Exported so a DOM/unit test can exercise the pure formatter directly on a
   // hand-built `retention` object, without standing up a server. The formatter
