@@ -7,11 +7,13 @@ streaming output). This is the zero-config path — you supply nothing but a sta
 `name` and the API owns the whole storage lifecycle.
 
 Some deployments want the stack to read source media from, or write packaged
-output to, storage they already run: an AWS-region S3 bucket, or a generic
-S3-compatible object store fronted by its own S3 API. For those cases the
-provision request accepts two optional blocks, `sourceStorage` and
-`packagedStorage`, that point a role at an operator-owned bucket instead of the
-per-stack MinIO default.
+output to, a bucket they already run. For those cases the provision request
+accepts two optional blocks, `sourceStorage` and `packagedStorage`, that point a
+role at an operator-owned bucket instead of the per-stack MinIO default.
+
+One limit to know up front: a block may only redirect the **bucket name**. A
+block that also names an external S3 API host via `endpointUrl` is refused with
+a 400 — see Example 2 and issue #641.
 
 External storage is **additive**. If you omit both blocks you get exactly the
 behaviour you get today — MinIO remains the zero-config default. If you supply
@@ -30,7 +32,7 @@ and wired into the provision request body at lines 64-67.
 | `accessKeyId` | **Yes** | Access key ID for the bucket. |
 | `secretAccessKey` | **Yes** | Secret access key. Stored as an OSC secret, never in plaintext (see below). |
 | `region` | No | Region of the bucket (e.g. `eu-north-1`). Omit for providers that ignore region. |
-| `endpointUrl` | No | Full URL of the S3 API endpoint. Omit for AWS-region buckets; set it for a generic S3-compatible provider. Must be a valid URL. |
+| `endpointUrl` | No | Full URL of the S3 API endpoint. Must be a valid URL — but **supplying it currently fails the request with 400** (issue #641): only the bucket name can be redirected. Omit it to use the stack's own object-storage endpoint. See Example 2. |
 | `sessionToken` | No | Temporary session token for short-lived / assumed-role credentials. Stored as an OSC secret. |
 | `publicBaseUrl` | No | Public HTTPS base URL under which objects in this bucket are served (CDN origin). Used for `packagedStorage` so player-facing manifests resolve to your delivery domain rather than the raw bucket endpoint. |
 
@@ -65,9 +67,10 @@ back — like every OSC secret, these are write-once and are not echoed.
 
 ## Example 1 — an AWS-region S3 bucket
 
-For a bucket that lives in an AWS region, provide `region` and **omit**
-`endpointUrl`. Without an explicit endpoint the standard AWS S3 endpoint for the
-region is used.
+For a bucket that lives in an S3 region, provide `region` and **omit**
+`endpointUrl`. With no explicit endpoint the role uses your bucket name against
+the stack's own object-storage endpoint, which is the only redirection the
+pipeline can honour today (see Example 2).
 
 ```bash
 curl -X POST https://<your-instance>/api/v1/provision \
@@ -86,12 +89,20 @@ curl -X POST https://<your-instance>/api/v1/provision \
 Here only the source role is redirected to `acme-media-ingest`; packaged output
 still lands on the per-stack MinIO bucket because `packagedStorage` was omitted.
 
-## Example 2 — a generic S3-compatible provider
+## Example 2 — a generic S3-compatible provider (not supported yet)
 
-For a cloud object store that presents an S3-compatible API on its own host,
-set `endpointUrl` to that provider's S3 endpoint. `region` is usually still
-accepted (some providers ignore it; supply whatever value the provider
-documents, or omit it).
+> **Not supported yet — tracked by issue #641.** Pointing a role at an external
+> S3 API host is not something the pipeline can do today, and the provision
+> route will not pretend otherwise. The request below is **refused with 400**.
+
+A provision request may only redirect the **bucket name**. The bytes are still
+read and written against the same object-storage endpoint and credentials the
+stack already uses: the packager is configured with the stack's own endpoint and
+credentials, and the transcode step forms bucket-only `s3://<bucket>/...` URIs
+with no per-job endpoint or credential override. So a request that names a
+different, non-default endpoint cannot be honoured, and rather than accept it
+and silently write to the default endpoint, the route rejects it up front —
+before any OSC instance is created — naming the offending field:
 
 ```bash
 curl -X POST https://<your-instance>/api/v1/provision \
@@ -109,8 +120,48 @@ curl -X POST https://<your-instance>/api/v1/provision \
   }'
 ```
 
-This redirects the packaged-output role to `acme-streaming-output` on the
-external provider, while source ingest continues to use MinIO.
+```json
+400
+{
+  "error": "requested storage redirection cannot be honoured: packagedStorage.endpointUrl",
+  "unsupported": [
+    {
+      "field": "packagedStorage.endpointUrl",
+      "message": "packagedStorage.endpointUrl requests redirection to an external, non-default object-storage endpoint, which the transcode/packaging pipeline cannot honour yet (issue #641). Only the bucket name can be redirected; remove packagedStorage.endpointUrl to use the stack's object-storage endpoint, or omit the block for the zero-config default."
+    }
+  ]
+}
+```
+
+The same rejection applies to `sourceStorage.endpointUrl`; the field name in the
+error tells you which role was at fault.
+
+To get a request the API accepts, drop `endpointUrl` and keep the bucket. The
+role then uses your bucket name against the stack's own object-storage endpoint:
+
+```bash
+curl -X POST https://<your-instance>/api/v1/provision \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "prodstack",
+    "packagedStorage": {
+      "bucket": "acme-streaming-output",
+      "accessKeyId": "OBJSTOREKEYEXAMPLE",
+      "secretAccessKey": "objstore-secret-EXAMPLE-DO-NOT-USE",
+      "region": "us-east-1",
+      "publicBaseUrl": "https://cdn.example.com/vod"
+    }
+  }'
+```
+
+Omit the whole `packagedStorage` block instead if you are happy with the
+zero-config default bucket. Note that `publicBaseUrl` is **not** affected by this
+restriction: it only changes the host in emitted delivery and manifest URLs for
+objects that have already been written to the honoured bucket, so it stays
+usable (see the CDN section below).
+
+Issue #641 is where real external endpoint plus credential support is being
+tracked; this section will be rewritten when the pipeline can honour it.
 
 ## Serving packaged output from a CDN origin
 
@@ -150,8 +201,9 @@ part of the packager's `OutputFolder` contract, not the bucket name itself.
   opt-in per role.
 - Supply `sourceStorage` and/or `packagedStorage` to redirect a role to an
   operator-owned bucket.
-- Omit `endpointUrl` for an AWS-region bucket; set it for a generic
-  S3-compatible provider.
+- Only the bucket name can be redirected today. Leave `endpointUrl` out —
+  supplying it is refused with 400 until issue #641 lands, and omitting it means
+  the role uses your bucket name on the stack's own object-storage endpoint.
 - Credentials (`secretAccessKey`, `sessionToken`) are stored as OSC secrets and
   never as plaintext parameters (ADR-002). Only `bucket`, `endpointUrl`, and
   `region` are persisted.
