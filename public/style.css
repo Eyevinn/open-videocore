@@ -3952,3 +3952,36 @@ td[data-empty='logs-never-written'] .ops-table-empty-detail {
   justify-content: flex-end;
   flex: 0 0 auto;
 }
+
+/* ─── Parametrised profile parameters (issue #869) ───────────────────────────
+   The asset-detail run control grows a field per SpEL parameter the chosen
+   profile declares. Same fieldset/legend furniture as .search-md-fieldset
+   above, and the fields reuse .form-row/.form-field so they line up with the
+   pipeline/profile selects they sit under. */
+.profile-params-fieldset {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin: 12px 0 0;
+}
+
+.profile-params-legend {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  padding: 0 4px;
+}
+
+.profile-params-row {
+  margin-top: 8px;
+}
+
+/* The API's rejected-key message, next to the fields it is about. Takes no
+   space while empty, so a clean form reserves no gap. */
+.profile-params-error:not(:empty) {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--danger);
+}
