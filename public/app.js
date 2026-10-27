@@ -130,6 +130,13 @@ import { mountAssetClip } from './asset-clip.js';
 // Full contract grounding, including why membership (`assetIds`) can neither be
 // sent nor affected, is in that module's header.
 import { mountCollectionRename } from './collection-rename.js';
+// The collection detail panel's "Edit metadata" action (issue #862): the
+// affordance for `description`, `tags` and `custom` — the three descriptive
+// fields PATCH /api/v1/collections/{id} has accepted since issue #560 but which
+// nothing in this UI could set. The body is built in ONE place inside that
+// module (`collectionEditPatchBody`), which only ever writes those three keys,
+// so the edit path can never send `assetIds`.
+import { mountCollectionEdit } from './collection-edit.js';
 
 // Read-only tracks panel (issue #902, broken out of #794): one section per track
 // kind — video, audio, subtitle — each listing only the attributes the API
@@ -5794,9 +5801,32 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
 
     const kvDiv = document.createElement('div');
     kvDiv.className = 'kv-grid';
+    // Descriptive metadata is READ here as well as written by the edit dialog
+    // (issue #862): the three fields are part of `collectionSchema`
+    // (src/routes/collections.ts:126-137 — `description?`, `tags?`, `custom?`)
+    // and arrive on GET /api/v1/collections/{id}, but this panel never showed
+    // them, so a saved value had nowhere to appear. Each row is rendered from
+    // the server's response, escaped as text; an absent field shows '—'.
+    const customEntries = coll.custom && typeof coll.custom === 'object' && !Array.isArray(coll.custom)
+      ? Object.keys(coll.custom)
+      : [];
     kvDiv.innerHTML = [
       '<span class="kv-key">ID</span><span class="kv-val text-mono">' + escHtml(coll.id) + '</span>',
       '<span class="kv-key">Name</span><span class="kv-val">' + escHtml(coll.name || '—') + '</span>',
+      '<span class="kv-key">Description</span><span class="kv-val" id="coll-description">' + escHtml(coll.description || '—') + '</span>',
+      '<span class="kv-key">Tags</span><span class="kv-val" id="coll-tags">' +
+        escHtml(Array.isArray(coll.tags) && coll.tags.length > 0 ? coll.tags.join(', ') : '—') +
+        '</span>',
+      '<span class="kv-key">Custom</span><span class="kv-val" id="coll-custom">' +
+        escHtml(
+          customEntries.length > 0
+            ? customEntries.map(function(k) {
+                const v = coll.custom[k];
+                return k + ': ' + (typeof v === 'string' ? v : JSON.stringify(v));
+              }).join(', ')
+            : '—'
+        ) +
+        '</span>',
       '<span class="kv-key">Created</span><span class="kv-val">' + escHtml(fmtDate(coll.createdAt)) + '</span>',
     ].join('');
     body.appendChild(kvDiv);
@@ -5857,11 +5887,48 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
       },
     });
 
-    // Rename is the only action in this row today, so for a role that cannot
-    // write (no control mounted) the row and its outcome area would be two empty
-    // boxes with margins. Take them back out rather than leaving dead chrome
-    // above the member list.
-    if (!collRename.button) {
+    // ── Edit metadata: description, tags and custom (issue #862) ──
+    //
+    // Contract, fetched before this call was written (CLAUDE.md rule 7) and
+    // cited in full in public/collection-edit.js:
+    //   PATCH /api/v1/collections/{id} — `description: z.string().optional()`,
+    //        `tags: z.array(z.string()).optional()`,
+    //        `custom: z.record(z.unknown()).optional()` on `updateBodySchema`
+    //        (src/routes/collections.ts:250-263, inside `.strict()` at :263;
+    //        wired at :423-444); 200 = the updated collection, 400/404 = { error }.
+    //   Every present key is applied WHOLESALE and an absent key is left alone
+    //        (collections.ts:241-249) — which is why `tags` is edited as a whole
+    //        list here rather than appended to, and why removing a tag is just a
+    //        shorter array.
+    //   Membership is never sent: the edit body is built only in
+    //        `collectionEditPatchBody`, which writes at most
+    //        description/tags/custom. `assetIds` stays on the add/remove
+    //        controls below (PUT/DELETE /:id/assets/:assetId).
+    // Same action row and the same write gate as the rename, so there is one
+    // place on this panel where a collection's own fields are edited.
+    const collEdit = mountCollectionEdit({
+      collection: coll,
+      actionsRow: collActionsDiv,
+      canChange: canRenameCollection(),
+      apiFetch: apiFetch,
+      openModal: openModal,
+      showMsg: showMsg,
+      messageHost: function () {
+        return detailPanel.querySelector('#coll-action-msg') ||
+          detailPanel.querySelector('#coll-detail-body');
+      },
+      onSaved: async function (updated, message) {
+        // Collection search hits carry description/tags/custom, and the list
+        // behind the panel may show tags, so refresh it too.
+        if (typeof onRefresh === 'function') onRefresh();
+        await rerenderCollectionThenMsg(message, updated ? 'success' : 'error');
+      },
+    });
+
+    // For a role that cannot write neither control is mounted, so the row and
+    // its outcome area would be two empty boxes with margins. Take them back out
+    // rather than leaving dead chrome above the member list.
+    if (!collRename.button && !collEdit.button) {
       collActionsDiv.remove();
       collActionMsg.remove();
     }
