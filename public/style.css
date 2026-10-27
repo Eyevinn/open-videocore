@@ -3916,3 +3916,39 @@ td[data-empty='logs-never-written'] .ops-table-empty-detail {
 .pf-yaml-error {
   margin-top: 0;
 }
+
+/* ─── Search-tab metadata filter (issue #850) ───────────────────────────────
+   Repeatable `metadata.<key>=<value>` rows. A real fieldset/legend so the pairs
+   read as one group (same shape as .external-id-fieldset above), and the rows
+   reuse the tab's existing .form-row/.form-field furniture so the inputs line
+   up with Query/Tags/Container above them. */
+.search-md-fieldset {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin: 12px 0 0;
+}
+
+.search-md-legend {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  padding: 0 4px;
+}
+
+.search-md-rows {
+  margin-top: 8px;
+}
+
+/* The row's own gap; .form-row already lays the fields out side by side. */
+.search-md-row + .search-md-row {
+  margin-top: 8px;
+}
+
+/* The Remove button sits on the input baseline, not under the label line. */
+.search-md-remove-field {
+  justify-content: flex-end;
+  flex: 0 0 auto;
+}
