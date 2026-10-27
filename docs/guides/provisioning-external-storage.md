@@ -11,9 +11,16 @@ output to, a bucket they already run. For those cases the provision request
 accepts two optional blocks, `sourceStorage` and `packagedStorage`, that point a
 role at an operator-owned bucket instead of the per-stack MinIO default.
 
-One limit to know up front: a block may only redirect the **bucket name**. A
-block that also names an external S3 API host via `endpointUrl` is refused with
-a 400 — see Example 2 and issue #641.
+One limit to know up front, and it is a limit of **this route only**: a
+`sourceStorage`/`packagedStorage` block on `POST /api/v1/provision` may only
+redirect the **bucket name**. A block that also names an external S3 API host
+via `endpointUrl` is refused with a 400 — see Example 2 and issue #641.
+
+Reading source media from an external S3 API host *is* supported today, through
+a different route: register the host as a storage backend with
+`POST /api/v1/storage/backends` and reference it per ingest with `sourceBackend`.
+See [Reading from an external S3 API host today](#reading-from-an-external-s3-api-host-today)
+below.
 
 External storage is **additive**. If you omit both blocks you get exactly the
 behaviour you get today — MinIO remains the zero-config default. If you supply
@@ -32,7 +39,7 @@ and wired into the provision request body at lines 64-67.
 | `accessKeyId` | **Yes** | Access key ID for the bucket. |
 | `secretAccessKey` | **Yes** | Secret access key. Stored as an OSC secret, never in plaintext (see below). |
 | `region` | No | Region of the bucket (e.g. `eu-north-1`). Omit for providers that ignore region. |
-| `endpointUrl` | No | Full URL of the S3 API endpoint. Must be a valid URL — but **supplying it currently fails the request with 400** (issue #641): only the bucket name can be redirected. Omit it to use the stack's own object-storage endpoint. See Example 2. |
+| `endpointUrl` | No | Full URL of the S3 API endpoint. Must be a valid URL — but **supplying it currently fails the provision request with 400** (issue #641): on this route only the bucket name can be redirected. Omit it to use the stack's own object-storage endpoint. See Example 2. (The same field on `POST /api/v1/storage/backends` *is* honoured — see below.) |
 | `sessionToken` | No | Temporary session token for short-lived / assumed-role credentials. Stored as an OSC secret. |
 | `publicBaseUrl` | No | Public HTTPS base URL under which objects in this bucket are served (CDN origin). Used for `packagedStorage` so player-facing manifests resolve to your delivery domain rather than the raw bucket endpoint. |
 
@@ -65,12 +72,17 @@ Practically: it is safe to inspect a provisioned stack's stored config and to
 share it for debugging. It is never safe to expect a credential to be readable
 back — like every OSC secret, these are write-once and are not echoed.
 
-## Example 1 — an AWS-region S3 bucket
+## Example 1 — redirecting a role's bucket name
 
-For a bucket that lives in an S3 region, provide `region` and **omit**
-`endpointUrl`. With no explicit endpoint the role uses your bucket name against
-the stack's own object-storage endpoint, which is the only redirection the
-pipeline can honour today (see Example 2).
+Supply the bucket and its credentials and **omit** `endpointUrl`. The bucket
+*name* is the part the pipeline honours: the source-reading services address
+`s3://<your-bucket>/<key>` against the stack's own object-storage endpoint, which
+is the only redirection this route can honour (see Example 2). The credentials
+you supply are pre-registered at provision time as per-service OSC secrets so the
+runtime paths can reference them — in `src/routes/provision.ts` the `sourceStorage`
+branch calls `applyCredentialMapping` with `encoreCredentialMapping` and
+`ffmpegS3CredentialMapping` for the two source-reading service ids — and `region`
+is kept as a stored, non-secret coordinate.
 
 ```bash
 curl -X POST https://<your-instance>/api/v1/provision \
@@ -79,8 +91,8 @@ curl -X POST https://<your-instance>/api/v1/provision \
     "name": "prodstack",
     "sourceStorage": {
       "bucket": "acme-media-ingest",
-      "accessKeyId": "AKIAEXAMPLE1234567890",
-      "secretAccessKey": "wJalrXUtnFEMI-EXAMPLE-KEY-DO-NOT-USE",
+      "accessKeyId": "EXAMPLEKEYID1234567890",
+      "secretAccessKey": "example-secret-key-DO-NOT-USE",
       "region": "eu-north-1"
     }
   }'
@@ -88,12 +100,18 @@ curl -X POST https://<your-instance>/api/v1/provision \
 
 Here only the source role is redirected to `acme-media-ingest`; packaged output
 still lands on the per-stack MinIO bucket because `packagedStorage` was omitted.
+If that bucket only exists on an external S3 API host, this route is not the way
+to reach it — see
+[Reading from an external S3 API host today](#reading-from-an-external-s3-api-host-today).
 
-## Example 2 — a generic S3-compatible provider (not supported yet)
+## Example 2 — a generic S3-compatible provider (not supported on this route)
 
-> **Not supported yet — tracked by issue #641.** Pointing a role at an external
-> S3 API host is not something the pipeline can do today, and the provision
-> route will not pretend otherwise. The request below is **refused with 400**.
+> **Not supported on `POST /api/v1/provision` — tracked by issue #641.** This
+> route cannot point a stack role at an external S3 API host, and it will not
+> pretend otherwise: the request below is **refused with 400**. This is a limit of
+> the provision route, not of the API as a whole — ingest can already read from
+> an external host via a registered storage backend, see
+> [Reading from an external S3 API host today](#reading-from-an-external-s3-api-host-today).
 
 A provision request may only redirect the **bucket name**. The bytes are still
 read and written against the same object-storage endpoint and credentials the
@@ -160,8 +178,67 @@ restriction: it only changes the host in emitted delivery and manifest URLs for
 objects that have already been written to the honoured bucket, so it stays
 usable (see the CDN section below).
 
-Issue #641 is where real external endpoint plus credential support is being
-tracked; this section will be rewritten when the pipeline can honour it.
+Issue #641 is where external endpoint plus credential support *for the provision
+route* is being tracked; this section will be rewritten when the route can honour
+it. In the meantime, an external S3 API host is reachable through the storage
+backend registry, below.
+
+## Reading from an external S3 API host today
+
+What `POST /api/v1/provision` cannot do, the storage backend registry can: it
+accepts the external host's `endpointUrl` and keeps the credentials, and ingest
+jobs then read the object **in place** on that host. Two steps.
+
+First register the host as a backend. `POST /api/v1/storage/backends` requires
+`name`, `bucket`, `accessKeyId`, and `secretAccessKey`, and accepts `role`
+(`source`, `packaged`, `both` — the default — or `archive`), `region`,
+`endpointUrl`, `sessionToken`, and `publicBaseUrl`:
+
+```bash
+curl -X POST https://<your-instance>/api/v1/storage/backends \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "acme-ingest",
+    "role": "source",
+    "bucket": "acme-media-ingest",
+    "accessKeyId": "EXAMPLEKEYID1234567890",
+    "secretAccessKey": "example-secret-key-DO-NOT-USE",
+    "region": "us-east-1",
+    "endpointUrl": "https://s3.object-store.example.com"
+  }'
+```
+
+The 201 response echoes the backend's `id`, `bucket`, `endpointUrl`, and
+`region`, with the credentials redacted (`secretAccessKey: "***redacted***"`) —
+the same write-once rule as everywhere else in this guide.
+
+Then reference it per ingest with `sourceBackend` on
+`POST /api/v1/assets/ingest-url`, where `sourceUrl` addresses the object *within*
+that backend. The backend must serve the `source` or `both` role, and no
+credential is ever supplied inline — the registered endpoint and credentials are
+reused server-side:
+
+```bash
+curl -X POST https://<your-instance>/api/v1/assets/ingest-url \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sourceUrl": "s3://acme-media-ingest/incoming/clip.mp4",
+    "sourceBackend": "acme-ingest",
+    "title": "Clip"
+  }'
+```
+
+The probe and transcode jobs then read `s3://<bucket>/<key>` on the registered
+endpoint, carrying the backend's endpoint and `{{secrets.<name>}}` credential
+references in the job body rather than pulling the bytes into stack-managed
+storage first.
+
+Two things this does **not** change. It is a *source*-side path: packaged output
+still lands on the bucket the stack was provisioned with, because the packager
+gets a single fixed `S3EndpointUrl` and output relocation resolves a destination
+to a bucket and key prefix only. And it does not make
+`sourceStorage.endpointUrl`/`packagedStorage.endpointUrl` work on the provision
+route — those are still refused with the 400 above.
 
 ## Serving packaged output from a CDN origin
 
@@ -201,9 +278,13 @@ part of the packager's `OutputFolder` contract, not the bucket name itself.
   opt-in per role.
 - Supply `sourceStorage` and/or `packagedStorage` to redirect a role to an
   operator-owned bucket.
-- Only the bucket name can be redirected today. Leave `endpointUrl` out —
-  supplying it is refused with 400 until issue #641 lands, and omitting it means
-  the role uses your bucket name on the stack's own object-storage endpoint.
+- On `POST /api/v1/provision` only the bucket name can be redirected today.
+  Leave `endpointUrl` out — supplying it is refused with 400 until issue #641
+  lands, and omitting it means the role uses your bucket name on the stack's own
+  object-storage endpoint.
+- To ingest from a bucket on an external S3 API host, register it with
+  `POST /api/v1/storage/backends` (which does accept `endpointUrl`) and pass
+  `sourceBackend` on `POST /api/v1/assets/ingest-url`.
 - Credentials (`secretAccessKey`, `sessionToken`) are stored as OSC secrets and
   never as plaintext parameters (ADR-002). Only `bucket`, `endpointUrl`, and
   `region` are persisted.

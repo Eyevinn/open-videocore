@@ -1563,7 +1563,7 @@ Access Token as the OSC access token. Generate strong passwords for
   -d '{"name": "mystack"}'</code></pre></div>
     <p>Provisioning is asynchronous. Poll the returned <code>operationId</code> until <code>status</code> reaches <code>"done"</code>:</p>
     <div class="code-block"><pre><code>curl https://&lt;your-instance&gt;/api/v1/provision/operations/&lt;operationId&gt;</code></pre></div>
-    <div class="callout">By default the stack provisions its own object storage and buckets — no storage configuration required. To point at an existing S3-compatible bucket instead, pass the optional <code>sourceStorage</code> / <code>packagedStorage</code> blocks — see <a href="ref-provisioning.html#post-api-v1-provision">provision</a> in the reference.</div>
+    <div class="callout">By default the stack provisions its own object storage and buckets — no storage configuration required. To redirect a role to a bucket you already run, pass the optional <code>sourceStorage</code> / <code>packagedStorage</code> blocks — see <a href="ref-provisioning.html#post-api-v1-provision">provision</a> in the reference. These blocks redirect the bucket <strong>name</strong> only; they do not take an external S3 API host, and a block carrying <code>endpointUrl</code> is refused with a 400. To ingest from a bucket on an external S3 API host, register it with <a href="ref-storage.html#post-api-v1-storage-backends">storage backends</a> (which does take <code>endpointUrl</code>) and pass <code>sourceBackend</code> on <a href="ref-assets.html#post-api-v1-assets-ingest-url">ingest-url</a>.</div>
   </li>
   <li>
     <h3>Bootstrap transcoding profiles</h3>
