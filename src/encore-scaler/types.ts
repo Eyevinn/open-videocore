@@ -360,6 +360,28 @@ export type EncoreInstanceRecord = {
   // ever killing an instance with a genuine in-flight transcode when the tracked
   // activeJobs count has diverged from the instance's real IN_PROGRESS state.
   draining?: boolean;
+  // #1219: epoch ms at which `draining` was set by an OPERATOR CANCEL
+  // (cancelled-job-reclaim.ts recordOperatorCancel) rather than by scale-down.
+  //
+  // The provenance matters because `draining` carries two different meanings to
+  // scale-down. A drain written by scale-down itself implies the instance was
+  // ALREADY a teardown candidate (idle-and-aged, or holding abandoned work) and
+  // is only being held until its real work clears — so destroying it the moment
+  // that work clears is correct. A drain written by a cancel implies nothing of
+  // the kind: the instance may be warm, healthy and nowhere near its idle
+  // timeout, and the cancel may well be honoured in seconds. Destroying it then
+  // would turn every routine cancel into instance churn (the exact failure
+  // cancelled-job-reclaim.ts:50-55 promises not to cause).
+  //
+  // So scale-down treats this stamp as "keep out of routing, but do NOT count
+  // as evidence for teardown": an instance whose ONLY candidacy reason is a
+  // cancel-set drain is destroyed only on positive evidence — a job that has
+  // demonstrably ignored its cancel, or the ordinary idle-and-aged condition.
+  // Cleared again (with `draining`) once Encore confirms the cancel was
+  // honoured, which returns the instance to service. Only ever set on a record
+  // that was NOT already draining, so it can never overwrite or clear an
+  // operator- or scale-down-initiated drain.
+  cancelDrainingSince?: number;
   // #1071: epoch ms at which a spawn gave up waiting for this instance to report
   // `running` and left it ALIVE rather than destroying it. The instance exists on
   // OSC and is probably still coming up (node provisioning), so it is tracked
@@ -500,6 +522,26 @@ export const keys = {
   // chance to GET that instance's /encoreJobs/{uuid} endpoint. See
   // src/encore-scaler/packaging-pin.ts.
   pendingPackaging: (instanceId: string) => `encore:pending-packaging:${instanceId}`,
+  // #1219: epoch ms (decimal string) at which an OPERATOR cancelled this job,
+  // written by the scaler client's cancel path for a job that had already been
+  // dispatched. Keyed by our externalId (encoreJobId, globally unique like
+  // jobUuid) with the same 24h TTL as the other dispatch-time keys, so it stays
+  // resolvable for exactly as long as the job URL it refers to.
+  //
+  // Why the timestamp is recorded at all: a delivered cancel does not guarantee
+  // the job STOPS. A frozen transcode answers the cancel endpoint 200 and keeps
+  // running (#1219), so the job stays QUEUED/IN_PROGRESS in Encore's own active
+  // set forever. Scale-down reads "real in-flight work" from that set and so
+  // drains — never tears down — the instance holding it, which is why the only
+  // way to stop such a job used to be destroying the Encore instance by hand.
+  //
+  // This key is what lets the scaler tell the two apart: an active Encore job
+  // the operator explicitly cancelled MORE than the grace window ago is work
+  // nobody wants, so it stops protecting its instance from teardown. The
+  // timestamp (not a bare flag) is what provides the grace window — a cancel
+  // Encore is about to honour normally must not trigger a teardown.
+  // See src/encore-scaler/cancelled-job-reclaim.ts.
+  jobCancelRequested: (encoreJobId: string) => `encore:job-cancel-requested:${encoreJobId}`,
   // #778: hash of orphan-candidate instanceId -> epoch ms (string) of the FIRST
   // sweep that saw a scaler-owned Encore instance running on OSC with no pool
   // record. The orphan reaper only destroys an instance that is still orphaned
