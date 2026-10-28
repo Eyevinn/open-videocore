@@ -385,6 +385,10 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
       return runWithRequestStack(owningStack, async () => {
         const applied = await opts.packaging!.handleSuccess(request.body);
         if (!applied) return reply.code(404).send({ error: 'not_found' });
+        // Set when the packaged output could NOT be copied to the destination
+        // the caller requested (#1279). Declared out here because it decides
+        // both how the execution settles and which webhook is dispatched below.
+        let deliveryFailure: string | undefined;
         // Advance the matching PipelineExecution when packaging completes.
         if (opts.pipelineRepository) {
           const execution = await opts.pipelineRepository.findRunningByAssetAndStep(
@@ -479,10 +483,26 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
                     ]
                   };
                 } catch (err) {
-                  // Leave the relocation un-recorded so the copy is retried on a
-                  // subsequent (at-least-once) packager callback. The packaged
-                  // output already exists at the default staging location, so the
-                  // execution still advances below and downstream is not blocked.
+                  // The caller ASKED for the output at this destination (via
+                  // `destination`, `externalBackend` or `destinationBucket` —
+                  // all three normalize into execution.destinationBucket, see
+                  // resolveOutputDestination in routes/assets.ts) and the copy
+                  // did not get it there. Issue #1279: this used to be logged
+                  // and the execution then settled `done` below, so the output
+                  // sat only in the stack's internal staging storage while the
+                  // caller saw success and nothing on the job said otherwise.
+                  //
+                  // Record the reason and settle the `package` step and the
+                  // execution as FAILED instead (same shape as the packager
+                  // failure path above: `StepExecution.status = 'failed'` +
+                  // `StepExecution.error`, `PipelineExecution.status =
+                  // 'failed'` — src/data/pipeline-repo.ts). The relocation is
+                  // still left un-recorded, so re-driving the package step
+                  // re-attempts the copy; what we no longer do is report
+                  // success for an undelivered output.
+                  deliveryFailure = `output delivery to destination failed: ${
+                    err instanceof Error ? err.message : String(err)
+                  }`;
                   fastify.log.error(
                     { err, packagingId, executionId: execution.id },
                     'post-package relocation to destination override failed'
@@ -491,23 +511,68 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
               }
             }
             const now = new Date().toISOString();
-            const steps = execution.steps.map((s) =>
-              s.name === 'package' && s.status === 'running'
-                ? { ...s, status: 'done' as const, completedAt: now }
-                : s
-            );
-            await opts.pipelineRepository.update(execution.id, {
-              steps,
-              status: allStepsDone(steps) ? 'done' : 'running',
-              ...(relocationPatch ?? {})
-            });
+            if (deliveryFailure) {
+              // Delivery to the requested destination failed (#1279): settle
+              // the `package` step and the execution as failed, carrying the
+              // reason on the step's `error` so GET /api/v1/pipelines/{id} and
+              // the asset's executions show WHY, and settle the matching
+              // `package` Job with the same reason via failPackageJob — exactly
+              // how the packager failure callback below attributes a failure.
+              const runningPackageStep = execution.steps.find(
+                (s) => s.name === 'package' && s.status === 'running'
+              );
+              const failedSteps = execution.steps.map((s) =>
+                s.name === 'package' && s.status === 'running'
+                  ? {
+                      ...s,
+                      status: 'failed' as const,
+                      error: deliveryFailure as string,
+                      completedAt: now
+                    }
+                  : s
+              );
+              await opts.pipelineRepository.update(execution.id, {
+                steps: failedSteps,
+                status: 'failed'
+              });
+              await failPackageJob(
+                {
+                  jobs: opts.jobRepository,
+                  pipeline: opts.pipelineRepository,
+                  logger: fastify.log
+                },
+                { jobId: runningPackageStep?.jobId, assetId: execution.assetId },
+                deliveryFailure
+              );
+            } else {
+              const steps = execution.steps.map((s) =>
+                s.name === 'package' && s.status === 'running'
+                  ? { ...s, status: 'done' as const, completedAt: now }
+                  : s
+              );
+              await opts.pipelineRepository.update(execution.id, {
+                steps,
+                status: allStepsDone(steps) ? 'done' : 'running',
+                ...(relocationPatch ?? {})
+              });
+            }
           }
         }
         if (opts.webhookDispatcher) {
-          void opts.webhookDispatcher.dispatch({
-            type: 'package.complete',
-            payload: { assetId: request.body.jobId }
-          });
+          // #1279: an output that never reached the requested destination is
+          // not a completed package — notify `package.failed` (the event the
+          // packager failure path uses) instead of `package.complete`.
+          void opts.webhookDispatcher.dispatch(
+            deliveryFailure
+              ? {
+                  type: 'package.failed',
+                  payload: { assetId: request.body.jobId, error: deliveryFailure }
+                }
+              : {
+                  type: 'package.complete',
+                  payload: { assetId: request.body.jobId }
+                }
+          );
         }
         return reply.code(200).send({ ok: true });
       });
