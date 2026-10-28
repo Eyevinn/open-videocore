@@ -579,7 +579,7 @@ minutes by silence and fixes the relationship between the two values.
 |---|---|---|
 | Accept 5 minutes, document it as a known limit | **Rejected** | It is not a limit, it is a near-total gap: the slot exists for long-form clip/trim, and the honest version of this option is F2 (remove the step) rather than shipping one that works only on short clips. |
 | Raise `TIMEOUT_MS` globally for all callers | **Rejected** | The awaited routes (`POST /:id/clip`, `POST /:id/export`) hold an HTTP request open for the whole wait — the reason `UNKNOWN_STATUS_GRACE_MS` exists at all (#786). A global raise lengthens held connections past any sensible gateway timeout for jobs that do not need it. |
-| Poll in a detached loop with no budget | **Rejected** | Unbounded waits on OSC calls are the exact class of hazard already logged as friction (`incoming-waitforinstanceready-unbounded.md`, `incoming-osc-client-calls-cannot-be-bounded.md`) and the hazard D5 celebrates removing from this slot. A fire-and-forget step still must terminate. |
+| Poll in a detached loop with no budget | **Rejected** | Unbounded waits on OSC calls are the exact class of hazard already logged as friction (the SDK's `waitForJobToComplete` has a fixed internal poll loop and no caller-supplied timeout: agents-repo `docs/osc-feedback/submitted-2026-06-02-issue6-metadata.md` friction #2, see C6) and the hazard D5 celebrates removing from this slot. A fire-and-forget step still must terminate. |
 | Copy the helper into the detector with a different constant | **Rejected** | Two drifting copies of the terminal-status vocabulary, which is itself only partly evidenced (`ACTIVE_STATUS` padding, #786). One helper, one option. |
 
 ---
