@@ -224,6 +224,19 @@ export type PackagerSuccessPayload = {
   outputPath?: string;
 };
 
+// Caller control over the TERMINAL write on the `package` Job during a packager
+// success (issue #1279).
+//
+// `settleJob: false` means "record the packaged output on the asset, but leave
+// the Job active — I will settle it". The packager-success route passes it when
+// the post-package copy to a caller-requested destination failed: the Job must
+// end `failed` with that reason, and a `done` written first could never be
+// corrected (`done` is terminal in ALLOWED_JOB_TRANSITIONS, src/data/job-repo.ts).
+// Omitted/true keeps the default: handleSuccess settles the Job `done` itself.
+export type PackagerSuccessOptions = {
+  settleJob?: boolean;
+};
+
 // Failure callback payload from the packager (POST .../packagerCallback/failure).
 export type PackagerFailurePayload = {
   message: string;
@@ -588,7 +601,16 @@ export class PackagingService implements PackagingTrigger {
   // signals successful completion. The jobId in the payload is the assetId we
   // used when enqueueing. Writes manifestUrls onto the asset.
   // NEVER changes the asset's lifecycle status.
-  async handleSuccess(payload: PackagerSuccessPayload): Promise<boolean> {
+  //
+  // `options.settleJob` (issue #1279) lets the CALLER own the terminal write on
+  // the `package` Job when it — and only it — knows whether the packaged output
+  // actually reached the destination the caller asked for. See the block guarded
+  // by it below; default (omitted) keeps the pre-#1279 behaviour of settling
+  // `done` here, which is what every other caller wants.
+  async handleSuccess(
+    payload: PackagerSuccessPayload,
+    options?: PackagerSuccessOptions
+  ): Promise<boolean> {
     const assetId = payload.jobId; // we set jobId = assetId at enqueue time
     const asset = await this.deps.assets.get(assetId);
     if (!asset) return false;
@@ -609,6 +631,24 @@ export class PackagingService implements PackagingTrigger {
       manifestUrls,
       ...(packagedOutput ? { packagedOutput } : {})
     });
+    // Issue #1279: the packager finishing is NOT the same thing as the output
+    // being delivered. When the execution carries a destination override, the
+    // packager-success route attempts the copy to that destination BEFORE
+    // calling this method and passes `settleJob: false` if the copy failed, so
+    // that it can settle the Job `failed` itself with the reason.
+    //
+    // This return MUST stay ahead of completePackageJob: `done` is terminal in
+    // the repository's transition table (ALLOWED_JOB_TRANSITIONS,
+    // src/data/job-repo.ts) and both settle helpers early-return on an inactive
+    // job (`if (!isActiveJobStatus(job.status)) return job.id;`,
+    // src/pipeline/package-job.ts), so a `done` written here could never be
+    // corrected afterwards and GET /api/v1/jobs/{id} would keep reporting
+    // success for an output that never arrived — the symptom in #1279. The
+    // asset writes above still stand: they record where the packager really put
+    // the output, which is true whether or not delivery then succeeded. The
+    // caller attributes the failure (asset `packagingError`, the execution's
+    // `package` step error, and failPackageJob).
+    if (options?.settleJob === false) return true;
     // Settle the observable `package` Job (issue #976). Idempotent: an
     // at-least-once packager callback for an already-settled job is a no-op.
     const packageJobId = await completePackageJob(this.packageJobDeps(), { assetId });
