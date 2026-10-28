@@ -54,9 +54,16 @@ export const VideoTrackSchema = z.object({
   width: z.number(),
   height: z.number(),
   bitrateBps: z.number().optional(),
-  frameRate: z.number().optional()
+  frameRate: z.number().optional(),
+  // Start timecode of the source, e.g. "01:00:00:00" (issue #1066). Optional
+  // like `frameRate`: absent on documents written before the probe reported it
+  // and on sources that carry no timecode.
+  startTimecode: z.string().optional()
 });
-export type VideoTrack = z.infer<typeof VideoTrackSchema>;
+// Named `DocVideoTrack` (not `VideoTrack`) for the same reason as
+// `DocAudioTrack` below: the flat domain model in asset-repo.ts exports a
+// `VideoTrack` of its own (issue #978), and the two names must not clash.
+export type DocVideoTrack = z.infer<typeof VideoTrackSchema>;
 
 export const AudioTrackSchema = z.object({
   index: z.number(),
@@ -137,7 +144,13 @@ const SceneDetectionSchema = z.object({
 const StatusTransitionSchema = z.object({
   at: z.string(),
   from: z.string().nullable(),
-  to: z.string()
+  to: z.string(),
+  // Why a BACKGROUND settle moved the asset (issue #1085) — e.g. an abandoned
+  // client upload vs an interrupted URL pull, which share the same
+  // `uploading -> failed` pair. Optional/additive: every document written before
+  // #1085 simply lacks it and stays a valid v1 document, so no schemaVersion
+  // bump is required (the reviewState / packagedOutput precedent).
+  reason: z.string().optional()
 });
 
 // Explicit delete-lock (ADR-020 decision 3, issue #568). An operator-set flag
@@ -330,7 +343,15 @@ export const AssetDocumentSchema = z.object({
     // Explicit delete-lock (ADR-020 decision 3, issue #568). Optional so
     // documents written before #568 (field absent) still deserialize as
     // unlocked — no schemaVersion bump required, all v1 documents remain valid.
-    deleteLock: DeleteLockSchema.optional()
+    deleteLock: DeleteLockSchema.optional(),
+    // The provisioned stack this asset was created against (issue #1097).
+    // System-owned provenance of WHERE the asset lives — not editorial — so it
+    // belongs here under `administrative`, beside `source` and `storage`, and
+    // NOT under user-writable `descriptive`. Optional so documents written
+    // before #1097 (field absent) still deserialize; no schemaVersion bump is
+    // required, all v1 documents remain valid, and an absent value keeps the
+    // previous first-listed-stack resolution.
+    stackName: z.string().optional()
   }),
 
   structural: z
@@ -396,11 +417,30 @@ export type AssetDocument = z.infer<typeof AssetDocumentSchema>;
 function technicalFromAsset(asset: Asset): AssetDocument['technical'] {
   const tm = asset.technicalMetadata;
   const technical: AssetDocument['technical'] = {};
+  // Per-track video, read back onto the flat Asset by `technicalToAsset` below
+  // (issue #978). `technicalMetadata` stays AUTHORITATIVE for the four
+  // attributes it carries — a re-probe writes them through unchanged — while
+  // the stored track's `index` / `frameRate` and any second-and-later track
+  // survive the round-trip instead of being dropped. With no stored tracks this
+  // produces exactly the single-entry array it always did.
+  const storedVideo = asset.videoTracks ?? [];
   if (tm) {
     technical.container = tm.containerFormat;
     technical.durationMs = Math.round(tm.durationSeconds * 1000);
+    // `frameRate` / `startTimecode` are written only when the probe reported them
+    // (issue #1066) so an audio-only or timecode-less source stores no key at all
+    // rather than a misleading 0 / empty string.
     technical.video = [
-      { codec: tm.codec, width: tm.width, height: tm.height, bitrateBps: tm.bitrateBps }
+      {
+        ...storedVideo[0],
+        codec: tm.codec,
+        width: tm.width,
+        height: tm.height,
+        bitrateBps: tm.bitrateBps,
+        ...(tm.frameRate !== undefined ? { frameRate: tm.frameRate } : {}),
+        ...(tm.startTimecode !== undefined ? { startTimecode: tm.startTimecode } : {})
+      },
+      ...storedVideo.slice(1)
     ];
     technical.audio = tm.audioTracks?.map((a) => ({
       index: a.index,
@@ -409,6 +449,10 @@ function technicalFromAsset(asset: Asset): AssetDocument['technical'] {
       sampleRateHz: a.sampleRateHz
     }));
     technical.probe = { source: 'eyevinn-ffmpeg-s3', probedAt: tm.extractedAt };
+  } else if (storedVideo.length > 0) {
+    // Probed tracks with no probe block (so no flattened `technicalMetadata`)
+    // still round-trip rather than being erased by the next write.
+    technical.video = storedVideo;
   }
   if (asset.technicalMetadataError) {
     technical.error = asset.technicalMetadataError;
@@ -418,7 +462,7 @@ function technicalFromAsset(asset: Asset): AssetDocument['technical'] {
 
 function technicalToAsset(
   technical: AssetDocument['technical']
-): Pick<Asset, 'technicalMetadata' | 'technicalMetadataError'> {
+): Pick<Asset, 'technicalMetadata' | 'technicalMetadataError' | 'videoTracks'> {
   const v = technical.video?.[0];
   let technicalMetadata: Asset['technicalMetadata'] = null;
   if (v && technical.probe) {
@@ -435,10 +479,18 @@ function technicalToAsset(
         channels: a.channels,
         sampleRateHz: a.sampleRateHz
       })),
-      extractedAt: technical.probe.probedAt
+      extractedAt: technical.probe.probedAt,
+      // Both optional on the document (issue #1066): a document written before
+      // the fields existed reads back with them absent, not zeroed.
+      ...(v.frameRate !== undefined ? { frameRate: v.frameRate } : {}),
+      ...(v.startTimecode !== undefined ? { startTimecode: v.startTimecode } : {})
     };
   }
-  return { technicalMetadata, technicalMetadataError: technical.error };
+  // Every stored video track, projected onto the flat Asset (issue #978).
+  // Undefined (not []) when the document has no `technical.video` block, so an
+  // unprobed asset stays clean and a later write does not invent an array.
+  const videoTracks = technical.video?.map((t) => ({ ...t }));
+  return { technicalMetadata, technicalMetadataError: technical.error, videoTracks };
 }
 
 // Map a flat domain Asset to its persisted four-namespace document body.
@@ -504,11 +556,22 @@ export function toAssetDocument(
   if (asset.externalIdentifiers && asset.externalIdentifiers.length > 0) {
     doc.administrative.externalIdentifiers = asset.externalIdentifiers;
   }
+  // Durable stack identity (issue #1097). Only persisted when the asset actually
+  // carries one, so pre-#1097 assets (and assets created outside a request)
+  // round-trip with the field absent — the documented legacy case.
+  if (asset.stackName) {
+    doc.administrative.stackName = asset.stackName;
+  }
   if (asset.objectKey) {
     doc.administrative.storage = {
       bucket: opts.storageBucket ?? '',
       key: asset.objectKey,
-      sizeBytes: opts.storageSizeBytes ?? 0
+      // Issue #1059: the size recorded at ingest completion now actually lands
+      // here (and is read back in fromAssetDocument). Before #1059 nothing ever
+      // supplied a size and this slot was unconditionally 0; `?? 0` keeps that
+      // exact behaviour for assets that carry no recorded size, so the document
+      // shape is unchanged and no schemaVersion bump is required.
+      sizeBytes: asset.sourceSizeBytes ?? opts.storageSizeBytes ?? 0
     };
   }
   if (asset.manifestUrls && (asset.manifestUrls.hls || asset.manifestUrls.dash)) {
@@ -652,13 +715,26 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
     versionOfAssetId,
     versionGroupId,
     objectKey: doc.administrative.storage?.key,
+    // Size recorded at ingest completion (issue #1059). `0` is the pre-#1059
+    // "nothing was ever recorded" placeholder, not a real zero-length source, so
+    // it maps back to undefined — a legacy document must not be read as "this
+    // object should be 0 bytes".
+    sourceSizeBytes:
+      doc.administrative.storage?.sizeBytes && doc.administrative.storage.sizeBytes > 0
+        ? doc.administrative.storage.sizeBytes
+        : undefined,
     statusHistory: (doc.administrative.statusHistory ?? []).map((t) => ({
       at: t.at,
       from: t.from as AssetStatus | null,
-      to: t.to as AssetStatus
+      to: t.to as AssetStatus,
+      // Carried through only when the stored entry has one (issue #1085), so a
+      // pre-#1085 entry round-trips without an added `reason: undefined` key.
+      ...(t.reason !== undefined ? { reason: t.reason } : {})
     })),
     technicalMetadata: technical.technicalMetadata,
     technicalMetadataError: technical.technicalMetadataError,
+    // Per-track video from `technical.video[]` (issue #978).
+    videoTracks: technical.videoTracks,
     manifestUrls,
     packagingError: doc.structural?.packagingError,
     // Durable packaged-output location (issue #502). Absent block maps back to
@@ -714,6 +790,9 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
         ? doc.administrative.externalIdentifiers
         : undefined,
     collections: collections && collections.length > 0 ? collections : undefined,
+    // Durable stack identity (issue #1097). Absent on pre-#1097 documents, which
+    // read back as undefined and keep the first-listed-stack behaviour.
+    stackName: doc.administrative.stackName,
     createdAt: doc.administrative.createdAt,
     updatedAt: doc.administrative.updatedAt
   };

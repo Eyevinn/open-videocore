@@ -11,8 +11,12 @@ import { z } from 'zod';
 import type { Redis } from 'ioredis';
 import { InMemoryJobRepository, JOB_STATUSES, JOB_TYPES, JOB_INTERRUPTION_REASONS, type JobRepository, type JobStatus } from '../data/job-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
+import type { AssetRepository } from '../data/asset-repo.js';
 import { keys } from '../encore-scaler/types.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
+// #1227: recompute the asset's state from the job's FINAL state once the cancel
+// has made that state terminal.
+import { recomputeAssetStateAfterTerminalJob } from '../pipeline/asset-state-after-terminal-job.js';
 import type { MessageFailureClass } from '../encore-scaler/retry-policy.js';
 import { authGate } from '../auth/middleware.js';
 
@@ -51,13 +55,29 @@ const jobSchema = z.object({
   type: z.enum(JOB_TYPES),
   status: z.enum(JOB_STATUSES),
   assetId: z.string(),
+  // Human-readable name of the asset `assetId` points at, resolved at read time
+  // (issue #988). Mirrors `assetName` on a pipeline execution
+  // (src/routes/pipelines.ts:35) so both listings identify an asset by
+  // something other than a 26-char ULID. ADDITIVE and OPTIONAL: absent when the
+  // asset has been deleted, when the lookup fails, or when the router is
+  // registered without an asset repository — `assetId` remains the identifier
+  // every asset endpoint accepts, and callers must fall back to it.
+  assetName: z
+    .string()
+    .optional()
+    .describe(
+      "Human-readable name of the job's asset, resolved at read time. Absent " +
+        'when the asset has been deleted or cannot be read; fall back to ' +
+        '`assetId`, which is always present.'
+    ),
   sourceUrl: z.string(),
   progress: z.number(),
   bytesTransferred: z.number(),
   totalBytes: z.number().optional(),
-  // Number of ingest/URL-pull attempts (retry tracking for URL-pull ingest).
-  // This is the INGEST attempt count and is distinct from `encodeAttempts`
-  // below (which counts Encore dispatches of a transcode job).
+  // Number of ingest/URL-pull attempts (retry tracking for URL-pull ingest) or,
+  // for a `package` job (issue #976), the number of enqueues onto the packager
+  // queue — so a re-enqueue reads differently from a slow first run. Distinct
+  // from `encodeAttempts` below (Encore dispatches of a transcode job).
   attempts: z.number(),
   error: z.string().optional(),
   // Transcode-job fields (issue #8). Present only when type === 'transcode'.
@@ -66,6 +86,22 @@ const jobSchema = z.object({
   encoreInstanceId: z.string().optional(), // which pool instance is running this job
   profile: z.string().optional(),
   renditionAssetIds: z.array(z.string()).optional(),
+  // --- Package-job fields (issue #976). Present only when type === 'package'. ---
+  packagingId: z
+    .string()
+    .optional()
+    .describe(
+      'Correlation id carried through the packager queue message and echoed on ' +
+        'the packager completion callback. The package-job counterpart of ' +
+        '`encoreJobId`.'
+    ),
+  outputPrefix: z
+    .string()
+    .optional()
+    .describe(
+      'Deterministic packaged-output prefix this job writes its CMAF/HLS/DASH ' +
+        'objects under.'
+    ),
   // --- Durable encode-attempt capture (ADR-012, #380/#381) ---
   // Count of Encore dispatches for this transcode job (1 on first dispatch,
   // incremented on each transport-class re-dispatch). DISTINCT from `attempts`
@@ -114,12 +150,34 @@ const jobSchema = z.object({
 type JobsRouterOptions = {
   repository?: JobRepository;
   redis?: Redis; // for Encore instance lookup
+  // Resolves the Valkey holding the scaler state of the stack a job was
+  // dispatched on (every scaler key lives on the job's own stack's Valkey,
+  // #615). Preferred over `redis`, which is the first stack's connection and
+  // reads an empty namespace for a job on any other stack.
+  redisForJob?: (encoreJobId: string) => Promise<Redis | undefined>;
   pipelineRepository?: PipelineRepository; // to release the running pipeline lock on cancel
+  // Resolves `assetName` on read (issue #988). OPTIONAL, like every other repo
+  // on this router: without it jobs are served exactly as before, with no
+  // `assetName`. main.ts injects the same workspace-scoped repository the
+  // pipelines router gets (src/main.ts:1910).
+  assetRepository?: AssetRepository;
 };
 
 export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const repo = opts.repository ?? new InMemoryJobRepository();
+
+  // Resolve a job's asset name for read-time enrichment. Mirrors the pipelines
+  // router's enrichment (src/routes/pipelines.ts:95-102) exactly, including the
+  // `.catch(() => undefined)`: a deleted asset, a tombstoned one, or an
+  // unreachable store degrades to NO name rather than failing the read. The
+  // caller still has `assetId`.
+  async function resolveAssetName(assetId: string): Promise<string | undefined> {
+    const assetRepository = opts.assetRepository;
+    if (!assetRepository || !assetId) return undefined;
+    const asset = await assetRepository.get(assetId).catch(() => undefined);
+    return asset?.name;
+  }
 
   // 401 presence gate (issue #711): reject anonymous requests to this
   // workspace-scoped router. Plugin-scoped so it does not affect public routers.
@@ -141,7 +199,16 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
       }
     },
     async (request) => {
-      return repo.list(request.query);
+      const { items, total } = await repo.list(request.query);
+      // Per-row asset lookup, issued in PARALLEL (Promise.all over the page),
+      // so a 50-row page costs one round-trip's latency rather than 50 serial
+      // ones — the same shape as the pipelines listing
+      // (src/routes/pipelines.ts:95-102). Each lookup degrades on its own: one
+      // missing asset leaves that row without a name and never fails the page.
+      const enriched = await Promise.all(
+        items.map(async (job) => ({ ...job, assetName: await resolveAssetName(job.assetId) }))
+      );
+      return { items: enriched, total };
     }
   );
 
@@ -211,6 +278,37 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
         }
       }
 
+      // Release the ASSET (#1227). The cancel above makes the job terminal, but
+      // the asset was advanced to `processing` when the work was dispatched and
+      // only the transcode completion handler ever moved it back — so a
+      // cancelled (then re-run) job left the asset reading PROCESSING with
+      // nothing running, which is what #1227 was reported from. Recompute it
+      // from the job's FINAL state: the asset leaves `processing` once this was
+      // its last active job, to `ready` if renditions exist or to its prior
+      // state otherwise (src/pipeline/asset-state-after-terminal-job.ts states
+      // the rule). Best-effort by construction — the recompute never throws and
+      // the cancel's 200 does not depend on it; without an asset repository
+      // wired (tests, `jobsRouter` registered bare) this is simply skipped.
+      const assetRepository = opts.assetRepository;
+      if (assetRepository) {
+        const recompute = await recomputeAssetStateAfterTerminalJob(
+          updated ?? { ...job, status: 'cancelled' },
+          {
+            assets: assetRepository,
+            jobs: repo,
+            logWarn: (detail) => request.log?.warn(detail)
+          }
+        );
+        if (recompute.outcome === 'applied') {
+          request.log?.info({
+            msg: 'cancelled job released its asset',
+            jobId: job.id,
+            assetId: job.assetId,
+            assetStatus: recompute.status
+          });
+        }
+      }
+
       return reply.code(200).send(updated ?? job);
     }
   );
@@ -236,6 +334,10 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
       if (!job) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // Resolved ONCE for this job and spread onto every 200 below (the status
+      // may be refreshed from Encore, and the instance id annotated, before we
+      // reply — but the asset does not change across those branches).
+      const assetName = await resolveAssetName(job.assetId);
       // For running transcode jobs, actively poll Encore for the current status.
       // This bridges the gap when the encore-callback-listener cannot reach the
       // API (e.g. local dev). If Encore has no record the job is marked failed.
@@ -246,7 +348,7 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
             const encoreStatus = await encore.getJobStatus(job.encoreInternalJobId) as JobStatus | undefined;
             if (encoreStatus && encoreStatus !== job.status) {
               const updated = await repo.update(job.id, { status: encoreStatus });
-              return reply.code(200).send(updated ?? job);
+              return reply.code(200).send({ ...(updated ?? job), assetName });
             }
           } catch {
             // Encore unreachable or job not found — leave status as-is
@@ -256,21 +358,24 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
       // Annotate with the Encore pool instance that is (or was) running this job.
       // Read from opts live so a stack provisioned after startup (which activates
       // the scaler and sets opts.redis) is picked up without a restart (#103).
-      const redis = opts.redis;
+      const redis =
+        job.encoreJobId && opts.redisForJob
+          ? await opts.redisForJob(job.encoreJobId).catch(() => undefined)
+          : opts.redis;
       if (redis && job.encoreJobId) {
         try {
           const decoded = decodeEncoreJobId(job.encoreJobId);
           if (decoded) {
             const instanceId = await redis.hget(keys.jobInstance(decoded.workspaceId), job.encoreJobId);
             if (instanceId) {
-              return reply.code(200).send({ ...job, encoreInstanceId: instanceId });
+              return reply.code(200).send({ ...job, assetName, encoreInstanceId: instanceId });
             }
           }
         } catch {
           // non-fatal — omit encoreInstanceId if lookup fails
         }
       }
-      return reply.code(200).send(job);
+      return reply.code(200).send({ ...job, assetName });
     }
   );
 };

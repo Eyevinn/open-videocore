@@ -1,5 +1,5 @@
 // Retention config router (issue #325, foundation for #323; extended for the
-// audit-log retention window in #566).
+// audit-log retention window in #566 and the operational-log window in #1067).
 //
 // Exposes instance-global retention windows that govern how long resources are
 // kept before their retention sweep may purge them:
@@ -7,9 +7,16 @@
 //   - `auditRetentionMs` — the AUDIT-LOG window (#566). Default off (0 =
 //     indefinite retention); when set, the audit purge sweep expires whole
 //     audit entries aged past it. See docs/architecture/ADR-021-audit-log-retention.md.
-// Both share this ONE config surface (not a parallel endpoint): GET /config
-// reports both effective windows so an operator can see the current policy at a
-// glance, and PATCH /config can hot-swap either independently.
+//   - `logRetentionMs`   — the OPERATIONAL-LOG window (#1067). Default off (0 =
+//     indefinite retention); when set, the log purge sweep
+//     (src/pipeline/log-retention-purge-sweep.ts) expires whole log records aged
+//     past it from the persisted log partition (src/data/couch-log-repo.ts).
+//     Same representation and validation as `auditRetentionMs` — the log
+//     partition is modelled on the audit partition, and log volume is higher, so
+//     it gets the same operator-visible window rather than a new mechanism.
+// All three share this ONE config surface (not parallel endpoints): GET /config
+// reports every effective window so an operator can see the current policy at a
+// glance, and PATCH /config can hot-swap any of them independently.
 //
 // Modelled on the Encore auto-scaler config mechanism (src/routes/scaler.ts): a
 // live mutable module-scoped var plus an `onConfigChange` callback, so PATCH
@@ -35,24 +42,59 @@ import { z } from 'zod';
 // existing behaviour for every deployment that does not opt in.
 export const RETENTION_DISABLED_MS = 0;
 
+// The largest accepted retention window: 100 years in ms. Any realistic media
+// archive policy is orders of magnitude below this, while it is ~2,700x smaller
+// than the ±8.64e15 ms Date range, so `archivedAt + retentionMs` can never leave
+// the representable range for any stamp a real asset carries. PATCH /config is
+// intentionally unauthenticated (see header), so an unbounded window would let
+// any caller feed date arithmetic downstream of this value — bounding it here
+// keeps that blast radius at a 400.
+export const MAX_RETENTION_MS = 100 * 365 * 24 * 60 * 60 * 1000;
+
 // Resolve the boot-time retention window (12-factor: config via env). Unset,
 // non-numeric, or negative all resolve to disabled (0 = never purge), matching
 // the acceptance criterion that an unset/`0` value is behaviourally identical to
 // today. Mirrors the parseInt env convention in src/main.ts:468-469.
+// Clamped to MAX_RETENTION_MS so a boot-time value can never exceed what
+// `retentionConfigSchema.retentionMs` accepts — GET /config serializes through
+// that same schema, so an out-of-bounds env value would otherwise make the
+// endpoint unreadable rather than merely over-generous. The clamp is scoped to
+// THIS window only: `auditRetentionMs` has no upper bound (see below).
 export function archiveRetentionMsFromEnv(): number {
-  return retentionMsFromEnv('ARCHIVE_RETENTION_MS');
+  return Math.min(retentionMsFromEnv('ARCHIVE_RETENTION_MS'), MAX_RETENTION_MS);
 }
 
 // Resolve the boot-time AUDIT-LOG retention window (issue #566). Default off:
 // unset/non-numeric/negative all resolve to 0 = indefinite retention (never
 // purge), so #563's behaviour is preserved for every deployment that does not
 // opt in. Same parse rules as the archived-asset window (12-factor: env config).
+//
+// Deliberately NOT clamped to MAX_RETENTION_MS. ADR-021 fixes this window's
+// contract as "unset/`0`/negative -> `0`" with no upper bound
+// (docs/architecture/ADR-021-audit-log-retention.md:37), and
+// `retentionConfigSchema.auditRetentionMs` is correspondingly
+// `z.number().int().min(0)` with no `.max()` — so there is nothing for a clamp
+// here to keep GET /config inside, and silently shrinking a configured audit
+// window would contradict the documented contract.
 export function auditRetentionMsFromEnv(): number {
   return retentionMsFromEnv('AUDIT_RETENTION_MS');
 }
 
+// Resolve the boot-time OPERATIONAL-LOG retention window (issue #1067). Default
+// off: unset/non-numeric/negative all resolve to 0 = indefinite retention (never
+// purge), so #996's persist-only behaviour is preserved for every deployment
+// that does not opt in. Same parse rules as the audit and archived-asset windows
+// (12-factor: env config).
+export function logRetentionMsFromEnv(): number {
+  return retentionMsFromEnv('LOG_RETENTION_MS');
+}
+
 // Shared env parse for a retention window: unset/non-numeric/negative -> 0
 // (disabled). Mirrors the parseInt env convention in src/main.ts:468-469.
+// Range-bounding is the CALLER's business, because the two windows have
+// different documented bounds: the archived-asset window is clamped to
+// MAX_RETENTION_MS by `archiveRetentionMsFromEnv`, the audit-log window is
+// unbounded per ADR-021.
 function retentionMsFromEnv(name: string): number {
   const raw = process.env[name];
   if (!raw) {
@@ -72,17 +114,32 @@ type RetentionRouterOptions = {
   // 0 = indefinite retention (never purge). Optional so existing callers that
   // only manage the archived-asset window keep working; defaults to 0.
   auditRetentionMs?: number;
+  // The boot-time operational-log retention window in milliseconds (issue
+  // #1067). 0 = indefinite retention (never purge). Optional so existing callers
+  // that only manage the other windows keep working; defaults to 0.
+  logRetentionMs?: number;
   // Callback to propagate a live retention-config change to the sweeps at
   // runtime, mirroring scaler's onConfigChange (src/routes/scaler.ts:40). Fires
-  // with BOTH effective windows so main.ts can update the two instance globals.
-  onConfigChange?: (cfg: { retentionMs: number; auditRetentionMs: number }) => void;
+  // with ALL effective windows so main.ts can update its instance globals.
+  onConfigChange?: (cfg: {
+    retentionMs: number;
+    auditRetentionMs: number;
+    logRetentionMs: number;
+  }) => void;
 };
 
 const retentionConfigSchema = z.object({
-  // 0 = retention disabled (never purge); any positive value is a window in ms.
-  retentionMs: z.number().int().min(0),
+  // 0 = retention disabled (never purge); any positive value is a window in ms,
+  // up to MAX_RETENTION_MS. The upper bound is defence in depth for every
+  // consumer that does date arithmetic on the window: `archivedAt + retentionMs`
+  // must stay inside the representable Date range (see
+  // src/data/asset-retention.ts purgeAfterOf, which is total regardless).
+  retentionMs: z.number().int().min(0).max(MAX_RETENTION_MS),
   // The audit-log window (issue #566). 0 = indefinite retention (never purge).
-  auditRetentionMs: z.number().int().min(0)
+  auditRetentionMs: z.number().int().min(0),
+  // The operational-log window (issue #1067). 0 = indefinite retention (never
+  // purge). Same representation/validation as auditRetentionMs above.
+  logRetentionMs: z.number().int().min(0)
 });
 
 export const retentionRouter: FastifyPluginAsync<RetentionRouterOptions> = async (fastify, opts) => {
@@ -92,6 +149,7 @@ export const retentionRouter: FastifyPluginAsync<RetentionRouterOptions> = async
   // scaler.ts holds `liveIdleTimeoutMs` (src/routes/scaler.ts:92-94).
   let liveRetentionMs = opts.retentionMs;
   let liveAuditRetentionMs = opts.auditRetentionMs ?? RETENTION_DISABLED_MS;
+  let liveLogRetentionMs = opts.logRetentionMs ?? RETENTION_DISABLED_MS;
 
   app.get(
     '/config',
@@ -101,9 +159,14 @@ export const retentionRouter: FastifyPluginAsync<RetentionRouterOptions> = async
         response: { 200: retentionConfigSchema }
       }
     },
-    // Report BOTH effective windows so an operator can see the current policy,
-    // including the audit-log retention window (issue #566).
-    async () => ({ retentionMs: liveRetentionMs, auditRetentionMs: liveAuditRetentionMs })
+    // Report EVERY effective window so an operator can see the current policy,
+    // including the audit-log (issue #566) and operational-log (issue #1067)
+    // retention windows.
+    async () => ({
+      retentionMs: liveRetentionMs,
+      auditRetentionMs: liveAuditRetentionMs,
+      logRetentionMs: liveLogRetentionMs
+    })
   );
 
   app.patch(
@@ -116,14 +179,20 @@ export const retentionRouter: FastifyPluginAsync<RetentionRouterOptions> = async
       }
     },
     async (request) => {
-      const { retentionMs, auditRetentionMs } = request.body;
+      const { retentionMs, auditRetentionMs, logRetentionMs } = request.body;
       if (retentionMs !== undefined) liveRetentionMs = retentionMs;
       if (auditRetentionMs !== undefined) liveAuditRetentionMs = auditRetentionMs;
+      if (logRetentionMs !== undefined) liveLogRetentionMs = logRetentionMs;
       opts.onConfigChange?.({
         retentionMs: liveRetentionMs,
-        auditRetentionMs: liveAuditRetentionMs
+        auditRetentionMs: liveAuditRetentionMs,
+        logRetentionMs: liveLogRetentionMs
       });
-      return { retentionMs: liveRetentionMs, auditRetentionMs: liveAuditRetentionMs };
+      return {
+        retentionMs: liveRetentionMs,
+        auditRetentionMs: liveAuditRetentionMs,
+        logRetentionMs: liveLogRetentionMs
+      };
     }
   );
 };

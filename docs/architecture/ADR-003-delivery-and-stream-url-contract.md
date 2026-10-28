@@ -216,10 +216,10 @@ do not attempt to resolve it against a bucket.**
 #### The `not_configured` variant
 
 `status: "not_configured"` means the asset HAS packaged output, but this
-deployment cannot advertise a fully-resolvable playback URL — because the API's
-own public origin (`PUBLIC_BASE_URL`) is unset, so no absolute proxy URL can be
-built. Body shape (built by `notConfiguredDelivery`,
-`src/routes/assets.ts:1360-1372`):
+deployment cannot advertise a fully-resolvable playback URL **in the delivery
+mode it is configured for**. Which setting is missing depends on the mode, and
+since #860 the response says so. Body shape (built by `notConfiguredDelivery`,
+`src/routes/assets.ts`):
 
 - `urls.hls` / `urls.dash` are **omitted** (`urls` is `{}`) so a consumer never
   mistakes an unplayable value for a ready URL.
@@ -227,19 +227,25 @@ built. Body shape (built by `notConfiguredDelivery`,
   object-store access can locate the master manifest objects deterministically:
   `packagedBucket`, `packagedPrefix` (the job-nested prefix the packager wrote
   under), `masterHlsKey`, `masterDashKey`. Populated from the asset's
-  `packagedOutput` block (#502): `src/routes/assets.ts:1338-1351`;
+  `packagedOutput` block (#502) by `deliveryResolutionFor`;
   `PackagedOutput` type + field meanings: `src/data/asset-repo.ts:357-382`.
+- `resolution.missingConfiguration` (array of env-var names) and
+  `resolution.reason` (human-readable) name the setting to change (#860):
+  `PACKAGED_PUBLIC_BASE_URL` in `public` mode, `PUBLIC_BASE_URL` in `proxy` mode.
+  These are emitted even when the asset has no persisted `packagedOutput`, since
+  the misconfiguration is a property of the deployment, not of the asset.
 
-`resolution` is entirely additive: an asset packaged before #502 (no persisted
-`packagedOutput`) simply omits `resolution` (`src/routes/assets.ts:1342-1344`).
+The `packaged*`/`master*Key` fields are entirely additive: an asset packaged
+before #502 (no persisted `packagedOutput`) simply omits them.
 
 `not_configured` is returned from the proxy branch when the proxy base is not
-absolute (`src/routes/assets.ts:3151-3155`) and from the public-mode branch when
-neither format resolves to a playable URL (`src/routes/assets.ts:3206-3208`).
+absolute, and from the public-mode branch when neither format resolves to an
+absolute public URL. **The public branch never substitutes a `/stream/*` proxy
+URL to avoid this status** (#860) — see section 3.
 
 The correct fix for `not_configured` is **not** direct bucket access — it is to
-configure `PUBLIC_BASE_URL` on the deployment so `/delivery` can advertise
-absolute `/stream/*` URLs. The `resolution` metadata exists only for an operator
+set the variable the response names, so `/delivery` can advertise absolute URLs
+in the configured mode. The `resolution` metadata exists only for an operator
 who can already address the objects — it tells that operator the exact keys,
 which is precisely what bucket listing does not (listing is `403` on both
 buckets). It is not a supported path for normal API consumers, and the layout it
@@ -375,19 +381,33 @@ for the default per-stack MinIO backend (`deliveryMode`,
   proxy mode too, and "proxy" describes what the API *advertises*, not what the
   bucket *permits*.
 - `public` (default when unset/unrecognised) — advertises the stored CMAF
-  manifest URLs resolved to a public origin; on the zero-config MinIO backend
-  (no `PACKAGED_PUBLIC_BASE_URL`) the stored value is a **bare object-key path
-  with no scheme and no host** (e.g. `/openvideocore-packaged/<id>/<uuid>/index.m3u8`),
-  which a player cannot fetch for that reason alone — not because the bucket
-  denies it. The handler therefore routes it through the same `/stream/*` proxy
-  to keep the advertised URL absolute and resolvable (#341,
-  `src/routes/assets.ts:3168-3208`). Setting `PACKAGED_PUBLIC_BASE_URL` to the
-  bucket's own externally-reachable origin makes this mode emit a directly
-  fetchable URL instead; see OPEN-3.
+  manifest URLs resolved to the packaged bucket's public origin. That origin is
+  `PACKAGED_PUBLIC_BASE_URL` when set, else the resolved stack's own MinIO
+  endpoint (#859, `packagedPublicOrigin`). On a deployment where neither is
+  available the stored value stays a **bare object-key path with no scheme and
+  no host** (e.g. `/openvideocore-packaged/<id>/<uuid>/index.m3u8`), which a
+  player cannot fetch.
 
-In both modes on the default backend, resolvable playback ultimately flows
-through `/stream/*` unless `PACKAGED_PUBLIC_BASE_URL` is set. To get absolute
-`ready` URLs, set `PUBLIC_BASE_URL`.
+  Since #860 that case returns `not_configured` naming
+  `PACKAGED_PUBLIC_BASE_URL`. It does **not** fall back to a `/stream/*` proxy
+  URL. The earlier #341 fallback did, which left a deployment nominally in
+  `public` mode while behaving as `proxy` — the state this section calls
+  mutually exclusive — and, worse, hid the unset origin behind a ready-looking
+  `200` whose URL then `401`s, because `/stream/*` requires a bearer token.
+  A missing origin is a configuration problem, reported as one; a deployment
+  that wants proxy delivery asks for it with `DELIVERY_MODE=proxy`.
+
+The two modes are genuinely exclusive on the advertised-URL surface: `public`
+never emits a `/stream/*` URL and `proxy` never emits a bucket URL. To get
+absolute `ready` URLs, set `PACKAGED_PUBLIC_BASE_URL` (public mode) or
+`PUBLIC_BASE_URL` (proxy mode) — or, in public mode, deploy against a
+provisioned stack, whose MinIO endpoint #859 derives the origin from.
+
+> **Known divergence (out of scope for #860).** `GET /:id/files` builds its
+> `fileGroups[].manifestUrl` with the same proxy fallback and is not
+> delivery-mode aware, so in the unconfigured `public` case it still advertises a
+> `/stream/*` URL where `/delivery` now reports `not_configured`. Tracked
+> separately.
 
 ---
 
@@ -452,8 +472,13 @@ directly, and let the player resolve child references through `/stream/*`.
   playback data path (mitigate with a fronting CDN over `/stream/*` if needed —
   segment responses set `Cache-Control` and advertise `Accept-Ranges`). On the
   corrected premise this cost is now a *choice*, not a necessity — see OPEN-1.
-- Fully-resolvable `ready` URLs require `PUBLIC_BASE_URL` to be configured;
-  otherwise `/delivery` returns `not_configured`.
+- Fully-resolvable `ready` URLs require the origin for the configured mode
+  (`PACKAGED_PUBLIC_BASE_URL` for `public`, `PUBLIC_BASE_URL` for `proxy`);
+  otherwise `/delivery` returns `not_configured` naming the missing variable
+  (#860). Since #860 an unconfigured `public`-mode deployment reports that
+  explicitly rather than silently serving proxy URLs, so stacks that relied on
+  the old fallback must set an origin — on a provisioned stack #859 derives one
+  from the stack's MinIO endpoint automatically.
 
 ### Open questions raised by the corrected premise (#857)
 
@@ -498,12 +523,14 @@ resolve any of them.
   anonymous GETs against object storage are blocked") is conditionally phrased and
   also source-bucket scoped, so it is not false, but it cites the #113 constraint
   as its motivation and is worth re-reading when OPEN-2 is actioned.
-- **OPEN-3 — `DELIVERY_MODE=public` behaviour on the default backend.** The #341
-  fallback routes public mode through the proxy because the *stored* value is a
-  bare object-key path. Now that the packaged bucket is known to be an
-  externally-readable origin, whether the deployment should instead set
-  `PACKAGED_PUBLIC_BASE_URL` to that origin by default (making public mode
-  genuinely direct) is open.
+- **OPEN-3 — `DELIVERY_MODE=public` behaviour on the default backend.**
+  *Resolved by #859 + #860.* The #341 fallback routed public mode through the
+  proxy because the *stored* value is a bare object-key path. Since the packaged
+  bucket is an externally-readable origin, #859 derives
+  `PACKAGED_PUBLIC_BASE_URL` from the stack's own MinIO endpoint when it is
+  unset, making public mode genuinely direct by default; #860 then removed the
+  proxy fallback, so a deployment with no derivable origin reports
+  `not_configured` instead of quietly adopting the other mode's posture.
 - **OPEN-4 — Is public-read on the packaged bucket the right posture for
   multi-tenant deployments?** Anyone holding an exact packaged key can fetch that
   object with no credentials and no token. Enumeration is denied and keys are

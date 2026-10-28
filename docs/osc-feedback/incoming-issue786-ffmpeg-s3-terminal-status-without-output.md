@@ -73,3 +73,31 @@ API reported success.
 - Service documentation stating that ffmpeg output must be `s3://…` with the
   credential fields in the job body, and rejecting a job whose output target is
   an `http(s)://` URL rather than accepting it and writing nothing.
+
+## Addendum 2026-09-30 — the same gap bit a second endpoint (issue #944)
+
+Auditing `POST /api/v1/assets/:id/export` against this note (issue #944) found
+that the export / re-wrap runner had the same two defects as clip, unfixed:
+
+- It classified the job outcome with a **deny-list** of two statuses
+  (`'Failed'`, `'Error'`), so `'Stopped'` — which is in
+  `osc-job-poll.ts:TERMINAL_STATUS` and is therefore *returned* by the poller,
+  not thrown — read as a successful export.
+- It never called `getLogsForInstance`, despite declaring it on `OscJobApi` and
+  having it wired in from `main.ts`, and it reaped the instance in a `finally`.
+
+Which means gap 3 above ("**Logs disappear with the instance** … We now fetch logs
+*before* `removeJob` whenever the outcome is not a known-good status") was only
+true of the clip pipeline when it was written. It is true of both now.
+
+Nothing new is being asked of OSC here — this is the same request, reinforced.
+The point worth making to the service owners is the **cost shape**: because
+`job.status` is the only completion signal and its vocabulary is unpublished,
+every caller has to independently maintain a guessed classification of that
+vocabulary, in every pipeline, and a caller that gets it subtly wrong gets a
+*silent false success* rather than an error. Two endpoints in this codebase got
+it wrong in the same way, five months apart, from the same missing enumeration.
+A published status enumeration — or better, a boolean `done`/`succeeded` on the
+job document, plus a per-job result carrying the ffmpeg exit code and the output
+URIs actually written — would remove the class of bug rather than one instance of
+it.

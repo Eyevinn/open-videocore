@@ -5,24 +5,24 @@
 // StackConfig.redisUrl). main.ts resolves it at boot and again on every
 // stack change, and activates the scaler when it resolves.
 //
-// Before #780 that resolution read the LITERAL `default` parameter-store
-// namespace (STACK_CONFIG_NAMESPACE) instead of the deployment's derived
-// namespace, and skipped the #733 legacy fallback. On any deployment whose
-// derived namespace is a real tenant id (post-#712) it found nothing, returned
-// undefined, and the scaler never activated — with no error and no warning, so
-// the only symptom was `scalerActive: false` and no transcoding at all.
+// Before #780 this resolution open-coded its own parameter-store read, which
+// disagreed with the namespace the rest of the app used. It found nothing,
+// returned undefined, and the scaler never activated — with no error and no
+// warning, so the only symptom was `scalerActive: false` and no transcoding at
+// all.
 //
 // This module resolves through WorkspaceStackResolver.resolveStackConfig()
-// instead — the SAME derived namespace and legacy fallback every other consumer
-// uses — and classifies the outcome so an inactive scaler is always logged.
+// instead — the SAME read path every other consumer uses — and classifies the
+// outcome so an inactive scaler is always logged. Since #804 that read path is
+// the constant STACK_CONFIG_NAMESPACE on both the read and the write side, so
+// there is no longer a second derivation that could disagree with it.
 //
 // Contract sources verified (CLAUDE.md rule 7):
 //   - WorkspaceStackResolver.resolveStackConfig(stackName?):
 //     Promise<StackConfig | undefined> — src/services/workspace-stack.ts.
-//     It derives the namespace via deriveWorkspaceId(oscContext)
-//     (workspace-stack.ts:403) and reads through
-//     loadStackConfigWithLegacyFallback / listStackNamesWithLegacyFallback
-//     (workspace-stack.ts:481,524 — the #751/#733 helpers).
+//     It reads under the constant STACK_CONFIG_NAMESPACE through
+//     loadStackConfigWithMigration / listStackNamesWithMigration
+//     (workspace-stack.ts — the bounded one-shot #804 migration helpers).
 //   - StackConfig.redisUrl: string — src/services/param-store.ts:63.
 //   - ParamStore.loadStackConfig / listStackNames — src/services/param-store.ts:108-125.
 

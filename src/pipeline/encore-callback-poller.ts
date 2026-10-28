@@ -24,6 +24,9 @@
 //   - Encore job document fields externalId/status/output — src/routes/internal.ts
 //     encoreCallbackSchema (SMOKE TEST CONFIRMED 2026-06-01).
 //   - completeTranscode signature — src/pipeline/transcode.ts:138.
+//   - WebhookDispatcher.dispatch({ type, payload }) — WebhookEvent,
+//     src/services/webhook-dispatcher.ts:23-26/:67; event-type vocabulary
+//     WEBHOOK_EVENT_TYPES — src/data/webhook-repo.ts:28-36 (#829).
 //   - JobRepository.findByEncoreJobId — src/data/job-repo.ts:129 (workspace-scoped
 //     via PerWorkspaceJobRepository, which decodes the {workspaceId}__{jobId}
 //     externalId — src/data/per-workspace-repos.ts:92).
@@ -31,16 +34,36 @@
 import type { Redis } from 'ioredis';
 import type { Context } from '@osaas/client-core';
 import type { JobRepository } from '../data/job-repo.js';
+import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import type { AssetRepository } from '../data/asset-repo.js';
 import { isStepComplete } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { completeTranscode, type CallbackRendition } from './transcode.js';
+// #1226: object-storage surface for reclaiming a cancelled job's late output.
+import type { CancelledJobOutputStorage } from './cancelled-transcode-completion.js';
+import type { PipelineLogSink } from '../services/pipeline-log.js';
+import { dispatchTranscodeCompletionEvents } from './transcode-completion-events.js';
+// #1060: structured source-read failure detail for the failed `transcode` step.
+import { buildSourceReadErrorDetail } from './encore-source-read-failure.js';
+import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
+import {
+  PERSISTED_STACK_FALLBACK_MESSAGE,
+  runWithPersistedStack,
+  runWithRequestStack
+} from '../services/request-stack-context.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
+// #1288: the statuses that mean "this Encore attempt has not stopped yet", so a
+// still-running attempt is never mistaken for a terminal failure.
+import { ENCORE_ACTIVE_STATUSES } from '../encore-scaler/encore-paging-contract.js';
 import { DEFAULT_RECONCILE_GRACE_MS } from '../encore-scaler/scaler-loop.js';
 import { decideRetry, clearRetryState, makePriorAttemptCanceler } from '../encore-scaler/retry-store.js';
 import { pinInstanceForPackaging, unpinInstanceForPackaging } from '../encore-scaler/packaging-pin.js';
 import { DEFAULT_PACKAGE_STALL_TIMEOUT_MS } from './stalled-package-reconciler.js';
+// Package-step Job records (issue #976) — the same lifecycle module
+// PackagingService uses, so this OSC-native handoff leaves an identical
+// observable object behind.
+import { failPackageJob, startPackageJob } from './package-job.js';
 
 // Resolve the correct Encore job API URL using the reverse UUID mapping stored
 // at dispatch time. The callback listener always uses its own configured Encore
@@ -63,6 +86,34 @@ async function resolveUrlFromEncoreUuid(
 const DEFAULT_QUEUE_KEY = 'ovc:transcode-done';
 const BZPOPMIN_TIMEOUT_SECONDS = 5;
 
+// Bounded retry for a completion message whose handling throws.
+//
+// A failed message used to be put back with its ORIGINAL score, and BZPOPMIN
+// pops the lowest score first, so the same message came straight back — about
+// once a second, forever. One message that can never be applied (a job whose
+// document is gone, a transition the repository rejects) therefore blocked
+// every later completion on that Valkey, and their jobs were then failed by
+// the reconcile as "dropped by Encore" although Encore had finished them.
+//
+// Now a failed message is re-added BEHIND everything currently queued (a score
+// in the future), the loop backs off longer on each consecutive failure of the
+// same message, and after MAX_MESSAGE_ATTEMPTS it is moved to the dead-letter
+// set `<queueKey>:dead` for an operator, with the last error logged. The
+// attempt counter lives in the hash `<queueKey>:attempts`, keyed by the raw
+// message, so it survives a restart; the hash's TTL is refreshed on every
+// failure so an abandoned counter expires on its own.
+export const MAX_MESSAGE_ATTEMPTS = 8;
+export const DEAD_LETTER_SUFFIX = ':dead';
+const ATTEMPTS_SUFFIX = ':attempts';
+const ATTEMPTS_TTL_MS = 24 * 60 * 60_000;
+const MAX_MESSAGE_BACKOFF_MS = 30_000;
+
+// Back-off before the loop pops again after `attempt` consecutive failures of
+// one message: 1s, 2s, 4s, ... capped at 30s.
+export function messageRetryBackoffMs(attempt: number): number {
+  return Math.min(MAX_MESSAGE_BACKOFF_MS, 1000 * 2 ** Math.max(0, attempt - 1));
+}
+
 // The eyevinn-encore-packager's INPUT queue (#94). Must match the RedisQueue
 // set on the provisioned packager instance (provision.ts). We use the same key
 // as PackagingService / makeOscPackagerQueue ('encore-packager:jobs') so all
@@ -82,9 +133,12 @@ type Logger = {
   info(...a: any[]): void;
   warn(...a: any[]): void;
   error(...a: any[]): void;
+  // Optional (issue #1097): used only for the legacy-document fallback notice,
+  // so a logger without a debug level (several test fakes) still satisfies this.
+  debug?(...a: any[]): void;
 };
 
-type PollerDeps = {
+export type PollerDeps = {
   redis: Redis;
   jobRepository: JobRepository;
   assetRepository: AssetRepository;
@@ -95,6 +149,16 @@ type PollerDeps = {
   // "packaging-queue". Overridable so a deployment can point at a differently
   // named packager queue without a code change.
   packagingQueueKey?: string;
+  // Resolves the queue key the ambient stack's packager consumes (per-stack
+  // packager queues), given the key above as the fallback. Called inside the
+  // job's persisted stack, so a completion on any stack enqueues for that
+  // stack's packager. Optional: unset enqueues onto packagingQueueKey as before.
+  resolvePackagingQueueKey?: (defaultKey: string) => Promise<string>;
+  // Bounded retry of a message whose handling throws (see MAX_MESSAGE_ATTEMPTS).
+  // Both optional, defaulting to the module constants; injectable so a test can
+  // drive a message to the dead-letter set without waiting out the back-off.
+  maxMessageAttempts?: number;
+  messageRetryBackoffMs?: (attempt: number) => number;
   // #464: bounds for the independent reconciliation sweep. All optional; when
   // unset the poller applies the defaults below so behaviour is identical to
   // before these knobs existed. Threaded the same way queueKey/packagingQueueKey
@@ -116,6 +180,16 @@ type PollerDeps = {
   // from ENCORE_RECONCILE_GRACE_MS. Unset => DEFAULT_RECONCILE_GRACE_MS so
   // behaviour is unchanged when the env var is absent.
   reconcileGraceMs?: number;
+  // #830: minimum interval between two persisted progress writes for the SAME
+  // transcode job. The sweep reads Encore's own `progress` off the IN_PROGRESS
+  // findByStatus page it already pages through per instance; without a bound,
+  // every sweep cycle would issue a CouchDB write per running job. Threaded the
+  // same way sweepIntervalMs is (raw value in, default applied at use); main.ts
+  // reads it from ENCORE_PROGRESS_WRITE_INTERVAL_MS. Unset =>
+  // DEFAULT_PROGRESS_WRITE_INTERVAL_MS. Mirrors url-pull-worker.ts's
+  // PROGRESS_INTERVAL_MS (:43-44), which throttles ingest progress writes for
+  // exactly the same reason.
+  progressWriteIntervalMs?: number;
   // On-demand packager provisioning (epic #226, issue #244; #496). The SAME
   // closure the assets router receives as `ensurePackaging` (src/routes/assets.ts
   // opts, called at assets.ts:1484 on the manual package-start path). Threaded in
@@ -128,6 +202,37 @@ type PollerDeps = {
   // isn't active, or a test pre-wires packaging) the handoff proceeds as before.
   // Throwing fails the `package` step with a diagnostic instead of enqueueing.
   ensurePackaging?: () => Promise<void>;
+  // Webhook event dispatcher (issue #13, wired here by #829). This module is one
+  // of the THREE paths that can apply a transcode terminal state (the others are
+  // src/routes/internal.ts POST /encore-callback and settleFailedTranscode in
+  // src/pipeline/failed-transcode-reconciler.ts — enumerated in full in
+  // src/pipeline/transcode-completion-events.ts), and until #829 the callback
+  // route was the only one with a dispatcher — so on a deployment whose
+  // completions arrive through this poller (the callback listener's
+  // fire-and-forget zAdd dropping a message, or a failure Encore never calls
+  // back on, both of which the sweep below exists to cover), subscribers to
+  // `transcode.complete`, `asset.ready`, `transcode.failed` and `asset.failed`
+  // silently received nothing. Optional: absent on deployments with webhooks
+  // disabled, in which case emission is a no-op exactly as before.
+  // Fire-and-forget — a delivery failure never affects the completion flow.
+  webhookDispatcher?: WebhookDispatcher;
+  // Best-effort operational log sink (issue #995). Handed to completeTranscode so
+  // the terminal transcode transition appends one record to the in-memory
+  // LogStore GET /api/v1/logs reads (src/main.ts, `logStore`; read path
+  // src/routes/logs.ts:94). Optional: absent => no log record, behaviour
+  // unchanged. Emission never throws (src/services/pipeline-log.ts).
+  pipelineLog?: PipelineLogSink;
+  // #1226: resolves object storage for the transcode OUTPUT bucket of the stack
+  // the completion belongs to. Called ONLY when a completion arrives for a job
+  // the user already CANCELLED, so the output of the stopped run is reclaimed
+  // and the job record (`cancelled`), renditionCount (0) and the files in the
+  // bucket agree — the state #1226 was reported from was a cancelled job
+  // reporting 0 renditions over a complete output. Invoked inside the job's
+  // persisted stack (handleMessageInStack runs under runWithPersistedStack), so
+  // the handle is for THAT stack's packaged/output bucket. Optional: absent =>
+  // the discard is still recorded durably on the job and the objects are left
+  // for an operator, exactly as the rule's own fallback describes.
+  resolveTranscodeOutputStorage?: () => Promise<CancelledJobOutputStorage | undefined>;
   logger: Logger;
 };
 
@@ -201,20 +306,44 @@ async function enqueuePackagingJob(
   assetId: string,
   encoreJobUrl: string
 ): Promise<void> {
-  const queueKey = deps.packagingQueueKey ?? DEFAULT_PACKAGING_QUEUE_KEY;
+  let queueKey = deps.packagingQueueKey ?? DEFAULT_PACKAGING_QUEUE_KEY;
   const message = JSON.stringify({ jobId: assetId, url: encoreJobUrl });
+  // Record the observable `package` Job and stamp it onto the execution's
+  // running `package` step (issue #976) BEFORE the ZADD, so the packager cannot
+  // consume the entry and call back before the record exists. This is the same
+  // ordering PackagingService.triggerPackaging uses; both go through the one
+  // lifecycle module so the two handoff paths cannot drift. Best-effort — never
+  // throws (src/pipeline/package-job.ts).
+  const packageJobDeps = { jobs: deps.jobRepository, pipeline: deps.pipelineRepository, logger: deps.logger };
+  const packageJobId = await startPackageJob(packageJobDeps, assetId);
   // #498: purge stale ghost entries BEFORE our ZADD so the packager instance this
   // job's own on-demand provisioning (#496/#497) just brought up can never drain
   // an ancient job whose no-jobId failure callback would be misattributed to THIS
   // fresh, healthy run. Best-effort — purgeStalePackagingJobs never throws, so a
   // purge hiccup cannot block the enqueue below.
-  await purgeStalePackagingJobs(deps.redis, queueKey, { logger: deps.logger });
+  // Packaging is handed off on THIS poller's Valkey: a stack's packager consumes
+  // its own stack's Valkey (src/main.ts ensurePackaging), and this poller drains
+  // exactly that stack's completions, so the queue the packager reads and the
+  // one this writes are the same store.
   try {
+    // Inside the try: a parameter-store failure resolving the per-stack key
+    // fails this job like a failed ZADD, rather than throwing into the poller.
+    if (deps.resolvePackagingQueueKey) {
+      queueKey = await deps.resolvePackagingQueueKey(queueKey);
+    }
+    await purgeStalePackagingJobs(deps.redis, queueKey, { logger: deps.logger });
     await deps.redis.zadd(queueKey, Date.now(), message);
     deps.logger.info({ msg: 'encore-callback-poller: enqueued packaging job', queueKey, assetId, url: encoreJobUrl });
   } catch (err) {
     const emsg = err instanceof Error ? err.message : String(err);
     deps.logger.error({ msg: 'encore-callback-poller: failed to enqueue packaging job', queueKey, assetId, err });
+    // The enqueue never happened, so no packager callback can settle this job:
+    // fail it here with the same reason recorded on the asset (issue #976).
+    await failPackageJob(
+      packageJobDeps,
+      { jobId: packageJobId, assetId },
+      `failed to enqueue packaging job: ${emsg}`
+    );
     try {
       await deps.assetRepository.update(assetId, {
         packagingError: `failed to enqueue packaging job: ${emsg}`
@@ -328,14 +457,95 @@ async function decrementActiveJobs(
   }
 }
 
-// Process one queue message: fetch the Encore job, resolve our job, complete the
-// transcode, and advance the matching PipelineExecution.
+// The stack a queue message's transcode job belongs to (issue #1097).
+//
+// This loop is the restart/resume path for transcode completions: messages left
+// in the processing set by a killed process are returned to the queue on startup
+// (recoverProcessingQueue below) and drained here with NO ambient stack context
+// at all. Every repository call in handleMessage therefore resolved the
+// FIRST-LISTED stack, so a completion for a job on any other stack found no
+// local job and was dropped ("no local job for externalId"), leaving the job
+// `running` and its asset `processing` forever.
+//
+// Two identity sources, in priority order:
+//   1. `Job.stackName` (src/data/job-repo.ts) — the stack the job was created
+//      against, persisted at create time. Authoritative.
+//   2. the contextId embedded in the externalId we issued
+//      (`encodeEncoreJobId(contextId, jobLocalId)`, src/data/job-repo.ts), which
+//      is the resolved stack name for a provisioned stack and the fixed
+//      DEPLOYMENT_CONTEXT otherwise. This is the #1058 identity source and it is
+//      what makes the lookup in (1) land on the right stack in the first place.
+// The externalId is read from the dispatch-time UUID mapping
+// (`keys.uuidToExternalId`, src/encore-scaler/types.ts) so no Encore round-trip
+// is needed. Returns undefined when neither source answers (no mapping, no
+// decodable context) — the documented legacy case, which keeps today's
+// first-listed-stack behaviour.
+//
+// Exported for tests only.
+export async function stackForQueueMessage(
+  deps: PollerDeps,
+  raw: string
+): Promise<string | undefined> {
+  try {
+    const { jobId: encoreUuid } = JSON.parse(raw) as { jobId?: string };
+    if (!encoreUuid) return undefined;
+    const externalId = await deps.redis.get(keys.uuidToExternalId(encoreUuid));
+    if (!externalId) return undefined;
+    const decoded = decodeEncoreJobId(externalId)?.workspaceId;
+    const found = await runWithRequestStack(decoded, () =>
+      deps.jobRepository.findByEncoreJobId(externalId)
+    );
+    if (found?.job.stackName) return found.job.stackName;
+    // The decoded contextId is the fixed DEPLOYMENT_CONTEXT ('default',
+    // src/auth/workspace.ts:46) — not a stack name — for a single-stack
+    // env-override deployment and for every job dispatched before stacks were
+    // provisioned. Returning it as if it WERE a stack name degrades safely (an
+    // unknown name resolves first-listed), but it suppresses the documented
+    // legacy-document debug notice on this path, so an operator grepping for
+    // pre-#1097 jobs would not see them. Report it as "no persisted identity"
+    // instead, which is what it is.
+    return decoded === DEPLOYMENT_CONTEXT ? undefined : decoded;
+  } catch {
+    // Best-effort: a corrupt message, a Valkey hiccup or a repository error here
+    // must never stop the message from being processed. It degrades to the
+    // ambient (first-listed) resolution, exactly as before this resolution
+    // existed.
+    return undefined;
+  }
+}
+
+// Process one queue message in the stack its job belongs to (issue #1097), then
+// fetch the Encore job, resolve our job, complete the transcode, and advance the
+// matching PipelineExecution.
 //
 // Throws on retryable failures (network errors, non-2xx Encore fetch, DB write
 // errors) so the outer loop can re-queue the message and retry. Non-retryable
 // cases (unparseable message, unknown externalId) log and return cleanly so the
 // message is dropped rather than looped forever.
 async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
+  const stackName = await stackForQueueMessage(deps, raw);
+  return runWithPersistedStack(
+    stackName,
+    () => handleMessageInStack(deps, raw),
+    () =>
+      deps.logger.debug?.({
+        msg: `encore-callback-poller: ${PERSISTED_STACK_FALLBACK_MESSAGE}`,
+        raw
+      })
+  );
+}
+
+// #1288: Encore statuses that mean the attempt is still in flight, i.e. its
+// outcome is NOT yet known. Taken from Encore's Status.kt enum as pinned in
+// src/encore-scaler/encore-paging-contract.ts: ENCORE_ACTIVE_STATUSES
+// ('QUEUED' | 'IN_PROGRESS') plus 'NEW' (a submitted job Encore has not queued
+// yet) — the complement of the terminal SUCCESSFUL | FAILED | CANCELLED.
+const IN_FLIGHT_ENCORE_STATUSES: ReadonlySet<string> = new Set<string>([
+  'NEW',
+  ...ENCORE_ACTIVE_STATUSES
+]);
+
+async function handleMessageInStack(deps: PollerDeps, raw: string): Promise<void> {
   let message: { jobId?: string; url?: string };
   try {
     message = JSON.parse(raw);
@@ -406,9 +616,47 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
     return;
   }
 
+  const upper = status.toUpperCase();
+
+  // #1288: a NON-TERMINAL status is not a completion — never settle on it.
+  //
+  // The document we just fetched is the one at keys.jobEncoreUrl for this
+  // externalId (resolveUrlFromEncoreUuid above), and the retry re-dispatch
+  // OVERWRITES that key with the CURRENT attempt's URL. So a stale queue message
+  // for a superseded attempt (re-queued by the sweep from attempt 1's FAILED
+  // record, or a duplicate callback) resolves to the attempt that is RUNNING
+  // right now. Falling through here sent that running attempt's IN_PROGRESS
+  // status into the failure branch below, where the failure message is
+  // SYNTHESISED from the status itself (`encore status: ${status}`) — the retry
+  // gate classified "encore status: IN_PROGRESS" as deterministic, settled
+  // `not-retryable`, and the job ended permanently `failed` with
+  // "encore status: IN_PROGRESS" while Encore kept encoding for nobody. A
+  // transient failure then got two attempts instead of three.
+  //
+  // So: leave a running attempt alone. It settles when it actually ends — via
+  // its own callback, or via the sweep, which re-queues any local job that is
+  // still non-terminal once Encore reports its record terminal (sweepTerminalJobs
+  // below). Returning (rather than throwing) is deliberate: this message carries
+  // no new information, so re-queueing it would only re-ask the same question.
+  //
+  // Terminal statuses are SUCCESSFUL | FAILED | CANCELLED; NEW, QUEUED and
+  // IN_PROGRESS are still in flight — Encore's own Status.kt enum, pinned as
+  // ENCORE_STATUS_ENUM / ENCORE_ACTIVE_STATUSES in
+  // src/encore-scaler/encore-paging-contract.ts.
+  if (IN_FLIGHT_ENCORE_STATUSES.has(upper)) {
+    deps.logger.info({
+      msg: 'encore-callback-poller: encore job is still running — not settling (a retry may be in flight)',
+      jobId: found.job.id,
+      externalId,
+      encoreUuid,
+      status,
+      localStatus: found.job.status
+    });
+    return;
+  }
+
   deps.logger.info({ msg: 'encore-callback-poller: completing transcode', jobId: found.job.id, externalId, status });
 
-  const upper = status.toUpperCase();
   const success = upper === 'SUCCESSFUL' || upper === 'SUCCESS';
 
   // #707: on a SUCCESSFUL (terminal) callback, atomically stamp a TERMINAL value
@@ -449,6 +697,22 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
       try {
         terminalInstanceId =
           (await deps.redis.hget(keys.jobInstance(decoded.workspaceId), externalId)) ?? undefined;
+        // Persist the mapping we are about to delete (issue #739). Threading
+        // `terminalInstanceId` only helps callers inside THIS function call;
+        // packaging dispatched later out of band — the package-only pipeline in
+        // src/routes/assets.ts, and the unpin on the packager's success callback
+        // in src/routes/internal.ts — has no such thread and previously re-read
+        // keys.jobInstance, which this hdel had already emptied. Same 24h TTL as
+        // keys.jobEncoreUrl (scaler-loop.ts:1250) so the job's URL and the
+        // instance that serves it expire together.
+        if (terminalInstanceId) {
+          await deps.redis.set(
+            keys.jobTerminalInstance(externalId),
+            terminalInstanceId,
+            'EX',
+            86_400
+          );
+        }
         await deps.redis.hset(keys.jobStatus(decoded.workspaceId), externalId, 'SUCCESSFUL');
         await deps.redis.hdel(keys.jobInstance(decoded.workspaceId), externalId);
       } catch (err) {
@@ -556,6 +820,24 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
     }
   }
 
+  // A completion is proof the job was dispatched. A job still `queued` here
+  // missed its onDispatched hook — the scaler's hooks ran outside the job's
+  // stack and looked it up in the wrong CouchDB (fixed in src/main.ts
+  // inEncoreJobStack), or the process restarted between dispatch and the hook
+  // — and the repository rejects `queued -> done` as an invalid transition,
+  // which would make this message a permanently failing one. Advance it to
+  // `running` first, exactly as the hook would have.
+  if (found.job.status === 'queued' || found.job.status === 'pending') {
+    deps.logger.warn({
+      msg: 'encore-callback-poller: completion for a job never marked running — advancing it before settling',
+      jobId: found.job.id,
+      externalId,
+      status: found.job.status
+    });
+    await deps.jobRepository.update(found.job.id, { status: 'running' });
+    found.job.status = 'running';
+  }
+
   // completeTranscode touches CouchDB — let any throw propagate so the outer
   // loop re-queues and retries on transient DB errors.
   const result = await completeTranscode(
@@ -566,8 +848,59 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
       error: success ? undefined : (job.message ?? `encore status: ${status}`),
       renditions: success ? normaliseRenditions(job.output) : []
     },
-    { jobs: deps.jobRepository, assets: deps.assetRepository }
+    {
+      jobs: deps.jobRepository,
+      assets: deps.assetRepository,
+      // Operational log for the `transcode` stage's terminal state (issue #995).
+      // This module is one of the three paths that can apply a transcode terminal
+      // state (enumerated in src/pipeline/transcode-completion-events.ts) and it
+      // is the OSC-native one a normal run settles through, so it must append too
+      // or the Logs tab shows a stage that started and never finished.
+      pipelineLog: deps.pipelineLog,
+      // #1226: lets completeTranscode reclaim the output of a run that was
+      // CANCELLED before this completion arrived. Resolved lazily inside the
+      // rule, so a normal completion never builds a storage handle.
+      resolveOutputStorage: deps.resolveTranscodeOutputStorage,
+      // #1226: a completion for a job the user had cancelled. Log the reclaim
+      // explicitly — the symptom this issue was reported from was the summary
+      // line at the end of this function saying only `applied false
+      // renditionCount 0`, which read as "nothing was produced" while a complete
+      // output sat in the bucket. The job stays `cancelled` (cancel wins) and
+      // the output of the stopped run is removed, so the three now agree.
+      onCancelledCompletionDiscarded: (reclaim) =>
+        deps.logger.info({
+          msg: 'encore-callback-poller: discarded a completion for a cancelled job and reclaimed its output',
+          jobId: found.job.id,
+          externalId,
+          status,
+          outputPrefix: reclaim.outputPrefix,
+          discardedRenditionCount: reclaim.discardedRenditionCount,
+          outputRemoved: reclaim.outputRemoved,
+          ...(reclaim.removalError ? { removalError: reclaim.removalError } : {}),
+          ...(reclaim.assetStatus ? { assetStatus: reclaim.assetStatus } : {})
+        }),
+      logWarn: (detail) => deps.logger.warn(detail)
+    }
   );
+
+  // #829: notify webhook subscribers that this transcode reached a terminal
+  // state. Emitted IMMEDIATELY behind the shared completion-application step
+  // (completeTranscode above) rather than at the end of this function, so no
+  // later early return on the pipeline-advance / packaging-handoff path (e.g.
+  // the ensurePackaging failure below) can swallow an event for a transcode that
+  // genuinely completed. The payloads come from the SAME helper
+  // src/routes/internal.ts uses, so they are identical whichever path detected
+  // the completion. The `result.applied` guard inside the helper keeps a sweep
+  // that re-observes an already-settled job from double-firing. Fire-and-forget:
+  // the dispatcher swallows its own delivery errors, so this cannot throw into
+  // (or slow down) the completion flow below.
+  dispatchTranscodeCompletionEvents({
+    dispatcher: deps.webhookDispatcher,
+    job: found.job,
+    success,
+    error: job.message ?? `encore status: ${status}`,
+    result
+  });
 
   // #525 pt.2: on a successful completion, pin the instance that ran this job
   // against premature scale-down BEFORE decrementActiveJobs below — that call
@@ -711,10 +1044,23 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
       const tIdx = steps.findIndex((s) => s.name === 'transcode' && s.encoreJobId === externalId);
 
       if (!success) {
+        const failureText = job.message ?? `encore status: ${status}`;
+        // #1060: when the failure is a SOURCE-READ failure (the storage answered
+        // 404/403 for the input object, or the connection to it failed), attach
+        // the structured detail alongside the unchanged free text. Same builder
+        // the other two settle paths use (failed-transcode-reconciler.ts
+        // releasePipelineLock, routes/internal.ts), so the same Encore message
+        // yields the same detail whichever path observed the failure.
+        const errorDetail = buildSourceReadErrorDetail({
+          failureText,
+          encoreJobId: externalId,
+          assetId: found.job.assetId
+        });
         steps[tIdx] = {
           ...steps[tIdx],
           status: 'failed',
-          error: job.message ?? `encore status: ${status}`,
+          error: failureText,
+          ...(errorDetail ? { errorDetail } : {}),
           completedAt: now
         };
         await deps.pipelineRepository.update(execution.id, { steps, status: 'failed' });
@@ -891,10 +1237,163 @@ const DEFAULT_SWEEP_PAGE_SIZE = 100;
 // the only thing that differs per status is the findByStatus query below.
 const SWEEP_STATUSES = ['SUCCESSFUL', 'FAILED'] as const;
 
+// #830 — live transcode progress.
+//
+// A running transcode reported progress: 0 for its entire duration: Encore
+// computes the value and returns it on every job document, the Job record has a
+// `progress` field, the pipelines route enriches a running step from it
+// (src/routes/pipelines.ts:56-71 enrichWithProgress) and both UI surfaces render
+// it — but nothing ever copied Encore's number onto our job. The push channel
+// (progressCallbackUri, injected at dispatch by scaler-loop.ts:992-996) delivers
+// only the terminal callback on current stacks (#812), so the value is read here
+// instead, off a response this loop already fetches.
+//
+// CONTRACT SOURCES VERIFIED (CLAUDE.md rule 7) — Encore's own OpenAPI document,
+// fetched live from a running OSC Encore instance at GET /v3/api-docs
+// (2026-09-25, instance scalerovctestmtvumibi):
+//   - path `/encoreJobs/search/findByStatus`, operationId
+//     `executeSearch-encorejob-get`, `status` query enum
+//     [NEW, QUEUED, IN_PROGRESS, SUCCESSFUL, FAILED, CANCELLED]; 200 response
+//     schema `PagedModelEntityModelEncoreJob` =
+//     { _embedded: { encoreJobs: EntityModelEncoreJob[] }, page, _links }.
+//   - `EntityModelEncoreJob.progress` — {"type":"integer","format":"int32",
+//     "default":"0","description":"The EncoreJob progress","example":57,
+//     "readOnly":true}. Integer percent, 0-100 (the live evidence on #830 shows
+//     8 -> 27 -> 47 -> 75 over one run).
+//   - `EntityModelEncoreJob.externalId` — {"type":"string","description":
+//     "External id - for external backreference"}. This is OUR encoreJobId: the
+//     transcode dispatch submits `externalId: encoreJobId`
+//     (src/pipeline/transcode.ts:146) and JobRepository.findByEncoreJobId
+//     (src/data/job-repo.ts:257) resolves it back to the local job — the same
+//     lookup the terminal sweep below already performs.
+//   - Write target: UpdateJobInput.progress (src/data/job-repo.ts:176), clamped
+//     to 0-100 by clampProgress (job-repo.ts:306-309).
+const PROGRESS_STATUS = 'IN_PROGRESS';
+
+// Minimum gap between two persisted progress writes for one job (#830 acceptance
+// criterion: "Progress writes are throttled rather than issued on every poll").
+const DEFAULT_PROGRESS_WRITE_INTERVAL_MS = 10_000;
+
+// Drop a throttle entry this long after its last write, so the map cannot grow
+// without bound across a long-lived process (a job that stops appearing on the
+// IN_PROGRESS page has finished and will never be rate-limited again).
+const PROGRESS_THROTTLE_TTL_MS = 60 * 60_000;
+
+type ProgressThrottleEntry = { at: number; value: number };
+
+// Throttle state keyed by the poller's own deps object, so each running poller
+// (and each test) gets an isolated map that is collected with it.
+const progressThrottleByDeps = new WeakMap<PollerDeps, Map<string, ProgressThrottleEntry>>();
+
+function progressThrottleState(deps: PollerDeps): Map<string, ProgressThrottleEntry> {
+  let state = progressThrottleByDeps.get(deps);
+  if (!state) {
+    state = new Map();
+    progressThrottleByDeps.set(deps, state);
+  }
+  return state;
+}
+
+// Read Encore's reported `progress` for every IN_PROGRESS job on ONE instance and
+// persist it onto the matching local transcode job.
+//
+// Deliberately additive and best-effort: it never enqueues, never changes a job's
+// status, and swallows every fetch/parse/repository error (a progress number is
+// cosmetic — failing to read it must never disturb the terminal reconciliation
+// this sweep exists for). Runs inside the existing per-instance sweep loop, so it
+// adds no control loop and no new timer (#464: "Do NOT add a second control loop;
+// extend this one").
+//
+// Two independent guards keep CouchDB writes off the poll cadence:
+//   1. unchanged value  — Encore reports integer percent, so most cycles repeat
+//                         the previous number; those are skipped outright.
+//   2. minimum interval — a changed value is still only written once per
+//                         progressWriteIntervalMs per job.
+// Returns the number of jobs actually written (test observability).
+export async function syncInProgressJobProgress(
+  deps: PollerDeps,
+  record: EncoreInstanceRecord,
+  sat: string,
+  opts: { pageSize: number; now?: () => number }
+): Promise<number> {
+  const { logger, jobRepository } = deps;
+  const now = opts.now ?? (() => Date.now());
+  const intervalMs = deps.progressWriteIntervalMs ?? DEFAULT_PROGRESS_WRITE_INTERVAL_MS;
+  const throttle = progressThrottleState(deps);
+
+  const searchUrl =
+    `${record.url.replace(/\/+$/, '')}/encoreJobs/search/findByStatus` +
+    `?status=${PROGRESS_STATUS}&page=0&size=${opts.pageSize}`;
+
+  let encoreJobs: Array<{ externalId?: string; progress?: number }> = [];
+  try {
+    const res = await fetch(searchUrl, { headers: { authorization: `Bearer ${sat}` } });
+    if (!res.ok) return 0;
+    const body = (await res.json()) as {
+      _embedded?: { encoreJobs?: typeof encoreJobs };
+    };
+    encoreJobs = body._embedded?.encoreJobs ?? [];
+  } catch {
+    return 0;
+  }
+
+  let written = 0;
+  const at = now();
+
+  for (const encoreJob of encoreJobs) {
+    const externalId = encoreJob.externalId;
+    const progress = encoreJob.progress;
+    // `progress` is optional on the schema and defaults to 0; a non-numeric or
+    // absent value carries no information, so there is nothing to copy.
+    if (!externalId || typeof progress !== 'number' || !Number.isFinite(progress)) continue;
+
+    const previous = throttle.get(externalId);
+    // Guard 1: Encore has not moved since the last value we persisted.
+    if (previous && previous.value === progress) continue;
+    // Guard 2: it has moved, but not long enough ago to spend a write on.
+    if (previous && at - previous.at < intervalMs) continue;
+
+    try {
+      const found = await jobRepository.findByEncoreJobId(externalId);
+      if (!found) continue;
+      const { job } = found;
+      // Never write progress onto a job that has already settled — a terminal
+      // job's progress is whatever completeTranscode left there.
+      if (job.status === 'done' || job.status === 'failed' || job.status === 'cancelled') continue;
+      if (job.progress === progress) {
+        // Already correct in the store (e.g. first sight after a restart):
+        // record it so the unchanged-value guard suppresses future cycles.
+        throttle.set(externalId, { at, value: progress });
+        continue;
+      }
+      await jobRepository.update(job.id, { progress });
+      throttle.set(externalId, { at, value: progress });
+      written++;
+      logger.info({
+        msg: 'encore-callback-poller: progress updated from encore',
+        externalId,
+        jobId: job.id,
+        progress,
+        instanceId: record.instanceId
+      });
+    } catch (err) {
+      logger.warn({ msg: 'encore-callback-poller: progress update failed', externalId, err });
+    }
+  }
+
+  // Bounded-memory housekeeping: forget jobs we have not written for in an hour.
+  for (const [key, entry] of throttle) {
+    if (at - entry.at > PROGRESS_THROTTLE_TTL_MS) throttle.delete(key);
+  }
+
+  return written;
+}
+
 // Scan `encore:pool:*` keys to find all workspaces that have an active pool,
-// then for each workspace check every Encore instance for terminal jobs
-// (SUCCESSFUL or FAILED) that have a UUID→externalId mapping but whose local job
-// is not yet in a terminal state. If such a job exists and is not already in the
+// then for each workspace check every Encore instance for (a) live progress on
+// its IN_PROGRESS jobs (#830, syncInProgressJobProgress above) and (b) terminal
+// jobs (SUCCESSFUL or FAILED) that have a UUID→externalId mapping but whose local
+// job is not yet in a terminal state. If such a job exists and is not already in the
 // queue, push a synthetic message so the regular loop picks it up and runs the
 // shared handleMessage → completeTranscode path (which marks the job done or
 // failed based on the live Encore status).
@@ -934,6 +1433,11 @@ export async function sweepTerminalJobs(deps: PollerDeps, queueKey: string): Pro
 
       let record: EncoreInstanceRecord;
       try { record = JSON.parse(instanceJson) as EncoreInstanceRecord; } catch { continue; }
+
+      // #830: copy Encore's own `progress` onto the matching local jobs for this
+      // instance's IN_PROGRESS page. Same loop, same timer, same page-size bound
+      // as the terminal statuses below; never throws (best-effort by contract).
+      await syncInProgressJobProgress(deps, record, sat, { pageSize });
 
       // Query each terminal status in turn. Both SUCCESSFUL and FAILED jobs are
       // reconciled the same way — the only per-status difference is this query;
@@ -1025,11 +1529,61 @@ async function recoverProcessingQueue(
   }
 }
 
+// A message's handling threw: put it back for a bounded number of retries,
+// behind everything currently queued, or dead-letter it once the bound is hit.
+// Returns how long the loop should back off before popping again. Never throws
+// — a Valkey hiccup here is logged and the message is left wherever it is
+// (the processing set, recovered on the next start).
+async function requeueOrDeadLetter(
+  deps: PollerDeps,
+  queueKey: string,
+  processingKey: string,
+  raw: string,
+  err: unknown
+): Promise<number> {
+  const attemptsKey = `${queueKey}${ATTEMPTS_SUFFIX}`;
+  const maxAttempts = deps.maxMessageAttempts ?? MAX_MESSAGE_ATTEMPTS;
+  const backoffFor = deps.messageRetryBackoffMs ?? messageRetryBackoffMs;
+  try {
+    const attempt = await deps.redis.hincrby(attemptsKey, raw, 1);
+    await deps.redis.pexpire(attemptsKey, ATTEMPTS_TTL_MS);
+    if (attempt >= maxAttempts) {
+      await deps.redis.zadd(`${queueKey}${DEAD_LETTER_SUFFIX}`, Date.now(), raw);
+      await deps.redis.zrem(processingKey, raw);
+      await deps.redis.hdel(attemptsKey, raw);
+      deps.logger.error({
+        msg: `encore-callback-poller: message failed ${attempt} times — moved to the dead-letter set`,
+        deadLetterKey: `${queueKey}${DEAD_LETTER_SUFFIX}`,
+        raw,
+        err
+      });
+      return backoffFor(1);
+    }
+    const backoffMs = backoffFor(attempt);
+    // Score in the future: every completion already queued (and any that
+    // arrives within the back-off) is popped before this one is retried.
+    await deps.redis.zadd(queueKey, Date.now() + backoffMs, raw);
+    await deps.redis.zrem(processingKey, raw);
+    deps.logger.warn({
+      msg: 'encore-callback-poller: message failed — re-queued behind the current queue',
+      attempt,
+      maxAttempts,
+      backoffMs,
+      raw
+    });
+    return backoffMs;
+  } catch (requeueErr) {
+    deps.logger.warn({ msg: 'encore-callback-poller: failed to re-queue message', raw, err: requeueErr });
+    return backoffFor(1);
+  }
+}
+
 // Start the background poller loop. Returns a stop() function that aborts the
 // loop after the in-flight BZPOPMIN times out (up to BZPOPMIN_TIMEOUT_SECONDS).
 export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
   const queueKey = deps.queueKey ?? DEFAULT_QUEUE_KEY;
   const processingKey = `${queueKey}:processing`;
+  const attemptsKey = `${queueKey}${ATTEMPTS_SUFFIX}`;
   const controller = new AbortController();
   const { signal } = controller;
 
@@ -1122,16 +1676,21 @@ export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
 
         await handleMessage(deps, raw);
 
-        // Phase 2: processing succeeded — remove from the processing set.
+        // Phase 2: processing succeeded — remove from the processing set and
+        // forget any failed attempts a previous pop of this message recorded.
         await deps.redis.zrem(processingKey, raw);
+        await deps.redis.hdel(attemptsKey, raw).catch(() => {});
       } catch (err) {
         deps.logger.error({ msg: 'encore-callback-poller: loop error', err });
-        // Return the message to the main queue so it is retried, then back off.
-        if (raw !== undefined && score !== undefined) {
-          await deps.redis.zadd(queueKey, score, raw).catch(() => {});
-          await deps.redis.zrem(processingKey, raw).catch(() => {});
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        // Return the message for a bounded retry (or dead-letter it), then back
+        // off before the next pop. A pop that itself failed (raw undefined)
+        // just backs off.
+        const backoffMs =
+          raw !== undefined && score !== undefined
+            ? await requeueOrDeadLetter(deps, queueKey, processingKey, raw, err)
+            : (deps.messageRetryBackoffMs ?? messageRetryBackoffMs)(1);
+        if (signal.aborted) break;
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
       }
     }
     deps.logger.info({ msg: 'encore-callback-poller: stopped', queueKey });
@@ -1139,13 +1698,34 @@ export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
 
   void loop();
 
+  // #1213: stop() is idempotent. It is now called from two places — the stack
+  // teardown path (before the stack's Valkey is removed) and the poller sync /
+  // deactivation that follows it — and a second call must not re-disconnect a
+  // released connection or log a second "stopped" line.
+  let stopped = false;
   return () => {
+    if (stopped) return;
+    stopped = true;
     controller.abort();
     clearInterval(sweepTimer);
     // Release the dedicated blocking connection. The in-flight BZPOPMIN (if
     // any) will still resolve/timeout server-side, but .disconnect() drops
     // our end immediately rather than waiting on it — deactivateScaler
     // callers expect stop() to return promptly (issue #103).
+    //
+    // disconnect() also stops ioredis reconnecting (ioredis README, "disconnect":
+    // it closes the connection and does NOT retry), which is what makes stopping
+    // this poller before its Valkey is deprovisioned the cure for the
+    // once-a-second ECONNREFUSED retry loop reported in #1213.
     blockingRedis.disconnect();
+    // Release our 'error' listener with the connection. Without this, an error
+    // event emitted while the socket tears down (the Valkey of a stack being
+    // deleted is gone, so the close path can still surface ECONNREFUSED) logs a
+    // warning for a poller the caller has already stopped, which is exactly the
+    // noise #1213 was reported from.
+    // Optional-called for the same reason as sweepTimer.unref?.() above: the
+    // duplicated client is whatever deps.redis.duplicate() returned, which for
+    // a test double need not implement the full EventEmitter surface.
+    blockingRedis.removeAllListeners?.('error');
   };
 }

@@ -57,6 +57,19 @@
 
 import type { Asset, AssetRepository, ListResult } from '../data/asset-repo.js';
 
+// The reason recorded on this sweep's `uploading -> failed` statusHistory entry
+// (issue #1085). It must stay DISTINCT from the interrupted-pull reconciler's
+// reason (INTERRUPTED_PULL_ASSET_REASON,
+// src/pipeline/interrupted-ingest-reconciler.ts): both settles write the same
+// `uploading -> failed` pair, so the reason is the only thing in the history
+// that says whether the CLIENT stopped uploading or the SERVER's pull worker
+// died. Exported so callers and tests assert on the same string.
+//
+// This names the sweep's existing behaviour; it does not change WHICH assets it
+// settles or WHEN (issue #1085 explicitly leaves the 24h client-upload sweep's
+// behaviour alone).
+export const ABANDONED_UPLOAD_REASON = 'upload abandoned';
+
 type Logger = {
   info?(...a: unknown[]): void;
   warn?(...a: unknown[]): void;
@@ -138,7 +151,13 @@ export async function settleAbandonedUploads(
       // state machine and appends the `uploading -> failed` statusHistory entry
       // (applyStatus, src/data/asset-repo.ts:1080-1098), which is the durable
       // evidence that the upload did not complete.
-      const result = await deps.assets.update(asset.id, { status: 'failed' });
+      // `statusReason` annotates that appended entry with WHY (issue #1085), so
+      // an abandoned client upload is distinguishable from an interrupted URL
+      // pull, which lands on the identical `uploading -> failed` pair.
+      const result = await deps.assets.update(asset.id, {
+        status: 'failed',
+        statusReason: ABANDONED_UPLOAD_REASON
+      });
       if (result === undefined) {
         deps.logger?.warn?.(
           '[abandoned-upload-sweep] asset %s vanished before settle',

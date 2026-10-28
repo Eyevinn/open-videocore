@@ -28,6 +28,8 @@ import {
   ReferencedByJobError,
   STORAGE_BYTE_CLASSES,
   STORAGE_TIERS,
+  allowedReviewTransitions,
+  currentVersionId,
   defaultStorageTiering,
   isUlid,
   normalizeTags,
@@ -36,8 +38,30 @@ import {
   type AssetAudioTrack,
   type AssetRepository,
   type PackagedOutput,
-  type SubtitleTrack
+  type SubtitleTrack,
+  type VideoTrack
 } from '../data/asset-repo.js';
+// Per-asset retention window on the read contract (issue #1034). The projection
+// lives in ONE module shared with nothing else to re-derive: it reuses
+// archivedAtOf() (the purge sweep's own eligibility source) and the live
+// instance-global retention window, so the route adds no second source of truth.
+import {
+  assetRetentionWindow,
+  AssetRetentionWindowSchema,
+  type AssetRetentionWindow
+} from '../data/asset-retention.js';
+// Boot/fallback resolution of the archived-asset retention window from the
+// environment (12-factor), used when the router is wired without a live getter.
+import { archiveRetentionMsFromEnv } from './retention.js';
+// Created-at range filtering (issue #833). The wire grammar, the inclusive
+// bound semantics and the normalisation to canonical UTC instants live in ONE
+// module shared with GET /api/v1/search/, so the two endpoints cannot answer a
+// differently-shaped range for the same query string.
+import {
+  CreatedFromSchema,
+  CreatedToSchema,
+  resolveCreatedRange
+} from '../data/created-range.js';
 // Collection membership (issue #570). The asset DELETE route blocks archiving an
 // asset that is still a member of one or more collections; the collection repo
 // owns the authoritative membership representation (the flat `assetIds` list,
@@ -70,6 +94,17 @@ import { authGate } from '../auth/middleware.js';
 import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
 import { emitAudit, originActor, type AuditEmitter } from '../data/audit-emit.js';
+// On-demand purge of a single archived asset (issue #837). The route REUSES the
+// retention sweep's per-asset purge path (`purgeArchivedAsset`) so the
+// cross-bucket object removal and the doc-replace-to-tombstone step are one
+// implementation shared with the timed sweep (#327), not a parallel one. The
+// cycle this creates with the sweep module (it imports `parseS3Uri` from here)
+// is only ever exercised at call time — both sides export hoisted function
+// declarations and neither touches the other at module-evaluation time.
+import {
+  purgeArchivedAsset,
+  type PurgeStorage
+} from '../pipeline/archived-asset-purge-sweep.js';
 import {
   SourceTooLargeError,
   WorkspaceStorage,
@@ -82,6 +117,7 @@ import {
   PublicManifestBaseUrlError
 } from '../pipeline/packaging.js';
 import { runPull, type PullDeps } from '../pipeline/url-pull-worker.js';
+import { runWithPersistedStack } from '../services/request-stack-context.js';
 import { type StorageQuotaGuard } from '../data/storage-quota.js';
 import {
   extractTechnicalMetadata,
@@ -95,8 +131,21 @@ import {
   type StorageBackendRegistry
 } from '../services/storage-backend-registry.js';
 import { InvalidPathTemplateError } from '../services/destination-path-template.js';
-import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
-import { submitTranscode } from '../pipeline/transcode.js';
+import {
+  STACK_CONFIG_NAMESPACE,
+  stackResolvedMinioEndpoint
+} from '../services/workspace-stack.js';
+import {
+  objectStoreStackMismatch,
+  objectStoreStackMismatchMessage,
+  isObjectStoreStackMismatchError
+} from '../services/object-store-stack-identity.js';
+import { submitTranscode, DEFAULT_PROFILE_NAME } from '../pipeline/transcode.js';
+import {
+  logPipelineEvent,
+  type PipelineLogSink,
+  type PipelineLogStage
+} from '../services/pipeline-log.js';
 import { validateProfileParams } from '../pipeline/profile-params.js';
 import { resolveProfileYaml } from '../pipeline/resolve-profile-yaml.js';
 import {
@@ -131,9 +180,38 @@ import {
   type FrameExtractor
 } from '../pipeline/thumbnail.js';
 import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/clip.js';
-import { oscClipJobLog } from '../pipeline/osc-clip.js';
+import {
+  resolveRunnerOption,
+  runnerS3Config,
+  RunnerFactoryUnresolvedError,
+  type RunnerOption
+} from '../pipeline/runner-option.js';
+// Shared accessor for the ffmpeg log an awaited OSC job failure carries as data
+// (issue #786 for clip, issue #944 for export / re-wrap). Used on the 502 paths
+// of POST /:id/clip and POST /:id/export to log the job's own output
+// SERVER-SIDE; it is never put in the response body.
+import { oscJobLog } from '../pipeline/osc-job-log.js';
 import { parseDestination } from '../pipeline/output-relocation.js';
+// Deliver an existing asset object to a registered export destination (issue
+// #1131). The module owns the byte movement (server-side CopyObject) and the
+// landing verification that makes the endpoint's terminal status truthful.
+import {
+  deliverAssetObject,
+  destinationEndpointRefusal,
+  type DeliveryFailureReason,
+  type DeliveryObjectClient
+} from '../pipeline/asset-delivery.js';
 import { requireSourceObject, tryResolveSourceObject } from '../pipeline/source-object.js';
+// Structured step failure detail (issue #1060). ONE shared schema so this
+// router's copy of stepExecutionSchema and the pipelines router's copy
+// (src/routes/pipelines.ts) cannot drift on it.
+import { stepErrorDetailSchema } from '../pipeline/step-error-detail.js';
+// Pre-dispatch verification that the transcode source object is actually present
+// and readable in the bucket the transcoder will read (issue #1059).
+import {
+  checkTranscodeSourceReadable,
+  type SourceStatReader
+} from '../pipeline/source-readiness.js';
 import {
   backendOutputDestination,
   DEFAULT_BACKEND_ID
@@ -143,6 +221,7 @@ import {
   manifestUrlsForLocation,
   outputPrefix,
   packagedBucket,
+  packagedPublicOrigin,
   packagedRelocationOrigin,
   proxyManifestUrlsFor,
   resolvePackagedOutput,
@@ -156,15 +235,21 @@ import {
 import type { EncoreClient } from '../pipeline/encore-client.js';
 import { isProfileRunnable } from '../services/profile-runnability.js';
 import { validateProfileColourSignalling } from '../pipeline/profile-colour-guard.js';
-import { decodeEncoreJobId } from '../data/job-repo.js';
-import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
+// `decodeEncoreJobId` / `keys` / `EncoreInstanceRecord` are no longer imported
+// here (issue #739): the encoreJobId -> instance -> pool-record walk they were
+// used for now lives behind `resolvePackagingTarget` in
+// src/encore-scaler/packaging-target.ts, shared with src/routes/internal.ts.
+import { pinInstanceForPackaging } from '../encore-scaler/packaging-pin.js';
+import {
+  resolvePackagingTarget,
+  type PackagingTarget
+} from '../encore-scaler/packaging-target.js';
 import { isDependencyUnreachableError } from '../encore-scaler/dependency-timeout.js';
 import {
   checkStackReachability,
   firstUnreachable
 } from '../services/stack-reachability.js';
 import { isJobThroughputCapExceededError } from '../encore-scaler/job-throughput-cap.js';
-import type { EncoreProfile } from '../pipeline/encode-presets.js';
 import {
   rewrap,
   REWRAP_FORMATS,
@@ -177,10 +262,39 @@ import {
   externalObjectUrl
 } from '../pipeline/packaging.js';
 
+// Fallback source bucket for runner-factory resolution when the request carries
+// no resolved stack. Mirrors the default in WorkspaceConnections.sourceBucket
+// (src/services/workspace-stack.ts:369) and MINIO_SOURCE_BUCKET (main.ts:900).
+const DEFAULT_SOURCE_BUCKET = 'openvideocore-source';
+
 const statusSchema = z.enum(ASSET_STATUSES);
 
 // Editorial review state (issue #134), distinct from lifecycle `status`.
 const reviewStateSchema = z.enum(ASSET_REVIEW_STATES);
+
+// Read shape of the review-state sub-resource (issue #897): the asset's current
+// editorial review state plus the moves the review state machine allows from
+// it. `allowedTransitions` is derived server-side from the one transition table
+// that also drives the 422 gate (ALLOWED_REVIEW_TRANSITIONS,
+// src/data/asset-repo.ts), so a client gates on legal moves without keeping its
+// own copy of the graph.
+const reviewStateReadSchema = z.object({
+  reviewState: reviewStateSchema.describe(
+    'The current editorial review state. `draft` for assets that have never ' +
+      'been submitted (including ones stored before the field existed). ' +
+      'INDEPENDENT of the lifecycle `status`.'
+  ),
+  allowedTransitions: z
+    .array(reviewStateSchema)
+    .describe(
+      'The review states this asset may move to next, from its current ' +
+        '`reviewState`. Every value listed here is accepted by ' +
+        'POST /assets/{id}/review-state; every state NOT listed (other than ' +
+        '`reviewState` itself) is refused with 422. The current state is ' +
+        'never listed — re-sending it succeeds as an idempotent no-op but is ' +
+        'not a move. May be empty, which means the state is terminal.'
+    )
+});
 
 // Storage-tier state (ADR-019, issue #556), distinct from lifecycle `status`.
 // The physical byte-location axis (`hot` | `archive`) tracked per byte class,
@@ -214,21 +328,41 @@ const storageTieringSchema = z.object({
     )
 });
 
-// A custom Encore profile a caller may supply instead of a named preset. Kept
-// permissive (forwarded to Encore) but bounded so it cannot be abused.
-const encoreOutputSchema = z.object({
-  label: z.string().min(1).max(64),
-  width: z.number().int().positive(),
-  height: z.number().int().positive(),
-  videoBitrateBps: z.number().int().positive(),
-  audioBitrateBps: z.number().int().positive(),
-  format: z.string().min(1).max(32)
-});
+// `customProfile` is REMOVED from the API (issue #1022). It used to accept a
+// full `outputs` ladder (label/width/height/videoBitrateBps/audioBitrateBps/
+// format, 1-16 renditions), validate every field, and then submit only its
+// `name` — so every encoding setting a caller supplied was silently discarded.
+//
+// Contract that makes an inline ladder impossible (fetched 2026-10-05 from
+// github.com/svt/encore, the upstream transcoding service this API submits to —
+// the same project cited by src/pipeline/encore-client.ts:33-36):
+//   - `encore-common/.../model/EncoreJob.kt:52,58,66,74,180` — the job document
+//     is `profile: String` + `profileParams: Map<String, Any?>` + outputFolder +
+//     baseName + inputs. No `outputs` / inline-profile field exists.
+//   - `encore-common/.../service/profile/ProfileService.kt` —
+//     `getProfile(job: EncoreJob)` resolves `profiles[job.profile]` out of the
+//     server-side profile index and throws "Could not find location for profile
+//     ${job.profile}!" otherwise.
+// A ladder is therefore expressed by REGISTERING a profile (POST
+// /api/v1/profiles — src/routes/profiles.ts:209-234, stored in the per-tenant
+// profile store the transcoding instances load via GET
+// /api/v1/profiles/index.yml) and naming it in `profile`.
+//
+// The field is kept in the schema purely to REJECT it with that explanation: if
+// it were simply dropped, Zod would strip the unknown key and a caller's ladder
+// would still vanish silently — the exact failure mode #1022 is about.
+const REMOVED_CUSTOM_PROFILE_MESSAGE =
+  'customProfile was removed: an encoding ladder cannot be supplied inline — the transcoding service resolves a profile by NAME only. Register the ladder as a profile (POST /api/v1/profiles) and pass its name as `profile`.';
 
-const customProfileSchema = z.object({
-  name: z.string().min(1).max(128),
-  outputs: z.array(encoreOutputSchema).min(1).max(16)
-});
+const removedCustomProfileSchema = z
+  .undefined({ invalid_type_error: REMOVED_CUSTOM_PROFILE_MESSAGE })
+  .describe(
+    'REMOVED (issue #1022). Supplying this field is rejected with a 400. An encoding ladder ' +
+      'cannot be submitted inline: the transcoding service resolves a profile by NAME against ' +
+      'its own profile index, so an inline `outputs` array could never reach the encoder — it ' +
+      'used to be validated and then discarded. Register the ladder as a profile ' +
+      '(POST /api/v1/profiles) and pass its name as `profile`.'
+  );
 
 // profileParams (issue #287): a flat string map forwarded verbatim into the
 // Encore job document's `profileParams` object, which Encore evaluates as SpEL
@@ -278,27 +412,39 @@ const burnInSchema = z.object({
     )
 });
 
-const transcodeBodySchema = z
-  .object({
-    profile: z.string().min(1).optional(),
-    customProfile: customProfileSchema.optional(),
-    profileParams: profileParamsSchema.optional(),
-    burnIn: burnInSchema.optional()
-  })
-  .refine((b) => !(b.profile && b.customProfile), {
-    message: 'specify either profile or customProfile, not both'
-  });
+const transcodeBodySchema = z.object({
+  // Name of a profile registered in the profile store (GET /api/v1/profiles).
+  // An unknown name is rejected with a 400 BEFORE submission (issue #1022) so a
+  // typo surfaces here rather than as a dropped job on the transcoding side.
+  // Omitted -> DEFAULT_PROFILE_NAME.
+  profile: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Name of a profile registered on this deployment (list them with GET /api/v1/profiles). ' +
+        'The encoding ladder lives in the profile; the transcoding service resolves this name ' +
+        'against the profile index it loads. A name this deployment does not hold is rejected ' +
+        'with a 400 `unknown_profile` at submit time rather than failing later as a dropped ' +
+        'job (issue #1022). Omitted: the deployment default profile is used, and the job ' +
+        'record reports whichever profile was actually submitted.'
+    ),
+  customProfile: removedCustomProfileSchema,
+  profileParams: profileParamsSchema.optional(),
+  burnIn: burnInSchema.optional()
+});
 
 const transcodeAcceptedSchema = z.object({
   jobId: z.string(),
   encoreJobId: z.string(),
   // Non-fatal notice (issue #394). Present ONLY when profileParams validation
-  // could not be performed because the profile YAML was unresolvable — either a
-  // custom profile that is not in the operator profile store, or the profile
-  // store was unreachable. The request was still accepted (202) and the
-  // profileParams keys were forwarded to Encore UNCHECKED. Absent when the keys
-  // were validated against the profile's declared params, or when the request
-  // carried no profileParams at all.
+  // could not be performed because the profile YAML was unresolvable — either
+  // the profile store was unreachable, or no profile was named and the default
+  // profile is not in the store (a CALLER-NAMED profile missing from a reachable
+  // store is now a 400, not a warning — issue #1022). The request was still
+  // accepted (202) and the profileParams keys were forwarded to Encore
+  // UNCHECKED. Absent when the keys were validated against the profile's
+  // declared params, or when the request carried no profileParams at all.
   warning: z
     .object({
       code: z
@@ -316,9 +462,10 @@ const transcodeAcceptedSchema = z.object({
     })
     .describe(
       'Present only when profileParams validation could not be performed because the ' +
-        'profile YAML was unresolvable (a custom profile not in the store, or the profile ' +
-        'store was unreachable). The request was still accepted and the keys were forwarded ' +
-        'to Encore unchecked.'
+        'profile YAML was unresolvable (the profile store was unreachable, or no profile ' +
+        'was named and the default profile is not in the store). A caller-named profile ' +
+        'that a reachable store does not hold is rejected with a 400 instead. The request ' +
+        'was still accepted and the keys were forwarded to Encore unchecked.'
     )
     .optional()
 });
@@ -365,7 +512,13 @@ const listQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional(),
   offset: z.coerce.number().int().min(0).optional(),
   status: statusSchema.optional(),
-  parentId: z.string().min(1).optional()
+  parentId: z.string().min(1).optional(),
+  // Inclusive created-at range (issue #833). Same grammar and same match
+  // semantics as `GET /api/v1/search/?from=&to=` — both import the one
+  // definition in data/created-range.ts. Applied to the whole result set before
+  // `limit`/`offset`, so it narrows `total` and every page.
+  from: CreatedFromSchema.optional(),
+  to: CreatedToSchema.optional()
 });
 
 // TAMS-addressed lookup query params (issue #175, sub-task of #116; contract
@@ -529,11 +682,24 @@ const deliveryUrlsSchema = z.object({
 // (issue #502) for a client to locate the master manifest objects itself
 // against its own object-store access. All fields are optional/additive: a
 // pre-#502 asset (no persisted `packagedOutput`) simply omits them.
+//
+// `missingConfiguration` / `reason` (issue #860) name WHICH configuration is
+// absent, so `not_configured` is actionable rather than merely negative. Before
+// #860 an unconfigured `public`-mode deployment silently advertised authorized
+// proxy URLs instead, which concealed the missing setting entirely (an operator
+// copied a manifest URL out of the API and got a bare 401 with nothing saying
+// why). Both fields are optional: a caller that only keys off `status` is
+// unaffected.
 const deliveryResolutionSchema = z.object({
   packagedBucket: z.string().optional(),
   packagedPrefix: z.string().optional(),
   masterHlsKey: z.string().optional(),
-  masterDashKey: z.string().optional()
+  masterDashKey: z.string().optional(),
+  // Environment variable name(s) that would make this deployment able to
+  // advertise a resolvable playback URL, most-preferred first.
+  missingConfiguration: z.array(z.string()).optional(),
+  // Human-readable explanation of what is unset and what setting it enables.
+  reason: z.string().optional()
 });
 
 // `status` (issue #506) is the unambiguous readiness signal a consuming
@@ -545,7 +711,12 @@ const deliveryResolutionSchema = z.object({
 //                        playback URL can be built. `urls.hls`/`urls.dash` are
 //                        omitted; `resolution` carries the packaged prefix and
 //                        master manifest keys for deterministic client-side
-//                        resolution instead.
+//                        resolution instead, plus (issue #860)
+//                        `resolution.missingConfiguration` / `resolution.reason`
+//                        naming the setting that would make delivery resolvable.
+//                        This status is NEVER substituted by a URL from the
+//                        other delivery mode: see the DELIVERY_MODE precedence
+//                        block in the `/:id/delivery` handler.
 //   - `failed`         — the asset's ingest/processing lifecycle ended in
 //                        `failed` (`AssetStatus`, src/data/asset-repo.ts:25-29)
 //                        and it never produced packaged output, so there is no
@@ -599,6 +770,76 @@ const assetFilesSchema = z.object({
   fileGroups: z.array(assetFileGroupSchema)
 });
 
+// Per-asset storage usage of the CURRENT output set (issue #1242). A derived
+// read, like the files view above: nothing is stored, every number is measured
+// against the object store at request time from the asset's own storage fields
+// (`renditions[].objectKey`, the packaged prefix the stream proxy resolves).
+//
+// WHY: the deployment-wide total (`GET /api/v1/usage`, src/routes/usage.ts) says
+// how many bytes are consumed overall but not by WHAT, so an operator deciding
+// whether to re-encode an asset at a different ladder cannot see what the
+// existing output set costs. This attributes the bytes to one asset.
+//
+// SCOPE: outputs only — the transcoded renditions and the packaged (HLS/DASH)
+// object set. The ingested source object is deliberately NOT counted here: it is
+// an input, it is not reproduced by a re-encode, and counting it would make
+// "what does this output set cost" unanswerable from the response.
+const assetStorageUsageRenditionSchema = z.object({
+  // The rendition's stable ULID (asset-repo.ts Rendition.id).
+  id: z.string(),
+  // Rung label from the encode profile, when the rendition carries one.
+  label: z.string().optional(),
+  // Bucket-local object key actually measured (an `s3://bucket/key` rendition
+  // key is reported here bucket-excluded, matching the /:id/files convention).
+  objectKey: z.string(),
+  // The bucket the object was measured in.
+  bucket: z.string().optional(),
+  // Size in bytes, or null when the object could not be measured: either it is
+  // absent from the store (a stale rendition record) or the store could not be
+  // read. Null NEVER means zero — `complete` below reports whether any are null.
+  sizeBytes: z.number().nullable(),
+  // Whether this rendition's bytes are included in `renditions.bytes` /
+  // `totalBytes`. False for an unmeasurable object, and false for a rendition
+  // whose object lives inside the measured packaged prefix (its bytes are
+  // already counted in `packagedOutput.bytes`, so counting them again would
+  // double the total).
+  counted: z.boolean()
+});
+
+const assetStorageUsagePackagedSchema = z.object({
+  // The packaged bucket the prefix was listed in.
+  bucket: z.string(),
+  // The packaged-output key prefix measured, with a trailing slash. This is the
+  // SAME prefix the stream proxy serves objects from (resolveStreamPrefix).
+  prefix: z.string(),
+  // How many objects (manifests + CMAF init/media segments) sit under it.
+  objectCount: z.number(),
+  bytes: z.number()
+});
+
+const assetStorageUsageSchema = z.object({
+  assetId: z.string(),
+  // Renditions + packaged output, in bytes. Only `counted` renditions and a
+  // measured packaged set contribute, so this never includes a guessed size.
+  totalBytes: z.number(),
+  // True when every part of the output set was measured. False when a rendition
+  // object was missing/unreadable or the packaged prefix could not be listed —
+  // the reported bytes are then a LOWER BOUND, not the whole output set.
+  complete: z.boolean(),
+  renditions: z.object({
+    // How many rendition records the asset carries.
+    count: z.number(),
+    // How many of them contributed bytes to the total.
+    countedCount: z.number(),
+    bytes: z.number(),
+    items: z.array(assetStorageUsageRenditionSchema)
+  }),
+  // Null when the asset has no packaged output at all (never packaged), and
+  // null — with `complete: false` — when it has packaged output that could not
+  // be measured here (no object-store connection to list the prefix with).
+  packagedOutput: assetStorageUsagePackagedSchema.nullable()
+});
+
 // Thumbnail extraction request (issue #7): one or more timecodes in seconds.
 const thumbnailsBodySchema = z.object({
   timecodes: z.array(z.number().min(0)).min(1).max(50)
@@ -638,6 +879,65 @@ const exportBodySchema = z.object({
   // export is additionally recorded as a version of the source asset.
   asVersion: z.boolean().optional()
 });
+
+// Deliver request (issue #1131): WHICH registered export destination the
+// asset's existing source object is to be delivered to. `destination` is the
+// stable id OR the human name of a registered output-role destination — the
+// SAME reference form the named-destination job path accepts
+// (`resolveJobDestination`, below) and the same records
+// GET /api/v1/export-destinations lists (src/routes/export-destinations.ts:
+// 279-288). Nothing else is accepted: this endpoint delivers bytes that already
+// exist, so there is no format, profile or output-name to choose. The bound
+// mirrors the destination id/name bound on the export-destinations surface
+// (`z.string().min(1).max(256)`, export-destinations.ts:301).
+const deliverBodySchema = z.object({
+  destination: z.string().min(1).max(256)
+});
+
+// Deliver result (issue #1131). Describes the object AS VERIFIED at the
+// destination after the copy: the bucket + key it was re-read at, its byte
+// count and etag. `status` is a single terminal value — the endpoint answers
+// 200 only when the object really landed, so a 200 can never mean "submitted"
+// or "probably".
+const deliverResultSchema = z.object({
+  assetId: z.string(),
+  status: z.literal('delivered'),
+  destination: z.object({
+    id: z.string(),
+    name: z.string(),
+    role: z.enum(['packaged', 'both'])
+  }),
+  bucket: z.string(),
+  objectKey: z.string(),
+  bytes: z.number(),
+  etag: z.string(),
+  deliveredAt: z.string()
+});
+
+// How each delivery failure reason (src/pipeline/asset-delivery.ts) surfaces as
+// HTTP. Exhaustive by type, so a new reason cannot be added without deciding
+// how it is reported — and none of them can be reported as a 200.
+//   - a destination we cannot write to / verify, and an over-size source, are
+//     caller-actionable 422s (the same code the #209 destination pre-flight
+//     uses for an unreachable destination bucket);
+//   - missing source BYTES are a 409: the asset document named an object that
+//     is not in the bucket, so there was nothing to deliver;
+//   - a failed copy, or a copy that did not land, is a 502 — the store is
+//     downstream of us and reported (or silently produced) a failure;
+//   - an unsettled delivery is a 504: we genuinely do not know the outcome, so
+//     it must not be dressed up as either success or a clean failure.
+const DELIVERY_FAILURE_RESPONSE: Record<
+  DeliveryFailureReason,
+  { status: 409 | 422 | 502 | 504; error: string }
+> = {
+  destination_unreachable: { status: 422, error: 'destination_unreachable' },
+  source_missing: { status: 409, error: 'source_missing' },
+  source_too_large: { status: 422, error: 'source_too_large' },
+  copy_failed: { status: 502, error: 'delivery_failed' },
+  not_landed: { status: 502, error: 'delivery_failed' },
+  timeout: { status: 504, error: 'delivery_timeout' }
+};
+
 // Clip / trim request (issue #17): a time window in seconds. `endSeconds` must
 // be strictly greater than `startSeconds`. Optional `outputName` names the new
 // child asset.
@@ -658,7 +958,12 @@ const clipBodySchema = z
 const transitionSchema = z.object({
   at: z.string(),
   from: statusSchema.nullable(),
-  to: statusSchema
+  to: statusSchema,
+  // Why a background settle moved the asset (issue #1085): the abandoned-upload
+  // sweep and the interrupted-pull reconciler both write `uploading -> failed`,
+  // and this is the only thing in the response that tells a caller which one it
+  // was. Optional — user-driven transitions carry none.
+  reason: z.string().optional()
 });
 
 const audioTrackSchema = z.object({
@@ -676,7 +981,25 @@ const technicalMetadataSchema = z.object({
   bitrateBps: z.number(),
   containerFormat: z.string(),
   audioTracks: z.array(audioTrackSchema),
-  extractedAt: z.string()
+  extractedAt: z.string(),
+  // Frames per second of the primary video stream (issue #1066). Clients doing
+  // frame-by-frame stepping need it to convert between frames and seconds.
+  // OPTIONAL: omitted for a source with no video stream, and for assets probed
+  // before the extractor read the rate.
+  frameRate: z
+    .number()
+    .optional()
+    .describe(
+      'Frames per second of the primary video stream, as reported by the probe. ' +
+        'Omitted when the source carries no video stream or was probed before ' +
+        'the frame rate was extracted.'
+    ),
+  // Start timecode of the source, e.g. "01:00:00:00" (issue #1066). OPTIONAL:
+  // most sources carry none.
+  startTimecode: z
+    .string()
+    .optional()
+    .describe('Start timecode of the source (e.g. "01:00:00:00"), when it carries one.')
 });
 
 const manifestUrlsSchema = z.object({
@@ -748,10 +1071,117 @@ const addSubtitleTrackSchema = z.object({
   default: z.boolean().optional()
 });
 
+// Machine-probed video tracks (issue #978). Mirrors the PERSISTED per-track
+// shape one-for-one — `VideoTrackSchema` in src/data/asset-document.ts
+// (index?, codec, width, height, bitrateBps?, frameRate?), stored at
+// `technical.video[]` — so the read API reports exactly what the probe wrote,
+// including the `index` / `frameRate` that `technicalMetadata` cannot carry.
+// Unlike `audioTrackOutSchema` above there is no `id`: these are stream
+// descriptors, not editorial records, so they are read-only and not individually
+// addressable.
+const videoTrackOutSchema = z.object({
+  index: z.number().optional(),
+  codec: z.string(),
+  width: z.number(),
+  height: z.number(),
+  bitrateBps: z.number().optional(),
+  frameRate: z
+    .number()
+    .optional()
+    .describe(
+      'Frames per second of this video track, as reported by the probe. Omitted ' +
+        'when the asset was probed before the frame rate was extracted.'
+    ),
+  startTimecode: z
+    .string()
+    .optional()
+    .describe('Start timecode of the source (e.g. "01:00:00:00"), when it carries one.')
+});
+
+// Project an asset's video tracks for the read API (issue #978). The canonical
+// source is `asset.videoTracks`, mapped straight off the persisted
+// `technical.video[]` (asset-document.ts `fromAssetDocument`). A repository that
+// keeps flat assets without a document round-trip (the in-memory tier) has no
+// such array, so fall back to the single track `technicalFromAsset` would
+// persist for that asset (asset-document.ts: codec, width, height, bitrateBps
+// off `technicalMetadata`) — the same bytes either tier would store, so both
+// backends answer identically. Unprobed asset: empty array, never undefined.
+function videoTracksOf(asset: Asset): VideoTrack[] {
+  // An audio-only source is recorded by the probe as `codec: 'unknown'` with zero
+  // dimensions (pipeline/metadata-extractor.ts parseFfprobe). That placeholder is
+  // not a video track, so drop it here for either storage tier rather than report
+  // a 0x0 "unknown" stream (issue #1066, AC2).
+  const isProbePlaceholder = (t: VideoTrack): boolean =>
+    t.codec === 'unknown' && !t.width && !t.height;
+  if (asset.videoTracks) {
+    return asset.videoTracks.filter((t) => !isProbePlaceholder(t));
+  }
+  const tm = asset.technicalMetadata;
+  if (!tm) {
+    return [];
+  }
+  return [
+    {
+      codec: tm.codec,
+      width: tm.width,
+      height: tm.height,
+      bitrateBps: tm.bitrateBps,
+      ...(tm.frameRate !== undefined ? { frameRate: tm.frameRate } : {}),
+      ...(tm.startTimecode !== undefined ? { startTimecode: tm.startTimecode } : {})
+    }
+  ].filter((t) => !isProbePlaceholder(t));
+}
+
 const tracksSchema = z.object({
+  // Always present, like the two arrays below: empty when the asset has not
+  // been probed (or carries no video stream). Additive — adding a required
+  // property to a RESPONSE does not break existing readers.
+  videoTracks: z.array(videoTrackOutSchema),
   audioTracks: z.array(audioTrackOutSchema),
   subtitleTracks: z.array(subtitleTrackOutSchema)
 });
+
+// Per-asset retention window (issue #1034). Read-only PROJECTION of the
+// instance-global retention policy (`retentionMs`, GET/PATCH
+// /api/v1/retention/config) onto one archived asset — it introduces no new
+// policy and no second source of truth: `archivedAt` is `archivedAtOf(asset)`,
+// the same function the purge sweep tests eligibility with, and `retentionMs` is
+// the live window read at request time (so a PATCH to the config can never leave
+// a client holding a stale deadline).
+//
+// Present ONLY while `status === "archived"` (the only state the purge sweep
+// scans); omitted entirely on every other asset, including the body of a
+// successful restore — which has just left `archived`.
+//
+// Attached by the ONE helper `withRetentionWindow` (below) at every response
+// that serializes an EXISTING asset — the single-asset reads (`GET /:id`,
+// `GET /by-external-id/...`), the `GET /` listing (so `?status=archived` rows
+// carry it), the deprecated free-text alias `GET /assets/search` (which has no
+// status filter, so archived rows reach it too), the `GET /:id/versions` chain
+// (which includes archived members by design), and the mutation bodies that
+// echo the stored asset — so the rule is uniform rather than per-route.
+//
+// Exactly TWO responses typed with `assetSchema` do NOT route through the
+// helper, both because they can never carry an archived asset:
+//   - creation responses (`201`): a newly created asset is never `archived`;
+//   - `GET /assets/by-tams-address`: it resolves `ready` assets only.
+// Any NEW route that serializes a stored asset belongs in the first list, not
+// this one, unless it is provably archived-free.
+//
+// The rule extends BEYOND this router: `GET /api/v1/search/`
+// (src/routes/search.ts) serves archived assets through `?status=archived` and
+// projects the same window from the same helper, so the canonical search
+// endpoint is never poorer than the deprecated `GET /assets/search` alias that
+// advertises it as `successor-version`.
+// The wire shape itself is the SHARED `AssetRetentionWindowSchema` from
+// src/data/asset-retention.ts (declared beside the projection that produces it),
+// re-exported here under the local name the asset schema uses. The canonical
+// successor search endpoint `GET /api/v1/search/` (src/routes/search.ts) imports
+// the same schema for its asset hits, so this router and that one publish one
+// definition of `retention` and cannot drift — in particular the DEPRECATED
+// alias `GET /assets/search` can never be richer than the successor-version
+// endpoint it points callers at.
+const retentionWindowSchema = AssetRetentionWindowSchema;
 
 const assetSchema = z.object({
   id: z.string(),
@@ -797,6 +1227,32 @@ const assetSchema = z.object({
   versionOfAssetId: z.string().optional(),
   versionGroupId: z.string().optional(),
   objectKey: z.string().optional(),
+  // Byte length of the stored source object (issue #1173), the read side of the
+  // length recorded at ingest completion (`Asset.sourceSizeBytes`,
+  // src/data/asset-repo.ts, persisted at `administrative.storage.sizeBytes`).
+  // It pairs with `objectKey` above: the recorded length always describes the
+  // recorded key, because any patch that changes `objectKey` without supplying a
+  // new length clears it (asset-repo.ts `update()`, couch-asset-repo.ts
+  // `applyPatch()`).
+  //
+  // OPTIONAL, and absence is MEANINGFUL: it means "no length was ever recorded",
+  // not "zero bytes". Absent on assets ingested before the length was recorded
+  // and on the finalize paths that cannot learn it (a presigned-PUT completion
+  // whose stat does not report a size), so it must never be coerced to `0` —
+  // a `0` on the wire would read as a legitimately empty source. The repositories
+  // already normalise the stored "nothing recorded" sentinel `0` back to
+  // undefined (asset-document.ts `fromAssetDocument`), so this field is either a
+  // positive byte count or missing.
+  sourceSizeBytes: z
+    .number()
+    .optional()
+    .describe(
+      'Byte length of the stored source object, as recorded when ingest ' +
+        'completed. Omitted — never 0 — when no length was ever recorded for ' +
+        'the current object key, e.g. an asset ingested through a finalize path ' +
+        'that could not learn the size. A present value always describes the ' +
+        'current `objectKey`.'
+    ),
   statusHistory: z.array(transitionSchema),
   // Technical metadata (issue #6). `null` until the first successful extraction
   // (or after a failed one); `technicalMetadataError` carries the last failure.
@@ -827,6 +1283,10 @@ const assetSchema = z.object({
   subtitleTracks: z.array(subtitleTrackOutSchema).optional(),
   // First-class tags (issue #11). Absent until the first tag is set.
   tags: z.array(z.string()).optional(),
+  // Per-asset retention window (issue #1034). Derived, read-only, and present
+  // ONLY while `status === "archived"` — see retentionWindowSchema above. It is
+  // not persisted on the asset document and is never accepted from a client.
+  retention: retentionWindowSchema.optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
@@ -910,10 +1370,11 @@ type AssetsRouterOptions = {
   // S3 bucket names Encore reads the source from / writes renditions to.
   sourceBucket?: string;
   outputBucket?: string;
-  // Thumbnail / poster-frame extraction (issue #7). Factory receives the
+  // Thumbnail / poster-frame extraction (issue #7). Either a ready FrameExtractor
+  // or a tagged factory (`runnerFactory(...)`, issue #838) that receives the
   // workspace's s3Config so the OSC ffmpeg job can write directly to the right
   // MinIO bucket. When absent (or no object storage), the thumbnail routes respond 501.
-  thumbnailExtractor?: FrameExtractor | ((s3Config: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => FrameExtractor);
+  thumbnailExtractor?: RunnerOption<FrameExtractor>;
   // Injectable extractor runner + extra deps (tests stub the extractor/TTL).
   // Defaults to the real awaited extractor.
   extractThumbnails?: typeof extractThumbnails;
@@ -925,26 +1386,38 @@ type AssetsRouterOptions = {
   thumbnailPublicBaseUrl?: string;
   // Export / re-wrap (issue #19). `rewrapRunner` runs the OSC ffmpeg `-c copy`
   // job (eyevinn-ffmpeg-s3 in production, a stub in tests). Like the thumbnail
-  // extractor it may be a factory that receives the workspace's s3Config so the
-  // OSC job can write the output directly to the right MinIO bucket via
-  // `s3://bucket/key` (a presigned PUT URL does NOT work — issue #316). When
-  // absent (or no object storage), POST /:id/export responds 501.
-  rewrapRunner?: RewrapRunner | ((s3Config: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => RewrapRunner);
+  // extractor it may be a tagged factory (`runnerFactory(...)`, issue #838) that
+  // receives the workspace's s3Config so the OSC job can write the output
+  // directly to the right MinIO bucket via `s3://bucket/key` (a presigned PUT
+  // URL does NOT work — issue #316). When absent (or no object storage),
+  // POST /:id/export responds 501.
+  rewrapRunner?: RunnerOption<RewrapRunner>;
   rewrap?: typeof rewrap;
   rewrapDeps?: Partial<RewrapDeps>;
   // Clip / trim (issue #17). `clipRunner` runs the OSC ffmpeg job
   // (eyevinn-ffmpeg-s3 in production, a stub in tests). Like the thumbnail
-  // extractor / rewrap runner it may be a factory that receives the workspace's
-  // s3Config so the OSC job can write the clip directly to the right MinIO
-  // bucket via `s3://bucket/key` (a presigned PUT URL does NOT work —
-  // issue #786). When absent (or no object storage), POST /:id/clip responds 501.
-  clipRunner?: ClipRunner | ((s3Config: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => ClipRunner);
+  // extractor and the re-wrap runner it may be a tagged factory
+  // (`runnerFactory(...)`, issue #838) that receives the workspace's s3Config so
+  // the OSC job can write the clip directly to the right MinIO bucket via
+  // `s3://bucket/key` — a presigned PUT URL does NOT work here either
+  // (issue #786: the job "succeeded" and no object was written). All three sites
+  // share one resolution helper so they cannot drift apart again. When absent
+  // (or no object storage), POST /:id/clip responds 501.
+  clipRunner?: RunnerOption<ClipRunner>;
   clip?: typeof runClip;
   clipDeps?: Partial<ClipDeps>;
   // HLS/DASH packaging (issue #9). When present, POST /:id/package is enabled.
   packaging?: import('../pipeline/packaging.js').PackagingService;
   // Redis for resolving Encore instance URL at packaging time.
   packagingRedis?: import('ioredis').Redis;
+  // Per-stack replacements for `packagingRedis` (every scaler key lives on the
+  // job's own stack's Valkey, #615). `packagingRedisForJob` resolves the Valkey
+  // of the stack an Encore job was dispatched on, for the job-url / instance /
+  // pin reads; `packagingRedisForStack` resolves the ambient request stack's
+  // Valkey, for the submit preflight. Both preferred over `packagingRedis`,
+  // which is the first stack's connection.
+  packagingRedisForJob?: (encoreJobId: string) => Promise<import('ioredis').Redis | undefined>;
+  packagingRedisForStack?: () => Promise<import('ioredis').Redis | undefined>;
   // On-demand packager provisioning (epic #226, issue #244). Invoked the first
   // time a pipeline reaches a `package` step: it provisions + wires the Encore
   // packager to the shared queue and output storage if absent, waits for
@@ -983,6 +1456,66 @@ type AssetsRouterOptions = {
   // un-audited (no-op). Emission is fire-and-forget: a failed audit write is
   // logged, never propagated — no route becomes newly failable.
   audit?: AuditEmitter;
+  // The EFFECTIVE instance-global archived-asset retention window, in ms, read
+  // per request (issue #1034). A getter rather than a number so the read path
+  // sees the live value PATCH /api/v1/retention/config hot-swaps — main.ts binds
+  // it to the same `archiveRetentionMs` instance global the purge loop ticks on
+  // (`retentionMs: () => archiveRetentionMs`), so the window a read reports and
+  // the window the sweep enforces cannot drift.
+  //
+  // When absent (tests and any wiring that does not pass it) it falls back to
+  // `archiveRetentionMsFromEnv()`, evaluated per call — the SAME env var
+  // (ARCHIVE_RETENTION_MS) main.ts resolves the boot value from, so an unwired
+  // router reports the deployment's configured window rather than inventing one.
+  // Used only to derive the read-only `retention` member of an archived asset.
+  retentionMs?: () => number;
+  // Best-effort operational log emission for pipeline steps (issue #995). Wired
+  // to the log store's `append()` write primitive — the same instance
+  // GET /api/v1/logs reads (src/main.ts, `logStore`; read path
+  // src/routes/logs.ts:94). When absent, pipeline execution proceeds without
+  // appending log records (no-op), so existing tests are unaffected. Emission
+  // never throws, so no route becomes newly failable.
+  pipelineLog?: PipelineLogSink;
+  // Asset delivery to a named export destination (issue #1131).
+  //
+  // `deliveryClient` is the object-store client POST /:id/deliver performs the
+  // server-side copy + landing verification with. In PRODUCTION the route uses
+  // the per-request stack client (`request.connections.storageClient`,
+  // src/services/workspace-stack.ts:148) so a delivery always runs against the
+  // same store this request's bytes live in; this option exists so a test can
+  // inject a fake, and when both are present the injected one wins — the same
+  // precedence `opts.subtitleGenerator ?? request.connections?.subtitleGenerator`
+  // uses. When neither is available the route answers 501.
+  deliveryClient?: DeliveryObjectClient;
+  // On-demand purge of a single archived asset (issue #837).
+  //
+  // `purgeToTombstone` replaces an archived asset's document with a tombstone
+  // (the doc-replace of issue #326). It is an INJECTED callback for the same
+  // reason the sweep's `purge` dep is: `purgeToTombstone` is NOT on the
+  // AssetRepository interface — it is a concrete method on
+  // CouchAssetRepository / InMemoryAssetRepository — so the per-stack repository
+  // proxy (PerWorkspaceAssetRepository) does not forward it. When absent, the
+  // route falls back to the concrete repo on the resolved stack connection
+  // (`request.connections.assets`) and finally to `opts.repository`, and
+  // answers 501 when neither exposes the method.
+  purgeToTombstone?: (
+    assetId: string
+  ) => Promise<string | boolean | undefined> | string | boolean | undefined;
+  // Resolve a storage handle for a bucket the purge must remove objects from.
+  // When absent, the route builds a WorkspaceStorage per target bucket from the
+  // request's own stack client (`request.connections.storageClient`), exactly as
+  // the stream route and GET /:id/files do; injectable so a test can assert the
+  // removed keys without a live object store. Returning undefined for a bucket
+  // skips object removal there — the tombstone is still recorded, matching the
+  // sweep's behaviour on an unconfigured store.
+  purgeStorageForBucket?: (bucket: string) => PurgeStorage | undefined;
+  // The object-storage endpoint `deliveryClient` is authenticated against, used
+  // to refuse a destination that declares a DIFFERENT endpoint (whose
+  // credentials this API cannot hold — see destinationEndpointRefusal in
+  // src/pipeline/asset-delivery.ts). Production reads it from the resolved
+  // stack (`request.connections.s3Config.endpoint`,
+  // src/services/workspace-stack.ts:152); injectable here for tests.
+  deliveryEndpoint?: string;
 };
 
 // Outcome of kicking off an OPTIONAL, fire-and-forget pipeline step (subtitles,
@@ -993,6 +1526,19 @@ type AssetsRouterOptions = {
 // asset (`subtitlesError` / `sceneDetectionError`) so the skip is explainable
 // after the fact.
 type OptionalStepOutcome = { started: true } | { started: false; reason: string };
+
+// Map a pipeline step to the coarse, operator-facing log stage (issue #995).
+// The Logs tab is a stage-level view, not a step-level one: `transcode` and
+// `package` are the two asynchronous steps that settle from an OSC callback and
+// get their own stage, and every other step (extract-metadata, thumbnail, and the
+// optional subtitles / scene-detect) is part of getting the asset in, so it
+// reports as `ingest`. CONTRACT: `PipelineStepName` — src/pipeline/pipelines.ts:22-23;
+// `PipelineLogStage` — src/services/pipeline-log.ts (PIPELINE_LOG_STAGES).
+function logStageForStep(name: PipelineStepName): PipelineLogStage {
+  if (name === 'transcode') return 'transcode';
+  if (name === 'package') return 'package';
+  return 'ingest';
+}
 
 // Skip reasons. They name the operator-facing knob that activates the step: the
 // per-stack instance name (StackConfig.autoSubtitlesInstanceName /
@@ -1022,6 +1568,17 @@ const stepExecutionSchema = z.object({
   jobId: z.string().optional(),
   encoreJobId: z.string().optional(),
   error: z.string().optional(),
+  // Machine-readable companion to `error` (issue #1060). ADDITIVE and OPTIONAL;
+  // present only for recognised failure classes (today `source_read_failed` — a
+  // transcode whose SOURCE object could not be read). Same shared schema the
+  // pipelines router uses, so the two step-schema copies cannot drift on it.
+  errorDetail: stepErrorDetailSchema
+    .optional()
+    .describe(
+      'Structured, machine-readable failure detail. Present only for ' +
+        'recognised failure classes; branch on `errorDetail.code` rather than ' +
+        'parsing `error`.'
+    ),
   skipReason: z.string().optional(),
   startedAt: z.string().optional(),
   completedAt: z.string().optional(),
@@ -1188,29 +1745,85 @@ export function externalObjectKeyFromSourceUrl(
   return key;
 }
 
-// Resolve the Encore job URL for packaging by looking up the instance URL from
-// the Redis pool using the encoreJobId → instanceId → EncoreInstanceRecord chain.
-// Returns undefined when the instance is no longer in the pool.
+// The Encore job id of the most recent SUCCESSFUL transcode recorded for an
+// asset's pipeline executions (issue #739). This is the packager's input handle
+// for a package-only run: the packager's work item is `{ jobId, url }` where
+// `url` is an Encore job API URL (CONTRACT: `PackagingJob` in
+// src/pipeline/packaging.ts:166-174, verified from the packager's
+// redisListener.ts; restated in ADR-021-external-s3-endpoint-source-and-packaged
+// C3). There is no rendition/bucket-prefix form of that work item, so a
+// package-only pipeline can only be built on top of an earlier transcode's job.
+//
+// `StepExecution.encoreJobId` (src/data/pipeline-repo.ts:43-56, field at :47 —
+// "Encore external job ID (transcode steps)") is the recorded handle; it is
+// stamped on the transcode step at dispatch (startPipelineExecution below) and
+// the step reaches `done` when the callback poller applies a successful
+// completion.
+// Executions are scanned newest-first by `createdAt` so the freshest transcode —
+// the one whose Encore job is most likely still resolvable — is preferred.
+// Ordering is by parsed instant, not by string: lexicographic comparison of
+// ISO-8601 is only correct for a single fixed UTC offset, and ordering these
+// silently wrong would pick a stale transcode's job as the packager's input.
+// Unparseable timestamps sort last so they can never displace a usable one.
+export function latestCompletedTranscodeEncoreJobId(
+  executions: readonly import('../data/pipeline-repo.js').PipelineExecution[]
+): string | undefined {
+  const instant = (iso: string): number => {
+    const ms = Date.parse(iso);
+    return Number.isNaN(ms) ? -Infinity : ms;
+  };
+  const newestFirst = [...executions].sort((a, b) => instant(b.createdAt) - instant(a.createdAt));
+  for (const execution of newestFirst) {
+    // Last matching step wins within one execution: a re-driven execution can
+    // carry more than one transcode attempt, and the latest is the live output.
+    for (let i = execution.steps.length - 1; i >= 0; i--) {
+      const step = execution.steps[i];
+      if (step.name === 'transcode' && step.status === 'done' && step.encoreJobId) {
+        return step.encoreJobId;
+      }
+    }
+  }
+  return undefined;
+}
+
+// Resolve the packager's `{ url, instanceId }` input for a completed transcode.
+//
+// Thin wrapper over the shared resolver in
+// src/encore-scaler/packaging-target.ts (CONTRACT: `resolvePackagingTarget`,
+// `PackagingTarget = { url: string; instanceId: string }`), which is also used
+// by the unpin path in src/routes/internal.ts so both ends of a packaging
+// handoff agree on how the instance is identified.
+//
+// `instanceId` comes back alongside `url` because resolution is only a
+// point-in-time check: the caller must PIN that instance against scale-down
+// before enqueueing the packaging job (#525 pt.2 —
+// src/encore-scaler/packaging-pin.ts, gated in scaler-loop.ts via
+// `hasPendingPackaging`). Returning it avoids a second Redis read at the pin
+// site — and, since the live `keys.jobInstance` mapping is deleted the moment a
+// transcode succeeds, a second read there would resolve nothing at all.
 async function resolveEncoreJobUrlForPackaging(
   encoreJobId: string,
   redis: import('ioredis').Redis | undefined
-): Promise<string | undefined> {
-  if (!redis) return undefined;
-  const decoded = decodeEncoreJobId(encoreJobId);
-  if (!decoded) return undefined;
-  const instanceId = await redis.hget(keys.jobInstance(decoded.workspaceId), encoreJobId);
-  if (!instanceId) return undefined;
-  const [instanceJson, encoreUuid] = await Promise.all([
-    redis.hget(keys.pool(decoded.workspaceId), instanceId),
-    redis.get(keys.jobUuid(encoreJobId))
-  ]);
-  if (!instanceJson || !encoreUuid) return undefined;
-  try {
-    const record = JSON.parse(instanceJson) as EncoreInstanceRecord;
-    return `${record.url.replace(/\/+$/, '')}/encoreJobs/${encoreUuid}`;
-  } catch {
-    return undefined;
-  }
+): Promise<PackagingTarget | undefined> {
+  return resolvePackagingTarget(redis, encoreJobId);
+}
+
+// The scaler-state Valkey of the stack `encoreJobId` was dispatched on: the
+// per-stack resolver when wired, else the injected first-stack connection.
+async function packagingRedisForJob(
+  opts: Pick<AssetsRouterOptions, 'packagingRedis' | 'packagingRedisForJob'>,
+  encoreJobId: string
+): Promise<import('ioredis').Redis | undefined> {
+  if (!opts.packagingRedisForJob) return opts.packagingRedis;
+  return opts.packagingRedisForJob(encoreJobId);
+}
+
+// The ambient request stack's scaler-state Valkey, for stack-level probes.
+async function packagingRedisForStack(
+  opts: Pick<AssetsRouterOptions, 'packagingRedis' | 'packagingRedisForStack'>
+): Promise<import('ioredis').Redis | undefined> {
+  if (!opts.packagingRedisForStack) return opts.packagingRedis;
+  return opts.packagingRedisForStack();
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,6 +1842,64 @@ export function parseS3Uri(uri: string): { bucket: string; key: string } | null 
   const match = /^s3:\/\/([^/]+)\/(.+)$/.exec(uri);
   if (!match) return null;
   return { bucket: match[1], key: match[2] };
+}
+
+// Every stored object an asset's purge would REMOVE, as `bucket\u0000key` identities
+// (issue #837 review). `objectKey` is a client-settable field on POST /assets and
+// PATCH /assets/:id, so two documents can point at the SAME bytes; the purge
+// route uses these sets to refuse destroying bytes another document still
+// references. A plain key lives in `sourceBucket`; an `s3://bucket/key` rendition
+// lives in that bucket (parseS3Uri) — the same bucket resolution
+// `purgeArchivedAsset` itself applies (src/pipeline/archived-asset-purge-sweep.ts).
+// The packaged-output prefix is NOT included: it is derived from the asset id
+// (outputPrefix(asset.id), src/pipeline/packaging.ts) and so cannot be aimed at
+// another asset.
+function purgeableObjectIdentities(asset: Asset, sourceBucket: string): Set<string> {
+  const ids = new Set<string>();
+  const add = (rawKey: string | undefined): void => {
+    if (!rawKey) return;
+    const s3 = parseS3Uri(rawKey);
+    ids.add(s3 ? `${s3.bucket}\u0000${s3.key}` : `${sourceBucket}\u0000${rawKey}`);
+  };
+  add(asset.objectKey);
+  for (const rendition of asset.renditions ?? []) add(rendition.objectKey);
+  for (const track of asset.subtitleTracks ?? []) add(track.objectKey);
+  for (const thumb of asset.thumbnails ?? []) add(thumb);
+  return ids;
+}
+
+// Find a DIFFERENT live asset document that references any of the objects this
+// purge would destroy (issue #837 review). Pages `list()` over the workspace's
+// assets (tombstones are excluded from `list()` by construction — the in-memory
+// repo drops the document and the Couch repo filters on `resourceType`), so the
+// answer covers every still-restorable document, archived ones included.
+// Returns the first collision found, or undefined when the bytes are unshared.
+async function findSharedObjectOwner(
+  repo: AssetRepository,
+  asset: Asset,
+  sourceBucket: string
+): Promise<{ assetId: string; bucket: string; key: string } | undefined> {
+  const mine = purgeableObjectIdentities(asset, sourceBucket);
+  if (mine.size === 0) {
+    return undefined;
+  }
+  let offset = 0;
+  for (;;) {
+    const page = await repo.list({ limit: MAX_LIMIT, offset });
+    for (const other of page.items) {
+      if (other.id === asset.id) continue;
+      for (const identity of purgeableObjectIdentities(other, sourceBucket)) {
+        if (mine.has(identity)) {
+          const [bucket, key] = identity.split('\u0000');
+          return { assetId: other.id, bucket, key };
+        }
+      }
+    }
+    if (page.items.length < MAX_LIMIT) break;
+    offset += page.items.length;
+    if (offset >= page.total) break;
+  }
+  return undefined;
 }
 
 // The publicly reachable origin of THIS API up to (and including) the assets
@@ -1350,18 +2021,55 @@ function deliveryResolutionFor(
   };
 }
 
+// Which configuration a `not_configured` delivery response is missing (issue
+// #860), per delivery mode. Naming the variable is the whole point: the reader
+// of the response has to be able to act on it, which is what the removed
+// silent proxy fallback prevented.
+const MISSING_PUBLIC_ORIGIN = {
+  missingConfiguration: ['PACKAGED_PUBLIC_BASE_URL'],
+  reason:
+    'DELIVERY_MODE=public requires a public origin for the packaged bucket. ' +
+    'Set PACKAGED_PUBLIC_BASE_URL to the externally reachable origin serving ' +
+    'the packaged bucket (a CDN or the stack MinIO endpoint), or set ' +
+    'DELIVERY_MODE=proxy to stream packaged objects back through this API.'
+} as const;
+
+const MISSING_API_ORIGIN = {
+  missingConfiguration: ['PUBLIC_BASE_URL'],
+  reason:
+    'DELIVERY_MODE=proxy requires this API to know its own public origin so ' +
+    'proxy playback URLs are absolute. Set PUBLIC_BASE_URL to the externally ' +
+    'reachable base URL of this API.'
+} as const;
+
 // The `not_configured` delivery body (issue #506): the asset HAS packaged
 // output but this deployment cannot advertise a fully-resolvable playback URL
-// (public delivery not configured — no PUBLIC_BASE_URL / public origin). The
-// response carries NO playable `urls.hls`/`urls.dash` so a consuming
-// application never treats it as ready; `resolution` carries the persisted
-// packaged prefix + master manifest keys (#502) so a client with its own
-// object-store access can resolve the manifest objects deterministically.
+// in the delivery mode it is configured for. The response carries NO playable
+// `urls.hls`/`urls.dash` so a consuming application never treats it as ready;
+// `resolution` carries the persisted packaged prefix + master manifest keys
+// (#502) so a client with its own object-store access can resolve the manifest
+// objects deterministically, plus the missing-configuration detail (#860) so an
+// operator can see what to set. `missing` is emitted even for a pre-#502 asset
+// with no persisted `packagedOutput`, since the misconfiguration is a property
+// of the deployment, not of the asset.
 function notConfiguredDelivery(
   asset: { id: string; packagedOutput?: PackagedOutput },
-  expiresAt: string
+  expiresAt: string,
+  missing?: { missingConfiguration: readonly string[]; reason: string }
 ): z.infer<typeof deliverySchema> {
-  const resolution = deliveryResolutionFor(asset);
+  const located = deliveryResolutionFor(asset);
+  const resolution =
+    located || missing
+      ? {
+          ...located,
+          ...(missing
+            ? {
+                missingConfiguration: [...missing.missingConfiguration],
+                reason: missing.reason
+              }
+            : {})
+        }
+      : undefined;
   return {
     assetId: asset.id,
     status: 'not_configured',
@@ -1595,6 +2303,26 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   const storageFor = opts.storageFor;
   // Best-effort audit emitter (issue #564). Undefined => mutations run un-audited.
   const audit = opts.audit;
+  // Live read of the effective archived-asset retention window (issue #1034).
+  // Called per request so the derived `retention` member reflects a hot-swapped
+  // PATCH /api/v1/retention/config; falls back to the env var main.ts boots from.
+  const retentionMsNow = opts.retentionMs ?? archiveRetentionMsFromEnv;
+
+  // Attach the derived, read-only `retention` window to an asset about to be
+  // serialized through `assetSchema` (issue #1034). A no-op for any asset that
+  // is not `archived`: assetRetentionWindow returns undefined and the response
+  // simply carries no `retention` member (the field is optional, so this stays
+  // additive and non-breaking for every existing client). Nothing is persisted —
+  // the window is projected from the asset's own statusHistory plus the live
+  // instance-global policy at read time.
+  function withRetentionWindow(asset: Asset): Asset & { retention?: AssetRetentionWindow } {
+    const retention = assetRetentionWindow(asset, retentionMsNow());
+    return retention ? { ...asset, retention } : asset;
+  }
+
+  // Best-effort operational log sink (issue #995). Undefined => pipeline steps
+  // run without appending to the log store GET /api/v1/logs reads.
+  const pipelineLog = opts.pipelineLog;
 
   // Resolve the scaler/Encore context key for a transcode request (issue #615).
   // The scaler auto-scaler partitions its Encore pool, Valkey queue keys, and
@@ -1608,11 +2336,156 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // env-override) or when it resolves undefined (no provisioned stack), leaving
   // single-stack behaviour byte-identical.
   async function transcodeContext(request: import('fastify').FastifyRequest): Promise<string> {
-    if (!opts.resolveStackContext) return DEPLOYMENT_CONTEXT;
+    return (await transcodeStackIdentity(request)).contextId;
+  }
+
+  // The control plane's stack identity for this request (issue #1058).
+  // `contextId` is what keys the scaler (unchanged); `resolved` is the stack
+  // NAME the resolver reported, or undefined when no resolver is wired or no
+  // stack is provisioned — the two cases where there is no identity to compare.
+  async function transcodeStackIdentity(
+    request: import('fastify').FastifyRequest
+  ): Promise<{ contextId: string; resolved: string | undefined }> {
+    if (!opts.resolveStackContext) return { contextId: DEPLOYMENT_CONTEXT, resolved: undefined };
     const header = request.headers['x-stack-name'];
     const requested = typeof header === 'string' && header.length > 0 ? header : undefined;
     const resolved = await opts.resolveStackContext(requested);
-    return resolved ?? DEPLOYMENT_CONTEXT;
+    return { contextId: resolved ?? DEPLOYMENT_CONTEXT, resolved };
+  }
+
+  // Fail loud when the data plane and the transcode control plane resolved
+  // DIFFERENT stacks (issue #1058). The source bytes live wherever the data
+  // plane wrote them (`request.connections`, keyed by the request's stack since
+  // this issue's fix); the transcoder is created with the S3 endpoint of the
+  // stack the control plane resolved. If those two identities disagree, the
+  // transcoder reads a bucket of the same literal name on the wrong instance and
+  // reports an indistinguishable 404 — so we refuse to submit instead.
+  //
+  // Compares stack IDENTITY, never endpoint hostnames: the transcoder correctly
+  // uses the in-cluster address while the API uses the public ingress for the
+  // same instance (issue #991), so hostnames legitimately differ.
+  function stackRoutingMismatch(
+    request: import('fastify').FastifyRequest,
+    controlPlaneStack: string | undefined
+  ): { dataPlaneStack: string; controlPlaneStack: string } | undefined {
+    const dataPlaneStack = request.connections?.stackName;
+    if (!dataPlaneStack || !controlPlaneStack) return undefined;
+    if (dataPlaneStack === controlPlaneStack) return undefined;
+    return { dataPlaneStack, controlPlaneStack };
+  }
+
+  // Reject a caller-supplied profile name the profile store does not hold
+  // (issue #1022). The transcoding service resolves `profile` against its own
+  // index and FAILS the job with "Could not find location for profile <name>!"
+  // when the name is absent (ProfileService.getProfile —
+  // github.com/svt/encore, encore-common/.../service/profile/ProfileService.kt,
+  // fetched 2026-10-05); the index it loads is exactly this store, served at GET
+  // /api/v1/profiles/index.yml (src/routes/profiles.ts:131-180). So a name this
+  // store does not hold cannot resolve, and submitting it only converts a
+  // typo into a job that dies after dispatch. We answer a 400 at submit time
+  // instead.
+  //
+  // Returns undefined (allow) when:
+  //   - no name was supplied (the submit path's own default applies, and a
+  //     deployment whose store has not been seeded must still be able to
+  //     transcode — that case stays permissive, as it did before);
+  //   - no profile store is wired on this deployment (nothing to check against);
+  //   - the store is UNREACHABLE — `resolveProfileYaml` reports
+  //     `store-unreachable` (src/pipeline/resolve-profile-yaml.ts:33-36) and we
+  //     keep the pre-existing permissive behaviour rather than turning a store
+  //     outage into a blanket rejection of every transcode.
+  async function unknownProfileReason(
+    profileName: string | undefined,
+    log: { warn: (obj: unknown, msg?: string) => void }
+  ): Promise<string | undefined> {
+    if (!profileName || !opts.profileRepository) return undefined;
+    const resolution = await resolveProfileYaml(opts.profileRepository, profileName);
+    if (resolution.status === 'found') return undefined;
+    if (resolution.status === 'store-unreachable') {
+      log.warn(
+        { err: resolution.error, profileName },
+        'profile existence check skipped: profile store unreachable (issue #1022)'
+      );
+      return undefined;
+    }
+    return `profile "${profileName}" is not registered on this deployment — list the available profiles with GET /api/v1/profiles, or register this one with POST /api/v1/profiles before submitting`;
+  }
+
+  // The single submit-time routing assertion for any path that dispatches a
+  // transcode (issues #1058 and #1093). Returns the refusal to send, or
+  // undefined when the request is correctly routed — which is every
+  // single-stack, env-override and no-resolver deployment, whose behaviour is
+  // therefore unchanged.
+  //
+  // TWO independent splits, both of which end as the same indistinguishable
+  // missing-object error from the transcoder (every stack's source bucket
+  // carries the identical literal name, routes/provision.ts), and both answered
+  // with the same 409 `stack_routing_mismatch` so the client contract is one
+  // error code:
+  //
+  //   1. DOCUMENTS vs control plane (issue #1058): the stack the asset/job
+  //      documents were resolved from (WorkspaceConnections.stackName) is not
+  //      the stack the transcoder will be created against.
+  //   2. REQUEST CREDENTIAL vs control plane — DEFENCE IN DEPTH, not the #1093
+  //      mitigation. `WorkspaceConnections.s3Config` is tagged with the stack
+  //      identity it was built for, and that tag is compared here. Today the
+  //      tag and `connections.stackName` are set from the same local at every
+  //      producer (workspace-stack.ts buildConnectionsFromStack /
+  //      buildEnvConnections / buildInMemoryConnections), so after check (1) has
+  //      passed this one cannot fire on any path that exists now. It is kept
+  //      because the credential is carried, cached, re-read from the resolver
+  //      cache and handed to runner factories separately from the document
+  //      connections — a future path that rebuilds or injects an s3Config can
+  //      break that equality, and this catches it at the edge for the cost of a
+  //      string compare.
+  //
+  //      The PRODUCTION-REACHABLE #1093 mis-route is NOT visible from here: the
+  //      credential the spawned transcoder is actually created with is resolved
+  //      by services/encore-s3-config.ts resolveEncoreS3Config, from the
+  //      parameter store, against the routed stack key — never from
+  //      request.connections. That resolver now refuses the first-provisioned
+  //      substitution itself (ObjectStoreStackMismatchError), and the submit
+  //      path below maps that refusal onto this same 409.
+  //
+  // Both compare stack IDENTITY, never endpoint hostnames: the transcoder uses
+  // the in-cluster address while the API uses the public ingress for the SAME
+  // instance (issue #991), so hostnames legitimately differ.
+  function transcodeRoutingRefusal(
+    request: import('fastify').FastifyRequest,
+    controlPlaneStack: string | undefined
+  ): { message: string; logFields: Record<string, unknown>; logMessage: string } | undefined {
+    const documents = stackRoutingMismatch(request, controlPlaneStack);
+    if (documents) {
+      return {
+        message: `the source object was written to stack "${documents.dataPlaneStack}" but the transcoder would be created against stack "${documents.controlPlaneStack}" — both stacks use the same bucket name, so the transcode would fail with an indistinguishable 404. Retry naming one stack consistently via X-Stack-Name.`,
+        logFields: {
+          reason: 'documents',
+          dataPlaneStack: documents.dataPlaneStack,
+          controlPlaneStack: documents.controlPlaneStack
+        },
+        logMessage:
+          'refusing to dispatch a transcode: the source bytes and the transcoder resolve different stacks (issue #1058)'
+      };
+    }
+    const credential = objectStoreStackMismatch(
+      request.connections?.s3Config,
+      controlPlaneStack
+    );
+    if (credential) {
+      return {
+        message: objectStoreStackMismatchMessage(credential),
+        logFields: {
+          reason: 'request-object-store-credential',
+          expectedStack: credential.expectedStack,
+          actualStack: credential.actualStack,
+          // Endpoint HOST only — the resolved secret is never logged.
+          actualEndpointHost: credential.actualEndpointHost
+        },
+        logMessage:
+          'refusing to dispatch a transcode: the resolved object-store credential belongs to a different stack than the request routes to (issue #1093)'
+      };
+    }
+    return undefined;
   }
 
   // Resolve whether a named transcode profile can execute on this platform tier
@@ -1654,20 +2527,45 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // blocks the caller, and the extractor itself never throws (records failures
   // on the asset). No-op when the probe runner or object storage is not
   // configured. Returns true when an extraction was actually kicked off.
+  //
+  // `storage` lets a caller hand in a WorkspaceStorage it already resolved
+  // instead of resolving a fresh one here. Callers that run INSIDE the request
+  // can omit it — `storageFor()` reads the resolver cache entry the onRequest
+  // hook just warmed for this request's stack (issue #1058). A caller that
+  // reaches this AFTER the request's work has settled must pass the handle,
+  // because `makeRequestScopedStorageFactory` is a cache read and the entry can
+  // age past the resolver TTL (`CACHE_TTL_MS`, services/workspace-stack.ts)
+  // during a long transfer — after which the factory THROWS rather than
+  // returning the wrong stack. Same reason, and the same shape, as
+  // `onObjectStored(assetId, objectKey, storage?)` (routes/asset-upload.ts:83).
+  //
+  // `stackName` is the DURABLE stack identity read off the asset (or the job
+  // that produced it) — `Asset.stackName` / `Job.stackName` (issue #1097). The
+  // extractor re-enters it so a detached extraction resolves the right stack's
+  // repositories even once the ambient request context is gone. Omit it and the
+  // extractor keeps today's behaviour (ambient context, else first-listed stack).
   function triggerExtraction(
     assetId: string,
     objectKey: string,
-    externalSource?: ExternalProbeSource
+    externalSource?: ExternalProbeSource,
+    storage?: WorkspaceStorage,
+    stackName?: string
   ): boolean {
     if (!opts.probe || !storageFor) {
       return false;
     }
     void extractRunner(
-      { assetId, objectKey, ...(externalSource ? { externalSource } : {}) },
+      {
+        assetId,
+        objectKey,
+        ...(externalSource ? { externalSource } : {}),
+        ...(stackName ? { stackName } : {})
+      },
       {
         assets: repo,
-        storage: storageFor(),
+        storage: storage ?? storageFor(),
         probe: opts.probe,
+        stackLog: app.log,
         ...opts.extractDeps
       }
     );
@@ -1683,16 +2581,21 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // extractor never throws (it records failures on the asset), so callers read
   // back the asset to learn whether recovery succeeded. Assumes probe + storage
   // are configured (the route checks this before calling).
-  async function runExtractionSync(assetId: string, objectKey: string): Promise<void> {
+  async function runExtractionSync(
+    assetId: string,
+    objectKey: string,
+    stackName?: string
+  ): Promise<void> {
     if (!opts.probe || !storageFor) {
       return;
     }
     await extractRunner(
-      { assetId, objectKey },
+      { assetId, objectKey, ...(stackName ? { stackName } : {}) },
       {
         assets: repo,
         storage: storageFor(),
         probe: opts.probe,
+        stackLog: app.log,
         ...opts.extractDeps
       }
     );
@@ -1794,23 +2697,102 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   }
 
+  // MinIO coordinates a runner factory is built from, assembled from the stack
+  // this request resolved to (WorkspaceConnections.s3Config / .sourceBucket,
+  // src/services/workspace-stack.ts:118/116). Undefined when the stack carries
+  // no s3Config, which only matters for a factory option.
+  function requestRunnerS3Config(request: import('fastify').FastifyRequest) {
+    return runnerS3Config(
+      request.connections?.s3Config,
+      request.connections?.sourceBucket ?? DEFAULT_SOURCE_BUCKET
+    );
+  }
+
+  // Single resolution point for the thumbnail / re-wrap / clip runner options
+  // (issue #838). A plain injected runner passes straight through; a tagged
+  // factory is built from this request's s3Config. When the option is a factory
+  // and the stack resolved no s3Config there is nothing to build a runner from,
+  // so the route answers 501 not_configured rather than calling the factory as
+  // if it were the runner and dispatching no OSC job at all.
+  //
+  // Returns undefined once the 501 has been sent, matching the
+  // `requireSourceObject(asset, reply)` convention used above.
+  function resolveConfiguredRunner<T extends (...args: never[]) => unknown>(
+    option: RunnerOption<T>,
+    optionName: string,
+    request: import('fastify').FastifyRequest,
+    reply: import('fastify').FastifyReply
+  ): T | undefined {
+    try {
+      return resolveRunnerOption(option, requestRunnerS3Config(request), optionName);
+    } catch (err) {
+      if (err instanceof RunnerFactoryUnresolvedError) {
+        request.log.error({ err, option: optionName }, 'runner factory could not be resolved');
+        void reply.code(501).send({ error: 'not_configured', message: err.message });
+        return undefined;
+      }
+      throw err;
+    }
+  }
+
   // Fire-and-forget thumbnail extraction for a pipeline step. Uses a default
   // poster-frame timecode (1s in). No-op when thumbnails are not configured.
-  function triggerThumbnail(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): boolean {
+  //
+  // Returns false (step recorded as not started) when the extractor is a
+  // factory the stack cannot supply credentials for — the same explicit failure
+  // the thumbnail route turns into a 501. It is logged at error level rather
+  // than thrown because this is a fire-and-forget pipeline step: throwing here
+  // would fail the whole execution, which an unconfigured optional step must
+  // never do.
+  //
+  // `storage` has exactly the meaning it has on `triggerExtraction` above
+  // (issue #1051 review): a caller that already resolved a WorkspaceStorage
+  // hands it in instead of resolving a fresh one here. Callers running INSIDE
+  // the request may omit it and get the resolver-cache entry the onRequest hook
+  // warmed for this request's stack; a caller that reaches this AFTER the
+  // request's work has settled MUST pass the handle, because `storageFor()` is a
+  // cache read whose entry can age past the resolver TTL (`CACHE_TTL_MS`,
+  // services/workspace-stack.ts) during a long transfer — after which the
+  // factory THROWS rather than returning the wrong stack, and here that throw
+  // would land in a detached continuation. Same shape as
+  // `triggerExtraction(assetId, objectKey, externalSource?, storage?)` and
+  // `onObjectStored(assetId, objectKey, storage?)` (routes/asset-upload.ts).
+  //
+  // Note this only covers the DATA plane. The runner factory is still built from
+  // `request.connections` (issue #1062), which is request-scoped state captured
+  // synchronously here rather than a TTL'd cache read, so it stays correct for a
+  // non-default `x-stack-name` even when called from a detached continuation.
+  function triggerThumbnail(
+    assetId: string,
+    objectKey: string,
+    request: import('fastify').FastifyRequest,
+    storage?: WorkspaceStorage
+  ): boolean {
     if (!opts.thumbnailExtractor || !storageFor) {
       return false;
     }
-    const s3Cfg = request.connections?.s3Config;
-    const resolvedExtractor =
-      typeof opts.thumbnailExtractor === 'function' && s3Cfg
-        ? (opts.thumbnailExtractor as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => FrameExtractor)({
-            ...s3Cfg,
-            bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
-          })
-        : (opts.thumbnailExtractor as FrameExtractor);
+    let resolvedExtractor: FrameExtractor;
+    try {
+      resolvedExtractor = resolveRunnerOption(
+        opts.thumbnailExtractor,
+        requestRunnerS3Config(request),
+        'thumbnailExtractor'
+      );
+    } catch (err) {
+      if (err instanceof RunnerFactoryUnresolvedError) {
+        request.log.error({ err, assetId }, 'skipping pipeline thumbnail step: runner factory could not be resolved');
+        return false;
+      }
+      throw err;
+    }
     void thumbnailRunner(
       { assetId, objectKey, timecodes: [1] },
-      { assets: repo, storage: storageFor(), extractor: resolvedExtractor, ...opts.thumbnailDeps }
+      {
+        assets: repo,
+        storage: storage ?? storageFor(),
+        extractor: resolvedExtractor,
+        ...opts.thumbnailDeps
+      }
     ).catch(() => {
       /* thumbnail failures are recorded on the asset by the runner */
     });
@@ -1989,7 +2971,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     pipelineName: keyof typeof BUILT_IN_PIPELINES,
     request: import('fastify').FastifyRequest,
     reply: import('fastify').FastifyReply,
-    encodeOpts?: { profile?: string; customProfile?: EncoreProfile; profileParams?: Record<string, string> },
+    encodeOpts?: { profile?: string; profileParams?: Record<string, string> },
     // Optional per-execution destination override (issue #207). Already
     // validated + trailing-slash-normalized by the edge schema. Persisted on the
     // execution record so #208 (packager relocation) and #210 (delivery) can
@@ -2013,6 +2995,32 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
     const firstStep = steps[0];
 
+    // Data-plane / control-plane stack agreement (issue #1058), for ANY pipeline
+    // that contains a transcode step — not just one that starts with it, since
+    // `abr-vod` and `full` reach transcode later and the live reproduction used
+    // `abr-vod`. Resolved BEFORE the execution record is created, so a split
+    // never leaves a dangling execution with a step marked running against a
+    // source the transcoder cannot read. Reused verbatim as the scaler context
+    // in the step loop below, so the identity we verified is the identity we
+    // submit with.
+    const controlPlane = await transcodeStackIdentity(request);
+    if (steps.includes('transcode')) {
+      // Both routing splits: documents (#1058) and the object-store credential
+      // the bytes would actually be read with (#1093).
+      const refusal = transcodeRoutingRefusal(request, controlPlane.resolved);
+      if (refusal) {
+        request.log.error(
+          { assetId: asset.id, pipeline: pipelineName, ...refusal.logFields },
+          refusal.logMessage
+        );
+        reply.code(409).send({
+          error: 'stack_routing_mismatch',
+          message: refusal.message
+        });
+        return undefined;
+      }
+    }
+
     // Pre-flight the first step's requirements before creating the execution so
     // an un-runnable pipeline never leaves a dangling running execution.
     if (firstStep === 'transcode' || firstStep === 'package') {
@@ -2025,14 +3033,103 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return undefined;
       }
     }
+    // Package-only pipeline (issue #739): packaging consumes the asset's EXISTING
+    // transcoded renditions, so a package-first pipeline with nothing to package
+    // has no source of output. Fail clearly up front rather than dispatching a
+    // packager job that would settle empty/partial. This gate only fires when
+    // `package` is the FIRST step (the package-only pipeline); in `abr-vod`/`full`
+    // the preceding `transcode` step produces the renditions, so their absence
+    // here is legitimate and must not block. `asset.renditions` is the embedded
+    // ABR-variant array populated on transcode completion (see the renditionSchema
+    // on the asset response contract, assets.ts, and the transcode callback in
+    // src/routes/internal.ts which records renditions on the source asset).
+    if (firstStep === 'package' && (asset.renditions ?? []).length === 0) {
+      reply.code(409).send({
+        error: 'no_renditions',
+        message: 'asset has no transcoded renditions to package; transcode the asset before running the package pipeline'
+      });
+      return undefined;
+    }
+    // Package-only pipeline (issue #739), part 2: resolve the packager's ACTUAL
+    // INPUT before creating the execution.
+    //
+    // Having renditions is necessary but NOT sufficient. The packager's work
+    // item is `{ jobId, url }` and `url` is the Encore job API URL it fetches to
+    // locate the transcoded output (CONTRACT: `PackagingJob`,
+    // src/pipeline/packaging.ts:166-174, verified from the packager's
+    // redisListener.ts; `PackagingTrigger.triggerPackaging(assetId,
+    // encoreJobUrl)` at :187-192). The envelope has no slot for "package these
+    // `renditions[].objectKey` values", and the Encore job document is only
+    // served while that Encore instance is in the pool. So a package-only run is
+    // supportable exactly when a previous transcode's job is still resolvable AND
+    // its instance is still pooled — which is the recovery case this pipeline is
+    // for (a pipeline whose `transcode` succeeded and whose `package` failed).
+    //
+    // Both failure modes are refused synchronously with a 409 naming the reason.
+    // Dispatching anyway (e.g. with an empty url) would be a broken contract
+    // call: the packager would have nothing to fetch, never signal, and
+    // reconcileStalledPackages (src/pipeline/stalled-package-reconciler.ts)
+    // would fail the step 15 minutes later with an opaque "packager never
+    // signalled completion" — the exact failure #739 exists to remove.
+    //
+    // Resolution goes through `resolvePackagingTarget`
+    // (src/encore-scaler/packaging-target.ts), which reads the terminal-surviving
+    // keys (`jobTerminalInstance`, `jobEncoreUrl`) rather than the live
+    // `keys.jobInstance` mapping. That distinction is load-bearing: the callback
+    // poller hdel's `jobInstance` on every successful transcode, so a resolver
+    // built on it can only ever answer for a transcode that has NOT succeeded —
+    // i.e. never for this pipeline.
+    //
+    // SCOPE: packaging an asset whose Encore instance is long gone (the
+    // "transcoded last week" case) needs a packager work item keyed by rendition
+    // object keys, which the service does not offer. Logged as OSC friction —
+    // docs/osc-feedback/incoming-packager-input-encore-job-url-only.md.
+    let packageOnlyEncoreJobUrl: string | undefined;
+    let packageOnlyEncoreJobId: string | undefined;
+    let packageOnlyInstanceId: string | undefined;
+    if (firstStep === 'package') {
+      const encoreJobId = latestCompletedTranscodeEncoreJobId(existing);
+      if (!encoreJobId) {
+        reply.code(409).send({
+          error: 'no_transcode_job',
+          message:
+            'no completed transcode is recorded in this asset\'s pipeline history to package from; the packager is driven by an Encore job URL, which only a pipeline transcode records. An asset transcoded via POST /:id/transcode alone has no such record — run the abr-vod pipeline to transcode and package.'
+        });
+        return undefined;
+      }
+      const resolved = await resolveEncoreJobUrlForPackaging(
+        encoreJobId,
+        await packagingRedisForJob(opts, encoreJobId)
+      );
+      if (!resolved) {
+        reply.code(409).send({
+          error: 'instance_not_found',
+          message:
+            'the transcode job the packager would read is no longer resolvable (its Encore instance has left the pool, or the job is older than the 24h key retention); re-run the abr-vod pipeline to produce packageable output'
+        });
+        return undefined;
+      }
+      packageOnlyEncoreJobUrl = resolved.url;
+      packageOnlyInstanceId = resolved.instanceId;
+      packageOnlyEncoreJobId = encoreJobId;
+    }
     // Unified source-object resolution (issue #612): every first step below
     // consumes the asset's source object, so gate them all through the ONE
     // shared resolver. A source-less asset now fails identically here and in the
     // single-operation routes (POST /:id/{transcode,package,thumbnails,clip,
     // export,extract-metadata}) — a consistent 409 no_object.
+    //
+    // `package` is deliberately NOT in this list (issue #739). It is the one
+    // first step that does not read the asset's source object: the packager
+    // fetches the Encore job's transcoded output, resolved above. An asset whose
+    // source was archived or deleted after a successful transcode still has
+    // exactly the output a package-only run consumes, so gating it on the source
+    // would 409 `no_object` on a runnable pipeline. Every OTHER first step below
+    // does read the source and is unchanged. (`package` is only ever a first
+    // step in the package-only pipeline — in `abr-vod`/`full` the preceding
+    // `transcode` step is the first step and is gated here as before.)
     if (
       firstStep === 'transcode' ||
-      firstStep === 'package' ||
       firstStep === 'extract-metadata' ||
       firstStep === 'thumbnail' ||
       firstStep === 'subtitles' ||
@@ -2043,12 +3140,177 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     }
 
+    // #1059: the resolver above proves the asset RECORDS a source key. It does
+    // NOT prove the BYTES are still in the bucket the transcoder reads — and for
+    // large sources they sometimes are not (#1057 / #1058). Without this check
+    // the execution is accepted, the scaler spawns a transcoder, and the run
+    // fails ~2 minutes later with an opaque probe 404 that names nothing. So HEAD
+    // (stat) the EXACT bucket + key the transcode step is about to put in the
+    // job's `s3://<bucket>/<key>` input (transcode.ts:120) and fail here, before
+    // any execution record exists, with an error naming bucket, key and endpoint.
+    //
+    // Gated on the pipeline CONTAINING a transcode step (`transcode`, `abr-vod`,
+    // `full`), the same condition the profile pre-flights below use — a transcode
+    // reads this object store location whether it is the first step or runs after
+    // the fire-and-forget ones. Pipelines with no transcode step are untouched:
+    // `package` reads the transcoder's OUTPUT, not the source (see above), and the
+    // fire-and-forget steps record their own per-step outcome on the asset.
+    //
+    // The stat goes through the per-request StorageFactory, which is bound to the
+    // SAME per-stack `config.sourceBucket` (workspace-stack.ts:213-214) that the
+    // input URI's bucket is taken from (:248, carried as
+    // WorkspaceConnections.sourceBucket) — so it addresses exactly the object the
+    // transcoder will read. OPT-IN, fail-open: a deployment with no object store
+    // wired cannot verify presence, and must keep submitting exactly as before,
+    // so the guard is skipped with a warning rather than blocking the pipeline.
+    if (steps.includes('transcode')) {
+      const preflightSource = tryResolveSourceObject(asset);
+      const transcodeSourceBucket =
+        request.connections?.sourceBucket ?? opts.sourceBucket;
+      // Same per-stack endpoint the spawned transcoder is configured with
+      // (StackConfig.minioEndpoint -> EncoreS3Config.endpoint, see
+      // services/encore-s3-config.ts); undefined on the env-override path.
+      const transcodeSourceEndpoint = stackResolvedMinioEndpoint(request.connections);
+      let sourceStatReader: SourceStatReader | undefined;
+      try {
+        // Take the stat reader from the SAME resolution the bucket and the
+        // endpoint above come from: this request's already-resolved connections
+        // (`WorkspaceConnections.storageFor`, services/workspace-stack.ts:147,
+        // bound to that stack's `config.sourceBucket` at :274, the same field
+        // the input URI's bucket is read from at :248). The router-level factory
+        // reaches the same stack by a different route — the ambient request stack
+        // name plus a CACHED read (`makeRequestScopedStorageFactory`,
+        // services/request-stack-context.ts:78-92) — which yields nothing and
+        // THROWS once that cache entry goes cold, degrading the check to
+        // "submitting unverified" on a stack whose connections this request
+        // already holds. Resolving the probe, the bucket and the reported
+        // endpoint from one object removes that second resolution entirely, so
+        // the diagnostic can never name an endpoint the probe did not address.
+        // Fall back to the router-level factory only where `connections` carries
+        // no storage (env-override path). The invariant is "same resolved
+        // stack", not "same URL" — the spawned transcoder is legitimately handed
+        // an in-cluster alias of that same object store
+        // (services/internal-minio-endpoint.ts).
+        const connectionsStorageFor = request.connections?.storageFor;
+        sourceStatReader = connectionsStorageFor
+          ? connectionsStorageFor()
+          : storageFor
+            ? storageFor()
+            : undefined;
+      } catch (err) {
+        // storageFor() throws when the resolved stack has no object storage
+        // (main.ts:658-664). Treated as "cannot verify", not as a failure.
+        request.log.warn(
+          { err, bucket: transcodeSourceBucket },
+          'could not open object storage to verify the transcode source object (issue #1059) — submitting unverified'
+        );
+        sourceStatReader = undefined;
+      }
+      // An `s3://<bucket>/<key>` objectKey is an EXTERNAL-bucket registration
+      // (assets.ts:3166/3182 store the full locator, not a workspace-local key),
+      // which lives outside the stack source bucket this stat addresses. Stat'ing
+      // the locator as a local key would 409 against the wrong bucket with a
+      // message that misdescribes the cause, so leave those sources to the
+      // transcode step (pipeline/transcode.ts composes its own URI for them).
+      const externalSourceLocator = preflightSource?.objectKey.startsWith('s3://') ?? false;
+      if (externalSourceLocator) {
+        request.log.info(
+          { assetId: asset.id, objectKey: preflightSource?.objectKey },
+          'source is an external-bucket locator — starting the transcode pipeline WITHOUT verifying the source object (issue #1059)'
+        );
+      }
+      // No bucket resolved at all (no stack connections AND no configured source
+      // bucket): there is nothing to name in a diagnostic and nothing to stat
+      // against, so this is the same "cannot verify" case as having no object
+      // store wired. The 501 guard above only covers `firstStep === 'transcode'`,
+      // so a `full` pipeline can reach here with neither bucket source set.
+      if (preflightSource && sourceStatReader && transcodeSourceBucket && !externalSourceLocator) {
+        const readiness = await checkTranscodeSourceReadable(
+          {
+            bucket: transcodeSourceBucket,
+            objectKey: preflightSource.objectKey,
+            ...(transcodeSourceEndpoint ? { endpoint: transcodeSourceEndpoint } : {}),
+            // The stack identity #1058's gate just RESOLVED for this request,
+            // not the deployment-wide default: the gate above has already proved
+            // the data plane and the control plane agree, so `controlPlane`
+            // names the one stack this submission concerns. Falling back to
+            // DEPLOYMENT_CONTEXT only where #1058 also does — no resolver wired
+            // or no provisioned stack (transcodeStackIdentity, assets.ts) —
+            // keeps single-stack and env-override deployments byte-identical.
+            stackName: controlPlane.resolved ?? request.connections?.stackName ?? DEPLOYMENT_CONTEXT,
+            // The size recorded when ingest completed (issue #1059): the URL
+            // pull worker's `bytesTransferred` (pipeline/url-pull-worker.ts) or
+            // the upload route's (routes/asset-upload.ts), persisted on the
+            // asset as `Asset.sourceSizeBytes` (data/asset-repo.ts) via the
+            // document's `administrative.storage.sizeBytes`
+            // (data/asset-document.ts). Undefined for assets ingested before
+            // #1059, and for paths that never learn the length (external-bucket
+            // registration) — the size comparison is then skipped and presence
+            // alone is enforced. The length always describes
+            // `preflightSource.objectKey`: the repositories clear it when
+            // `objectKey` is patched to a DIFFERENT key with no new size, and
+            // every ingest-completion path that can replace the object under the
+            // same deterministic key writes the object's true length in the same
+            // patch (routes/asset-upload.ts `finalizedSourceSizeBytes`, used by
+            // the presigned single-part and multipart finalizes, plus the
+            // streamed PUT and the URL-pull worker's `bytesTransferred`).
+            ...(asset.sourceSizeBytes !== undefined
+              ? { expectedSizeBytes: asset.sourceSizeBytes }
+              : {})
+          },
+          sourceStatReader
+        );
+        if (!readiness.readable) {
+          request.log.warn(
+            {
+              assetId: asset.id,
+              bucket: transcodeSourceBucket,
+              objectKey: preflightSource.objectKey,
+              endpoint: transcodeSourceEndpoint,
+              stack: controlPlane.resolved ?? request.connections?.stackName,
+              reason: readiness.reason,
+              expectedSizeBytes: asset.sourceSizeBytes,
+              observedSizeBytes: readiness.sizeBytes
+            },
+            'refusing to start a transcode pipeline: the source object is not readable (issue #1059)'
+          );
+          // `probe-failed` means the object store could not be asked at all —
+          // a dependency failure (502), not a conflict with the asset's state.
+          // Everything else is a definite answer ABOUT the asset's source, so it
+          // takes the same 409 shape as the other source-related refusals above.
+          if (readiness.reason === 'probe-failed') {
+            reply
+              .code(502)
+              .send({ error: 'source_verification_failed', message: readiness.message });
+          } else {
+            reply.code(409).send({ error: 'source_unreadable', message: readiness.message });
+          }
+          return undefined;
+        }
+      } else if (!sourceStatReader || !transcodeSourceBucket) {
+        request.log.warn(
+          { assetId: asset.id, bucket: transcodeSourceBucket },
+          !transcodeSourceBucket
+            ? 'no source bucket resolved for this stack — starting the transcode pipeline WITHOUT verifying the source object exists (issue #1059)'
+            : 'no object storage wired for this stack — starting the transcode pipeline WITHOUT verifying the source object exists (issue #1059)'
+        );
+      }
+    }
+
     void firstStep; // pre-flight above used firstStep; execution drives the loop
 
     // Reject a named GPU-only (NVENC/CUDA) profile the platform cannot execute
     // (issue #286) up front, when the pipeline includes a transcode step, so no
     // dangling running execution is created for a job Encore cannot run.
     if (steps.includes('transcode')) {
+      // Reject a profile name this deployment does not hold (issue #1022) before
+      // a running execution is created: the name could only fail on the
+      // transcoding side, after dispatch, leaving the execution hanging.
+      const unknownProfile = await unknownProfileReason(encodeOpts?.profile, request.log);
+      if (unknownProfile) {
+        reply.code(400).send({ error: 'unknown_profile', message: unknownProfile });
+        return undefined;
+      }
       const unrunnable = await unrunnableProfileReason(encodeOpts?.profile);
       if (unrunnable) {
         reply.code(422).send({ error: 'profile_unrunnable', message: unrunnable });
@@ -2126,6 +3388,35 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     const resolvedSource = tryResolveSourceObject(asset);
     const sourceObjectKey = resolvedSource?.objectKey ?? '';
 
+    // Operational log (issue #995): one entry per SYNCHRONOUS step that settles
+    // inside the loop below. The two asynchronous steps are NOT logged here —
+    // `transcode` is logged by submitTranscode/completeTranscode and `package` by
+    // PackagingService, at the same points those modules emit their audit
+    // entries, so a run that settles from an OSC callback is covered even though
+    // this request has long since returned. Stage-mapped via logStageForStep, so
+    // the whole `ingest` pipeline reports under the `ingest` stage.
+    const logSettledStep = (
+      name: PipelineStepName,
+      outcome: 'done' | 'skipped',
+      reason?: string
+    ): void => {
+      logPipelineEvent(
+        pipelineLog,
+        {
+          stage: logStageForStep(name),
+          // A skip is not a failure (issue #789) but it IS the absence of work an
+          // operator would otherwise assume happened, so it is a `warn` rather
+          // than an `info`.
+          level: outcome === 'skipped' ? 'warn' : 'info',
+          message:
+            outcome === 'skipped'
+              ? `${name} step skipped for asset ${asset.id} (execution ${execution.id}): ${reason ?? 'no reason recorded'}`
+              : `${name} step completed for asset ${asset.id} (execution ${execution.id})`
+        },
+        request.log
+      );
+    };
+
     // Execute steps synchronously until we hit an asynchronous step (transcode/
     // package) which completes via an OSC callback, or run out of steps. The
     // fire-and-forget steps (extract-metadata, thumbnail) settle immediately.
@@ -2133,13 +3424,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       for (let i = 0; i < stepsCopy.length; i++) {
         const step = stepsCopy[i];
         if (step.name === 'extract-metadata') {
-          triggerExtraction(asset.id, sourceObjectKey);
+          // asset.stackName (issue #1097): the detached probe re-enters the
+          // stack the asset actually lives on.
+          triggerExtraction(asset.id, sourceObjectKey, undefined, undefined, asset.stackName);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+          logSettledStep(step.name, 'done');
           continue;
         }
         if (step.name === 'thumbnail') {
           triggerThumbnail(asset.id, sourceObjectKey, request);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+          logSettledStep(step.name, 'done');
           continue;
         }
         if (step.name === 'subtitles') {
@@ -2150,6 +3445,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           const outcome = triggerSubtitles(asset.id, sourceObjectKey, request);
           if (outcome.started) {
             stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+            logSettledStep(step.name, 'done');
           } else {
             // #789: nothing ran, so `done` would be a lie. Settle as `skipped`
             // (a terminal, non-failing state) and record WHY on the asset.
@@ -2161,6 +3457,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               startedAt: now(),
               completedAt: now()
             };
+            logSettledStep(step.name, 'skipped', outcome.reason);
           }
           continue;
         }
@@ -2172,6 +3469,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           const outcome = triggerSceneDetect(asset.id, sourceObjectKey, request);
           if (outcome.started) {
             stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+            logSettledStep(step.name, 'done');
           } else {
             // #789: see the subtitles branch above.
             await recordOptionalStepSkip('scene-detect', asset.id, outcome.reason, request);
@@ -2182,6 +3480,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               startedAt: now(),
               completedAt: now()
             };
+            logSettledStep(step.name, 'skipped', outcome.reason);
           }
           continue;
         }
@@ -2202,7 +3501,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               // this request routes to (issue #615), not the fixed deployment
               // context, so a pipeline execution against a healthy named stack
               // is not pinned to whichever stack was provisioned first.
-              workspaceId: await transcodeContext(request),
+              workspaceId: controlPlane.contextId,
               sourceAssetId: asset.id,
               sourceObjectKey,
               // Read the transcode INPUT from the resolved stack's per-stack
@@ -2218,14 +3517,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               sourceBucket: request.connections?.sourceBucket ?? (opts.sourceBucket as string),
               outputBucket: resolvedOutputBucket,
               preset: encodeOpts?.profile,
-              customProfile: encodeOpts?.customProfile,
               // profileParams (issue #288): forwarded verbatim into the same
               // transcode submission path as POST /:id/transcode so SpEL-
               // parametrised profiles work from execute too. Undefined leaves
               // execute behaviour unchanged.
               profileParams: encodeOpts?.profileParams
             },
-            { jobs, assets: repo, encore: opts.encore!, audit, auditLog: request.log }
+            { jobs, assets: repo, encore: opts.encore!, audit, auditLog: request.log, pipelineLog }
           );
           stepsCopy[i] = {
             ...step,
@@ -2248,8 +3546,102 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           if (opts.ensurePackaging) {
             await opts.ensurePackaging();
           }
-          void opts.packaging!.triggerPackaging(asset.id, '');
-          stepsCopy[i] = { ...step, status: 'running', startedAt: now() };
+          // The Encore job URL the packager fetches (issue #739). This branch is
+          // only ever reached with `package` as the FIRST step — every pipeline
+          // that has `package` after a `transcode` breaks out of this loop at the
+          // transcode step and is resumed by the callback poller, which resolves
+          // its own URL (src/pipeline/encore-callback-poller.ts:724). So the
+          // package-only pre-flight above has already resolved a real, live URL.
+          // Throwing rather than dispatching with a placeholder keeps the
+          // invariant enforced: an enqueue with an unusable `url` is a job the
+          // packager can never act on, so the step fails here (502, with the
+          // reason on the step) instead of stalling for 15 minutes.
+          if (!packageOnlyEncoreJobUrl) {
+            throw new Error(
+              'package step reached without a resolved Encore job URL — refusing to enqueue a packaging job the packager cannot act on'
+            );
+          }
+          // #525 pt.2 pin, for the package-only path (issue #739). Resolution
+          // above is a point-in-time check, NOT a guarantee: the packager fetches
+          // `packageOnlyEncoreJobUrl` asynchronously, and between resolve and
+          // fetch the scaler may tear the instance down — at which point the
+          // packager never signals and reconcileStalledPackages fails the step 15
+          // minutes later with the opaque "packager never signalled completion"
+          // this pipeline exists to remove.
+          //
+          // A package-only run is MORE exposed than the transcode->package
+          // handoff it borrows its shape from: there the pin lands the instant
+          // the job goes terminal, before activeJobs is decremented, so the idle
+          // clock has not started. Here the transcode finished minutes-to-hours
+          // ago, the instance is already idle, and it is the prime teardown
+          // candidate on the next scaler tick.
+          //
+          // CONTRACT: pinInstanceForPackaging(redis, instanceId, encoreJobId)
+          // (src/encore-scaler/packaging-pin.ts:40-52, Pick<Redis,'sadd'|'pexpire'>)
+          // writes keys.pendingPackaging(instanceId)
+          // (src/encore-scaler/types.ts:306) with the same TTL the stalled-package
+          // reconciler uses; scale-down honours it via `hasPendingPackaging`
+          // (src/encore-scaler/scaler-loop.ts:281-283 — "Do NOT destroy it").
+          // Pinned BEFORE the enqueue, matching the ordering rationale at
+          // src/pipeline/encore-callback-poller.ts:571-580 and
+          // src/routes/internal.ts:525-547 — a pin taken after the packager has
+          // already been handed the job is a pin that can lose the race.
+          //
+          // Best-effort, like both existing pin sites (they catch and warn): a
+          // pin failure means the Redis the pool state was just read from is
+          // faulty, and failing the step would deny a run that is still likely to
+          // succeed. Unpinned is the pre-fix behaviour, not worse than it.
+          const pinRedis = packageOnlyEncoreJobId
+            ? await packagingRedisForJob(opts, packageOnlyEncoreJobId)
+            : undefined;
+          if (pinRedis && packageOnlyInstanceId && packageOnlyEncoreJobId) {
+            try {
+              await pinInstanceForPackaging(
+                pinRedis,
+                packageOnlyInstanceId,
+                packageOnlyEncoreJobId
+              );
+            } catch (err) {
+              request.log.warn(
+                { err, instanceId: packageOnlyInstanceId, encoreJobId: packageOnlyEncoreJobId },
+                'failed to pin Encore instance for package-only packaging; proceeding unpinned'
+              );
+            }
+          }
+          // Awaited (was fire-and-forget) so the `package` Job it records (issue
+          // #976) is in hand before this step is persisted: a package-only
+          // execution's `package` step is still `pending` here, so the service
+          // cannot find it to stamp `steps[].jobId` itself — we stamp the
+          // returned id below, in the SAME write that marks the step running.
+          // triggerPackaging never throws (an enqueue failure is recorded on the
+          // asset and on the package job), so this cannot fail the step.
+          const packageJobId = await opts.packaging!.triggerPackaging(
+            asset.id,
+            packageOnlyEncoreJobUrl
+          );
+          // Stamp the transcode's Encore job id on the `package` step. A
+          // package-only execution has NO transcode step, and the packager's
+          // success callback releases the pin by looking the job id up on the
+          // execution and re-resolving its instance through
+          // `resolvePackagingInstanceId` (src/routes/internal.ts) — without this
+          // the unpin resolves `undefined`, is skipped, and the pin above lingers
+          // for its full TTL, blocking scale-down of an otherwise idle instance.
+          // This id is the pin's own member, so stamping it is what makes the
+          // pin releasable at all. It also
+          // gives operators and the stalled reconciler the only correlatable
+          // handle a package-only run has. `StepExecution.encoreJobId` is
+          // `string | undefined` (CONTRACT: src/data/pipeline-repo.ts:43-56,
+          // field at :47) — documented as transcode-stamped, not restricted to it.
+          stepsCopy[i] = {
+            ...step,
+            status: 'running',
+            // `StepExecution.jobId` — the internal job repo id, already on the
+            // contract (CONTRACT: src/data/pipeline-repo.ts:43-56, field at :45)
+            // and until now only populated by transcode steps (issue #976).
+            ...(packageJobId ? { jobId: packageJobId } : {}),
+            ...(packageOnlyEncoreJobId ? { encoreJobId: packageOnlyEncoreJobId } : {}),
+            startedAt: now()
+          };
           break; // async — advanced by packager callback
         }
       }
@@ -2257,8 +3649,35 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const message = err instanceof Error ? err.message : String(err);
       const idx = stepsCopy.findIndex((s) => s.status === 'pending');
       const failIdx = idx >= 0 ? idx : stepsCopy.length - 1;
-      stepsCopy[failIdx] = { ...stepsCopy[failIdx], status: 'failed', error: message, startedAt: now(), completedAt: now() };
+      // `failIdx` is -1 only when the execution has no steps at all, in which
+      // case there is no step record to mark failed — the execution-level
+      // `status: 'failed'` below is the whole story. Guard the write so we never
+      // stamp a bogus index on the array.
+      if (failIdx >= 0) {
+        stepsCopy[failIdx] = { ...stepsCopy[failIdx], status: 'failed', error: message, startedAt: now(), completedAt: now() };
+      }
+      // Step name for the log/stage, with a literal fallback for the no-steps
+      // case (which would otherwise read "undefined step failed"). `PipelineStepName`
+      // CONTRACT: src/pipeline/pipelines.ts:22-23; logStageForStep maps any
+      // non-transcode/package name to the `ingest` stage (src/routes/assets.ts:1106-1110),
+      // which is the correct coarse stage for an execution that never started a step.
+      const failedStep = failIdx >= 0 ? stepsCopy[failIdx] : undefined;
+      const failedStepLabel = failedStep ? failedStep.name : 'pipeline';
       await pipelineRepo.update(execution.id, { steps: stepsCopy, status: 'failed' });
+      // Operational log (issue #995): the step that failed the execution. This is
+      // the synchronous failure path — a step that threw before handing off to an
+      // OSC callback — so it is the only record of the failure the Logs tab would
+      // otherwise get (the callback-driven failures are logged by
+      // completeTranscode / PackagingService.handleFailure).
+      logPipelineEvent(
+        pipelineLog,
+        {
+          stage: failedStep ? logStageForStep(failedStep.name) : 'ingest',
+          level: 'error',
+          message: `${failedStepLabel} step failed for asset ${asset.id} (execution ${execution.id}): ${message}`
+        },
+        request.log
+      );
       reply.code(502).send({ error: 'pipeline_step_failed', message });
       return undefined;
     }
@@ -2448,20 +3867,81 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           description,
           tags
         });
+        // Audit: asset created (issue #999, instrumentation convention of #564).
+        // Same shape as POST / (assets.ts:2762-2772) — one entry, targetId = the
+        // new asset id, `detail.name`/`detail.status` read off the asset as
+        // created — plus `sourceUrl`, so an ingest-by-URL creation is
+        // distinguishable from a plain POST / in the queryable trail
+        // (GET /api/v1/audit). Emitted here, directly after repo.create and
+        // BEFORE the objectKey/status update below, for the same reason the
+        // default branch does: the asset exists from this point on, so a failure
+        // in any later step must not swallow the creation record. `detail.status`
+        // is therefore the status at creation, not the post-update one.
+        //
+        // `sourceUrl` here is the credential-free `s3://bucket/key` locator built
+        // below — the exact value the ingest job records (`sourceUrl`, CONTRACT:
+        // src/data/job-repo.ts:100) — never the registered external credential,
+        // which this path never holds as a literal anyway (#548).
+        const extObjectKey = `s3://${source.bucket}/${source.objectKey}`;
+        emitAudit(
+          audit,
+          {
+            actor: originActor('user'),
+            action: 'asset.created',
+            targetType: 'asset',
+            targetId: extAsset.id,
+            detail: { name: extAsset.name, status: extAsset.status, sourceUrl: extObjectKey }
+          },
+          request.log
+        );
         // The recorded source is the credential-free `s3://bucket/key` locator;
         // the object already lives in the external bucket, so no byte-pull runs
         // and the asset advances straight to `processing`.
-        const extObjectKey = `s3://${source.bucket}/${source.objectKey}`;
         await repo.update(extAsset.id, { objectKey: extObjectKey, status: 'processing' });
         const extJob = await jobs.create({
           type: 'ingest-url',
           assetId: extAsset.id,
           sourceUrl: extObjectKey
         });
+        // Audit: ingest-url job submitted (issue #1000). One entry, targetId = the
+        // new job id, emitted right after the durable job record exists — the same
+        // moment and the same shape the transcode submission uses
+        // (src/pipeline/transcode.ts:104-114). `system` origin matches every other
+        // `job.*` entry (transcode + package), so the job lifecycle reads as one
+        // consistent origin regardless of which surface triggered it.
+        emitAudit(
+          audit,
+          {
+            actor: originActor('system'),
+            action: 'job.submitted',
+            targetType: 'job',
+            targetId: extJob.id,
+            detail: { jobType: 'ingest-url', assetId: extAsset.id }
+          },
+          request.log
+        );
         await jobs.update(extJob.id, { status: 'running' });
         await jobs.update(extJob.id, { status: 'done', progress: 100 });
+        // Audit: this branch settles the job terminally INLINE (the bytes already
+        // live in the external bucket, so no pull worker runs and nothing else can
+        // ever emit the terminal entry for it). Same shape as the pull worker's
+        // success entry (src/pipeline/url-pull-worker.ts) minus `bytesTransferred`,
+        // which is meaningless when no bytes were transferred.
+        emitAudit(
+          audit,
+          {
+            actor: originActor('system'),
+            action: 'job.completed',
+            targetType: 'job',
+            targetId: extJob.id,
+            detail: { jobType: 'ingest-url', assetId: extAsset.id }
+          },
+          request.log
+        );
         // Fire-and-forget probe against the external source (job reads in place).
-        triggerExtraction(extAsset.id, extObjectKey, source);
+        // Carries the job's persisted stack (issue #1097) so the detached probe's
+        // asset write resolves this stack and not the first-listed one.
+        triggerExtraction(extAsset.id, extObjectKey, source, undefined, extJob.stackName);
         return reply.code(202).send({ assetId: extAsset.id, jobId: extJob.id });
       }
 
@@ -2486,6 +3966,24 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         description,
         tags
       });
+      // Audit: asset created (issue #999). Identical shape + placement to the
+      // external-backend branch above and to POST / (assets.ts:2762-2772), so an
+      // ingest-by-URL creation produces one `asset.created` entry no matter which
+      // branch served the request. The recorded `sourceUrl` is the request's own
+      // pull URL — the same value already persisted on the ingest job below
+      // (`sourceUrl`, CONTRACT: src/data/job-repo.ts:100), so this adds no value
+      // the API did not already store.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.created',
+          targetType: 'asset',
+          targetId: asset.id,
+          detail: { name: asset.name, status: asset.status, sourceUrl }
+        },
+        request.log
+      );
       const objectKey = `ingest/${asset.id}`;
       await repo.update(asset.id, { objectKey });
 
@@ -2495,20 +3993,125 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         sourceUrl
       });
 
+      // Resolved ONCE, here, while the request is still in flight — and reused
+      // for both the pull and the extraction that follows it (issue #1058
+      // review). `storageFor()` is a cache read keyed on this request's stack
+      // name, and a large pull can outlive the resolver TTL; resolving again
+      // from the `.then()` below would throw inside a detached promise (silent
+      // loss of the extraction plus an unhandled rejection) rather than return
+      // the right stack. The handle itself is a plain client wrapper with no
+      // TTL of its own, so holding it across the pull is safe.
+      const pullStorage = storageFor();
+
+      // Audit: ingest-url job submitted (issue #1000). See the external-backend
+      // branch above for the shape rationale. Emitted BEFORE the detached pull
+      // runner starts, so the audit trail records the submission regardless of the
+      // pull outcome — and the asset's history no longer starts mid-pipeline.
+      // `sourceUrl` is deliberately NOT in the detail bag: a pull source may be a
+      // pre-signed URL carrying credentials in its query string.
+      // This submission and the terminal job.completed/job.failed the worker emits
+      // can land in the same millisecond (equal `at`); the audit store mints
+      // monotonic ULID ids so GET /api/v1/audit's equal-`at` tiebreak resolves to
+      // true write order and never renders the lifecycle inverted (issue #1000
+      // review; CONTRACT: monotonic id minting in src/data/audit-repo.ts record()).
+      emitAudit(
+        audit,
+        {
+          actor: originActor('system'),
+          action: 'job.submitted',
+          targetType: 'job',
+          targetId: job.id,
+          detail: { jobType: 'ingest-url', assetId: asset.id }
+        },
+        request.log
+      );
+
       // Detached, non-blocking. runPull never throws (records failures on the
       // job), so an unhandled rejection cannot crash the process. Once the pull
       // reaches a terminal state we fire-and-forget technical metadata
-      // extraction against the now-stored object (issue #6); we only extract if
-      // the asset actually advanced to `processing` (pull succeeded).
+      // extraction AND poster-frame extraction against the now-stored object
+      // (issues #6, #1050); we only run either if the asset actually advanced to
+      // `processing` (pull succeeded).
+      //
+      // issue #1050: this branch previously ran extraction only, so a
+      // URL-ingested asset never got a `thumbnails` entry while an uploaded one
+      // did (main.ts onObjectStored runs both). The pull lands the bytes in
+      // OSC-managed storage under our own `ingest/<id>` key, so the thumbnail
+      // runner's presignedGet of that key resolves exactly as it does for an
+      // upload — the two paths are now at parity.
+      //
+      // Deliberately NOT applied to the external-backend branch above: there
+      // objectKey is `s3://<foreign-bucket>/<key>`, and the thumbnail runner
+      // resolves its source via deps.storage.presignedGet (thumbnail.ts:119),
+      // which cannot presign a bucket this deployment's storage does not own.
+      // triggerExtraction takes an externalSource for that case; triggerThumbnail
+      // has no equivalent, so calling it there would fail silently. Giving the
+      // thumbnail path the same external-source treatment is a separate change.
       void runner(
-        { jobId: job.id, assetId: asset.id, objectKey, sourceUrl },
-        { jobs, assets: repo, storage: storageFor(), quota: opts.quota, ...opts.pullDeps }
-      ).then(async () => {
-        const settled = await repo.get(asset.id);
-        if (settled?.status === 'processing') {
-          triggerExtraction(asset.id, objectKey);
+        {
+          jobId: job.id,
+          assetId: asset.id,
+          objectKey,
+          sourceUrl,
+          // The stack the job was just created against (issue #1097). The pull
+          // is detached and can be re-driven after a process restart, so the
+          // worker re-enters this persisted identity rather than depending on
+          // the ambient context it inherits from this request.
+          stackName: job.stackName
+        },
+        {
+          jobs,
+          assets: repo,
+          storage: pullStorage,
+          quota: opts.quota,
+          ...opts.pullDeps,
+          // Operational log for the `ingest` stage (issue #995). Threaded after
+          // the `pullDeps` spread because `PullDeps` carries no log sink of its
+          // own — the worker's start/success/failure entries are the only record
+          // the Logs tab gets of a URL-pull ingest, which runs detached and
+          // therefore outlives this request.
+          pipelineLog,
+          pipelineLogErrors: request.log,
+          stackLog: request.log,
+          // Terminal `job.completed` / `job.failed` emission for this job happens
+          // inside the worker, where the pull actually settles (issue #1000).
+          // Threaded after the `pullDeps` spread so an injected test dep bag can
+          // never silently drop the emitter.
+          audit,
+          auditLog: request.log
         }
-      });
+      )
+        // The read-back runs in the job's PERSISTED stack (issue #1097) rather
+        // than relying on the ambient context this continuation inherited, so it
+        // resolves the same repository the pull just wrote to.
+        .then(() =>
+          runWithPersistedStack(job.stackName, async () => {
+            const settled = await repo.get(asset.id);
+            if (settled?.status === 'processing') {
+              triggerExtraction(asset.id, objectKey, undefined, pullStorage, job.stackName);
+              // Same `pullStorage` handle, for the same reason (issue #1051
+              // review): this runs AFTER the request's work has settled, so
+              // `storageFor()` can have aged past the resolver TTL and would throw
+              // inside this detached continuation. Passing the handle resolved at
+              // request time keeps the thumbnail path symmetric with the
+              // extraction path immediately above instead of silently depending on
+              // the ambient request-stack context.
+              triggerThumbnail(asset.id, objectKey, request, pullStorage);
+            }
+          })
+        )
+        // This continuation outlives the request, so nothing is left to surface
+        // a rejection: `repo.get` resolves the stack through the ambient context
+        // and can fail on its own (a dead CouchDB, a stack de-provisioned mid
+        // pull). Logged rather than swallowed, and never rethrown, so an ingest
+        // whose extraction could not be kicked off is visible in the operational
+        // log instead of arriving as an unhandled rejection (issue #1058 review).
+        .catch((err: unknown) => {
+          request.log.error(
+            { err, assetId: asset.id, jobId: job.id },
+            'post-pull metadata/thumbnail extraction could not be started'
+          );
+        });
 
       return reply.code(202).send({ assetId: asset.id, jobId: job.id });
     }
@@ -2516,9 +4119,24 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
   app.get(
     '/',
-    { schema: { querystring: listQuerySchema, response: { 200: listSchema } } },
-    async (request) => {
-      return repo.list(request.query);
+    {
+      schema: {
+        querystring: listQuerySchema,
+        response: { 200: listSchema, 400: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const { from, to, ...rest } = request.query;
+      // An inverted range is a caller mistake, not an empty page (issue #833).
+      const created = resolveCreatedRange({ from, to });
+      if (!created.ok) {
+        return reply.code(400).send({ error: 'invalid_created_range', message: created.message });
+      }
+      const page = await repo.list({ ...rest, ...created.range });
+      // Same derived `retention` member as GET /:id (issue #1034), so a client
+      // listing `?status=archived` reads the window from the same contract
+      // instead of re-deriving it per row. Non-archived items are untouched.
+      return { ...page, items: page.items.map(withRetentionWindow) };
     }
   );
 
@@ -2569,7 +4187,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       reply.header('deprecation', 'true');
       reply.header('link', '</api/v1/search/>; rel="successor-version"');
       const items = await repo.search(request.query.q);
-      return { items };
+      // Map through the shared helper like every other existing-asset response
+      // (issue #1034): this alias has no status filter, so archived assets DO
+      // come back through it, and the response schema is the same `assetSchema`
+      // that advertises `retention` for them.
+      return { items: items.map(withRetentionWindow) };
     }
   );
 
@@ -2738,7 +4360,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(asset);
+      return reply.code(200).send(withRetentionWindow(asset));
     }
   );
 
@@ -2797,7 +4419,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(updated);
+      return reply.code(200).send(withRetentionWindow(updated));
     }
   );
 
@@ -2993,7 +4615,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           return reply.code(410).send({ error: 'gone', message: 'asset has been purged' });
         }
         if (state.kind === 'asset') {
-          return reply.code(200).send(state.asset);
+          // `retention` (issue #1034) is attached here, not persisted: an
+          // archived asset reports its earliest-possible purge time derived from
+          // the live retention policy; any other asset is unchanged.
+          return reply.code(200).send(withRetentionWindow(state.asset));
         }
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -3001,17 +4626,40 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(asset);
+      return reply.code(200).send(withRetentionWindow(asset));
     }
   );
 
-  // Enumerate every version in an asset's version chain (issue #118).
+  // Enumerate every version in an asset's version chain (issue #118; contract
+  // documented by ADR-024, issue #905).
+  //
   // Workspace-scoped and behind `authenticate`. Returns all assets sharing the
   // target's `versionGroupId`, oldest first, so a client can "show all versions
   // of this asset", compare, or roll back. An asset that has never participated
   // in a clip/export/rewrap version chain returns just itself (single-member
   // chain). DISTINCT from ?parentId= listing, which enumerates rendition/child
   // hierarchy, not edit versions.
+  //
+  // Envelope (ADR-024):
+  //   - assetId          the id that was queried (echoed; always a member)
+  //   - versionGroupId   the lineage id shared by every member. Absent only for
+  //                      a never-versioned asset, which has no group yet.
+  //   - currentVersionId the current version, chosen SERVER-SIDE (see
+  //                      currentVersionId() in asset-repo.ts). Always names a
+  //                      member of `versions`. Clients must read this field and
+  //                      must NOT re-derive it as "the last array element" —
+  //                      the newest `ready` member wins, so archived, failed
+  //                      and still-in-flight members are skipped whenever a
+  //                      usable one exists, and the two differ. It names the
+  //                      head of the lineage, NOT a guarantee of `ready`:
+  //                      check the named member's own `status` before
+  //                      dereferencing it.
+  //   - versions         the whole chain, oldest first (createdAt, then id).
+  //                      Includes `archived` members: this is lineage history,
+  //                      not a live-asset listing. Each member carries
+  //                      `versionOfAssetId`, so the chain's TREE topology is
+  //                      reconstructible client-side (ADR-024: chains branch).
+  //
   //   200 — the version chain (always includes the target); 404 — unknown asset
   app.get(
     '/:id/versions',
@@ -3019,7 +4667,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       schema: {
         params: z.object({ id: z.string() }),
         response: {
-          200: z.object({ assetId: z.string(), versions: z.array(assetSchema) }),
+          200: z.object({
+            assetId: z.string(),
+            versionGroupId: z.string().optional(),
+            currentVersionId: z.string(),
+            versions: z.array(assetSchema)
+          }),
           404: errorSchema
         }
       }
@@ -3029,7 +4682,25 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!versions) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send({ assetId: request.params.id, versions });
+      // Read the group off the TARGET asset rather than searching the returned
+      // page for it. The page is capped at MAX_LIMIT (couch-asset-repo.ts:624-627,
+      // ADR-024 D6), so on a truncated lineage the target can be absent from
+      // `versions` and a search would falsely report `versionGroupId: undefined`
+      // — i.e. "never versioned" — for an asset that is demonstrably versioned.
+      const target = await repo.get(request.params.id);
+      // listVersions always includes the target itself, so the chain is
+      // non-empty here and currentVersionId() cannot return undefined. The
+      // fallback keeps the field non-optional in the contract regardless.
+      const current = currentVersionId(versions) ?? request.params.id;
+      return reply.code(200).send({
+        assetId: request.params.id,
+        versionGroupId: target?.versionGroupId,
+        currentVersionId: current,
+        // The chain deliberately includes `archived` members (lineage history),
+        // so each one carries the same derived `retention` window GET /:id
+        // reports (issue #1034); live members carry none.
+        versions: versions.map(withRetentionWindow)
+      });
     }
   );
 
@@ -3076,10 +4747,28 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // For 'external' backends we emit URLs against the operator's public/CDN
       // origin (publicBaseUrl) or an endpointUrl-derived object URL. For 'minio'
       // (or unset) these resolve to undefined and the MinIO delivery-mode path
-      // (proxy/public, #200/#201) is kept unchanged — OSC MinIO blocks external
-      // presigned/public GETs.
+      // (proxy/public, #200/#201/#859) handles the per-stack backend below.
       const packagedBase = externalPublicBaseUrl(stackStorage?.packaged);
       const sourceBase = externalPublicBaseUrl(stackStorage?.source);
+      // Public origin for the DEFAULT per-stack MinIO backend (issue #859).
+      // PACKAGED_PUBLIC_BASE_URL wins when set; otherwise a PROVISIONED stack's
+      // OWN MinIO endpoint (StackConfig.minioEndpoint) IS the public origin for
+      // its packaged bucket, so a zero-config stack advertises absolute,
+      // anonymously fetchable manifest URLs instead of falling through to the
+      // authorized stream proxy below. That is sound precisely because this
+      // codebase applies the anonymous-read policy to the packaged bucket when it
+      // provisions the stack (routes/provision.ts, issue #199).
+      //
+      // The endpoint comes from `stackResolvedMinioEndpoint`, NOT from
+      // `s3Config.endpoint` directly: on the env-override path (COUCHDB_URL /
+      // MINIO_URL) that same field carries MINIO_URL verbatim for a MinIO we never
+      // policy-configured, so deriving an origin there would swap a working
+      // authorized proxy URL for one that 403s. It returns undefined for the
+      // env-override and in-memory paths, keeping their pre-#859
+      // relative-then-proxy behaviour unchanged.
+      const packagedPublicBase = packagedPublicOrigin(
+        stackResolvedMinioEndpoint(request.connections)
+      );
 
       // Preferred: packaged streaming manifests (issue #9 / #200 / #201 / #213).
       if (asset.manifestUrls && (asset.manifestUrls.hls || asset.manifestUrls.dash)) {
@@ -3139,6 +4828,16 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         //               resolved to the public-facing MinIO/CDN origin at read
         //               time (issue #200); a missing/invalid public origin is
         //               surfaced as an explicit 501, not a relative/internal path.
+        // The two modes have deliberately DIFFERENT security postures — an
+        // anonymously readable bucket versus a bearer-authorized API route — and
+        // `src/pipeline/packaging.ts DELIVERY_MODES` documents them as never both
+        // active. So neither branch may borrow the other's URLs to satisfy a
+        // resolvability requirement (issue #860): an unresolvable origin is a
+        // CONFIGURATION problem, reported as `not_configured` naming the missing
+        // variable, not a routing problem to be silently worked around. Until
+        // #860 the `public` branch fell back to proxy URLs, which left a
+        // deployment nominally `public` while behaving as `proxy` and hid the
+        // unset origin behind a ready-looking 200.
         if (deliveryMode() === 'proxy') {
           const proxyBase = assetsBaseUrl(request.url);
           // A proxy URL is only fully resolvable when the API's public origin is
@@ -3150,7 +4849,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // packaged-location metadata for deterministic client-side resolution.
           if (!isAbsoluteUrl(proxyBase)) {
             return reply.code(200).send(
-              notConfiguredDelivery(asset, expiresAt)
+              notConfiguredDelivery(asset, expiresAt, MISSING_API_ORIGIN)
             );
           }
           const proxied = proxyManifestUrlsFor(asset.id, proxyBase);
@@ -3166,45 +4865,43 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           });
         }
         try {
-          // In the default `public` mode, `resolvePublicManifestUrl` returns a
-          // genuinely public absolute URL only when PACKAGED_PUBLIC_BASE_URL is
-          // configured. On the zero-config per-stack MinIO backend it hands back
-          // the stored value verbatim (issue #320), which is a bare object-key
-          // path (e.g. `/openvideocore-packaged/<id>/<uuid>/index.m3u8`) with no
-          // scheme/host and no signature — not fetchable by a player, and OSC
-          // MinIO blocks external presigned/public GETs. When the resolved value
-          // is still non-absolute, route the manifest through the authorized
-          // stream proxy instead (issue #341), mirroring the DELIVERY_MODE=proxy
-          // branch above so `delivery.hls`/`delivery.dash` are always absolute,
-          // resolvable URLs — consistent with how `source` is emitted. The proxy
-          // base is derived from PUBLIC_BASE_URL / request context via
-          // `assetsBaseUrl`, never hardcoded.
-          const proxyBase = assetsBaseUrl(request.url);
-          const proxied = proxyManifestUrlsFor(asset.id, proxyBase);
-          // Whether the stream-proxy fallback can yield a fully-resolvable
-          // (absolute) URL — only when the API's public origin is configured
-          // (PUBLIC_BASE_URL). See the DELIVERY_MODE=proxy branch above.
-          const proxyResolvable = isAbsoluteUrl(proxyBase);
-          const toAbsolute = (
-            stored: string | undefined,
-            proxyUrl: string | undefined
-          ): string | undefined => {
+          // In the default `public` mode, `resolvePublicManifestUrl` resolves the
+          // stored manifest path against `packagedPublicBase` — the explicit
+          // PACKAGED_PUBLIC_BASE_URL when set, else the resolved stack's own
+          // MinIO origin (issue #859). The stored value itself is a bucket-
+          // prefixed object-key path (e.g.
+          // `/openvideocore-packaged/<id>/<uuid>/index.m3u8`) with no
+          // scheme/host, so it only becomes fetchable once joined onto that
+          // origin. When NO origin is resolvable at all the stored value comes
+          // back verbatim (issue #320) and is still non-absolute.
+          //
+          // That case is a MISSING PUBLIC ORIGIN, and it is reported as such
+          // (issue #860). This branch deliberately never touches
+          // `assetsBaseUrl` / `proxyManifestUrlsFor`: borrowing the proxy
+          // mode's authorized `/stream/*` URLs here would put the deployment in
+          // both delivery postures at once — the state
+          // `src/pipeline/packaging.ts DELIVERY_MODES` says cannot occur — and,
+          // worse, would conceal the very misconfiguration that triggered it
+          // behind a ready-looking 200 whose URL then 401s for the caller. A
+          // deployment that WANTS proxy delivery selects it with
+          // DELIVERY_MODE=proxy, which is handled above.
+          const toPublicUrl = (stored: string | undefined): string | undefined => {
             if (!stored) return undefined;
-            const resolved = resolvePublicManifestUrl(stored);
-            if (isAbsoluteUrl(resolved)) return resolved;
-            // The stored value is a bare object-key path (zero-config MinIO). It
-            // is only resolvable through the proxy when the proxy base itself is
-            // absolute; otherwise there is no resolvable URL to advertise.
-            return proxyResolvable ? proxyUrl : undefined;
+            const resolved = resolvePublicManifestUrl(stored, packagedPublicBase);
+            return isAbsoluteUrl(resolved) ? resolved : undefined;
           };
-          const hls = toAbsolute(asset.manifestUrls.hls, proxied.hls);
-          const dash = toAbsolute(asset.manifestUrls.dash, proxied.dash);
+          const hls = toPublicUrl(asset.manifestUrls.hls);
+          const dash = toPublicUrl(asset.manifestUrls.dash);
           // Neither format resolved to a playable URL although packaged output
-          // exists → public delivery is not configured. Never advertise a 200
-          // that looks ready with no resolvable URL (issue #506): emit the
-          // explicit `not_configured` signal + resolution metadata instead.
+          // exists → the packaged bucket's public origin is not configured.
+          // Never advertise a 200 that looks ready with no resolvable URL
+          // (issue #506): emit the explicit `not_configured` signal, the
+          // resolution metadata, and the name of the setting that is missing
+          // (issue #860) so the operator can fix it instead of debugging a 401.
           if (!hls && !dash) {
-            return reply.code(200).send(notConfiguredDelivery(asset, expiresAt));
+            return reply
+              .code(200)
+              .send(notConfiguredDelivery(asset, expiresAt, MISSING_PUBLIC_ORIGIN));
           }
           return reply.code(200).send({
             assetId: asset.id,
@@ -3563,9 +5260,21 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // so the ops UI's "Open" link (public/app.js) was unclickable. Route
       // through the authorized stream proxy when the stored value doesn't
       // already resolve to something absolute.
+      //
+      // The origin resolved against is the SAME one /:id/delivery uses
+      // (issue #859): PACKAGED_PUBLIC_BASE_URL when set, else a PROVISIONED
+      // stack's own MinIO endpoint via `stackResolvedMinioEndpoint` (undefined on
+      // the env-override / in-memory paths, which therefore keep proxying).
+      // Keeping the two call sites on one origin — and on the same
+      // stack-only restriction — is what makes `manifestUrl` here match the
+      // `urls.hls`/`urls.dash` delivery advertises, as this endpoint's contract
+      // documents above.
+      const packagedPublicBase = packagedPublicOrigin(
+        stackResolvedMinioEndpoint(request.connections)
+      );
       const proxied = proxyManifestUrlsFor(asset.id, assetsBaseUrl(request.url));
       const toAbsoluteManifestUrl = (stored: string, proxyUrl: string | undefined): string => {
-        const resolved = resolvePublicManifestUrl(stored);
+        const resolved = resolvePublicManifestUrl(stored, packagedPublicBase);
         return isAbsoluteUrl(resolved) ? resolved : proxyUrl ?? resolved;
       };
 
@@ -3599,6 +5308,212 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
 
       return reply.code(200).send({ files, fileGroups });
+    }
+  );
+
+  // Per-asset storage usage of the current output set (issue #1242).
+  //
+  // Answers "what does this asset's existing output set cost in storage" —
+  // the transcoded renditions plus the packaged (HLS/DASH) object set — so an
+  // operator can judge a re-encode before paying for it. The deployment-wide
+  // counters (`GET /api/v1/usage`) report the same bytes in aggregate; this is
+  // the per-asset attribution of them and adds no counter of its own: every
+  // number is measured against the object store at request time.
+  //
+  // Measurement, per part:
+  //   - renditions: `statObject().size` per `renditions[].objectKey`
+  //     (src/data/storage.ts:146). An `s3://bucket/key` rendition key (Encore
+  //     writes to its own output bucket) is resolved through `parseS3Uri` and
+  //     measured in THAT bucket, exactly as /:id/files presigns it.
+  //   - packaged output: a recursive prefix listing summed over the SAME prefix
+  //     the stream proxy serves from (`resolveStreamPrefix`), so the measured
+  //     object set is the one a player would actually fetch. Manifests and CMAF
+  //     segments are many small objects, so they are summed by prefix rather
+  //     than stat'ed one by one (src/data/storage.ts
+  //     `sumObjectSizesUnderPrefix`).
+  //
+  // A rendition whose object sits inside the measured packaged prefix is listed
+  // with its size but NOT counted again (`counted: false`) — the packaged sum
+  // already includes those bytes. An unmeasurable object reports
+  // `sizeBytes: null` and flips `complete` to false, so a partial read is never
+  // mistaken for a cheap asset.
+  //
+  //   200 — the usage projection
+  //   404 — unknown/foreign asset (existence not leaked; matches sibling routes)
+  //   501 — there is an output set to measure but object storage is not
+  //         configured here (same not_configured convention as /:id/files)
+  app.get(
+    '/:id/storage-usage',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: assetStorageUsageSchema, 404: errorSchema, 501: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+
+      const renditions = asset.renditions ?? [];
+      // Does this asset have packaged output at all? Either the durable
+      // packaged-output block (#502) or the manifest URLs the packager callback
+      // records. Both absent means it was never packaged, so there is no prefix
+      // worth listing and `packagedOutput` is reported as null without touching
+      // the store.
+      const packaged = asset.packagedOutput;
+      const hasPackagedOutput = Boolean(
+        packaged?.prefix ||
+          packaged?.masterHlsKey ||
+          packaged?.masterDashKey ||
+          asset.manifestUrls?.hls ||
+          asset.manifestUrls?.dash
+      );
+
+      const storageClient = request.connections?.storageClient;
+      const hasOutputs = renditions.length > 0 || hasPackagedOutput;
+      // Mirror /:id/files: only 501 when there is something to measure and no
+      // storage at all to measure it with. An asset with no outputs yet is a
+      // legitimate 200 with zero bytes.
+      if (hasOutputs && !storageFor && !storageClient) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'object storage is not configured'
+        });
+      }
+
+      let complete = true;
+
+      // --- Packaged output -----------------------------------------------
+      // Listed first so a rendition object that lives under the packaged
+      // prefix can be recognised and excluded from the total below.
+      //
+      // The bucket is the ambient packaged bucket (per-stack connection, else
+      // the env default) — the same resolution `/:id/stream/*` and `/:id/files`
+      // use, so this measures the bucket playback is actually served from, and
+      // it is echoed in the response so an operator can see which one that was.
+      let packagedUsage: z.infer<typeof assetStorageUsagePackagedSchema> | null = null;
+      let packagedPrefix: string | undefined;
+      let packagedBucketName: string | undefined;
+      if (hasPackagedOutput) {
+        if (storageClient) {
+          packagedBucketName = request.connections?.packagedBucket ?? packagedBucket();
+          // resolveStreamPrefix returns the prefix WITHOUT a trailing slash
+          // (it composes as `<prefix>/<relative>`); the listing and the
+          // double-count check below both want it slash-terminated.
+          const resolved = await resolveStreamPrefix(asset, storageClient, packagedBucketName);
+          packagedPrefix = `${resolved.replace(/\/+$/, '')}/`;
+          try {
+            const sum = await new WorkspaceStorage(
+              storageClient,
+              packagedBucketName
+            ).sumObjectSizesUnderPrefix(packagedPrefix);
+            packagedUsage = {
+              bucket: packagedBucketName,
+              prefix: packagedPrefix,
+              objectCount: sum.objectCount,
+              bytes: sum.totalBytes
+            };
+          } catch (err) {
+            // A listing failure must not 500 a read-only usage projection: the
+            // asset still has packaged output, we just cannot size it. Report
+            // it as unmeasured (null + complete:false) and log the cause.
+            request.log.warn(
+              { err, assetId: asset.id, bucket: packagedBucketName, prefix: packagedPrefix },
+              'storage-usage: failed to list packaged output prefix'
+            );
+            complete = false;
+            packagedPrefix = undefined;
+          }
+        } else {
+          // No object-store connection on this request: the prefix cannot be
+          // listed (a presigning-only storage factory has no listing surface).
+          complete = false;
+        }
+      }
+
+      // --- Renditions ------------------------------------------------------
+      const storage = storageFor ? storageFor() : undefined;
+      const items: z.infer<typeof assetStorageUsageRenditionSchema>[] = [];
+      // Two renditions can point at the same object (e.g. a re-transcode that
+      // reused a key); each object's bytes are counted ONCE.
+      const countedObjects = new Set<string>();
+      let renditionBytes = 0;
+
+      for (const r of renditions) {
+        const s3Uri = parseS3Uri(r.objectKey);
+        let bucket: string | undefined;
+        let key: string;
+        let objectStorage: WorkspaceStorage | undefined;
+        if (s3Uri && storageClient) {
+          bucket = s3Uri.bucket;
+          key = s3Uri.key;
+          objectStorage = new WorkspaceStorage(storageClient, bucket);
+        } else {
+          // A plain object key lives in the workspace source bucket, reached
+          // through the same factory /:id/files presigns with. An s3:// key with
+          // no client is NOT measurable: its bucket is not the factory's bucket,
+          // so measuring it there would report another object's size.
+          key = s3Uri ? s3Uri.key : r.objectKey;
+          objectStorage = s3Uri ? undefined : storage;
+        }
+
+        let sizeBytes: number | null = null;
+        if (objectStorage) {
+          try {
+            const stat = await objectStorage.statObject(key);
+            // statObject resolves undefined for a missing key (storage.ts:151).
+            sizeBytes = stat ? stat.size : null;
+          } catch (err) {
+            request.log.warn(
+              { err, assetId: asset.id, bucket, objectKey: key },
+              'storage-usage: failed to stat rendition object'
+            );
+            sizeBytes = null;
+          }
+        }
+
+        // Already inside the packaged prefix we summed? Then its bytes are in
+        // `packagedOutput.bytes` and must not be added again.
+        const insidePackaged =
+          packagedUsage !== null &&
+          packagedPrefix !== undefined &&
+          (bucket ?? packagedBucketName) === packagedUsage.bucket &&
+          key.startsWith(packagedPrefix);
+
+        const duplicate = countedObjects.has(`${bucket ?? ''}/${key}`);
+        const counted = sizeBytes !== null && !insidePackaged && !duplicate;
+        if (counted && sizeBytes !== null) {
+          countedObjects.add(`${bucket ?? ''}/${key}`);
+          renditionBytes += sizeBytes;
+        }
+        if (sizeBytes === null) {
+          complete = false;
+        }
+
+        items.push({
+          id: r.id,
+          label: r.label,
+          objectKey: key,
+          bucket,
+          sizeBytes,
+          counted
+        });
+      }
+
+      return reply.code(200).send({
+        assetId: asset.id,
+        totalBytes: renditionBytes + (packagedUsage?.bytes ?? 0),
+        complete,
+        renditions: {
+          count: renditions.length,
+          countedCount: items.filter((i) => i.counted).length,
+          bytes: renditionBytes,
+          items
+        },
+        packagedOutput: packagedUsage
+      });
     }
   );
 
@@ -3661,26 +5576,44 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // the asset recovered to `ready`.
       const wedged = asset.status === 'processing' && asset.technicalMetadataError !== undefined;
       if (wedged) {
-        await runExtractionSync(asset.id, source.objectKey);
+        await runExtractionSync(asset.id, source.objectKey, asset.stackName);
         const settled = await repo.get(asset.id);
         return reply.code(200).send({
           assetId: asset.id,
           status: settled?.status ?? asset.status
         });
       }
-      triggerExtraction(asset.id, source.objectKey);
+      triggerExtraction(asset.id, source.objectKey, undefined, undefined, asset.stackName);
       return reply.code(202).send({ assetId: asset.id, status: 'extracting' });
     }
   );
 
   // Submit an ABR transcoding job to Encore (issue #8). Workspace-scoped and
-  // behind `authenticate`. Resolves a preset (default 1080p) or a custom
-  // profile, creates a TranscodeJob, advances the source asset to `processing`,
-  // and submits to Encore. Returns the job id + Encore job id immediately; the
-  // caller polls GET /api/v1/jobs/:id and the Encore callback finishes the work.
+  // behind `authenticate`. Resolves the named profile (default
+  // DEFAULT_PROFILE_NAME), creates a TranscodeJob, advances the source asset to
+  // `processing`, and submits to Encore. Returns the job id + Encore job id
+  // immediately; the caller polls GET /api/v1/jobs/:id and the Encore callback
+  // finishes the work. The recorded `Job.profile` is the profile actually
+  // submitted (issue #1022).
   //   202 — accepted, transcode submitted
+  //   400 — `unknown_profile` — the named profile is not registered on this
+  //         deployment, so it could never resolve on the transcoding side
+  //         (issue #1022); `unknown_profile_params` — a profileParams key the
+  //         profile does not declare; a body carrying the REMOVED
+  //         `customProfile` field (issue #1022 — an encoding ladder cannot be
+  //         supplied inline; register a profile and name it)
   //   404 — unknown/foreign source asset (existence not leaked)
-  //   409 — the source asset has no stored object to transcode
+  //   409 — `no_object` — the source asset has no stored object to transcode
+  //         (pipeline/source-object.ts NO_SOURCE_OBJECT_ERROR);
+  //         `burn_in_source_not_ready` / `burn_in_source_not_available` — a
+  //         burn-in was asked for but its caption source has no key yet, or the
+  //         key's bytes have not landed (issues #388 / #389);
+  //         `stack_routing_mismatch` — the source bytes and the transcoder would
+  //         resolve DIFFERENT stacks, so the transcode would fail with an
+  //         indistinguishable 404 (issue #1058), or the object-store credential
+  //         the transcoder would be spawned with belongs to another stack than
+  //         this request routes to (issue #1093). Refused rather than
+  //         submitted; retry naming one stack consistently via `X-Stack-Name`.
   //   501 — transcoding is not configured on this deployment
   //   502 — Encore rejected the submission
   app.post(
@@ -3725,6 +5658,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       let profileParamsWarning:
         | { code: 'profile_params_unvalidated'; message: string; profile: string; unvalidatedKeys: string[] }
         | undefined;
+      // Reject a caller-supplied profile name this deployment does not hold
+      // (issue #1022) BEFORE any other profile check: an unknown name can only
+      // fail on the transcoding side ("Could not find location for profile …"),
+      // and that failure arrives after dispatch, long after the 202.
+      const unknownProfile = await unknownProfileReason(request.body.profile, request.log);
+      if (unknownProfile) {
+        return reply.code(400).send({ error: 'unknown_profile', message: unknownProfile });
+      }
       // Reject a named GPU-only (NVENC/CUDA) profile that cannot execute on this
       // platform tier (issue #286) before submitting to Encore.
       const unrunnable = await unrunnableProfileReason(request.body.profile);
@@ -3743,13 +5684,16 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // operator-managed profile store — the same profiles GET /api/v1/profiles
       // serves and Encore loads — and reject keys that profile does not declare
       // with a descriptive 400, so a mistyped SpEL param name is an actionable
-      // error rather than a silently-ignored value. Degrades gracefully: a
-      // custom profile (not in the store) or an unresolvable profile is treated
-      // permissively (validateProfileParams passes an undefined YAML through), so
-      // custom/operator profiles are never falsely rejected. An empty/absent map
-      // always passes.
-      if (request.body.profileParams && !request.body.customProfile) {
-        const profileName = request.body.profile ?? 'program';
+      // error rather than a silently-ignored value. Degrades gracefully: an
+      // unresolvable profile YAML is treated permissively (validateProfileParams
+      // passes an undefined YAML through), so a store outage — or an unseeded
+      // store on the default-profile path — never falsely rejects. An
+      // empty/absent map always passes. Since issue #1022 a CALLER-NAMED profile
+      // missing from a reachable store is already a 400 above, so the
+      // unresolvable case reaching here is the store outage or the unnamed
+      // default.
+      if (request.body.profileParams) {
+        const profileName = request.body.profile ?? DEFAULT_PROFILE_NAME;
         // Resolve the profile YAML while distinguishing a genuine not-found from
         // an unreachable profile store (issue #392). A store outage makes
         // ProfileRepository.get() THROW (couch-profile-repo does not catch); the
@@ -3900,6 +5844,26 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // per-stack value exists. Output PATH template is unchanged.
       const resolvedOutputBucket =
         request.connections?.packagedBucket ?? opts.outputBucket;
+
+      // Data-plane / control-plane stack agreement (issue #1058). Resolved once
+      // here and reused as the scaler context below, so the identity we verified
+      // is the identity we submit with.
+      const controlPlane = await transcodeStackIdentity(request);
+      // Both routing splits: documents (#1058) and the object-store credential
+      // the source read would actually use (#1093). Asserted BEFORE the
+      // reachability preflight below, so a mis-routed credential is named as
+      // such rather than probing the wrong instance first.
+      const refusal = transcodeRoutingRefusal(request, controlPlane.resolved);
+      if (refusal) {
+        request.log.error(
+          { assetId: asset.id, objectKey: source.objectKey, ...refusal.logFields },
+          refusal.logMessage
+        );
+        return reply.code(409).send({
+          error: 'stack_routing_mismatch',
+          message: refusal.message
+        });
+      }
       try {
         // FAST reachability preflight (issue #617): before enqueuing work, probe
         // the stack's dependencies (queue/Valkey via the shared IORedis ping,
@@ -3912,9 +5876,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         // opt-in: a dependency with no wired probe client is reported
         // not_configured and does NOT trip the guard, so deployments/tests
         // without a live queue/storage submit exactly as before.
-        const queueEndpoint = opts.packagingRedis
-          ? `redis://${opts.packagingRedis.options.host ?? 'localhost'}:${
-              opts.packagingRedis.options.port ?? 6379
+        const packagingRedis = await packagingRedisForStack(opts);
+        const queueEndpoint = packagingRedis
+          ? `redis://${packagingRedis.options.host ?? 'localhost'}:${
+              packagingRedis.options.port ?? 6379
             }`
           : undefined;
         const preflight = await checkStackReachability(
@@ -3924,10 +5889,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             ...(request.connections?.s3Config
               ? { minioEndpoint: request.connections.s3Config.endpoint }
               : {}),
-            bucket: opts.sourceBucket
+            // Probe the bucket the transcode will actually read — the resolved
+            // stack's source bucket (issue #639/#1058) — not the deployment-wide
+            // boot default.
+            bucket: request.connections?.sourceBucket ?? opts.sourceBucket
           },
           {
-            ...(opts.packagingRedis ? { queueClient: opts.packagingRedis } : {}),
+            ...(packagingRedis ? { queueClient: packagingRedis } : {}),
             ...(request.connections?.storageClient
               ? { storageClient: request.connections.storageClient }
               : {})
@@ -3942,11 +5910,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             // request routes to (issue #615), resolved from X-Stack-Name, not
             // the fixed deployment context — so a transcode against a healthy
             // named stack reaches that stack regardless of provisioning order.
-            workspaceId: await transcodeContext(request),
+            workspaceId: controlPlane.contextId,
             sourceAssetId: asset.id,
             sourceObjectKey: source.objectKey,
             preset: request.body.profile,
-            customProfile: request.body.customProfile as EncoreProfile | undefined,
             profileParams: request.body.profileParams,
             burnInSubtitlesFilter,
             // Read the transcode INPUT from the resolved stack's per-stack
@@ -3960,7 +5927,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             sourceBucket: request.connections?.sourceBucket ?? opts.sourceBucket,
             outputBucket: resolvedOutputBucket
           },
-          { jobs, assets: repo, encore: opts.encore, audit, auditLog: request.log }
+          { jobs, assets: repo, encore: opts.encore, audit, auditLog: request.log, pipelineLog }
         );
         return reply
           .code(202)
@@ -3993,6 +5960,33 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         if (isJobThroughputCapExceededError(err)) {
           return reply.code(err.statusCode).send(err.toResponseBody());
         }
+        // The credential the TRANSCODER would be spawned with belongs to a
+        // different stack than this request routes to (issue #1093). Resolved
+        // deep in the scaler's `resolveS3Config` callback
+        // (services/encore-s3-config.ts), which refuses rather than silently
+        // substituting the first-provisioned stack's object store. Answer the
+        // SAME 409 `stack_routing_mismatch` the edge checks above answer — it
+        // is the same class of fault, and a client must not have to distinguish
+        // "mis-routed, retry naming one stack" from a 502 transcoder failure.
+        // The error carries two stack ids and an endpoint host; it has no
+        // credential field, so nothing secret can reach the body or the log.
+        if (isObjectStoreStackMismatchError(err)) {
+          request.log.error(
+            {
+              assetId: asset.id,
+              objectKey: source.objectKey,
+              reason: 'transcoder-object-store-credential',
+              expectedStack: err.expectedStack,
+              actualStack: err.actualStack,
+              actualEndpointHost: err.actualEndpointHost
+            },
+            'refusing to dispatch a transcode: the object-store credential the transcoder would be spawned with belongs to a different stack than the request routes to (issue #1093)'
+          );
+          return reply.code(409).send({
+            error: 'stack_routing_mismatch',
+            message: err.message
+          });
+        }
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'encore_submit_failed', message });
       }
@@ -4008,9 +6002,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //
   //   202 — packaging enqueued (or pipeline started)
   //   404 — unknown/foreign asset (existence not leaked)
-  //   409 — pipeline already running / job not found / instance unavailable
+  //   409 — pipeline already running / job not found / instance unavailable /
+  //         `stack_routing_mismatch` (issue #1058, pipeline mode only — it shares
+  //         `startPipelineExecution` with POST /:id/execute, whose abr-vod
+  //         pipeline contains a transcode step),
+  //         (pipeline mode, issue #1059) `source_unreadable` — the source object
+  //         is missing from the bucket the transcode step would read. The #1058
+  //         stack-routing gate runs FIRST (is this the right stack at all?), then
+  //         the #1059 readiness gate (are the bytes actually there?).
   //   501 — required service not configured on this deployment
-  //   502 — Encore submission failed
+  //   502 — Encore submission failed, or (pipeline mode, issue #1059)
+  //         `source_verification_failed` — the object store could not be asked
   app.post(
     '/:id/package',
     {
@@ -4091,10 +6093,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // Resolve the Encore instance URL + UUID from Redis. Both must be present
       // (stored at dispatch time). If the instance has been scaled down, packaging
       // cannot proceed — the Encore job data is only accessible while the instance runs.
-      const encoreJobUrl = await resolveEncoreJobUrlForPackaging(encoreJobId, opts.packagingRedis);
-      if (!encoreJobUrl) {
+      const resolvedPackagingTarget = await resolveEncoreJobUrlForPackaging(
+        encoreJobId,
+        await packagingRedisForJob(opts, encoreJobId)
+      );
+      if (!resolvedPackagingTarget) {
         return reply.code(409).send({ error: 'instance_not_found', message: 'Encore instance no longer in pool — cannot resolve job URL for packaging' });
       }
+      const encoreJobUrl = resolvedPackagingTarget.url;
       // On-demand packager provisioning (epic #226, issue #244): the direct
       // package path also ensures the packager is live before enqueueing, so a
       // job is never dropped onto an unconsumed queue. Idempotent/concurrency-
@@ -4117,10 +6123,26 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // progress as a first-class PipelineExecution. The first step runs immediately;
   // asynchronous steps (transcode/package) advance via OSC callbacks.
   //   202 — pipeline execution created
+  //   400 — `unknown_profile` (issue #1022) — for a pipeline containing a
+  //         transcode step, the named profile is not registered on this
+  //         deployment; or the body carries the REMOVED `customProfile` field
   //   404 — unknown asset
-  //   409 — a pipeline is already running / asset has no stored object
+  //   409 — a pipeline is already running / asset has no stored object /
+  //         (package-only, issue #739) `no_renditions` — nothing to package,
+  //         `no_transcode_job` — no recorded completed transcode to package from,
+  //         `instance_not_found` — the transcode's Encore instance is no longer
+  //         pooled, so the job URL the packager needs cannot be resolved /
+  //         `stack_routing_mismatch` (issue #1058) — for any pipeline CONTAINING
+  //         a transcode step, the source bytes and the transcoder would resolve
+  //         different stacks; refused before the execution record is created /
+  //         `source_unreadable` (issue #1059) — the asset records a source key but
+  //         the object is missing / empty / the wrong size in the bucket the
+  //         transcode step would read. The two gates run in that order: #1058
+  //         settles WHICH stack, then #1059 checks the bytes are there on it
   //   501 — pipeline execution or the required OSC service is not configured
-  //   502 — the first step's submission failed
+  //   502 — the first step's submission failed, or (issue #1059)
+  //         `source_verification_failed` — the object store could not be asked
+  //         whether the transcode source exists
   app.post(
     '/:id/execute',
     {
@@ -4129,7 +6151,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         body: z.object({
           pipeline: z.enum(PIPELINE_NAMES as [string, ...string[]]),
           profile: z.string().min(1).optional(),
-          customProfile: customProfileSchema.optional(),
+          customProfile: removedCustomProfileSchema,
           // profileParams (issue #288): reuses the same flat string map validated
           // on POST /:id/transcode (profileParamsSchema, issue #287) and forwards
           // it into the shared transcode submission path so SpEL-parametrised
@@ -4199,7 +6221,6 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         reply,
         {
           profile: request.body.profile,
-          customProfile: request.body.customProfile as EncoreProfile | undefined,
           profileParams: request.body.profileParams
         },
         resolvedDestination.destinationBucket
@@ -4359,15 +6380,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'thumbnail extraction is not configured'
         });
       }
-      // Resolve the extractor: if it's a factory, call it with the workspace's
-      // s3Config so the ffmpeg job can write to the right MinIO bucket.
-      const s3Cfg = request.connections?.s3Config;
-      const resolvedExtractor = typeof opts.thumbnailExtractor === 'function' && s3Cfg
-        ? (opts.thumbnailExtractor as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => FrameExtractor)({
-            ...s3Cfg,
-            bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
-          })
-        : opts.thumbnailExtractor as FrameExtractor;
+      // Resolve the extractor: if it's a tagged factory, build it from the
+      // workspace's s3Config so the ffmpeg job can write to the right MinIO
+      // bucket; if it's a plain runner, use it directly. A factory with no
+      // s3Config is a 501, sent by the helper (issue #838).
+      const resolvedExtractor = resolveConfiguredRunner(
+        opts.thumbnailExtractor,
+        'thumbnailExtractor',
+        request,
+        reply
+      );
+      if (!resolvedExtractor) return reply; // 501 already sent
       try {
         const thumbnails = await thumbnailRunner(
           {
@@ -4400,7 +6423,25 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //   404 — unknown/foreign source asset (existence not leaked)
   //   409 — the source asset has no stored object to re-wrap
   //   501 — export / re-wrap is not configured on this deployment
-  //   502 — the OSC ffmpeg job failed
+  //   502 — the OSC ffmpeg job failed, ended on a status that is not
+  //         known-good, or produced no (or a zero-byte) output object
+  //
+  // OUTCOME CONTRACT (issue #944, the precondition #796 asked for before an
+  // export UI is built on this): a 201 is only ever returned for an export whose
+  // output object has been confirmed present and non-empty in storage. Three
+  // layers hold that up, and a client needs none of them to be true to read the
+  // status code correctly — 201 means "the object is there", every other code
+  // means "it is not":
+  //   1. the runner succeeds only on an ALLOW-list of job statuses
+  //      (osc-rewrap.ts:SUCCESS_STATUSES), so an unanticipated terminal value is
+  //      a failure rather than a success;
+  //   2. the orchestrator HEADs the written key and rejects a missing or 0-byte
+  //      object (rewrap.ts, via storage.ts:WorkspaceStorage.statObject), because
+  //      the OSC job status reports the container lifecycle and not the ffmpeg
+  //      outcome;
+  //   3. a failed export leaves the child asset `failed` with NO objectKey, so
+  //      it never serves a `/files` URL for an object that does not exist.
+  // Documented in docs/findings/export-truthful-status-944.md.
   app.post(
     '/:id/export',
     {
@@ -4432,19 +6473,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'export / re-wrap is not configured'
         });
       }
-      // Resolve the injected runner. In production it is a factory that needs
-      // the workspace's s3Config + bucket so the OSC ffmpeg job writes the
+      // Resolve the injected runner. In production it is a tagged factory that
+      // needs the workspace's s3Config + bucket so the OSC ffmpeg job writes the
       // output to `s3://bucket/key` natively (issue #316); tests inject a plain
-      // RewrapRunner and no s3Config, so fall back to using it directly. Mirrors
-      // the thumbnail extractor resolution above.
-      const s3Cfg = request.connections?.s3Config;
-      const resolvedRewrapRunner =
-        typeof opts.rewrapRunner === 'function' && s3Cfg
-          ? (opts.rewrapRunner as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => RewrapRunner)({
-              ...s3Cfg,
-              bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
-            })
-          : (opts.rewrapRunner as RewrapRunner);
+      // RewrapRunner and no s3Config, which passes through untouched. Same
+      // helper as the thumbnail and clip routes (issue #838).
+      const resolvedRewrapRunner = resolveConfiguredRunner(
+        opts.rewrapRunner,
+        'rewrapRunner',
+        request,
+        reply
+      );
+      if (!resolvedRewrapRunner) return reply; // 501 already sent
       try {
         const child = await rewrapRunner(
           {
@@ -4463,9 +6503,277 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         );
         return reply.code(201).send(child);
       } catch (err) {
+        // Same split as the clip route (issue #786, applied to export in #944):
+        // the ffmpeg log is what makes an export failure diagnosable, but it is
+        // output from a service we do not control and can carry storage
+        // endpoints, bucket names and container paths. It is logged
+        // SERVER-SIDE ONLY (osc-rewrap.ts:OscRewrapJobError carries it as data,
+        // not in `message`), and the caller gets just the status-bearing
+        // sentence.
+        request.log.warn(
+          { err, assetId: asset.id, oscJobLog: oscJobLog(err) },
+          'export/re-wrap job failed'
+        );
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'rewrap_failed', message });
       }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // Deliver an EXISTING asset to a registered export destination (issue #1131).
+  //
+  // Prerequisite for #945 (and the #910/#911 export-from-detail UI): the caller
+  // supplies `(assetId, destination)` and gets back a terminal, truthful answer
+  // about whether the asset's source object is now AT that destination.
+  //
+  // WHY A NEW ENDPOINT AND NOT A `destination` FIELD ON POST /:id/export.
+  // `/:id/export` is a container re-wrap/transmux: it dispatches an OSC ffmpeg
+  // `-c copy` job via `rewrapRunner` and answers 201 with a NEW CHILD ASSET
+  // (`exportBodySchema` = `{ targetFormat, outputName?, asVersion? }`, handler
+  // above). Its output location is the workspace's own bucket, fixed by the
+  // runner's `s3Config` (`requestRunnerS3Config`), and the ffmpeg-s3 job body
+  // carries exactly ONE S3 identity (`ffmpegS3CredentialMapping`,
+  // src/services/external-storage-credentials.ts:155-180) — so that job cannot
+  // be pointed at a separately-credentialed destination, and a `destination`
+  // field there would have to mean "transmux, then relocate", i.e. two
+  // operations with two failure modes behind one 201-with-an-asset contract.
+  // Delivery has a different terminal condition ("the object is present at the
+  // destination"), so it gets its own endpoint and its own 200 body, and
+  // `/:id/export` keeps its current meaning unchanged.
+  //
+  // COMPOSITION (all pre-existing contracts, nothing new invented):
+  //   - the destination reference is resolved by `resolveJobDestination`
+  //     (above) — the SAME #573/#574 path POST /:id/package and
+  //     POST /:id/execute use, so a destination's optional path template
+  //     (`StorageBackendRegistry.resolveDestinationBucket`,
+  //     src/services/storage-backend-registry.ts:982-998) keys a delivered
+  //     object exactly as it keys packaged output;
+  //   - the resolved string is split by `parseDestination`
+  //     (src/pipeline/output-relocation.ts:57-80) into { bucket, prefix };
+  //   - the bytes move by server-side CopyObject and the landing is VERIFIED by
+  //     re-reading the destination object (src/pipeline/asset-delivery.ts).
+  //
+  // TRUTHFUL TERMINAL STATUS. 200 `{ status: 'delivered' }` is sent only after
+  // the object has been re-read at the destination with the source's byte
+  // count. Everything else is an error naming what went wrong:
+  //   400 — the reference names no registered export destination (or names the
+  //         OSC-managed default, which is where the asset already is)
+  //   404 — unknown/foreign asset (existence is not leaked)
+  //   409 — the asset has no stored source object (`no_object`, the shared
+  //         source-resolution contract), or its bytes are gone from the source
+  //         bucket (`source_missing`) so there was nothing to copy
+  //   422 — the destination is registered for a non-output role, or is not
+  //         writable/verifiable with the credentials this API holds
+  //   501 — no storage-backend registry, or no object storage, on this
+  //         deployment
+  //   502 — the copy failed, or the store reported success but the object is
+  //         not actually at the destination
+  //   504 — the delivery did not settle within the bound, so its outcome could
+  //         not be confirmed
+  app.post(
+    '/:id/deliver',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: deliverBodySchema,
+        response: {
+          200: deliverResultSchema,
+          400: errorSchema,
+          404: errorSchema,
+          409: errorSchema,
+          422: errorSchema,
+          501: errorSchema,
+          502: errorSchema,
+          504: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      // Unified source-object resolution (issue #612): a source-less asset
+      // fails here the same way it fails for every other source-consuming
+      // operation (409 `no_object`).
+      const source = requireSourceObject(asset, reply);
+      if (!source) return reply;
+
+      const registry = opts.storageBackendRegistry;
+      if (!registry) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'storage-backend registry is not configured'
+        });
+      }
+
+      const ref = request.body.destination;
+      // The implicit OSC-managed default (ADR-017 D3) is the store the asset
+      // already lives in, not somewhere to deliver TO. `resolveForOutput`
+      // answers undefined for it by design
+      // (storage-backend-registry.ts:1040-1042), so name it explicitly rather
+      // than reporting it as an unknown destination.
+      if (ref === DEFAULT_BACKEND_ID) {
+        return reply.code(400).send({
+          error: 'bad_request',
+          message: `"${DEFAULT_BACKEND_ID}" is the platform-managed default store the asset already lives in, not an export destination; name a destination registered via POST /api/v1/export-destinations`
+        });
+      }
+      // Resolve the destination RECORD first, under the SAME workspace
+      // namespace the export-destinations surface registers records in
+      // (`workspaceId = STACK_CONFIG_NAMESPACE`,
+      // src/routes/export-destinations.ts:187), so this endpoint addresses
+      // exactly the destinations GET /api/v1/export-destinations lists.
+      // Resolving the record up front (rather than going straight to
+      // `resolveJobDestination`) is what lets a registered-but-wrong-role
+      // backend get its own, accurate error: `resolveDestinationBucket` folds
+      // that case into the generic "no destination matches" 400
+      // (storage-backend-registry.ts:988-991), which would misreport a
+      // destination that IS registered.
+      const record = await registry.resolveForOutput(STACK_CONFIG_NAMESPACE, ref);
+      if (!record) {
+        return reply.code(400).send({
+          error: 'bad_request',
+          message: new UnknownDestinationBackendError(ref).message
+        });
+      }
+      // Only output-role backends are export destinations (ADR-018 D1 —
+      // `isExportDestination`, src/routes/export-destinations.ts:174-176). A
+      // 'source'/'archive' backend is read/cold storage; delivering to it would
+      // silently cross the two surfaces, so it is refused with the same
+      // `backend_role`-style 422 the job path uses (`resolveJobDestination`
+      // above).
+      if (record.role !== 'packaged' && record.role !== 'both') {
+        return reply.code(422).send({
+          error: 'backend_role',
+          message: `storage backend "${ref}" is registered for the "${record.role}" role and cannot receive a delivery; register it with role "packaged" or "both"`
+        });
+      }
+
+      // Resolve the destination to the SAME `<bucket>/<prefix>/` string the
+      // relocation path consumes, through the SAME resolver the package/execute
+      // jobs use — so a #574 path template applies to a delivery identically.
+      // An error (unknown reference, unrenderable template, no registry) has
+      // already been sent by the resolver.
+      const resolved = await resolveJobDestination(
+        { destination: ref, assetId: asset.id },
+        reply
+      );
+      if (!resolved.ok) return reply;
+      const target =
+        resolved.destinationBucket !== undefined
+          ? parseDestination(resolved.destinationBucket)
+          : undefined;
+      if (!target) {
+        // A named destination always resolves to a non-empty bucket string, so
+        // this is defence in depth: refuse rather than copy to an unparseable
+        // location.
+        request.log.error(
+          { assetId: asset.id, destinationId: record.id },
+          'destination reference resolved to no usable bucket path'
+        );
+        return reply.code(422).send({
+          error: 'destination_unresolved',
+          message: `export destination "${ref}" did not resolve to a usable bucket path`
+        });
+      }
+
+      // A destination that declares its OWN endpoint cannot be delivered to
+      // from here: its secret access key lives write-only in OSC per-service
+      // secrets, so this process holds no credential for that endpoint, and
+      // copying to a same-named bucket on our own store would report a success
+      // for bytes that never reached the operator (see
+      // `destinationEndpointRefusal`, src/pipeline/asset-delivery.ts). Refuse
+      // instead of producing a false success.
+      const deploymentEndpoint = opts.deliveryEndpoint ?? request.connections?.s3Config?.endpoint;
+      const endpointRefusal = destinationEndpointRefusal(record.endpointUrl, deploymentEndpoint);
+      if (endpointRefusal) {
+        request.log.warn(
+          { assetId: asset.id, destinationId: record.id },
+          'refusing delivery: the destination is registered at an endpoint this API holds no credentials for (issue #1131)'
+        );
+        return reply.code(422).send({
+          error: 'destination_unreachable',
+          message: endpointRefusal
+        });
+      }
+
+      // The copy client: the per-request stack client in production, an
+      // injected fake in tests (see the option docs).
+      const client = opts.deliveryClient ?? request.connections?.storageClient;
+      if (!client) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'object storage is not configured; asset delivery is unavailable'
+        });
+      }
+
+      // Where the source bytes are now. A rendition/external source is stored
+      // as an `s3://bucket/key` URI (`parseS3Uri`, above); a plain key lives in
+      // THIS request's stack source bucket (`WorkspaceConnections.sourceBucket`,
+      // src/services/workspace-stack.ts:150), falling back to the router's
+      // configured bucket and finally the documented default.
+      const s3Source = parseS3Uri(source.objectKey);
+      const sourceLocation = s3Source
+        ? { bucket: s3Source.bucket, key: s3Source.key }
+        : {
+            bucket:
+              request.connections?.sourceBucket ?? opts.sourceBucket ?? DEFAULT_SOURCE_BUCKET,
+            key: source.objectKey
+          };
+
+      const outcome = await deliverAssetObject(client, {
+        source: sourceLocation,
+        target
+      });
+      if (!outcome.ok) {
+        const mapped = DELIVERY_FAILURE_RESPONSE[outcome.reason];
+        request.log.warn(
+          {
+            assetId: asset.id,
+            destinationId: record.id,
+            reason: outcome.reason,
+            bucket: target.bucket
+          },
+          'asset delivery did not land at the destination'
+        );
+        return reply.code(mapped.status).send({
+          error: mapped.error,
+          message: outcome.message
+        });
+      }
+
+      // Audit the delivery (issue #564 emitter): emitted ONLY on a verified
+      // landing, so the audit trail cannot claim a delivery that did not
+      // happen. Fire-and-forget — a failed audit write never fails the request.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.delivered',
+          targetType: 'asset',
+          targetId: asset.id,
+          detail: {
+            destinationId: record.id,
+            destinationName: record.name,
+            bucket: outcome.bucket,
+            objectKey: outcome.objectKey,
+            bytes: outcome.bytes
+          }
+        },
+        request.log
+      );
+      return reply.code(200).send({
+        assetId: asset.id,
+        status: 'delivered' as const,
+        destination: { id: record.id, name: record.name, role: record.role },
+        bucket: outcome.bucket,
+        objectKey: outcome.objectKey,
+        bytes: outcome.bytes,
+        etag: outcome.etag,
+        deliveredAt: new Date().toISOString()
+      });
     }
   );
 
@@ -4499,19 +6807,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'clip extraction is not configured'
         });
       }
-      // Resolve the injected runner. In production it is a factory that needs
-      // the workspace's s3Config + bucket so the OSC ffmpeg job writes the clip
-      // to `s3://bucket/key` natively (issue #786); tests inject a plain
-      // ClipRunner and no s3Config, so fall back to using it directly. Mirrors
-      // the rewrap runner resolution above.
-      const clipS3Cfg = request.connections?.s3Config;
-      const resolvedClipRunner =
-        typeof opts.clipRunner === 'function' && clipS3Cfg
-          ? (opts.clipRunner as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => ClipRunner)({
-              ...clipS3Cfg,
-              bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
-            })
-          : (opts.clipRunner as ClipRunner);
+      // Same resolution helper as thumbnail and re-wrap (issue #838). In
+      // production the option is a tagged factory that needs the workspace's
+      // s3Config + bucket so the OSC ffmpeg job writes the clip to
+      // `s3://bucket/key` natively (issue #786); tests inject a plain ClipRunner,
+      // which passes through untouched. A factory with no resolvable s3Config is
+      // a 501 here rather than a call that dispatches no job at all.
+      const resolvedClipRunner = resolveConfiguredRunner(
+        opts.clipRunner,
+        'clipRunner',
+        request,
+        reply
+      );
+      if (!resolvedClipRunner) return reply; // 501 already sent
       try {
         const child = await clipRunnerOrchestrator(
           {
@@ -4537,7 +6845,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         // SERVER-SIDE ONLY (osc-clip.ts:OscClipJobError carries it as data, not
         // in `message`), and the caller gets just the status-bearing sentence.
         request.log.warn(
-          { err, assetId: asset.id, oscJobLog: oscClipJobLog(err) },
+          { err, assetId: asset.id, oscJobLog: oscJobLog(err) },
           'clip job failed'
         );
         const message = err instanceof Error ? err.message : String(err);
@@ -4578,9 +6886,21 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
-  // Proxy a single thumbnail image through the API. OSC MinIO blocks anonymous
-  // presigned URL access, so the browser cannot load MinIO URLs directly.
-  // This endpoint fetches the object using admin credentials and streams it.
+  // Proxy a single thumbnail image through the API: fetches the object with the
+  // deployment's storage credentials and streams it to a bearer-carrying caller.
+  //
+  // Originally this was the ONLY option, because anonymous presigned GETs
+  // against the hosted object store were observed returning 403 from outside
+  // the cluster (#113). That no longer reproduces — re-verified 2026-09-25 from
+  // outside the cluster: presigned anonymous GET → 200 image/jpeg, unsigned →
+  // 403 AccessDenied, tampered → 403 SignatureDoesNotMatch, expired → 403
+  // AccessDenied (docs/osc-feedback/incoming-presigned-get-thumbnails.md). So
+  // `/:id/thumbnails/:index/url` below is now the browser path (see #800), and
+  // this route stays for server-to-server callers that already hold a token and
+  // for deployments whose object store is not reachable from the client — it is
+  // also the fallback the ops UI drops back to when a deployment cannot presign
+  // (public/thumbnail-url.js, issue #801). Coverage:
+  // test/thumbnail-unauthenticated-fetch.test.ts.
   //   200 — image/jpeg stream
   //   404 — unknown asset or out-of-range index
   //   501 — storage not configured
@@ -4738,7 +7058,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         },
         request.log
       );
-      return reply.code(200).send(updated);
+      return reply.code(200).send(withRetentionWindow(updated));
     }
   );
 
@@ -4760,9 +7080,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // omitted from the response.
   // -------------------------------------------------------------------------
 
-  // List an asset's audio + subtitle tracks.
-  //   200 — { audioTracks, subtitleTracks } (each possibly empty)
+  // List an asset's video + audio + subtitle tracks.
+  //   200 — { videoTracks, audioTracks, subtitleTracks } (each possibly empty)
   //   404 — unknown/foreign asset
+  //
+  // `videoTracks` (issue #978) is the machine-probed set, projected from the
+  // persisted `technical.video[]` (asset-document.ts) onto `asset.videoTracks`;
+  // the other two are editorial records managed through the POST/DELETE routes
+  // below. Read-only: there is no write path for video tracks.
   app.get(
     '/:id/tracks',
     {
@@ -4778,6 +7103,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(404).send({ error: 'not_found' });
       }
       return reply.code(200).send({
+        videoTracks: videoTracksOf(asset),
         audioTracks: asset.audioTracks ?? [],
         subtitleTracks: asset.subtitleTracks ?? []
       });
@@ -4947,7 +7273,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(updated);
+      return reply.code(200).send(withRetentionWindow(updated));
     }
   );
 
@@ -4975,7 +7301,41 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(updated);
+      return reply.code(200).send(withRetentionWindow(updated));
+    }
+  );
+
+  // GET /:id/review-state — read the asset's editorial review state together
+  // with the moves that are legal from it (issue #897, prerequisite for the
+  // "only legal transitions offered" criterion in #792). The read sits beside
+  // the POST below so a client reads the state and its legal moves from the
+  // same sub-resource it writes to.
+  //
+  // `allowedTransitions` is computed by allowedReviewTransitions()
+  // (src/data/asset-repo.ts) from the SAME table the 422 gate validates
+  // against, so what the API advertises and what it accepts cannot diverge.
+  //   200 — current review state + allowed next states
+  //   404 — unknown/foreign asset (existence not leaked)
+  app.get(
+    '/:id/review-state',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: reviewStateReadSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      // Absent reviewState reads as `draft` (the same default applyReviewState
+      // uses), so a pre-#134 asset reports a concrete state and its real moves
+      // rather than an empty one.
+      const current = asset.reviewState ?? 'draft';
+      return reply
+        .code(200)
+        .send({ reviewState: current, allowedTransitions: allowedReviewTransitions(current) });
     }
   );
 
@@ -4984,6 +7344,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // (draft -> in-review -> approved | rejected, with re-review paths) and never
   // touches `status`. Forward-only transitions are validated by the review state
   // machine; an illegal move returns 422 (same mapping as the status machine).
+  // A caller that wants to avoid the 422 reads the legal moves first from
+  // GET /:id/review-state (issue #897) rather than re-deriving them.
   //   200 — review state transitioned, full asset returned
   //   404 — unknown/foreign asset (existence not leaked)
   //   422 — invalid review-state transition
@@ -5001,7 +7363,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(updated);
+      return reply.code(200).send(withRetentionWindow(updated));
     }
   );
 
@@ -5048,7 +7410,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           request.log
         );
       }
-      return reply.code(200).send(updated);
+      return reply.code(200).send(withRetentionWindow(updated));
     }
   );
 
@@ -5141,6 +7503,270 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
+  // On-demand purge of ONE archived asset (issue #837).
+  //
+  // Before this route the only way to destroy an asset's bytes was the timed
+  // retention sweep (src/pipeline/archived-asset-purge-sweep.ts), driven by the
+  // instance-global window that defaults to 0 = never purge
+  // (RETENTION_DISABLED_MS, src/routes/retention.ts) — so `archived` was
+  // terminal unless an operator widened a GLOBAL policy to collect one asset.
+  // This is the deliberate, per-asset alternative: it changes no policy and
+  // sweeps nothing else.
+  //
+  // IT IS A SEPARATE, SECOND STEP, not a stronger DELETE. A `/purge`
+  // sub-resource (rather than `DELETE /:id?purge=true`) is what keeps that true:
+  // the asset must ALREADY be `archived`, so no single call can take a `ready`
+  // asset to destroyed, and the destructive verb is not reachable by adding a
+  // query parameter to the soft delete.
+  //
+  // IRREVERSIBLE. The source object, every rendition (including renditions in a
+  // foreign bucket), the whole packaged-output prefix, subtitle objects and
+  // thumbnails are removed, and the document is REPLACED by a tombstone — there
+  // is no restore afterwards (POST /:id/restore answers 410 on a tombstone,
+  // issue #326). The destruction itself is delegated to `purgeArchivedAsset`,
+  // the SAME per-asset path the retention sweep runs, so the two can never drift.
+  //
+  // GUARDS, in order:
+  //   410 — already purged (the id now resolves to a tombstone). Checked first so
+  //         a repeat call reports `gone` rather than `not_found`, consistent with
+  //         GET /:id and POST /:id/restore (issue #326).
+  //   404 — unknown asset.
+  //   409 — `delete_blocked` / `delete_protected`: an asset with
+  //         `deleteLock.locked` is a HARD block, exactly as DELETE /:id treats
+  //         it (ADR-020 decisions 1 & 2). There is no force override here —
+  //         unlock via DELETE /:id/lock first.
+  //   409 — `not_archived`: the asset is in any other lifecycle state. Archive it
+  //         with DELETE /:id first.
+  //   409 — `delete_blocked` / `referenced_by_job`: an active (pending/queued/
+  //         running) job still names this asset as its source, exactly as
+  //         DELETE /:id refuses (ADR-020 decision 1). Archiving does not cancel
+  //         jobs, so an archived asset can still be referenced.
+  //   409 — `has_children`: the asset still has a LIVE (non-archived) child.
+  //         The same block DELETE /:id enforces and the route equivalent of the
+  //         sweep's child-ordering deferral (anyLiveChild) — without it an
+  //         archived parent could be purged out from under a live child, leaving
+  //         the child pointing at a tombstone. Purge the children first.
+  //   409 — `shared_objects`: one of the objects this purge would remove is also
+  //         referenced by another live asset document. THE INVARIANT: a purge
+  //         only ever destroys bytes no other live asset references. Needed
+  //         because `objectKey` is client-settable (POST /assets, PATCH
+  //         /assets/:id — accepted even while archived), so a document can be
+  //         aimed at another asset's bytes; the delete-lock guard above protects
+  //         the locked document, this one protects its bytes.
+  //   501 — the resolved repository exposes no purge-to-tombstone write path, so
+  //         this deployment cannot record the purge (same `not_configured`
+  //         convention as the other capability-gated routes here).
+  //   204 — purged.
+  app.delete(
+    '/:id/purge',
+    {
+      schema: {
+        summary: 'Purge an archived asset on demand (IRREVERSIBLE)',
+        description:
+          'Permanently destroy ONE already-archived asset: its stored objects (source, renditions, ' +
+          'packaged output, subtitles, thumbnails) are removed and its document is replaced by a ' +
+          'tombstone. This is IRREVERSIBLE — the asset cannot be restored afterwards, and reads of ' +
+          'its id return 410 Gone from then on. The asset must already be `archived` (archive it ' +
+          'first with `DELETE /api/v1/assets/{id}`), and a delete-locked asset is refused with 409 ' +
+          '`delete_blocked` / `delete_protected` just as archiving is. The same integrity blocks ' +
+          '`DELETE /api/v1/assets/{id}` applies are enforced here: 409 `delete_blocked` / ' +
+          '`referenced_by_job` while an active job still names the asset as its source, and 409 ' +
+          '`has_children` while it still has a live (non-archived) child — purge the children ' +
+          'first so no child is left pointing at a tombstone. A purge destroys only bytes no other ' +
+          'asset references: if any object of this asset (source, rendition, subtitle, thumbnail) ' +
+          'is also referenced by another asset, the purge is refused with 409 `shared_objects` and ' +
+          'nothing is removed. Independent of the global ' +
+          'archived-asset retention window (`GET /api/v1/retention/config`): purging one asset here ' +
+          'changes no policy and affects no other asset. The purge is recorded in the audit log ' +
+          '(`GET /api/v1/audit`) as `asset.purged`.',
+        params: z.object({ id: z.string() }),
+        response: {
+          204: z.null(),
+          404: errorSchema,
+          409: z.union([deleteBlockedSchema, errorSchema]),
+          410: errorSchema,
+          501: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const id = request.params.id;
+
+      // Already purged -> 410 Gone, never 404 (tombstone semantics, issue #326).
+      // getState() surfaces the distinction on the ULID id path, as in GET /:id.
+      if (isUlid(id)) {
+        const state = await repo.getState(id);
+        if (state.kind === 'tombstone') {
+          return reply.code(410).send({ error: 'gone', message: 'asset has been purged' });
+        }
+      }
+
+      const existing = await repo.get(id);
+      if (!existing) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+
+      // HARD delete-lock block, identical in effect to DELETE /:id: surfaced as
+      // the shared `delete_blocked` envelope with reason `delete_protected` via
+      // DeleteProtectedError in this router's error handler. Checked BEFORE the
+      // archived-state check so a locked asset reports the lock (the actionable
+      // block) whatever state it is in.
+      if (existing.deleteLock?.locked) {
+        throw new DeleteProtectedError(id);
+      }
+
+      // Purge is only ever the second step: refuse anything not already archived.
+      if (existing.status !== 'archived') {
+        return reply.code(409).send({
+          error: 'not_archived',
+          message:
+            `asset is ${existing.status}, not archived; archive it with ` +
+            'DELETE /api/v1/assets/{id} before purging'
+        });
+      }
+
+      // In-flight job reference, the SAME hard block DELETE /:id applies (ADR-020
+      // decision 1, issue #569). An asset can be archived while a job that names
+      // it as source is still pending/queued/running — archiving does not cancel
+      // jobs — so destroying its bytes here would corrupt that in-flight
+      // pipeline. Same `delete_blocked` / `referenced_by_job` envelope, naming
+      // the blocking job ids; no force override exists on this route.
+      const activeJobs = await jobs.findActiveByAssetId(id);
+      if (activeJobs.length > 0) {
+        throw new ReferencedByJobError(
+          id,
+          activeJobs.map((j) => j.id)
+        );
+      }
+
+      // Live-child block, the SAME check DELETE /:id applies and the route
+      // equivalent of the sweep's child-ordering deferral (anyLiveChild,
+      // src/pipeline/archived-asset-purge-sweep.ts). An archived PARENT with a
+      // live child must not be purged: the child would be left pointing at a
+      // tombstone. `countChildren` counts only non-archived children (both the
+      // in-memory and Couch repos exclude `archived`), which is exactly the
+      // sweep's "live child" notion — an archived child is itself purgeable and
+      // never blocks. Where the sweep DEFERS (and retries on a later tick), the
+      // on-demand route REFUSES with the pre-existing `has_children` envelope:
+      // purge the children first.
+      const childCount = await repo.countChildren(id);
+      if (childCount > 0) {
+        throw new HasChildrenError(id);
+      }
+
+      // The source bucket this purge's plain keys resolve in — resolved ONCE and
+      // passed to both the ownership guard below and purgeArchivedAsset, so the
+      // bytes checked are the bytes removed.
+      const purgeSourceBucket =
+        request.connections?.sourceBucket ?? opts.sourceBucket ?? DEFAULT_SOURCE_BUCKET;
+
+      // OBJECT-OWNERSHIP INVARIANT (issue #837 review): a purge only ever
+      // destroys bytes that NO other live asset document references.
+      //
+      // Why this guard has to exist: `objectKey` is a client-settable field on
+      // POST /api/v1/assets and PATCH /api/v1/assets/{id}, and PATCH is accepted
+      // on an already-archived asset. Without this check a caller could aim
+      // their own archived asset (or a decoy) at another asset's source or
+      // rendition key — including a key belonging to a delete-locked asset — and
+      // destroy those bytes from here. The delete-lock guard above protects the
+      // locked DOCUMENT; only this guard protects its BYTES.
+      //
+      // `objectKey` stays client-settable (ingest, the objectkey backfill and the
+      // re-point flows all depend on writing it), so ownership is verified at
+      // purge time instead: every object this purge would remove — source,
+      // renditions (plain or `s3://bucket/key`), subtitles, thumbnails — is
+      // compared, per bucket, against every other live document's objects. Any
+      // overlap is refused with 409 `shared_objects` naming the other asset, and
+      // nothing is removed. The packaged-output prefix is exempt by construction:
+      // it is derived from the asset id (outputPrefix), not from a client field.
+      const sharedWith = await findSharedObjectOwner(repo, existing, purgeSourceBucket);
+      if (sharedWith) {
+        return reply.code(409).send({
+          error: 'shared_objects',
+          message:
+            `asset ${id} cannot be purged: its stored object ` +
+            `${sharedWith.key} (bucket ${sharedWith.bucket}) is also referenced by ` +
+            `asset ${sharedWith.assetId}, so destroying it would remove bytes that ` +
+            'asset still points at'
+        });
+      }
+
+      // Resolve the doc-replace write path. Preference order: the injected
+      // callback, then the resolved stack's CONCRETE repo
+      // (request.connections.assets), falling back to the router's own
+      // `repo` — because purgeToTombstone is not on the AssetRepository
+      // interface and the per-stack proxy does not forward it
+      // (src/data/per-workspace-repos.ts).
+      type PurgeCapable = {
+        purgeToTombstone?: (assetId: string) => Promise<string | undefined> | boolean;
+      };
+      const concreteRepo = (request.connections?.assets ?? repo) as unknown as PurgeCapable;
+      const purge =
+        opts.purgeToTombstone ??
+        (typeof concreteRepo.purgeToTombstone === 'function'
+          ? concreteRepo.purgeToTombstone.bind(concreteRepo)
+          : undefined);
+      if (!purge) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'this deployment cannot purge assets (no purge-to-tombstone write path)'
+        });
+      }
+
+      // Per-bucket storage handles, built from THIS request's stack client so the
+      // bytes removed are the bytes this request's asset owns (mirrors the
+      // per-bucket WorkspaceStorage construction in the stream route and
+      // GET /:id/files). Undefined when the stack has no object storage: the
+      // tombstone is still recorded, exactly as in the sweep.
+      const storageForBucket =
+        opts.purgeStorageForBucket ??
+        ((bucket: string): PurgeStorage | undefined => {
+          const client = request.connections?.storageClient;
+          return client ? new WorkspaceStorage(client, bucket) : undefined;
+        });
+
+      await purgeArchivedAsset(
+        {
+          purge,
+          storageForBucket,
+          sourceBucket: purgeSourceBucket,
+          // Adapter onto the request logger. The sweep logs printf-style
+          // ('… %s: %o', id, err); here the format string becomes the message and
+          // its arguments ride along as structured context, so a best-effort
+          // object-removal failure is still visible per request.
+          logger: {
+            info: (...args: unknown[]) => {
+              request.log.info({ purgeDetail: args.slice(1) }, String(args[0]));
+            },
+            warn: (...args: unknown[]) => {
+              request.log.warn({ purgeDetail: args.slice(1) }, String(args[0]));
+            }
+          }
+        },
+        existing
+      );
+
+      // Audit: the purge (issue #837). `asset.archived` is already audited on
+      // DELETE /:id and `asset.restored` on POST /:id/restore; a purge is the
+      // more consequential, irreversible event, so it gets an entry on the SAME
+      // fire-and-forget emitter (issue #564) — emitted only after a completed
+      // purge, so a 404/409/410/501 never records one.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.purged',
+          targetType: 'asset',
+          targetId: existing.id,
+          detail: { from: 'archived', irreversible: true, onDemand: true }
+        },
+        request.log
+      );
+
+      return reply.code(204).send(null);
+    }
+  );
+
   // Explicit delete-lock set/clear (ADR-020 decision 3, issue #568). A DEDICATED
   // system write path for the `administrative.deleteLock` flag — chosen as a
   // `/:id/lock` sub-resource with PUT (set) / DELETE (clear), mirroring the
@@ -5178,7 +7804,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(updated);
+      return reply.code(200).send(withRetentionWindow(updated));
     }
   );
 
@@ -5200,7 +7826,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(updated);
+      return reply.code(200).send(withRetentionWindow(updated));
     }
   );
 
@@ -5212,9 +7838,22 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // audited `archived -> <target>` statusHistory entry (ADR-005: append, never
   // rewrite). Target status is the pre-archive status when it was `ready`,
   // otherwise `failed` (see restoreTargetStatus).
-  //   200 — restored asset (now `ready` or `failed`)
-  //   404 — unknown id, OR not currently `archived` (nothing to restore)
-  //   410 — the asset was already purged (its document is now a tombstone)
+  //   200 — restored asset (now `ready` or `failed`), state persisted, one
+  //         `asset.restored` audit entry emitted
+  //   404 — unknown id, OR not currently `archived` (nothing to restore) — no
+  //         state change and no audit entry
+  //   410 — the asset was already purged (its document is now a tombstone) — the
+  //         tombstone is NOT revived and no audit entry is emitted
+  // Restore moves the LIFECYCLE status only. The orthogonal `storageTiering`
+  // axis is untouched (see the storageTiering schema above: representation only,
+  // this API does not relocate bytes), so a restored asset whose bytes were
+  // relocated to the `archive` tier reports `ready` while those bytes are still
+  // cold — the response never claims otherwise.
+  // The 200 body likewise carries NO `retention` member (issue #1034): the
+  // window is attached by the same uniform rule as everywhere else, and the
+  // restored asset has just left `archived`, so there is no purge window left to
+  // report. The pre-restore window is readable from `GET /:id` while the asset
+  // is still archived.
   app.post(
     '/:id/restore',
     {
@@ -5239,7 +7878,26 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!restored) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(restored);
+      // Audit: the restore lifecycle transition (issue #930, instrumentation
+      // convention of #564). The inverse operation (DELETE -> `asset.archived`
+      // above) and every ordinary PATCH transition (`asset.status_changed`) each
+      // record one entry, so without this the queryable audit trail
+      // (GET /api/v1/audit) showed the archive and NEVER the revival — the API
+      // reported success for a state change nothing was accountable for. Emitted
+      // only on a real restore: a 404 (unknown/not archived — no state change)
+      // and a 410 (tombstoned) both return above and produce no entry.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.restored',
+          targetType: 'asset',
+          targetId: restored.id,
+          detail: { from: 'archived', to: restored.status }
+        },
+        request.log
+      );
+      return reply.code(200).send(withRetentionWindow(restored));
     }
   );
 };

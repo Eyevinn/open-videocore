@@ -14,6 +14,7 @@ import {
   type OptionalServiceDescriptor
 } from '../services/optional-services.js';
 import type { OperationStore } from '../services/operation-store.js';
+import { confirmInstanceAbsent } from '../services/deprovision.js';
 
 // Per-optional-service provision / deprovision / status endpoints (issue #195).
 //
@@ -354,8 +355,18 @@ export const optionalServicesRouter: FastifyPluginAsync<
 
           // Probe first so a retry after a completed teardown reports not_found
           // rather than erroring (mirrors deprovision.ts:teardownService).
+          //
+          // The probe alone cannot be trusted: getInstance resolves `undefined`
+          // for ANY non-401 error, so a fault would read as "already gone" and
+          // leave the instance running (issue #1039). confirmInstanceAbsent
+          // re-reads the instance list and THROWS when absence cannot be
+          // established — the catch below then reports the operation as failed,
+          // which is retryable, instead of a false success.
           const existing = await getInstance(osc, descriptor.serviceId, name, sat);
-          if (!existing) {
+          if (
+            !existing &&
+            (await confirmInstanceAbsent(osc, descriptor.serviceId, name, sat))
+          ) {
             ops.update(op.id, {
               status: 'done',
               completedAt: Date.now(),

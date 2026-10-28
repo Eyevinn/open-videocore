@@ -43,14 +43,28 @@ function fakeStorage(): WorkspaceStorage {
   } as unknown as WorkspaceStorage;
 }
 
+// `minioEndpoint` populates the resolved stack's own MinIO endpoint on
+// request.connections.s3Config exactly as src/main.ts's preHandler does
+// (services/workspace-stack.ts buildConnectionsFromStack sets
+// s3Config.endpoint = StackConfig.minioEndpoint) — the coordinate issue #859
+// derives the packaged public origin from. Omitted => no stack resolved.
 async function buildApp(
-  opts: { withStorage?: boolean } = {}
+  opts: { withStorage?: boolean; minioEndpoint?: string } = {}
 ): Promise<{ app: FastifyInstance; repo: InMemoryAssetRepository }> {
   const app = Fastify();
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
   registerAuth(app);
   const repo = new InMemoryAssetRepository();
+  if (opts.minioEndpoint) {
+    const endpoint = opts.minioEndpoint;
+    app.decorateRequest('connections', null);
+    app.addHook('preHandler', async (request) => {
+      request.connections = {
+        s3Config: { endpoint, accessKey: 'admin', secretKey: 'x' }
+      } as unknown as NonNullable<typeof request.connections>;
+    });
+  }
   await app.register(assetsRouter, {
     prefix: '/api/v1/assets',
     repository: repo,
@@ -184,12 +198,15 @@ describe('GET /:id/delivery', () => {
     expect(res.json().urls.hls).toBeDefined();
   });
 
-  // Issue #341: on the zero-config per-stack MinIO backend the stored
-  // manifestUrls are bare object-key paths (no scheme/host/signature) and OSC
-  // MinIO blocks external presigned/public GETs. The manifest branch must route
-  // these through the authorized stream proxy so `hls`/`dash` are absolute,
-  // resolvable URLs — consistent with how `source` is emitted.
+  // Issue #341 originally routed bare-path manifests through the authorized
+  // stream proxy so `hls`/`dash` were always absolute. Issue #860 restricts that
+  // to DELIVERY_MODE=proxy: in `public` mode a bare path means the packaged
+  // bucket's public origin is unset, which is a configuration problem reported
+  // as `not_configured` — not a resolvability problem to be routed around by
+  // borrowing the other delivery mode's URLs. The absolute-proxy-URL guarantee
+  // #341 asserted still holds, in the mode that actually selects the proxy.
   it('routes bare-path manifests through the absolute stream proxy URL', async () => {
+    process.env['DELIVERY_MODE'] = 'proxy';
     process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
     const { app, repo } = await buildApp();
     const id = await createAsset(app);
@@ -212,6 +229,7 @@ describe('GET /:id/delivery', () => {
   });
 
   it('emits only the packaged format through the proxy for bare-path manifests', async () => {
+    process.env['DELIVERY_MODE'] = 'proxy';
     process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
     const { app, repo } = await buildApp();
     const id = await createAsset(app);
@@ -265,10 +283,128 @@ describe('GET /:id/delivery', () => {
     expect(body.urls.dash).toBe('https://cdn.example/packaged/x/manifest.mpd');
   });
 
+  // Issue #859: on a DEFAULT (zero-config) stack nothing sets
+  // PACKAGED_PUBLIC_BASE_URL, but the stack's own MinIO endpoint IS the public
+  // origin for its packaged bucket. Delivery must advertise absolute URLs on
+  // that origin instead of routing the manifest through the authorized
+  // `/stream/*` proxy (which requires a bearer token).
+  describe('zero-config stack public base URL (issue #859)', () => {
+    const MINIO = 'https://stack-abc.minio.example';
+
+    it('derives absolute MinIO-origin URLs, not proxy URLs, when the env var is unset', async () => {
+      // PUBLIC_BASE_URL is set so the proxy fallback WOULD be resolvable —
+      // proving the MinIO origin is preferred rather than merely available.
+      process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
+      const { app, repo } = await buildApp({ minioEndpoint: MINIO });
+      const id = await createAsset(app);
+      await repo.update(id, {
+        manifestUrls: {
+          hls: `/openvideocore-packaged/${id}/abc/index.m3u8`,
+          dash: `/openvideocore-packaged/${id}/abc/manifest.mpd`
+        }
+      });
+
+      const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.status).toBe('ready');
+      expect(body.urls.hls).toBe(`${MINIO}/openvideocore-packaged/${id}/abc/index.m3u8`);
+      expect(body.urls.dash).toBe(`${MINIO}/openvideocore-packaged/${id}/abc/manifest.mpd`);
+      expect(body.urls.hls).not.toContain('/stream/');
+      // The manifest's relative child references resolve against this same
+      // origin + directory, so a player fetches segments anonymously too.
+      expect(new URL('seg-1.m4s', body.urls.hls).toString()).toBe(
+        `${MINIO}/openvideocore-packaged/${id}/abc/seg-1.m4s`
+      );
+    });
+
+    it('is absolute even when PUBLIC_BASE_URL is unset (no proxy base at all)', async () => {
+      const { app, repo } = await buildApp({ minioEndpoint: MINIO });
+      const id = await createAsset(app);
+      await repo.update(id, {
+        manifestUrls: { hls: `/openvideocore-packaged/${id}/abc/index.m3u8` }
+      });
+      const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+      const body = res.json();
+      expect(body.status).toBe('ready');
+      expect(body.urls.hls).toBe(`${MINIO}/openvideocore-packaged/${id}/abc/index.m3u8`);
+    });
+
+    it('lets an explicit PACKAGED_PUBLIC_BASE_URL win over the stack MinIO origin', async () => {
+      process.env['PACKAGED_PUBLIC_BASE_URL'] = 'https://cdn.example';
+      const { app, repo } = await buildApp({ minioEndpoint: MINIO });
+      const id = await createAsset(app);
+      await repo.update(id, {
+        manifestUrls: { hls: `/openvideocore-packaged/${id}/abc/index.m3u8` }
+      });
+      const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+      const body = res.json();
+      expect(body.urls.hls).toBe(
+        `https://cdn.example/openvideocore-packaged/${id}/abc/index.m3u8`
+      );
+    });
+
+    it('leaves DELIVERY_MODE=proxy proxying through the authorized stream route', async () => {
+      process.env['DELIVERY_MODE'] = 'proxy';
+      process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
+      const { app, repo } = await buildApp({ minioEndpoint: MINIO });
+      const id = await createAsset(app);
+      await repo.update(id, {
+        manifestUrls: {
+          hls: `/openvideocore-packaged/${id}/abc/index.m3u8`,
+          dash: `/openvideocore-packaged/${id}/abc/manifest.mpd`
+        }
+      });
+      const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+      const body = res.json();
+      expect(body.urls.hls).toBe(
+        `https://api.example.test/api/v1/assets/${id}/stream/index.m3u8`
+      );
+      expect(body.urls.dash).toBe(
+        `https://api.example.test/api/v1/assets/${id}/stream/manifest.mpd`
+      );
+    });
+
+    // GET /:id/files documents that fileGroups[].manifestUrl matches what
+    // /:id/delivery advertises, so both must resolve against the same origin.
+    it('matches fileGroups[].manifestUrl on GET /:id/files', async () => {
+      process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
+      const { app, repo } = await buildApp({ minioEndpoint: MINIO });
+      const id = await createAsset(app);
+      await repo.update(id, {
+        manifestUrls: {
+          hls: `/openvideocore-packaged/${id}/abc/index.m3u8`,
+          dash: `/openvideocore-packaged/${id}/abc/manifest.mpd`
+        }
+      });
+
+      const delivery = await app.inject({
+        method: 'GET',
+        url: `/api/v1/assets/${id}/delivery`,
+        headers: A
+      });
+      const files = await app.inject({
+        method: 'GET',
+        url: `/api/v1/assets/${id}/files`,
+        headers: A
+      });
+      expect(files.statusCode).toBe(200);
+      const groups = files.json().fileGroups as { id: string; manifestUrl: string }[];
+      const byId = (gid: string) => groups.find((g) => g.id === gid)?.manifestUrl;
+      expect(byId('hls')).toBe(delivery.json().urls.hls);
+      expect(byId('dash')).toBe(delivery.json().urls.dash);
+      expect(byId('hls')).toBe(`${MINIO}/openvideocore-packaged/${id}/abc/index.m3u8`);
+    });
+  });
+
   // Issue #506: a configured + packaged asset must return a fully-resolvable
   // ABSOLUTE playback URL and an explicit `ready` status, so a consuming app can
   // trust the URL plays without workarounds.
   it('returns status=ready with an absolute playback URL for a configured, packaged asset', async () => {
+    // "Configured" for `public` delivery means the packaged bucket has a public
+    // origin (issue #860); PUBLIC_BASE_URL alone configures the API's own
+    // origin, which is what DELIVERY_MODE=proxy needs.
+    process.env['PACKAGED_PUBLIC_BASE_URL'] = 'https://cdn.example';
     process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
     const { app, repo } = await buildApp();
     const id = await createAsset(app);
@@ -282,7 +418,7 @@ describe('GET /:id/delivery', () => {
     const body = res.json();
     expect(body.status).toBe('ready');
     expect(body.urls.hls).toBe(
-      `https://api.example.test/api/v1/assets/${id}/stream/index.m3u8`
+      `https://cdn.example/openvideocore-packaged/${id}/abc/index.m3u8`
     );
     // The advertised URL is absolute (fully resolvable), not a bare path.
     expect(() => new URL(body.urls.hls)).not.toThrow();
@@ -346,6 +482,126 @@ describe('GET /:id/delivery', () => {
     const body = res.json();
     expect(body.status).toBe('not_configured');
     expect(body.urls.hls).toBeUndefined();
+  });
+
+  // Issue #860: `public` and `proxy` are documented (src/pipeline/packaging.ts,
+  // DELIVERY_MODES) as mutually exclusive because they have deliberately
+  // different security postures — an anonymously readable bucket versus a
+  // bearer-authorized API route. Before #860, `public` mode silently advertised
+  // proxy `/stream/*` URLs whenever the public origin did not resolve, which put
+  // a deployment in both postures at once AND concealed the missing setting
+  // behind a ready-looking 200 (operators hit an unexplained 401 on a URL the
+  // API itself had handed them).
+  describe('public mode never substitutes proxy URLs (issue #860)', () => {
+    it('returns not_configured instead of a proxy URL when the public origin is unset', async () => {
+      // PUBLIC_BASE_URL is set, so the OLD proxy fallback would have been
+      // resolvable and returned a ready-looking 200. No stack MinIO endpoint and
+      // no PACKAGED_PUBLIC_BASE_URL => no public origin (issue #859).
+      process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
+      const { app, repo } = await buildApp();
+      const id = await createAsset(app);
+      await repo.update(id, {
+        manifestUrls: {
+          hls: `/openvideocore-packaged/${id}/abc/index.m3u8`,
+          dash: `/openvideocore-packaged/${id}/abc/manifest.mpd`
+        }
+      });
+
+      const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.status).toBe('not_configured');
+      expect(body.urls.hls).toBeUndefined();
+      expect(body.urls.dash).toBeUndefined();
+      // The invariant: no URL of the other delivery mode is ever advertised.
+      expect(JSON.stringify(body.urls)).not.toContain('/stream/');
+    });
+
+    it('names the missing configuration so the operator can act on it', async () => {
+      process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
+      const { app, repo } = await buildApp();
+      const id = await createAsset(app);
+      await repo.update(id, {
+        manifestUrls: { hls: `/openvideocore-packaged/${id}/abc/index.m3u8` }
+      });
+      const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+      const body = res.json();
+      expect(body.resolution.missingConfiguration).toEqual(['PACKAGED_PUBLIC_BASE_URL']);
+      expect(body.resolution.reason).toContain('PACKAGED_PUBLIC_BASE_URL');
+    });
+
+    it('names the missing configuration in proxy mode too', async () => {
+      process.env['DELIVERY_MODE'] = 'proxy';
+      const { app, repo } = await buildApp();
+      const id = await createAsset(app);
+      await repo.update(id, {
+        manifestUrls: { hls: `/openvideocore-packaged/${id}/abc/index.m3u8` }
+      });
+      const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+      const body = res.json();
+      expect(body.status).toBe('not_configured');
+      expect(body.resolution.missingConfiguration).toEqual(['PUBLIC_BASE_URL']);
+    });
+
+    it('still reports the packaged location alongside the missing configuration', async () => {
+      process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
+      const { app, repo } = await buildApp();
+      const id = await createAsset(app);
+      await repo.update(id, {
+        manifestUrls: { hls: `/openvideocore-packaged/${id}/abc/index.m3u8` },
+        packagedOutput: {
+          bucket: 'openvideocore-packaged',
+          prefix: `${id}/abc/`,
+          masterHlsKey: `${id}/abc/index.m3u8`
+        }
+      });
+      const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+      const body = res.json();
+      // Issue #506's deterministic-resolution metadata is unchanged (#860 is
+      // additive on the same object).
+      expect(body.resolution.packagedBucket).toBe('openvideocore-packaged');
+      expect(body.resolution.masterHlsKey).toBe(`${id}/abc/index.m3u8`);
+      expect(body.resolution.missingConfiguration).toEqual(['PACKAGED_PUBLIC_BASE_URL']);
+    });
+
+    it('is unchanged for a deployment whose public origin does resolve', async () => {
+      // PUBLIC_BASE_URL set as well, to prove the proxy base is never consulted.
+      process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
+      process.env['PACKAGED_PUBLIC_BASE_URL'] = 'https://cdn.example';
+      const { app, repo } = await buildApp();
+      const id = await createAsset(app);
+      await repo.update(id, {
+        manifestUrls: {
+          hls: `/openvideocore-packaged/${id}/abc/index.m3u8`,
+          dash: `/openvideocore-packaged/${id}/abc/manifest.mpd`
+        }
+      });
+      const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+      const body = res.json();
+      expect(body.status).toBe('ready');
+      expect(body.urls.hls).toBe(
+        `https://cdn.example/openvideocore-packaged/${id}/abc/index.m3u8`
+      );
+      expect(body.urls.dash).toBe(
+        `https://cdn.example/openvideocore-packaged/${id}/abc/manifest.mpd`
+      );
+      expect(body.resolution).toBeUndefined();
+    });
+
+    it('leaves an already-absolute stored manifest ready without a public origin', async () => {
+      // A manifest packaged against an explicit origin is already resolvable, so
+      // #860 does not turn it into not_configured.
+      process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
+      const { app, repo } = await buildApp();
+      const id = await createAsset(app);
+      await repo.update(id, {
+        manifestUrls: { hls: 'https://cdn.example/packaged/x/index.m3u8' }
+      });
+      const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+      const body = res.json();
+      expect(body.status).toBe('ready');
+      expect(body.urls.hls).toBe('https://cdn.example/packaged/x/index.m3u8');
+    });
   });
 
   // Issue #506: a not-yet-packaged asset (no manifests, no source object) is an

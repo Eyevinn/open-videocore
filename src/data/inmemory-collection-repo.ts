@@ -66,9 +66,10 @@ export class InMemoryCollectionRepository implements CollectionRepository {
       .map((c) => c.id);
   }
 
-  // Partial editorial update of descriptive metadata (issue #560). Applies only
-  // the present keys of `patch` (description/tags/custom) wholesale, leaving
-  // membership, name, and the delete-lock untouched.
+  // Partial editorial update of the name and descriptive metadata (issue #560;
+  // `name` added in issue #926). Applies only the present keys of `patch`
+  // (name/description/tags/custom) wholesale, leaving membership and the
+  // delete-lock untouched.
   async update(id: string, patch: UpdateCollectionInput): Promise<Collection> {
     const existing = this.store.get(id);
     if (!existing) {

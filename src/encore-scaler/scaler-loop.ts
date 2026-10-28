@@ -27,17 +27,47 @@ import {
 } from './types.js';
 import {
   destroyInstance,
+  evictVanishedInstances,
   listInstances,
+  reapOrphanedInstances,
+  resolvePendingSpawns,
   spawnInstance,
-  updateInstance
+  updateInstance,
+  ENCORE_CALLBACK_LISTENER_SERVICE_ID
 } from './instance-pool.js';
 import {
   makePriorAttemptCanceler,
   recordDispatch,
   requeueInterruptedByScaleDown
 } from './retry-store.js';
-import { probeCallbackTrust } from './callback-trust-probe.js';
+import {
+  probeCallbackTrust,
+  buildCallbackUri,
+  DEFAULT_PROBE_REQUEST_TIMEOUT_MS
+} from './callback-trust-probe.js';
+import { logScalerEvent, ScalerLogThrottle, type ScalerLogPhase } from './scaler-log.js';
+import {
+  assignmentTrailFingerprint,
+  describeProbeResult,
+  formatAssignmentTrail,
+  recordedProbeOutcome,
+  shouldLogAssignmentTrail,
+  type AssignmentDecision,
+  type AssignmentOutcome,
+  type ProbeOutcome
+} from './assignment-log.js';
+import {
+  DEFAULT_SPAWN_GATEWAY_BACKOFF_MS,
+  readSpawnFailure,
+  spawnFailureSecrets,
+  spawnGatewayBackoffRemainingMs
+} from './spawn-failure.js';
 import { hasPendingPackaging } from './packaging-pin.js';
+import {
+  ACTIVE_PAGE_SIZE,
+  fetchEncoreActiveState,
+  type EncoreActiveState
+} from './encore-active-state.js';
 
 // Default bounded wait for the outbound callback-listener TLS-trust probe
 // (issue #463) when EncoreScalerConfig.callbackTrustTimeoutMs is unset.
@@ -50,11 +80,249 @@ export const DEFAULT_CALLBACK_TRUST_TIMEOUT_MS = 60_000;
 // the finished job from its active set and the poller decrementing activeJobs.
 export const DEFAULT_RECONCILE_GRACE_MS = 10_000;
 
+// #769 review finding 4 — PARTIAL-VISIBILITY DROP POLICY.
+//
+// The defect #769 exists to fix is "the job is running on pool instance B, the
+// keys.jobInstance mapping says A, so reconcile fails a healthy job". The
+// pool-wide index fixes that whenever B's active set could be read. It does NOT
+// fix it when B could not be read — B unreachable, B's pool entry unparseable,
+// or B's active page truncated. In all three cases B contributes no positive
+// evidence, `instancesActiveFor` comes back empty, and the same healthy job is
+// failed. Refusing to diff a truncated instance against its OWN tracked jobs
+// (pass 2 below) does not help here: the job is being classified against A.
+//
+// POLICY CHOSEN (over "fail toward drop" and over "never drop under partial
+// visibility"): a drop decided WITHOUT full pool visibility is WITHHELD and
+// re-examined on the next pass, and only becomes terminal once the job has been
+// classified dropped on this many consecutive partial-visibility passes.
+//
+//   - It fixes the headline class. The overwhelmingly common case is one pass of
+//     partial visibility — an instance mid-spawn, a transient 5xx, a page that
+//     was briefly over the clamp. One more tick and B answers, the pool-wide
+//     index sees the job, and the drop is suppressed for good.
+//   - It is bounded, unlike "never drop under partial visibility". A pool entry
+//     that is permanently unreachable would otherwise strand every job that ever
+//     mapped to another instance in `running` forever, with no retry and no
+//     terminal state — trading a false FAILED for a permanent limbo, which is
+//     worse.
+//   - It is honest about what it costs: one extra reconcile interval of latency
+//     on a genuine drop, but only when visibility is already degraded.
+//
+// A full-visibility pass is unaffected and still decides immediately.
+export const PARTIAL_VISIBILITY_DROP_PASSES = 2;
+
+// TTL on the per-job counter behind the gate above. Long enough that consecutive
+// reconcile passes (tick interval, seconds) accumulate, short enough that a job
+// which stopped being a drop candidate and later becomes one again does not
+// inherit a stale count. The counter is also cleared explicitly whenever the job
+// is observed active, so this is a backstop against leaked keys, not the primary
+// reset.
+export const PARTIAL_VISIBILITY_DROP_TTL_MS = 10 * 60_000;
+
+// #778: how often the tick sweeps OSC for scaler-owned instances with no pool
+// record when EncoreScalerConfig.orphanReapIntervalMs is left to the registry's
+// default. The sweep costs one OSC list call plus a pool SCAN, so it runs on a
+// much coarser cadence than the 10s tick.
+export const DEFAULT_ORPHAN_REAP_INTERVAL_MS = 5 * 60_000;
+
+// #778 (review finding 6): minimum interval between "no usable idle timestamp"
+// warnings for the SAME instance. The condition is re-evaluated every tick (10s)
+// and persists until the instance is torn down, so the warning has to be
+// throttled to stay useful rather than drowning the log.
+export const MISSING_IDLE_STAMP_WARN_INTERVAL_MS = 30 * 60_000;
+
+// Resolve the epoch-ms an instance's idle clock should be measured from (#778).
+//
+// `lastIdleAt` is only advanced when a job COMPLETES (the callback poller's
+// decrement — encore-callback-poller.ts:320, routes/internal.ts:194). An
+// instance that is spawned and never dispatched a job therefore has no
+// completion behind it, and any record whose `lastIdleAt` was lost or written
+// as a non-number makes `now - lastIdleAt > idleTimeoutMs` evaluate to NaN >
+// number, i.e. false, forever: the instance is never a teardown candidate and
+// bills indefinitely.
+//
+// Order of preference:
+//   1. lastIdleAt — a real completion timestamp when there is one.
+//   2. readyAt    — the moment the instance entered the pool ready for work, so
+//                   a never-dispatched instance is idle from readiness.
+//   3. undefined  — nothing usable; callers FAIL CLOSED (see below).
+//
+// Numeric strings are accepted because the record round-trips through JSON in
+// Valkey and may have been repaired out of band.
+export function resolveIdleSince(record: EncoreInstanceRecord): number | undefined {
+  for (const candidate of [record.lastIdleAt, record.readyAt] as unknown[]) {
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) return candidate;
+    if (typeof candidate === 'string' && candidate.trim() !== '') {
+      const parsed = Number(candidate);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return undefined;
+}
+
+// Whether an instance's idle age exceeds idleTimeoutMs (#778).
+//
+// Fails CLOSED: when no usable idle timestamp exists the instance is treated as
+// eligible (idle age unknown => assume aged) rather than held forever. Eligible
+// only means "candidate": the scale-down path still runs the authoritative
+// Encore real-work check and the packaging-pin check before anything is
+// destroyed (#513/#525 pt.2), so an unknown timestamp can never kill an
+// instance that has in-flight work or a pending packaging handoff — such an
+// instance is drained, exactly as before.
+export function isIdlePastTimeout(
+  record: EncoreInstanceRecord,
+  now: number,
+  idleTimeoutMs: number
+): boolean {
+  const idleSince = resolveIdleSince(record);
+  if (idleSince === undefined) return true;
+  return now - idleSince > idleTimeoutMs;
+}
+
+// #1171 review finding A: how long before a service access token's own `exp`
+// this loop stops using its cached copy. The probe is a single HEAD with a 5s
+// bound, so anything comfortably longer than one request is enough; 60s also
+// absorbs modest clock skew between this process and the token issuer.
+export const SAT_EXPIRY_MARGIN_MS = 60_000;
+
+// Fallback cache lifetime for a token whose expiry we cannot read (not a JWT,
+// or no usable `exp` claim). Deliberately far shorter than the ~1h a real SAT
+// lasts: minting is one HTTPS POST on a path that only runs while an instance
+// is still being gated, so re-minting too often costs nothing, whereas holding
+// an expired token is what #1171's review flagged.
+export const SAT_UNKNOWN_EXPIRY_TTL_MS = 5 * 60_000;
+
+// #1171 review finding H: the bound on ONE service-access-token mint.
+//
+// The mint is a single HTTPS POST to the token service, awaited inside the
+// scaler's non-overlapping tick guard, and the OSC client passes no
+// `signal`/`timeout` to its fetch — so without this bound a token service that
+// accepts the connection and never answers stalls the tick (readiness, dispatch,
+// orphan sweep) for as long as the socket lives. Deliberately the same 5s as
+// DEFAULT_PROBE_REQUEST_TIMEOUT_MS (callback-trust-probe.ts:207): both bound a
+// single request on the readiness path, and the mint only exists to serve that
+// probe, so there is no reason for the token leg to be allowed to outlast the
+// probe request it feeds. Losing the token is not a failure — the probe falls
+// back to its unauthenticated behaviour (getCallbackListenerSat).
+export const SAT_MINT_TIMEOUT_MS = 5_000;
+
+// Epoch ms at which a service access token expires, read from the `exp` claim of
+// its (unverified) JWT payload, or undefined when that is not readable.
+//
+// Contract (CLAUDE.md rule 7): RFC 7519 §4.1.4 — `exp` is a NumericDate, i.e.
+// SECONDS since the epoch, in the second of the three dot-separated base64url
+// segments of a JWS (RFC 7515 §3.1). Verified against a live token minted
+// 2026-10-14 from `POST https://token.svc.prod.osaas.io/servicetoken` for
+// `eyevinn-encore-callback-listener`: three segments, payload
+// `{"...","iat":1760...,"exp":1760...}` with `exp - iat === 3601`.
+//
+// NOTE: the signature is deliberately NOT verified — this is a local cache-TTL
+// hint for a token WE minted and only send outbound, never a trust decision. A
+// token whose payload does not parse simply falls back to
+// SAT_UNKNOWN_EXPIRY_TTL_MS.
+export function jwtExpiryEpochMs(token: string): number | undefined {
+  const parts = token.split('.');
+  if (parts.length !== 3) return undefined;
+  const payload = parts[1];
+  if (payload === undefined || payload.length === 0) return undefined;
+  try {
+    const decoded = JSON.parse(
+      Buffer.from(payload, 'base64url').toString('utf8')
+    ) as { exp?: unknown };
+    const exp = decoded.exp;
+    if (typeof exp === 'number' && Number.isFinite(exp) && exp > 0) {
+      return exp * 1000;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export class EncoreScalerLoop {
   private timer: NodeJS.Timeout | undefined;
   private running = false;
+  // #778: epoch ms of the last orphan sweep, so the sweep runs on its own
+  // (much coarser) cadence than the tick. 0 = never swept, so the first tick
+  // after start-up sweeps immediately — that is when a pool lost to a restart
+  // is most likely to have left instances behind.
+  private lastOrphanSweepAt = 0;
+  // #778 review finding 6: instanceId -> epoch ms this loop last warned that the
+  // instance has no usable idle timestamp, so the per-tick warning is throttled
+  // instead of repeating every 10s until teardown.
+  private readonly missingIdleStampWarnedAt = new Map<string, number>();
+  // #998 review finding 3: one log entry per (workspace, phase) per throttle
+  // window, with the collapsed repeats counted into the next entry. Owned by the
+  // loop — one loop per workspace, created once (workspace-registry.ts) — so the
+  // state lives exactly as long as the loop whose appends it is limiting.
+  private readonly logThrottle = new ScalerLogThrottle();
+  // #1171: callback-listener service access token with the epoch ms at which
+  // this loop stops trusting it. Only used to disambiguate a 401/403 on the
+  // callback-trust probe (see ensureCallbackTrust), so it is fetched lazily — a
+  // pool that never probes never mints one. Caching it for the loop's lifetime
+  // was the #1171 review's finding A: a minted SAT expires (~1h) and the client
+  // renews nothing, so an indefinite cache turns every later re-probe into an
+  // expired-JWT 401. `expiresAtMs` comes from the token's own `exp` claim where
+  // readable (see getCallbackListenerSat). Never logged; `spawnFailureSecrets`
+  // redaction already covers SAT-shaped strings in log paths.
+  private callbackListenerSat:
+    | { token: string; expiresAtMs: number }
+    | undefined;
+  // #1172 assignment-trail suppression state (see logAssignmentTrail). Owned by
+  // the loop, like logThrottle: one loop per workspace, so the state lives
+  // exactly as long as the trail it is limiting.
+  private lastAssignmentFingerprint: string | undefined;
+  private lastAssignmentLoggedAt = 0;
+  private unchangedAssignmentTicks = 0;
 
   constructor(private config: EncoreScalerConfig) {}
+
+  // Mirror a control-loop FAILURE into the operational log store (issue #998,
+  // parent #985) so it is visible through GET /api/v1/logs and the Logs tab,
+  // not just in this container's stdout.
+  //
+  // Every call site below keeps its existing `console.error` verbatim — this is
+  // strictly additive — and this helper never throws, never awaits and is a
+  // no-op when no `logSink` is configured (see logScalerEvent,
+  // src/encore-scaler/scaler-log.ts), so no error path it instruments can
+  // change behaviour. `phase` is what makes the entry filterable: it becomes the
+  // `encore-scaler/<phase>: ` message prefix the `q` substring filter matches
+  // (src/services/log-store.ts applyLogQuery).
+  //
+  // THROTTLED (#998 review finding 3). The log store keeps a bounded,
+  // oldest-first window of records (LOG_STORE_MAX_RECORDS, src/services/
+  // log-store.ts) and this loop ticks every 10s, so a workspace stuck in a
+  // failing state would otherwise evict the pipeline history the Logs tab exists
+  // for. At most one entry per (workspace, phase) per window reaches the store;
+  // the repeats in between are counted and reported in the next entry, the same
+  // single-record-plus-counter shape the spawn-failure record uses
+  // (src/encore-scaler/spawn-failure.ts). The first failure after a quiet period
+  // always goes through, and `console.error` below is untouched either way — the
+  // container log keeps every occurrence.
+  //
+  // REDACTED (#998 review finding 1). The error's text is scrubbed by
+  // `describeScalerError` -> `redactSpawnFailureMessage` before it is persisted;
+  // the literal secrets this workspace's OSC calls carry are passed in so the
+  // known-value pass can run, exactly as spawnInstance's failure path does
+  // (instance-pool.ts).
+  private logFailure(
+    phase: ScalerLogPhase,
+    message: string,
+    err?: unknown
+  ): void {
+    if (!this.config.logSink) return;
+    const suppressed = this.logThrottle.admit(this.config.workspaceId, phase);
+    if (suppressed === undefined) return;
+    logScalerEvent(this.config.logSink, {
+      phase,
+      level: 'error',
+      workspaceId: this.config.workspaceId,
+      message,
+      err,
+      secrets: spawnFailureSecrets(this.config),
+      suppressed
+    });
+  }
 
   start(intervalMs = 10_000): void {
     if (this.timer) return;
@@ -67,6 +335,9 @@ export class EncoreScalerLoop {
           // A tick failure must not kill the interval; the next tick retries.
           // Log so spawn/dispatch errors are visible rather than silently lost.
           console.error('[encore-scaler] tick error (workspace=%s):', this.config.workspaceId, err);
+          // ...and durably, through the API/UI (#998): an operator reviewing an
+          // incident after the fact cannot read this container's stdout.
+          this.logFailure('tick', 'control-loop tick failed; the next tick retries', err);
         })
         .finally(() => {
           this.running = false;
@@ -116,11 +387,40 @@ export class EncoreScalerLoop {
           this.config.workspaceId,
           err
         );
+        this.logFailure(
+          'tick',
+          'failed-transcode reconcile sweep errored (scaling and dispatch continue)',
+          err
+        );
       }
     }
 
     // 1. Pending work.
     const pending = await redis.llen(keys.queue(workspaceId));
+
+    // 1b. Resolve any PENDING spawn (#1071): an instance a previous tick's spawn
+    //     left running because it had not reported `running` within the readiness
+    //     budget — normal while OSC provisions a new worker node. Promote it into
+    //     the pool proper the moment OSC reports it healthy, or destroy it once it
+    //     has had a second full budget and OSC still does not. This runs BEFORE
+    //     the pool is read so the scale-up gate below sees the result: a promoted
+    //     instance is capacity we already have (no sibling spawned for the node
+    //     already being provisioned), and a destroyed one frees its slot under
+    //     maxInstances. Never fatal to the tick.
+    try {
+      await resolvePendingSpawns(this.config);
+    } catch (err) {
+      console.error(
+        '[encore-scaler] pending-spawn resolve error (workspace=%s):',
+        workspaceId,
+        err
+      );
+      this.logFailure(
+        'spawn',
+        'pending-spawn resolution failed; a half-ready instance stays pending for the next tick',
+        err
+      );
+    }
 
     // 2. Current pool.
     let instances = await listInstances(redis, workspaceId);
@@ -128,14 +428,98 @@ export class EncoreScalerLoop {
     // 3. Scale up (one instance per tick). Pre-warm to minInstances regardless
     //    of pending work; otherwise scale up only when every instance is busy
     //    and there is pending work.
-    const allBusy = instances.every((i) => i.activeJobs >= JOBS_PER_INSTANCE);
+    //
+    //    #1071: `allBusy` asks "is all the capacity I HAVE already working?", so
+    //    it must only consider instances that can take work. A PENDING entry
+    //    cannot: it has never reported healthy and dispatch skips it, so its
+    //    activeJobs is permanently 0. Counting it made `allBusy` false for as
+    //    long as any instance was coming up, which froze scale-up for the WHOLE
+    //    workspace — 2 busy instances, 20 queued jobs and a cap of 5 would spawn
+    //    nothing. Pending entries are still counted in `instances.length` below:
+    //    they hold ONE slot each against maxInstances, because each is a real
+    //    instance OSC is really provisioning, but they never speak for the
+    //    busyness of the pool.
+    const usable = instances.filter((i) => i.pendingReadySince === undefined);
+    const allBusy = usable.every((i) => i.activeJobs >= JOBS_PER_INSTANCE);
     const belowMin = instances.length < minInstances;
     if (
       instances.length < maxInstances &&
       (belowMin || (pending > 0 && allBusy))
     ) {
-      const spawned = await spawnInstance(this.config);
-      instances = [...instances, spawned];
+      // #1071: a spawn that cannot create an instance must NOT abort the tick.
+      // spawnInstance retries transient OSC errors and then throws; letting that
+      // throw escape took out everything after this gate — scale-down (step 4),
+      // the orphan sweep (4b) and dispatch (5) — for as long as spawning kept
+      // failing. That is worst exactly where it hurts most: on the belowMin
+      // pre-warm path the gate fires on EVERY tick regardless of pending work,
+      // so a workspace that cannot spawn stopped reaping and stopped dispatching
+      // to the capacity it already had. The failure itself is recorded on the
+      // pool's own state by spawnInstance (keys.spawnFailure) and reported per
+      // workspace by GET /scaler/status, so swallowing it here loses no signal:
+      // it is precisely what makes "at cap" distinguishable from "cannot spawn"
+      // without pod logs.
+      //
+      // #1286: ...but a spawn that ended in a GATEWAY TIMEOUT is not simply
+      // retried on the next tick either. A 504 on createInstance is the platform
+      // telling us it is too slow to answer inside the ingress' 60s limit, while
+      // the create itself usually keeps going behind it. Starting another create
+      // 10s later therefore does two unhelpful things at once: it adds load to
+      // the thing that is already struggling, and it asks for a SECOND instance
+      // while the first one is still being built (under a new name, so the first
+      // one is nobody's — the extra instance #1223 reported). The spawn path's
+      // own adopt probe has just spent up to 90s watching for that instance
+      // (probeForGatewayTimedOutInstance, instance-pool.ts); this holds the next
+      // attempt off for a while longer so the platform, the orphan reaper and
+      // reconcile all get a chance to settle first.
+      //
+      // Read from pool state (keys.spawnFailure), not process memory, so it
+      // survives a restart and is the same for every replica. readSpawnFailure
+      // is total — it never throws — so this cannot be what breaks a tick.
+      const gatewayBackoffMs = spawnGatewayBackoffRemainingMs(
+        await readSpawnFailure(redis, workspaceId),
+        Date.now(),
+        this.config.spawnGatewayBackoffMs ?? DEFAULT_SPAWN_GATEWAY_BACKOFF_MS
+      );
+      if (gatewayBackoffMs > 0) {
+        console.warn(
+          '[encore-scaler] scale-up: holding off (workspace=%s pending=%d instances=%d ' +
+            'max=%d) — the last spawn timed out at the gateway and the platform may ' +
+            'still be creating that instance; next attempt in %dms (#1286)',
+          workspaceId,
+          pending,
+          instances.length,
+          maxInstances,
+          gatewayBackoffMs
+        );
+        // Not logFailure: nothing has failed on this tick, and the failure that
+        // caused the back-off is already recorded (keys.spawnFailure) and served
+        // with its status code by GET /scaler/status. Everything after this gate
+        // — scale-down, the orphan sweep, dispatch — runs exactly as usual.
+      } else {
+        try {
+          const spawned = await spawnInstance(this.config);
+          instances = [...instances, spawned];
+        } catch (err) {
+          console.error(
+            '[encore-scaler] scale-up: spawn failed (workspace=%s pending=%d instances=%d max=%d); ' +
+              'continuing the tick with the existing pool:',
+            workspaceId,
+            pending,
+            instances.length,
+            maxInstances,
+            err
+          );
+          // #998: this is the signal that distinguishes "pool is at maxInstances"
+          // from "OSC will not create the instance" — the exact ambiguity #1071
+          // described — so it must reach the API/UI, not only pod logs.
+          this.logFailure(
+            'spawn',
+            `scale-up spawn failed (pending=${pending} instances=${instances.length} ` +
+              `max=${maxInstances}); continuing the tick with the existing pool`,
+            err
+          );
+        }
+      }
     }
 
     // 4. Scale down idle instances, but never below minInstances — and NEVER an
@@ -156,7 +540,24 @@ export class EncoreScalerLoop {
     const survivors: EncoreInstanceRecord[] = [];
     let activeCount = instances.length;
     for (const inst of instances) {
-      const idlePastTimeout = now - inst.lastIdleAt > idleTimeoutMs;
+      // #778: idle age is measured from the last COMPLETION if there is one,
+      // else from the moment the instance became ready (readyAt) — so an
+      // instance that was spawned and never dispatched a job ages out normally.
+      // A record with neither usable timestamp fails closed (eligible), never
+      // "hold forever"; the real-work + packaging-pin checks below still decide
+      // whether it is destroyed or drained.
+      // #1071: a PENDING spawn is owned end to end by resolvePendingSpawns
+      // (step 1b) — it has never reported healthy, so neither the idle clock nor
+      // the real-work query says anything useful about it, and it has its own
+      // deadline. Never a scale-down candidate.
+      if (inst.pendingReadySince !== undefined) {
+        survivors.push(inst);
+        continue;
+      }
+      const idlePastTimeout = isIdlePastTimeout(inst, now, idleTimeoutMs);
+      if (inst.activeJobs === 0 && resolveIdleSince(inst) === undefined) {
+        this.warnMissingIdleStampThrottled(inst, now);
+      }
       // A candidate for teardown is either an instance the tracked count already
       // considers idle-and-aged, or one already marked draining (which is being
       // held only until its real work clears — see below).
@@ -234,12 +635,65 @@ export class EncoreScalerLoop {
     }
     instances = survivors;
 
+    // Prune the warn-throttle map for instances that have left the pool so it
+    // cannot grow unbounded over the life of the loop (#778 review finding 6).
+    if (this.missingIdleStampWarnedAt.size > 0) {
+      const live = new Set(instances.map((i) => i.instanceId));
+      for (const id of [...this.missingIdleStampWarnedAt.keys()]) {
+        if (!live.has(id)) this.missingIdleStampWarnedAt.delete(id);
+      }
+    }
+
+    // 4b. Reap instances OSC is still running for this workspace that have no
+    //     pool record at all (#778). Scale-down above can only ever consider
+    //     what is in the pool hash, so an instance orphaned by a spawn that died
+    //     before the pool write, a wiped Valkey, or a deleted deployment has
+    //     nothing else that can remove it. Opt-in (the registry enables it in
+    //     production) and throttled to its own cadence; never fatal to the tick.
+    await this.reapOrphansIfDue();
+
     // 5. Dispatch pending jobs to instances with spare capacity.
+    //
+    // #1172: every `continue`/`break` below is a decision an operator needs to
+    // be able to read back ("why did this ready instance get no job?"), so each
+    // one now records WHY on `decisions` before taking its existing branch. The
+    // control flow is untouched — the records are written, never consulted — and
+    // the whole set is emitted as ONE trail entry after the loop
+    // (logAssignmentTrail).
+    const decisions: AssignmentDecision[] = [];
+    const decide = (
+      inst: EncoreInstanceRecord,
+      outcome: AssignmentOutcome,
+      probe: ProbeOutcome,
+      assignedJobIds: string[] = []
+    ): void => {
+      decisions.push({
+        instanceId: inst.instanceId,
+        // Ready = the trust gate cleared it and it was not withheld for
+        // draining/pending-spawn. `at-capacity` is ready-but-full.
+        ready: outcome !== 'draining' && outcome !== 'pending-spawn' && outcome !== 'trust-probe-pending',
+        outcome,
+        probe,
+        assignedJobIds,
+        activeJobs: inst.activeJobs,
+        capacity: JOBS_PER_INSTANCE
+      });
+    };
     for (const inst of instances) {
       // A draining instance (issue #513) is being torn down: it must receive no
       // new job dispatches. Skip it so its real active-job count can reach zero
       // and a later tick can safely remove it.
       if (inst.draining === true) {
+        decide(inst, 'draining', recordedProbeOutcome(inst));
+        continue;
+      }
+      // #1071: a PENDING spawn is in the pool so it counts against maxInstances
+      // and cannot be lost, but OSC has never reported it `running`. Dispatching
+      // to it would post a job to an instance that is still being placed on a
+      // node. It becomes eligible the tick after resolvePendingSpawns promotes
+      // it, which is also when its callback-trust probe starts.
+      if (inst.pendingReadySince !== undefined) {
+        decide(inst, 'pending-spawn', recordedProbeOutcome(inst));
         continue;
       }
       // Gate first-job dispatch on confirmed outbound TLS trust to the paired
@@ -249,15 +703,29 @@ export class EncoreScalerLoop {
       // entirely, so warm instances incur no added latency. A quarantined
       // instance is never dispatched to. This never throws into the tick: a
       // probe failure keeps the job in the queue for a later tick.
-      if (!(await this.ensureCallbackTrust(inst))) {
+      const trust = await this.ensureCallbackTrust(inst);
+      if (!trust.eligible) {
+        // #1172: the trail now names the probe outcome that withheld the job,
+        // so "ready instance, no work" is explained on the tick it happens.
+        decide(inst, 'trust-probe-pending', trust.probe);
         continue; // not eligible this tick — leave its capacity unused
       }
+      // #1172: an instance that is full before the queue is consulted never
+      // enters the loop below, which is a legitimate (and previously invisible)
+      // reason for a queued job to sit still.
+      if (inst.activeJobs >= JOBS_PER_INSTANCE) {
+        decide(inst, 'at-capacity', trust.probe);
+        continue;
+      }
+      // Recorded per instance and reported once after the loop.
+      const assignedJobIds: string[] = [];
+      let outcome: AssignmentOutcome = 'queue-empty';
       while (inst.activeJobs < JOBS_PER_INSTANCE) {
         const claimed = await redis.rpoplpush(
           keys.queue(workspaceId),
           keys.inflight(workspaceId)
         );
-        if (!claimed) break; // queue empty
+        if (!claimed) break; // queue empty (outcome stays 'queue-empty')
 
         let job: QueuedJob;
         try {
@@ -276,6 +744,9 @@ export class EncoreScalerLoop {
         if (job.notBefore && job.notBefore > Date.now()) {
           await redis.lrem(keys.inflight(workspaceId), 1, claimed);
           await redis.rpush(keys.queue(workspaceId), claimed);
+          // #1172: a queue that is NOT empty while an instance sits idle looks
+          // identical to a broken dispatcher unless the backoff is stated.
+          if (assignedJobIds.length === 0) outcome = 'retry-backoff';
           break;
         }
 
@@ -287,12 +758,133 @@ export class EncoreScalerLoop {
         if (!dispatched) {
           // Re-queue at the head so it is retried on the next tick.
           await redis.rpush(keys.queue(workspaceId), claimed);
+          // #1172: the CAUSE is already reported by the #1136 dispatch-phase
+          // error entry, which this must not duplicate — the trail only records
+          // that this instance stopped taking work for that reason.
+          if (assignedJobIds.length === 0) outcome = 'dispatch-failed';
           break; // instance likely unhealthy; stop feeding it this tick
         }
 
         inst.activeJobs += 1;
+        assignedJobIds.push(job.jobId);
+        outcome = 'assigned';
         await updateInstance(redis, workspaceId, inst);
       }
+      decide(inst, outcome, trust.probe, assignedJobIds);
+    }
+
+    // 5b. #1172: ONE entry that explains this tick's assignment decisions —
+    //     queue depth, every instance considered, its probe outcome, and the
+    //     jobs it was given. Emitted after dispatch so it reports what actually
+    //     happened, and never before: a trail written mid-loop could not say
+    //     whether a later instance took the work.
+    this.logAssignmentTrail(pending, decisions);
+  }
+
+  // Append the per-tick readiness/assignment trail (issue #1172).
+  //
+  // Gated by shouldLogAssignmentTrail (src/encore-scaler/assignment-log.ts): a
+  // CHANGED decision picture is logged on the tick it changes, an unchanged one
+  // is re-stated at most once per ASSIGNMENT_TRAIL_REPEAT_MS with the count of
+  // the ticks it stood in for. Without that gate a 10s loop would write ~8,600
+  // info records a day per workspace into a bounded, oldest-first retained
+  // window (LOG_STORE_MAX_RECORDS, src/services/log-store.ts) and evict the
+  // history the trail exists to provide — the same reasoning, and the same
+  // window, as the #1136 error throttle.
+  //
+  // Skipped entirely when the tick considered NO instance: with an empty pool
+  // there is no per-instance decision to explain, and why the pool is empty is
+  // the scale-up path's story, already told by the spawn-failure record
+  // (keys.spawnFailure / GET /scaler/status, #1071) and the #1136 spawn-phase
+  // entry. Never throws and never awaits (logScalerEvent).
+  private logAssignmentTrail(queueDepth: number, decisions: AssignmentDecision[]): void {
+    if (!this.config.logSink) return;
+    if (decisions.length === 0) return;
+    const trail = { queueDepth, decisions };
+    const fingerprint = assignmentTrailFingerprint(trail);
+    const now = Date.now();
+    const unchangedTicks = shouldLogAssignmentTrail({
+      fingerprint,
+      lastFingerprint: this.lastAssignmentFingerprint,
+      lastLoggedAt: this.lastAssignmentLoggedAt,
+      unchangedTicks: this.unchangedAssignmentTicks,
+      now
+    });
+    if (unchangedTicks === undefined) {
+      this.unchangedAssignmentTicks += 1;
+      return;
+    }
+    this.lastAssignmentFingerprint = fingerprint;
+    this.lastAssignmentLoggedAt = now;
+    this.unchangedAssignmentTicks = 0;
+    logScalerEvent(this.config.logSink, {
+      phase: 'assign',
+      // A normal outcome, not a failure: the trail must never raise the level
+      // badge (public/logs-table.js) on a healthy pool.
+      level: 'info',
+      workspaceId: this.config.workspaceId,
+      message: formatAssignmentTrail({ ...trail, unchangedTicks })
+    });
+  }
+
+  // Report an instance whose record carries no usable idle timestamp — at most
+  // once per instance per MISSING_IDLE_STAMP_WARN_INTERVAL_MS (#778 review
+  // finding 6). The condition is evaluated on every 10s tick and persists until
+  // the instance is torn down, so an unthrottled warn emitted ~6 times a minute
+  // per affected instance and buried everything else in the log. Throttling keeps
+  // the signal (it is still reported, with the elapsed-since-first-seen) without
+  // the spam. The map is pruned of instances no longer in the pool so it cannot
+  // grow unbounded across a long-lived loop.
+  private warnMissingIdleStampThrottled(
+    inst: EncoreInstanceRecord,
+    now: number
+  ): void {
+    const lastWarnedAt = this.missingIdleStampWarnedAt.get(inst.instanceId);
+    if (
+      lastWarnedAt !== undefined &&
+      now - lastWarnedAt < MISSING_IDLE_STAMP_WARN_INTERVAL_MS
+    ) {
+      return;
+    }
+    this.missingIdleStampWarnedAt.set(inst.instanceId, now);
+    console.warn(
+      '[encore-scaler] instance %s has no usable idle timestamp ' +
+        '(lastIdleAt=%o readyAt=%o); treating it as idle-aged rather than ' +
+        'holding it indefinitely (#778). This message is throttled to once ' +
+        'every %dms per instance.',
+      inst.instanceId,
+      inst.lastIdleAt,
+      inst.readyAt,
+      MISSING_IDLE_STAMP_WARN_INTERVAL_MS
+    );
+  }
+
+  // Run the orphan sweep (#778) when its own interval has elapsed. Disabled
+  // unless EncoreScalerConfig.orphanReapIntervalMs is a positive number, so a
+  // caller that has not opted in (tests, embedders) makes no extra OSC calls.
+  // Swallows every error: a sweep failure must never break the tick's
+  // scaling/dispatch work, exactly like the other best-effort hooks above.
+  private async reapOrphansIfDue(): Promise<void> {
+    const intervalMs = this.config.orphanReapIntervalMs;
+    if (typeof intervalMs !== 'number' || !(intervalMs > 0)) return;
+    const now = Date.now();
+    if (now - this.lastOrphanSweepAt < intervalMs) return;
+    this.lastOrphanSweepAt = now;
+    try {
+      await reapOrphanedInstances(this.config);
+    } catch (err) {
+      console.error(
+        '[encore-scaler] orphan reap error (workspace=%s):',
+        this.config.workspaceId,
+        err
+      );
+      // #998: a sweep that keeps failing means orphaned instances keep billing,
+      // and nothing else can tear them down — so it needs operator visibility.
+      this.logFailure(
+        'reap',
+        'orphan instance sweep failed; instances with no pool record may still be running',
+        err
+      );
     }
   }
 
@@ -312,49 +904,28 @@ export class EncoreScalerLoop {
   //     scale-down that means "do not destroy" — we never terminate an instance
   //     whose real in-flight state we could not confirm is empty.
   //
-  // Contract: Encore /encoreJobs/search/findByStatus returns Spring HATEOAS pages
-  // { _embedded: { encoreJobs: [{ id, externalId, ... }] }, page: { totalElements } }
-  // (verified in encore-callback-poller.ts:505-508, SVT Encore, 2026-07-07).
+  // `truncated` (#769 review finding 2) says `activeExternalIds` is only PART of
+  // what Encore reports active (more than one page of ACTIVE_PAGE_SIZE for a
+  // status). `count` is still exact, so a count correction is safe, but no diff
+  // may conclude a tracked job vanished from a truncated instance.
+  //
+  // Contract: recorded as data in encore-paging-contract.ts and pinned by
+  // test/encore-findbystatus-contract.test.ts against
+  // docs/contracts/encore-findbystatus-paging.json — the endpoint, the
+  // `page.totalElements` all-pages semantics the truncation guard rests on, and
+  // the `_links.next` equivalence (#769 review finding 2).
+  //
+  // The query itself now lives in encore-active-state.ts so the orphan reaper
+  // (instance-pool.ts reapOrphanedInstances) runs the IDENTICAL check before it
+  // destroys anything (#778 review finding 2) — there is one definition of "does
+  // this instance have work", not two that can drift.
   private async fetchRealActiveState(
     record: EncoreInstanceRecord
-  ): Promise<{ count: number; activeExternalIds: Set<string> } | undefined> {
+  ): Promise<EncoreActiveState | undefined> {
     const { getToken } = this.config;
     try {
       const token = await getToken();
-      const base = record.url.replace(/\/$/, '');
-      const [resQ, resP] = await Promise.all([
-        fetch(`${base}/encoreJobs/search/findByStatus?status=QUEUED&page=0&size=100`, {
-          headers: { authorization: `Bearer ${token}` }
-        }),
-        fetch(`${base}/encoreJobs/search/findByStatus?status=IN_PROGRESS&page=0&size=100`, {
-          headers: { authorization: `Bearer ${token}` }
-        })
-      ]);
-      if (!resQ.ok || !resP.ok) return undefined;
-
-      type EncoreJobPage = {
-        _embedded?: { encoreJobs?: Array<{ externalId?: string }> };
-        page?: { totalElements?: number };
-      };
-      const [bodyQ, bodyP] = await Promise.all([
-        resQ.json().catch(() => ({})) as Promise<EncoreJobPage>,
-        resP.json().catch(() => ({})) as Promise<EncoreJobPage>
-      ]);
-      const queuedCount = bodyQ.page?.totalElements;
-      const inProgressCount = bodyP.page?.totalElements;
-      if (typeof queuedCount !== 'number' || typeof inProgressCount !== 'number') {
-        return undefined;
-      }
-
-      const activeExternalIds = new Set<string>();
-      for (const j of bodyQ._embedded?.encoreJobs ?? []) {
-        if (j.externalId) activeExternalIds.add(j.externalId);
-      }
-      for (const j of bodyP._embedded?.encoreJobs ?? []) {
-        if (j.externalId) activeExternalIds.add(j.externalId);
-      }
-
-      return { count: queuedCount + inProgressCount, activeExternalIds };
+      return await fetchEncoreActiveState(record.url, token);
     } catch {
       // Any error means we could not confirm the real state — surface undefined
       // so callers stay conservative (never destroy on an unconfirmed count).
@@ -600,13 +1171,13 @@ export class EncoreScalerLoop {
           }
         } else {
           // Payload unavailable (e.g. TTL expired): cannot rebuild the job, so
-          // leave it for reconcile()'s generic dropped-job path rather than fake
-          // a payload. Observable so the gap is diagnosable (issue #451 style).
+          // it cannot be re-enqueued and must be RESOLVED here instead (#1228).
           console.warn(
             `[encore-scaler] scale-down: job ${jobId} interrupted by scale-down of ` +
               `instance ${instanceId} but its payload is unavailable — cannot ` +
-              `re-enqueue; leaving for dropped-job reconciliation`
+              `re-enqueue; resolving it terminally (#1228)`
           );
+          await this.resolveUnrequeueableScaleDownLoss(instanceId, jobId);
         }
       }
     } catch (err) {
@@ -616,15 +1187,193 @@ export class EncoreScalerLoop {
         instanceId,
         err
       );
+      this.logFailure(
+        'reap',
+        `scale-down interruption re-enqueue failed for instance ${instanceId}; ` +
+          'jobs lost to this teardown may not have been re-queued',
+        err
+      );
+    }
+  }
+
+  // #1228: resolve a job that was lost to a scale-down / vanished-instance
+  // eviction and CANNOT be re-enqueued because its dispatch payload is gone
+  // (keys.jobPayload carries a 24h TTL — retry-store.ts recordDispatch /
+  // PAYLOAD_TTL_SECONDS — so a job interrupted after that window has nothing
+  // left to rebuild from).
+  //
+  // WHY THIS EXISTS AT ALL. Before #1228 this case only logged "leaving for
+  // dropped-job reconciliation" and returned, on the assumption that
+  // reconcile()'s generic dropped-job diff would pick the job up. It cannot:
+  // that diff only ever iterates instances present in keys.pool (reconcile()
+  // reads keys.pool and returns early when it is empty) and classifies drops
+  // for jobs mapped to THOSE instances — while the instance this job is mapped
+  // to has just been destroyed or evicted, so it has no pool record any more.
+  // Nothing therefore ever looked at the job again: keys.jobStatus stayed
+  // RUNNING, keys.jobInstance kept pointing at a dead instance, and the
+  // caller-facing Job stayed `running` indefinitely with no retry pending and
+  // no terminal outcome — the ambiguous limbo state #1228 reports. Resolution
+  // happens HERE because this is the one place that has both the identity of
+  // the lost job and the knowledge that it is unrecoverable.
+  //
+  // RESOLUTION RULES
+  //   - A job whose local status is ALREADY TERMINAL is left completely alone —
+  //     including a CANCELLED one (keys.jobStatus 'CANCELLED', written by
+  //     index.ts cancel() and encore-scaler-router.ts). The outcome was already
+  //     decided; overwriting it with FAILED would erase a deliberate cancel and
+  //     push a spurious failure through onJobsDropped. The status is RE-READ
+  //     here instead of reused from the caller's hgetall snapshot so a cancel
+  //     that landed during this sweep still wins the race.
+  //   - Anything else resolves to FAILED, definitively: there is no payload to
+  //     re-run, the job is not in Encore's active set, and no callback can
+  //     arrive for it. The local status is overwritten so getJobStatus() stops
+  //     reporting `running` (index.ts maps FAILED -> `failed`), the dead
+  //     keys.jobInstance mapping is removed so the job cannot linger as a drop
+  //     candidate against an instance that no longer exists, and the drop is
+  //     raised through the SAME onJobsDropped hook reconcile() uses so main.ts
+  //     drives the caller-facing Job terminal via the shared idempotent settle.
+  //
+  // Either way the outcome is logged explicitly (FAILED / left CANCELLED /
+  // left terminal) so an operator reading the scaler log can see how every
+  // payload-unavailable job ended, and the FAILED case is also appended to the
+  // operational log sink — it is a job that will never run again and no retry
+  // is pending.
+  //
+  // CONTRACT SOURCES VERIFIED (CLAUDE.md rule 7)
+  //   - keys.jobStatus / keys.jobInstance / keys.jobPayload semantics and TTL:
+  //     src/encore-scaler/types.ts keys (jobStatus, jobInstance, jobPayload).
+  //   - Terminal status vocabulary DONE/SUCCESSFUL/FAILED/CANCELLED and the
+  //     FAILED -> `failed` mapping: src/encore-scaler/index.ts getJobStatus
+  //     (`if (s === 'FAILED' || s === 'CANCELLED') return 'failed'`).
+  //   - CANCELLED is the cancel path's terminal write: index.ts cancel() and
+  //     encore-scaler-router.ts (redis.hset(keys.jobStatus(...), id,
+  //     'CANCELLED')).
+  //   - DroppedJob shape { encoreJobId, reason? } and the onJobsDropped
+  //     signature `(drops: DroppedJob[]) => Promise<void>`:
+  //     src/encore-scaler/types.ts DroppedJob / EncoreScalerConfig.
+  //   - Terminal settle performed by the hook (reason text -> failureText ->
+  //     settleFailedTranscode with 'gone-from-active-set'): src/main.ts
+  //     onJobsDropped.
+  //
+  // Best-effort per job: a failure resolving one job must never break the
+  // teardown or the rest of the sweep, so everything here is wrapped.
+  private async resolveUnrequeueableScaleDownLoss(
+    instanceId: string,
+    jobId: string
+  ): Promise<void> {
+    const { redis, workspaceId } = this.config;
+    try {
+      // Re-read, don't trust the snapshot: a cancel may have landed since.
+      const current = ((await redis.hget(keys.jobStatus(workspaceId), jobId)) ?? '')
+        .toUpperCase();
+      if (
+        current === 'CANCELLED' ||
+        current === 'FAILED' ||
+        current === 'DONE' ||
+        current === 'SUCCESSFUL'
+      ) {
+        console.warn(
+          '[encore-scaler] scale-down: job %s (lost with instance %s, payload ' +
+            'unavailable) is already terminal (%s) — leaving it alone, no ' +
+            'resolution needed (#1228)',
+          jobId,
+          instanceId,
+          current
+        );
+        return;
+      }
+
+      // Definite terminal outcome: FAILED.
+      await redis.hset(keys.jobStatus(workspaceId), jobId, 'FAILED');
+      try {
+        await redis.hdel(keys.jobInstance(workspaceId), jobId);
+      } catch {
+        // A surviving stale mapping is harmless now the status is terminal:
+        // every drop-candidate filter requires a RUNNING/QUEUED status.
+      }
+
+      const reason =
+        `interrupted by scale-down of instance ${instanceId} and could not be ` +
+        're-enqueued: the stored dispatch payload had expired, so the encode ' +
+        'cannot be rebuilt or retried';
+      console.warn(
+        '[encore-scaler] scale-down: job %s RESOLVED FAILED — lost with instance ' +
+          '%s and its dispatch payload is unavailable, so it is unrecoverable; ' +
+          'no retry is pending (#1228)',
+        jobId,
+        instanceId
+      );
+      this.logFailure(
+        'reap',
+        `job ${jobId} was lost when instance ${instanceId} was torn down and its ` +
+          'stored dispatch payload had already expired, so it could not be ' +
+          're-queued; resolved FAILED (no retry pending) — re-submit the encode ' +
+          'to run it again'
+      );
+
+      if (this.config.onJobsDropped) {
+        try {
+          await this.config.onJobsDropped([{ encoreJobId: jobId, reason }]);
+        } catch (hookErr) {
+          // The local status is already terminal, so the job is no longer in
+          // limbo for the scaler's own bookkeeping; surface the repo-side gap.
+          console.error(
+            '[encore-scaler] onJobsDropped failed while resolving payload-' +
+              'unavailable job %s (workspace=%s):',
+            jobId,
+            workspaceId,
+            hookErr
+          );
+          this.logFailure(
+            'reap',
+            `terminal settle of unrecoverable job ${jobId} failed; the scaler ` +
+              'marked it FAILED but the job record may still read running',
+            hookErr
+          );
+        }
+      }
+    } catch (err) {
+      console.error(
+        '[encore-scaler] failed to resolve payload-unavailable job %s ' +
+          '(workspace=%s, instance=%s):',
+        jobId,
+        workspaceId,
+        instanceId,
+        err
+      );
+      this.logFailure(
+        'reap',
+        `could not resolve unrecoverable job ${jobId} lost with instance ` +
+          `${instanceId}; it may still read running`,
+        err
+      );
     }
   }
 
   // Reconcile each instance's tracked activeJobs against its real IN_PROGRESS
   // job count. Corrects drift (e.g. a completion callback that never freed the
   // slot) so the pool can never get permanently stuck thinking every slot is
-  // full. Runs once per tick, is a no-op when the pool is empty, and skips
-  // instances already at zero (nothing to correct downward). Each instance is
-  // handled in isolation: one unreachable instance never breaks the tick.
+  // full. Runs once per tick and is a no-op when the pool is empty. Each
+  // instance is handled in isolation: one unreachable instance never breaks the
+  // tick.
+  //
+  // The pass runs in TWO passes (#839). Pass 1 fetches the real active set of
+  // EVERY pool instance — including ones tracked idle — and indexes it by
+  // instanceId; pass 2 then corrects counts and classifies drops against that
+  // COMPLETE pool-wide index. #769 is why the index must be complete before any
+  // classification: drop classification asks "is this externalId active anywhere
+  // in the pool?", which is only answerable once every instance has been
+  // fetched, and an incomplete answer is indistinguishable from a genuine drop.
+  //
+  // A third, targeted step then corrects the tracked count of any instance this
+  // pass proved is the real owner of a job keys.jobInstance had mapped elsewhere
+  // — suppressing the false drop without repairing the mapping and the holder's
+  // count would leave the divergence to recur every tick (#769 review finding 3).
+  //
+  // When pass 1 could not read EVERY instance, the pool-wide answer is partial
+  // and a drop decided on it is WITHHELD for a pass rather than written
+  // terminally FAILED (#769 review finding 4) — the policy, and the alternatives
+  // weighed against it, are documented on PARTIAL_VISIBILITY_DROP_PASSES.
   async reconcile(): Promise<void> {
     const { redis, workspaceId } = this.config;
 
@@ -642,41 +1391,250 @@ export class EncoreScalerLoop {
     // write is owned by the reconciler/main.ts repo layer.
     const droppedJobs: DroppedJob[] = [];
 
-    // #768 (diagnostic-only): index of instanceId -> the externalIds Encore
-    // actually reports active on that instance, accumulated as this pass fetches
-    // each instance's real state below. Used solely to log, at each
-    // drop-classification, whether a job flagged as dropped off ITS
-    // keys.jobInstance-mapped instance is in fact still active on a DIFFERENT
-    // pool instance — the signature of the stale-mapping hypothesis. It does not
-    // feed any decision; the classification logic below is unchanged.
+    // #768/#839/#769: index of instanceId -> the externalIds Encore actually
+    // reports QUEUED/IN_PROGRESS on that instance.
+    //
+    // #768 built this to LOG, at each drop-classification, whether a job flagged
+    // as dropped off ITS keys.jobInstance-mapped instance was in fact still
+    // active on a DIFFERENT pool instance — the signature of the stale-mapping
+    // hypothesis. #769 makes that same answer DECIDE: a job Encore still reports
+    // active somewhere in the pool is not dropped, whatever the mapping claims.
+    //
+    // #839: this index used to be built INCREMENTALLY inside the classification
+    // loop below, so at each classification it held only the instances iterated
+    // before or at the current one. Pool-hash iteration order is uncontrolled,
+    // so whenever the mapped instance sorted before the instance actually
+    // holding the job, the diagnostic logged foundActiveOnPoolInstances=(none)
+    // — a false negative indistinguishable from a genuine drop, biasing the
+    // whole diagnostic toward REFUTING the very hypothesis it exists to test.
+    // Two skips compounded it: idle-tracked instances (activeJobs === 0) and
+    // unreachable ones were never indexed at all. The index is now built in a
+    // FULL pass over every pool entry BEFORE any classification runs, so the
+    // signal is order-independent — and, since #769 now decides on it, so is the
+    // decision.
     const poolActiveByInstance = new Map<string, Set<string>>();
+    // #839: instances whose real active set could NOT be established this pass.
+    // Absence of a job from the index is only evidence of absence over the
+    // instances we actually checked, so these are named in the diagnostic to keep
+    // a `(none)` line interpretable. Three ways an instance lands here:
+    //   (unparseable) — its pool-hash entry is not valid JSON,
+    //   (unreachable) — fetchRealActiveState could not confirm its state,
+    //   (truncated)   — Encore reported more active jobs than the one page of
+    //                   ACTIVE_PAGE_SIZE per status we fetch, so the returned
+    //                   externalIds are a PARTIAL set (#769 review finding 2). A
+    //                   truncated instance is still indexed — an externalId
+    //                   Encore DID return is proof the job is alive — but its
+    //                   silence proves nothing, so it counts as unchecked for any
+    //                   "active nowhere" claim.
+    //
+    // #769 review finding 4: this list is no longer only a log field. While it is
+    // non-empty the pool view is PARTIAL, and a drop decided on a partial view is
+    // withheld for a pass rather than written terminally FAILED — see
+    // PARTIAL_VISIBILITY_DROP_PASSES.
+    const poolUncheckedInstances: string[] = [];
+    // The parsed record + real state per instance, captured once by the full
+    // pass and reused by the classification loop below — so classification sees
+    // exactly the same snapshot the index was built from (no second fetch, no
+    // skew between the two).
+    const poolPass: Array<{
+      instanceId: string;
+      record: EncoreInstanceRecord;
+      real: EncoreActiveState | undefined;
+    }> = [];
 
-    for (const [instanceId, instanceJson] of entries) {
-      try {
+    // Pass 1 (#839): index the whole pool. Every instance is fetched, including
+    // ones tracked idle (activeJobs === 0) and ones that turn out unreachable —
+    // a tracked count is precisely what is suspected of being stale, so an
+    // idle-tracked instance can still be the one really holding the job.
+    //
+    // The probes run CONCURRENTLY (#769 review finding 6): each is independent
+    // and self-isolating (fetchRealActiveState swallows its own errors), and
+    // reconcile is tick step 0 — serialising a getToken() plus two HTTP requests
+    // per instance would put 2N round-trips at the head of every tick now that
+    // idle-tracked and draining instances are probed too. Fan-out is bounded by
+    // the pool size, which is bounded by maxInstances. Results are folded back in
+    // pool-hash order so the pass stays deterministic.
+    const probed = await Promise.all(
+      entries.map(async ([instanceId, instanceJson]): Promise<{
+        instanceId: string;
+        record: EncoreInstanceRecord | undefined;
+        real: EncoreActiveState | undefined;
+      }> => {
         let record: EncoreInstanceRecord;
         try {
           record = JSON.parse(instanceJson) as EncoreInstanceRecord;
         } catch {
-          continue; // corrupt entry — leave it for the loop to skip elsewhere
+          // Corrupt entry — cannot be fetched or classified; reported as
+          // unchecked below so it is visible rather than silently missing.
+          return { instanceId, record: undefined, real: undefined };
         }
-        // Nothing to correct downward on an already-idle instance.
-        if (record.activeJobs === 0) continue;
-
         // Fetch both QUEUED and IN_PROGRESS documents (not just counts) — a
         // freshly dispatched job sits in QUEUED until Encore picks it up, so
-        // counting only IN_PROGRESS would make the instance look idle
-        // immediately after dispatch and trigger a spurious scale-up on the next
-        // tick. fetchRealActiveState reads each active job's externalId so we can
-        // tell WHICH tracked jobs (if any) have silently vanished — the
-        // dropped-job signal for #449.
-        const real = await this.fetchRealActiveState(record);
+        // counting only IN_PROGRESS would make the instance look idle immediately
+        // after dispatch and trigger a spurious scale-up on the next tick.
+        // fetchRealActiveState reads each active job's externalId so we can tell
+        // WHICH tracked jobs (if any) have silently vanished — the dropped-job
+        // signal for #449 — and which instance a supposedly dropped job is
+        // really live on (#768/#769).
+        let real: EncoreActiveState | undefined;
+        try {
+          real = await this.fetchRealActiveState(record);
+        } catch {
+          // fetchRealActiveState already swallows its own errors; belt-and-braces
+          // so one bad instance can never abort the index-building pass.
+          real = undefined;
+        }
+        return { instanceId, record, real };
+      })
+    );
+
+    for (const { instanceId, record, real } of probed) {
+      if (!record) {
+        poolUncheckedInstances.push(`${instanceId}(unparseable)`);
+        continue;
+      }
+      if (real) {
+        poolActiveByInstance.set(instanceId, real.activeExternalIds);
+        // Positive evidence from a truncated page is still evidence; its silence
+        // is not (#769 review finding 2).
+        if (real.truncated) poolUncheckedInstances.push(`${instanceId}(truncated)`);
+      } else {
+        poolUncheckedInstances.push(`${instanceId}(unreachable)`);
+      }
+      poolPass.push({ instanceId, record, real });
+    }
+
+    // An unreachable instance is kept (an outage mid-job must never cost the
+    // job) UNLESS OSC confirms it no longer exists: then its pool record is a
+    // leftover of a teardown or an external removal, and keeping it blocks
+    // the workspace — it counts as idle capacity so nothing scales up, and every
+    // dispatch to it fails and re-queues the job. Evict such records, and
+    // re-queue the jobs still mapped to them exactly as a scale-down
+    // interruption (the work on them is lost the same way). An evicted
+    // instance no longer makes the pool view partial, so it is dropped from
+    // the unchecked list too. Never fatal to the pass.
+    const unreachableIds = poolPass
+      .filter(({ real }) => real === undefined)
+      .map(({ instanceId }) => instanceId);
+    if (unreachableIds.length > 0) {
+      let evicted: string[] = [];
+      try {
+        evicted = await evictVanishedInstances(this.config, unreachableIds);
+      } catch (err) {
+        console.error(
+          '[encore-scaler] reconcile: vanished-instance check failed (workspace=%s):',
+          workspaceId,
+          err
+        );
+      }
+      if (evicted.length > 0) {
+        const gone = new Set(evicted);
+        for (const instanceId of evicted) {
+          await this.requeueScaleDownInterruptions(instanceId, new Set());
+        }
+        for (let i = poolPass.length - 1; i >= 0; i--) {
+          if (gone.has(poolPass[i]!.instanceId)) poolPass.splice(i, 1);
+        }
+        for (let i = poolUncheckedInstances.length - 1; i >= 0; i--) {
+          const entry = poolUncheckedInstances[i]!;
+          if (gone.has(entry.replace(/\(unreachable\)$/, ''))) poolUncheckedInstances.splice(i, 1);
+        }
+      }
+    }
+
+    // Every pool instance on which Encore currently reports `externalId` active.
+    // Non-empty => the job is NOT gone from the pool, whatever keys.jobInstance
+    // claims. It answers only over instances pass 1 could confirm, so it can
+    // never suppress a drop on ABSENCE of information — only on the positive
+    // "Encore reports this externalId QUEUED/IN_PROGRESS here" evidence.
+    const instancesActiveFor = (externalId: string): string[] => {
+      const found: string[] = [];
+      for (const [otherInstanceId, otherActive] of poolActiveByInstance) {
+        if (otherActive.has(externalId)) found.push(otherInstanceId);
+      }
+      return found;
+    };
+
+    // #769 review finding 4: is this pass deciding on a COMPLETE view of the
+    // pool? `instancesActiveFor` can only ever answer over the instances pass 1
+    // confirmed, so while any instance is unreachable, unparseable or truncated,
+    // an empty answer means "not found on the instances we could read" — not
+    // "not running anywhere". See PARTIAL_VISIBILITY_DROP_PASSES for the policy
+    // this drives and why.
+    const poolVisibilityIsPartial = poolUncheckedInstances.length > 0;
+
+    // Clear a job's partial-visibility counter. Best-effort and deliberately
+    // total: any failure (including a redis stub without `del`) must never
+    // affect the decision that just ran.
+    const clearPartialVisibilityGate = async (jobId: string): Promise<void> => {
+      try {
+        await redis.del(keys.partialVisibilityDropPasses(jobId));
+      } catch {
+        // The key carries a TTL, so a failed delete self-heals.
+      }
+    };
+
+    // Count this pass against the job's consecutive partial-visibility drop
+    // classifications and report whether the drop may now become terminal.
+    // Returns the new count alongside the verdict so the log can say how far
+    // through the gate the job is.
+    const admitPartialVisibilityDrop = async (
+      jobId: string
+    ): Promise<{ admit: boolean; passes: number }> => {
+      let passes = 0;
+      try {
+        const raw = await redis.get(keys.partialVisibilityDropPasses(jobId));
+        passes = Number(raw ?? '0') || 0;
+      } catch {
+        // Unreadable counter => treat as the first pass. This biases toward
+        // WITHHOLDING, the conservative direction for this gate: the job stays
+        // `running` and is re-examined, rather than being written terminally
+        // FAILED on evidence we could not even count. (The #708 completion
+        // grace check fails the other way, OPEN, because there a read failure
+        // must not SUPPRESS a drop; here a read failure must not CAUSE one.)
+        passes = 0;
+      }
+      passes += 1;
+      if (passes >= PARTIAL_VISIBILITY_DROP_PASSES) {
+        return { admit: true, passes };
+      }
+      try {
+        await redis.set(
+          keys.partialVisibilityDropPasses(jobId),
+          String(passes),
+          'PX',
+          PARTIAL_VISIBILITY_DROP_TTL_MS
+        );
+      } catch {
+        // If the counter cannot be persisted the job simply gets re-examined
+        // from zero next pass — still withheld, never wrongly failed.
+      }
+      return { admit: false, passes };
+    };
+
+    // Instances this pass PROVED own a tracked job that keys.jobInstance had
+    // mapped elsewhere (#769 review finding 3). Their tracked activeJobs is
+    // corrected after pass 2 — see the targeted correction below.
+    const mappingRepairedOnto = new Set<string>();
+
+    // Pass 2: correct counts and classify drops against the complete index,
+    // reading the snapshot captured above instead of fetching inline.
+    for (const { instanceId, record, real } of poolPass) {
+      try {
+        // Nothing to correct downward on an already-idle instance. An
+        // idle-tracked instance that is really running work is corrected by the
+        // targeted pass below (#769 review finding 3) rather than here: the
+        // generic idle-but-busy divergence is scale-down's to handle (#513
+        // drain-don't-kill marks such an instance draining instead of destroying
+        // it), and taking it over here would pre-empt that path.
+        if (record.activeJobs === 0) continue;
         if (!real) continue; // could not confirm — leave the record as-is
         const actualCount = real.count;
         const activeExternalIds = real.activeExternalIds;
-        // #768 (diagnostic-only): record what Encore reports active on THIS
-        // instance so a later drop-classification in this same pass can report
-        // where else in the pool a "dropped" externalId is in fact still live.
-        poolActiveByInstance.set(instanceId, activeExternalIds);
+        // #769 review finding 4: externalIds whose drop was WITHHELD this pass
+        // because pool visibility was partial. Declared out here because the
+        // tracked count correction at the end of the block has to see it.
+        const withheldForInstance: string[] = [];
 
         if (record.activeJobs !== actualCount) {
           // eslint-disable-next-line no-console
@@ -693,7 +1651,27 @@ export class EncoreScalerLoop {
           // (jobStatus hash, scaler-loop.ts:291) — against the externalIds
           // Encore still reports active. Anything tracked-running for this
           // instance that Encore no longer lists is dropped.
-          if (actualCount < record.activeJobs) {
+          //
+          // #769 review finding 2: NOT when this instance's active page was
+          // truncated. fetchRealActiveState asks for ONE page of ACTIVE_PAGE_SIZE
+          // per status, so an instance with more QUEUED or IN_PROGRESS jobs than
+          // that returns a partial externalId set; diffing against it would
+          // classify every tracked job sitting off page 0 as dropped. `count`
+          // comes from Encore's totalElements and is still exact, so the count
+          // correction below still runs — only the drop diff is withheld.
+          if (actualCount < record.activeJobs && real.truncated) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              '[encore-scaler] reconcile: instance %s returned a TRUNCATED active ' +
+                'page (Encore reports %d active, one page of %d per status was ' +
+                'fetched) — skipping drop classification for it this pass; its ' +
+                'tracked count is still corrected (#769)',
+              instanceId,
+              actualCount,
+              ACTIVE_PAGE_SIZE
+            );
+          }
+          if (actualCount < record.activeJobs && !real.truncated) {
             // #708: grace window for jobs the callback poller just saw complete.
             // reconcile can diff Encore's active set AFTER Encore drops a finished
             // job but BEFORE the poller has decremented record.activeJobs
@@ -716,7 +1694,112 @@ export class EncoreScalerLoop {
               // callback poller / cancel already settled has a terminal status.
               const st = (trackedStatuses[jobId] ?? '').toUpperCase();
               if (st !== 'RUNNING' && st !== 'QUEUED') continue;
-              if (activeExternalIds.has(jobId)) continue; // still live on Encore
+              if (activeExternalIds.has(jobId)) {
+                // Still live on Encore, right here on its mapped instance. Any
+                // partial-visibility drop counter this job accumulated on an
+                // earlier pass is stale — "consecutive" means consecutive
+                // (#769 review finding 4).
+                await clearPartialVisibilityGate(jobId);
+                continue;
+              }
+
+              // #769: the job is gone from THIS instance's active set, but
+              // keys.jobInstance is a single value overwritten on every
+              // re-dispatch — so "gone from the mapped instance" is NOT the same
+              // as "gone from the pool". Before concluding the job dropped, ask
+              // the phase-1 pool-wide index whether Encore still reports this
+              // externalId QUEUED/IN_PROGRESS on ANY instance. If it does, the
+              // job is running (the mapping is just stale): leave it alone. Not
+              // classifying it dropped also keeps it out of droppedForInstance,
+              // so the drop-reason recovery below no longer chases a FAILED
+              // document that cannot exist and no longer warns "no reason
+              // recovered" for a job that never failed (#704/#728 wording).
+              const activeElsewhere = instancesActiveFor(jobId);
+              if (activeElsewhere.length > 0) {
+                // #768 required three fields to attribute the stale-mapping
+                // signature: the mapped instance, where the externalId is really
+                // active, and whether a re-dispatch preceded the check. With
+                // #769 in place this branch is the ONLY place that signature can
+                // still surface — the drop-diagnostic line below is now
+                // unreachable for it — so it carries the same field set (#769
+                // review findings 1 and 5). Best-effort: a read failure must
+                // never affect the decision.
+                let reDispatched: boolean | 'unknown' = 'unknown';
+                try {
+                  const attemptsRaw = await redis.get(keys.jobAttempts(jobId));
+                  reDispatched = (Number(attemptsRaw ?? '0') || 0) > 1;
+                } catch {
+                  reDispatched = 'unknown';
+                }
+
+                // #769 review finding 3: detecting the divergence is not enough —
+                // repair it, or it recurs every tick for the job's lifetime.
+                // keys.jobInstance is written only at dispatch (see dispatch's
+                // redis.hset below), so nothing else corrects a mapping that has
+                // gone stale. When exactly ONE instance is confirmed running the
+                // job, that instance IS the owner: point the mapping at it, so
+                // the next pass reconciles the job against its real holder and
+                // this branch does not re-fire. When more than one instance
+                // reports it active the mapping is left alone and the ambiguity
+                // is reported — two instances running the same externalId is a
+                // duplicate dispatch, a different bug, and guessing an owner
+                // would hide it. The holder's own tracked activeJobs is corrected
+                // by the TARGETED post-pass-2 repair loop at the end of this
+                // method (`for (const instanceId of mappingRepairedOnto)`), not
+                // by pass 2 itself — pass 2 still skips instances tracked at
+                // activeJobs === 0, which is exactly the state a silently-adopted
+                // holder is usually in (#769 review finding 6).
+                //
+                // The job is demonstrably alive, so any partial-visibility drop
+                // counter it carries is void (#769 review finding 4).
+                await clearPartialVisibilityGate(jobId);
+
+                let jobInstanceRepairedTo = '(not-repaired)';
+                if (activeElsewhere.length === 1) {
+                  try {
+                    await redis.hset(
+                      keys.jobInstance(workspaceId),
+                      jobId,
+                      activeElsewhere[0]
+                    );
+                    jobInstanceRepairedTo = activeElsewhere[0];
+                    mappingRepairedOnto.add(activeElsewhere[0]);
+                  } catch {
+                    // A failed repair must not affect the decision: the job is
+                    // still confirmed alive, so it still must not be dropped.
+                    jobInstanceRepairedTo = '(repair-failed)';
+                  }
+                } else {
+                  // eslint-disable-next-line no-console
+                  console.warn(
+                    '[encore-scaler] reconcile: job %s is active on MORE THAN ONE ' +
+                      'pool instance (%s) — keys.jobInstance left pointing at %s; ' +
+                      'this is a duplicate dispatch, not a stale mapping (#769)',
+                    jobId,
+                    activeElsewhere.join(','),
+                    mappedInstanceId
+                  );
+                }
+
+                // eslint-disable-next-line no-console
+                console.warn(
+                  '[encore-scaler] stale-mapping-diagnostic (#768/#769): job %s is ' +
+                    'NOT dropped — keys.jobInstance=%s reconciledInstance=%s ' +
+                    'foundActiveOnPoolInstances=%s poolInstancesCheckedThisPass=%s ' +
+                    'poolInstancesUncheckedThisPass=%s reDispatched=%s ' +
+                    'jobInstanceRepairedTo=%s',
+                  jobId,
+                  mappedInstanceId,
+                  instanceId,
+                  activeElsewhere.join(','),
+                  [...poolActiveByInstance.keys()].join(',') || '(none)',
+                  poolUncheckedInstances.join(',') || '(none)',
+                  String(reDispatched),
+                  jobInstanceRepairedTo
+                );
+                continue;
+              }
+
               // #708: skip a job the poller recorded completing within the grace
               // window — it is settling terminally, not silently dropped. Fail
               // OPEN: a read error on this one key must never SUPPRESS a genuine
@@ -734,26 +1817,74 @@ export class EncoreScalerLoop {
                   continue;
                 }
               }
+
+              // #769 review finding 4: the job is active on none of the
+              // instances pass 1 could READ — which is only the same thing as
+              // "active nowhere in the pool" when pass 1 could read all of them.
+              // With any instance unchecked, this job may be running right now
+              // on the one we could not see, and failing it here would be the
+              // very defect #769 exists to fix, merely relocated from a stale
+              // mapping to a blind spot. Withhold the drop and re-examine next
+              // tick; only a job that survives PARTIAL_VISIBILITY_DROP_PASSES
+              // consecutive such passes is failed, so a permanently unreachable
+              // pool entry cannot strand jobs in `running` forever.
+              if (poolVisibilityIsPartial) {
+                const gate = await admitPartialVisibilityDrop(jobId);
+                if (!gate.admit) {
+                  // eslint-disable-next-line no-console
+                  console.warn(
+                    '[encore-scaler] reconcile: WITHHOLDING drop of job %s — the ' +
+                      'pool was only PARTIALLY visible this pass (unchecked: %s). ' +
+                      'keys.jobInstance=%s reconciledInstance=%s ' +
+                      'consecutivePartialVisibilityPasses=%d/%d; re-examining next ' +
+                      'tick (#769)',
+                    jobId,
+                    poolUncheckedInstances.join(',') || '(none)',
+                    mappedInstanceId,
+                    instanceId,
+                    gate.passes,
+                    PARTIAL_VISIBILITY_DROP_PASSES
+                  );
+                  withheldForInstance.push(jobId);
+                  continue;
+                }
+                // eslint-disable-next-line no-console
+                console.warn(
+                  '[encore-scaler] reconcile: job %s has now been classified ' +
+                    'dropped on %d consecutive passes with only PARTIAL pool ' +
+                    'visibility (unchecked: %s) — treating the drop as terminal ' +
+                    '(#769)',
+                  jobId,
+                  gate.passes,
+                  poolUncheckedInstances.join(',') || '(none)'
+                );
+              }
+              // The drop is being raised, so the gate's counter has done its job
+              // — clear it rather than leaving it to age out.
+              await clearPartialVisibilityGate(jobId);
+
               droppedForInstance.push(jobId);
 
-              // #768 (diagnostic-only): capture enough state at the exact
-              // drop-classification site to confirm or refute the hypothesis
-              // that a stale keys.jobInstance mapping (a single value overwritten
-              // on each re-dispatch, scaler-loop.ts dispatch:
-              // redis.hset(keys.jobInstance, jobId, instanceId)) causes a false
-              // drop. For this job we record: the instance keys.jobInstance maps
-              // it to (mappedInstanceId — equals instanceId here precisely
-              // BECAUSE we filtered mismatches out above, so logging it documents
-              // what the mapping claimed), the pool instances whose real active
-              // set we checked this pass, the instance(s) where the externalId is
-              // ACTUALLY still active (if any — a non-empty list on a job we are
-              // about to flag dropped is the stale-mapping signature), and
-              // whether the job had already been re-dispatched (attempts > 1).
-              // This changes no decision; droppedForInstance already holds jobId.
-              const foundActiveOn: string[] = [];
-              for (const [otherInstanceId, otherActive] of poolActiveByInstance) {
-                if (otherActive.has(jobId)) foundActiveOn.push(otherInstanceId);
-              }
+              // #768: capture enough state at the exact drop-classification
+              // site to attribute a real drop event. For this job we record: the
+              // instance keys.jobInstance maps it to (mappedInstanceId — equals
+              // instanceId here precisely BECAUSE we filtered mismatches out
+              // above, so logging it documents what the mapping claimed), the
+              // pool instances whose real active set pass 1 confirmed, the ones
+              // it could NOT confirm, and whether the job had already been
+              // re-dispatched (attempts > 1).
+              //
+              // #769: foundActiveOnPoolInstances is now necessarily empty here —
+              // a non-empty pool-wide answer short-circuits to the "NOT dropped"
+              // branch above instead of reaching this point (the stale-mapping
+              // signature moved to the stale-mapping-diagnostic line there). It
+              // is kept because it is now the load-bearing assertion of the drop
+              // decision: this job is active on NONE of the instances pass 1
+              // could confirm. poolInstancesUncheckedThisPass is the honest
+              // caveat on it — an unreachable, unparseable or page-truncated
+              // instance is unknown, not empty, so a drop logged with a non-empty
+              // unchecked list was decided without full pool visibility.
+              const foundActiveOn = instancesActiveFor(jobId);
               let reDispatched: boolean | 'unknown' = 'unknown';
               try {
                 const attemptsRaw = await redis.get(keys.jobAttempts(jobId));
@@ -767,12 +1898,13 @@ export class EncoreScalerLoop {
                 '[encore-scaler] drop-diagnostic (#768): classifying job %s as ' +
                   'dropped — keys.jobInstance=%s reconciledInstance=%s ' +
                   'foundActiveOnPoolInstances=%s poolInstancesCheckedThisPass=%s ' +
-                  'reDispatched=%s',
+                  'poolInstancesUncheckedThisPass=%s reDispatched=%s',
                 jobId,
                 mappedInstanceId,
                 instanceId,
                 foundActiveOn.length ? foundActiveOn.join(',') : '(none)',
                 [...poolActiveByInstance.keys()].join(',') || '(none)',
+                poolUncheckedInstances.join(',') || '(none)',
                 String(reDispatched)
               );
 
@@ -805,22 +1937,93 @@ export class EncoreScalerLoop {
             }
           }
 
-          record.activeJobs = actualCount;
-          // Do NOT update lastIdleAt here. The idle clock must only advance when
-          // the callback poller confirms the completion (via decrementActiveJobs).
-          // Setting lastIdleAt during reconciliation would start the teardown
-          // countdown before the poller has had a chance to process the message,
-          // causing the instance to be destroyed while the poller is still
-          // fetching from it.
-          await redis.hset(
-            keys.pool(workspaceId),
-            instanceId,
-            JSON.stringify(record)
-          );
+          // #769 review finding 4: do NOT adopt Encore's lower count while a
+          // drop off this instance is being withheld. `actualCount <
+          // record.activeJobs` is the ONLY thing that brings this block back to
+          // life on the next pass; writing the corrected count here would make
+          // the very next pass see tracked === actual, skip classification
+          // entirely, and leave the withheld job stuck in `running` with the
+          // gate never able to advance — turning a one-pass delay into permanent
+          // limbo. The tracked count therefore stays deliberately high for the
+          // at-most PARTIAL_VISIBILITY_DROP_PASSES passes the gate runs for. The
+          // cost is bounded and one-directional: an over-counted instance is
+          // treated as busier than it is, so dispatch under-subscribes it and
+          // scale-down leaves it alone — never the reverse.
+          if (withheldForInstance.length > 0) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              '[encore-scaler] reconcile: leaving instance %s tracked at %d ' +
+                '(Encore reports %d) because the drop of %s is withheld pending ' +
+                'full pool visibility — the count is corrected once those jobs ' +
+                'resolve (#769)',
+              instanceId,
+              record.activeJobs,
+              actualCount,
+              withheldForInstance.join(',')
+            );
+          } else {
+            record.activeJobs = actualCount;
+            // Do NOT update lastIdleAt here. The idle clock must only advance when
+            // the callback poller confirms the completion (via decrementActiveJobs).
+            // Setting lastIdleAt during reconciliation would start the teardown
+            // countdown before the poller has had a chance to process the message,
+            // causing the instance to be destroyed while the poller is still
+            // fetching from it.
+            await redis.hset(
+              keys.pool(workspaceId),
+              instanceId,
+              JSON.stringify(record)
+            );
+          }
         }
       } catch {
         // Swallow per-instance errors so one unreachable instance does not
         // break reconciliation (or the tick) for the rest of the pool.
+        continue;
+      }
+    }
+
+    // Targeted count repair for the instances this pass proved are the real
+    // owner of a tracked job (#769 review finding 3). Suppressing the false drop
+    // and repointing keys.jobInstance is only half the repair: the holder's
+    // tracked activeJobs was written for whatever the pool thought it was
+    // running, so an instance that silently picked up a re-dispatched job can
+    // still be credited with spare capacity it does not have — dispatch then
+    // over-subscribes it and scale-down victim selection keeps treating it as
+    // idle. Encore's own count for it is authoritative, so adopt it.
+    //
+    // Deliberately narrow: only instances named by a mapping repair this pass,
+    // not every idle-tracked instance found busy (that divergence belongs to
+    // scale-down's drain-don't-kill path, #513). Runs after pass 2 so it is
+    // independent of pool-hash iteration order — the holder may have been
+    // visited before the repair that named it. Truncated pages are fine here:
+    // `count` comes from Encore's totalElements and stays exact.
+    for (const instanceId of mappingRepairedOnto) {
+      const entry = poolPass.find((p) => p.instanceId === instanceId);
+      if (!entry || !entry.real) continue;
+      if (entry.record.activeJobs === entry.real.count) continue;
+      try {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[encore-scaler] reconcile: correcting activeJobs for instance %s to ' +
+            'Encore’s real count after a keys.jobInstance repair: tracked=%d ' +
+            'actual=%d (#769)',
+          instanceId,
+          entry.record.activeJobs,
+          entry.real.count
+        );
+        entry.record.activeJobs = entry.real.count;
+        // lastIdleAt is deliberately NOT touched, for the same reason as the
+        // correction in pass 2: the idle clock must only advance on a confirmed
+        // completion (decrementActiveJobs), never on a reconciliation.
+        await redis.hset(
+          keys.pool(workspaceId),
+          instanceId,
+          JSON.stringify(entry.record)
+        );
+      } catch {
+        // Best-effort: a failed count repair must never break the tick. The job
+        // is already confirmed alive and its mapping already repaired.
         continue;
       }
     }
@@ -837,6 +2040,12 @@ export class EncoreScalerLoop {
         console.error(
           '[encore-scaler] onJobsDropped error (workspace=%s):',
           workspaceId,
+          err
+        );
+        this.logFailure(
+          'tick',
+          `dropped-job settle hook failed for ${droppedJobs.length} job(s); ` +
+            'they may still be stuck non-terminal',
           err
         );
       }
@@ -870,7 +2079,16 @@ export class EncoreScalerLoop {
   //     (instanceId + ingress hostname) rather than throw into the tick loop.
   //   - A 401/403 from the listener ingress is NOT a transport failure and is
   //     NOT "trusted" either (issue #813): the callback path is reachable but
-  //     rejecting requests. Past the bounded wait that resolves to the degraded
+  //     rejecting requests. Since #814 the probe asks about `/encoreCallback`
+  //     itself rather than the bare ingress origin, so this branch now actually
+  //     fires during the ~14s window after a fresh listener's ingress starts
+  //     answering, in which the origin returns 200 while `/encoreCallback` is
+  //     still auth-walled (measured live; see callback-trust-probe.ts header).
+  //     That window is the #811/#812 failure. It lifted inside the bounded wait
+  //     on the instances measured for #814 (~14s) but NOT on the four in #1171
+  //     (401 for ~62s), so "it resolves on its own in time" is an expectation,
+  //     not a guarantee: the instance is held ineligible while it might, and
+  //     past the bounded wait it resolves to the degraded
   //     `callbackPathUnusableAt` state — persisted, logged, and dispatched to
   //     anyway so completion falls back to the terminal-job sweep instead of
   //     halting the pool. `callbackTrustReady` is never set for it, so
@@ -883,16 +2101,140 @@ export class EncoreScalerLoop {
   //      probe. A PKIX/handshake failure fast-fails (~1s) and does NOT consume
   //      the AbortSignal window, so the deadline is what actually bounds the
   //      wait across re-probes.
-  private async ensureCallbackTrust(inst: EncoreInstanceRecord): Promise<boolean> {
-    if (inst.callbackTrustReady) return true;
-    if (inst.callbackTrustQuarantinedAt) return false;
+  //
+  // #1172: the gate now also REPORTS what it decided and why, alongside the
+  // eligibility it has always returned. Every branch of ensureCallbackTrust
+  // below already knew its probe outcome and threw it away unless it was one of
+  // the two terminal failures (quarantine / sweep-only fallback) — which is
+  // exactly why "ready instance, no work" was unexplainable from the logs. The
+  // return shape carries the outcome out to the dispatch step, which folds it
+  // into the per-tick assignment trail (src/encore-scaler/assignment-log.ts).
+  // `eligible` keeps the old boolean's meaning EXACTLY, so no gate behaviour
+  // changes.
+
+  // Lazily mint + cache the callback-listener service access token used ONLY to
+  // disambiguate a 401/403 from the listener ingress (#1171). Returns undefined
+  // (never throws) if the token cannot be minted: the probe then behaves exactly
+  // as it did before, grading an unauthenticated 401/403 as 'callback-unusable'.
+  //
+  // EXPIRY-AWARE (#1171 review finding A). The first cut cached the token for
+  // the process lifetime, which silently un-fixed #1171 after about an hour:
+  // every re-probe then sent an EXPIRED JWT, the ingress answered 401 just as it
+  // does for a missing one, and every instance graded back to
+  // 'callback-unusable'. The cache therefore carries the token's own expiry and
+  // re-mints `SAT_EXPIRY_MARGIN_MS` before it, and `forceRefresh` lets the probe
+  // discard a token the ingress just rejected.
+  //
+  // Contracts (CLAUDE.md rule 7):
+  //   - `getServiceAccessToken(serviceId: string): Promise<string>` —
+  //     `@osaas/client-core@0.24.0` `lib/context.d.ts:25`, called with
+  //     `ENCORE_CALLBACK_LISTENER_SERVICE_ID`
+  //     (`src/encore-scaler/instance-pool.ts:68`), the same service id and the
+  //     same accessor instance-pool.ts:722 already uses for the paired listener.
+  //   - No renewal exists in the client to lean on: `lib/context.js:22-45`
+  //     POSTs `https://token.svc.<env>.osaas.io/servicetoken` per call and
+  //     returns `serviceAccessToken.token` ONLY — the `expiry` field of the
+  //     `ServiceAccessToken` type (`lib/context.d.ts:5-9`:
+  //     `{ serviceId; token; expiry }`) is discarded before we can see it — and
+  //     `refreshServiceAccessToken` (`lib/context.js:58-60`) is a plain
+  //     re-mint. Hence reading `exp` off the JWT here (jwtExpiryEpochMs).
+  private async getCallbackListenerSat(
+    opts: { forceRefresh?: boolean } = {}
+  ): Promise<string | undefined> {
+    const now = Date.now();
+    const cached = this.callbackListenerSat;
+    if (!opts.forceRefresh && cached !== undefined && cached.expiresAtMs > now) {
+      return cached.token;
+    }
+    // Drop the rejected/stale entry before the mint so a failed mint cannot
+    // leave an unusable token in the cache for the next probe to replay.
+    this.callbackListenerSat = undefined;
+    // BOUNDED (#1171 review finding H). `getServiceAccessToken` passes no
+    // `signal`/`timeout` to its own fetch (see the contract note above), and this
+    // is awaited inside the non-overlapping tick guard, so a slow token service
+    // would otherwise hold the whole scaler tick — readiness, dispatch and the
+    // orphan sweep — for as long as that socket stays open. Race the mint against
+    // a short timer that resolves `undefined`, which lands on exactly the
+    // fail-safe path the `catch` below already defines: no token, probe keeps its
+    // pre-#1171 behaviour, tick proceeds. The mint is left to settle in the
+    // background (it cannot be cancelled); it just no longer blocks anyone.
+    let mintTimer: ReturnType<typeof setTimeout> | undefined;
+    let mintDeadlineHit = false;
+    try {
+      const deadline = new Promise<undefined>((resolve) => {
+        mintTimer = setTimeout(() => {
+          mintDeadlineHit = true;
+          resolve(undefined);
+        }, SAT_MINT_TIMEOUT_MS);
+        // Never hold the event loop open for this guard timer.
+        if (typeof mintTimer.unref === 'function') mintTimer.unref();
+      });
+      const sat = await Promise.race([
+        this.config.oscContext.getServiceAccessToken(
+          ENCORE_CALLBACK_LISTENER_SERVICE_ID
+        ),
+        deadline
+      ]);
+      if (mintDeadlineHit && sat === undefined) {
+        console.warn(
+          '[encore-scaler] callback-listener service access token mint did not complete within %dms for the callback-trust probe (workspace=%s); continuing unauthenticated so the tick is not stalled',
+          SAT_MINT_TIMEOUT_MS,
+          this.config.workspaceId
+        );
+        return undefined;
+      }
+      if (typeof sat === 'string' && sat.length > 0) {
+        const exp = jwtExpiryEpochMs(sat);
+        this.callbackListenerSat = {
+          token: sat,
+          expiresAtMs:
+            exp !== undefined
+              ? exp - SAT_EXPIRY_MARGIN_MS
+              : Date.now() + SAT_UNKNOWN_EXPIRY_TTL_MS
+        };
+        return sat;
+      }
+      return undefined;
+    } catch (err) {
+      // Token minting is best-effort here: without it the probe simply loses
+      // the disambiguation, it does not fail. Logged once per occurrence at
+      // warn level, never with the token itself.
+      console.warn(
+        '[encore-scaler] could not mint callback-listener service access token for the callback-trust probe (workspace=%s): %s',
+        this.config.workspaceId,
+        err instanceof Error ? err.message : String(err)
+      );
+      return undefined;
+    } finally {
+      if (mintTimer) clearTimeout(mintTimer);
+    }
+  }
+
+  private async ensureCallbackTrust(
+    inst: EncoreInstanceRecord
+  ): Promise<{ eligible: boolean; probe: ProbeOutcome }> {
+    if (inst.callbackTrustReady) return { eligible: true, probe: { kind: 'confirmed-earlier' } };
+    if (inst.callbackTrustQuarantinedAt) {
+      return { eligible: false, probe: { kind: 'quarantined' } };
+    }
     // Already resolved to the degraded sweep-only fallback (issue #813): the
     // listener ingress rejected the probe for the whole bounded wait. The state
     // was persisted and logged once; do not re-probe every tick and do not
     // withhold jobs (completion falls back to the terminal-job sweep).
-    if (inst.callbackPathUnusableAt) return true;
+    if (inst.callbackPathUnusableAt) {
+      return {
+        eligible: true,
+        probe: {
+          kind: 'sweep-only-fallback',
+          detail:
+            inst.callbackPathUnusableStatus === undefined
+              ? undefined
+              : String(inst.callbackPathUnusableStatus)
+        }
+      };
+    }
     // No listener URL to probe (reconciled-from-OSC instance): fail open.
-    if (!inst.callbackListenerUrl) return true;
+    if (!inst.callbackListenerUrl) return { eligible: true, probe: { kind: 'none-to-probe' } };
 
     const timeoutMs =
       this.config.callbackTrustTimeoutMs ?? DEFAULT_CALLBACK_TRUST_TIMEOUT_MS;
@@ -910,13 +2252,33 @@ export class EncoreScalerLoop {
       await updateInstance(this.config.redis, this.config.workspaceId, inst);
     }
 
-    const result = await probeCallbackTrust(inst.callbackListenerUrl, timeoutMs);
+    // #1171: hand the probe (a) a SHORT per-request bound so one hung request
+    // cannot occupy a tick for the whole 60s bounded wait and stall readiness /
+    // job assignment, (b) the callback-listener SAT so an ingress auth-wall
+    // 401 is told apart from a genuinely closed callback path, and (c) a way to
+    // re-mint that SAT. (c) is review finding A: if the ingress rejects the
+    // authenticated attempt too, an expired cached token looks identical to a
+    // closed callback path, so the probe gets ONE re-mint-and-retry before it
+    // may grade the instance 'callback-unusable'.
+    const result = await probeCallbackTrust(
+      inst.callbackListenerUrl,
+      timeoutMs,
+      undefined,
+      {
+        requestTimeoutMs:
+          this.config.callbackProbeRequestTimeoutMs ??
+          DEFAULT_PROBE_REQUEST_TIMEOUT_MS,
+        authToken: await this.getCallbackListenerSat(),
+        refreshAuthToken: () =>
+          this.getCallbackListenerSat({ forceRefresh: true })
+      }
+    );
 
     if (result.ok) {
       inst.callbackTrustReady = true;
       inst.callbackTrustConfirmedAt = Date.now();
       await updateInstance(this.config.redis, this.config.workspaceId, inst);
-      return true;
+      return { eligible: true, probe: { kind: 'trusted-now' } };
     }
 
     // Probe did NOT confirm the callback path. If we are still inside the
@@ -927,7 +2289,11 @@ export class EncoreScalerLoop {
     // the deadline has not been exceeded.
     const elapsedMs = Date.now() - inst.callbackTrustFirstProbeAt;
     if (elapsedMs <= timeoutMs) {
-      return false;
+      // #1172: previously a SILENT `false` — the single most common reason a
+      // freshly ready instance has no work. The live probe outcome travels out
+      // so the trail can say which of tls-trust / timeout / connection /
+      // auth-walled ingress is holding the instance back on this tick.
+      return { eligible: false, probe: describeProbeResult(result) };
     }
 
     // Bounded wait EXCEEDED with the listener ingress still REJECTING the probe
@@ -939,7 +2305,18 @@ export class EncoreScalerLoop {
     // dispatched: their completion is reconciled by the terminal-job sweep
     // (src/pipeline/encore-callback-poller.ts sweepTerminalJobs), which is
     // strictly better than quarantining every instance and halting transcoding.
-    if (result.state === 'callback-unusable') {
+    //
+    // 'ingress-auth-window' (#1171) lands here the same way, and is reported
+    // with its own `probeState` so the two are distinguishable in the logs: for
+    // that state the authenticated re-probe proved the ingress and the listener
+    // are live and only the platform's inbound auth wall answered the
+    // unauthenticated probe. It is retried for the whole bounded wait like any
+    // other non-confirmation above, and if the wall somehow outlasts the wait we
+    // still dispatch rather than sidelining a healthy instance.
+    if (
+      result.state === 'callback-unusable' ||
+      result.state === 'ingress-auth-window'
+    ) {
       inst.callbackPathUnusableAt = Date.now();
       inst.callbackPathUnusableStatus = result.status;
       await updateInstance(this.config.redis, this.config.workspaceId, inst);
@@ -949,6 +2326,7 @@ export class EncoreScalerLoop {
           workspaceId: this.config.workspaceId,
           instanceId: inst.instanceId,
           callbackIngressHostname: hostname,
+          probeState: result.state,
           status: result.status,
           detail: result.detail,
           timeoutMs,
@@ -956,7 +2334,13 @@ export class EncoreScalerLoop {
           degraded: true
         }
       );
-      return true;
+      this.logFailure(
+        'dispatch',
+        `callback path NOT usable for instance ${inst.instanceId} ` +
+          `(ingress ${hostname} answered ${result.status} for the whole ${timeoutMs}ms ` +
+          'bounded wait); dispatching anyway with sweep-only completion'
+      );
+      return { eligible: true, probe: { kind: 'sweep-only-fallback', detail: String(result.status) } };
     }
 
     // Bounded wait EXCEEDED: quarantine the instance from job assignment and
@@ -976,7 +2360,13 @@ export class EncoreScalerLoop {
         elapsedMs
       }
     );
-    return false;
+    this.logFailure(
+      'dispatch',
+      `callback-trust bounded wait exceeded for instance ${inst.instanceId} ` +
+        `(ingress ${hostname}, errorClass=${String(result.errorClass)}); ` +
+        'instance quarantined from job assignment'
+    );
+    return { eligible: false, probe: { kind: 'quarantined', detail: result.errorClass } };
   }
 
   // POST a queued job's raw Encore payload to a chosen instance and record the
@@ -990,10 +2380,27 @@ export class EncoreScalerLoop {
     try {
       const token = await getToken();
       // Inject the paired callback listener URL so Encore POSTs progress to the
-      // listener bound to this exact instance (ADR-006).
+      // listener bound to this exact instance.
+      //
+      // Contract (CLAUDE.md rule 7), verified live 2026-09-26 against
+      // `GET <encore-instance>/v3/api-docs` (openapi 3.1.0, "Encore OpenAPI"):
+      // `components.schemas.EncoreJobRequestBody.properties.progressCallbackUri`
+      // is `{"type":"string"}` — a bare URL with no companion auth/token/header
+      // field, and the document declares no `securitySchemes` and no `security`
+      // on `POST /encoreJobs`. There is therefore no way to hand Encore a
+      // credential for this leg (#814); readiness of the callback path is
+      // gated by ensureCallbackTrust() instead.
+      //
+      // Built via the shared helper so this URI and the one probeCallbackTrust
+      // grades are always the same string.
       const payload = { ...job.payload };
       if (inst.callbackListenerUrl) {
-        payload['progressCallbackUri'] = `${inst.callbackListenerUrl.replace(/\/$/, '')}/encoreCallback`;
+        try {
+          payload['progressCallbackUri'] = buildCallbackUri(inst.callbackListenerUrl);
+        } catch {
+          // Unparseable listener URL: dispatch without a callback URI rather
+          // than failing the job — completion falls back to sweepTerminalJobs.
+        }
       }
       const res = await fetch(`${inst.url.replace(/\/$/, '')}/encoreJobs`, {
         method: 'POST',
@@ -1003,7 +2410,26 @@ export class EncoreScalerLoop {
         },
         body: JSON.stringify(payload)
       });
-      if (!res.ok) return false;
+      if (!res.ok) {
+        // #998: dispatch failure was the ONE loop error with no log line at all
+        // — `return false` re-queued the job silently, so a pool that could not
+        // accept work looked identical to an idle one from outside the
+        // container. Report it on both channels now. Still returns false: the
+        // caller re-queues the job for the next tick exactly as before.
+        console.error(
+          '[encore-scaler] dispatch: Encore POST /encoreJobs returned %d for job %s on instance %s (workspace=%s); re-queueing',
+          res.status,
+          job.jobId,
+          inst.instanceId,
+          workspaceId
+        );
+        this.logFailure(
+          'dispatch',
+          `job ${job.jobId} rejected by instance ${inst.instanceId} with HTTP ` +
+            `${res.status}; re-queued for the next tick`
+        );
+        return false;
+      }
 
       // Capture the Encore-assigned UUID so the packaging step can construct a
       // valid encoreJobs/{uuid} URL. We store it separately (not in our Job table,
@@ -1106,7 +2532,24 @@ export class EncoreScalerLoop {
         }
       }
       return true;
-    } catch {
+    } catch (err) {
+      // Transport-class failure (or any throw from the writes above). Same
+      // contract as before — return false so the caller re-queues the job — but
+      // no longer silent (#998): this is the path a wedged pool takes, and it
+      // used to leave nothing behind anywhere.
+      console.error(
+        '[encore-scaler] dispatch: POST /encoreJobs threw for job %s on instance %s (workspace=%s); re-queueing:',
+        job.jobId,
+        inst.instanceId,
+        workspaceId,
+        err
+      );
+      this.logFailure(
+        'dispatch',
+        `job ${job.jobId} could not be dispatched to instance ${inst.instanceId}; ` +
+          're-queued for the next tick',
+        err
+      );
       return false;
     }
   }

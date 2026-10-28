@@ -229,7 +229,11 @@ export async function requeueInterruptedByScaleDown(
   // between the interruption and the fresh dispatch.
   await redis.hset(keys.jobStatus(workspaceId), jobId, 'RUNNING');
   await redis.hdel(keys.jobInstance(workspaceId), jobId);
-  await redis.del(keys.jobUuid(jobId), keys.jobEncoreUrl(jobId));
+  // jobTerminalInstance is cleared alongside jobEncoreUrl (issue #739): both
+  // describe the PREVIOUS attempt's instance, and a re-dispatch invalidates them
+  // together. Leaving it would let packaging resolve a stale instance for a job
+  // that has since moved.
+  await redis.del(keys.jobUuid(jobId), keys.jobEncoreUrl(jobId), keys.jobTerminalInstance(jobId));
 
   await redis.lpush(keys.queue(workspaceId), JSON.stringify(requeued));
   return true;
@@ -357,7 +361,10 @@ export async function decideRetry(
   await redis.hdel(keys.jobInstance(workspaceId), jobId);
   await redis.del(
     keys.jobUuid(jobId),
-    keys.jobEncoreUrl(jobId)
+    keys.jobEncoreUrl(jobId),
+    // Issue #739: the terminal-instance mapping also describes the FAILED
+    // attempt's instance, so it is invalidated with the rest of them.
+    keys.jobTerminalInstance(jobId)
   );
 
   // Re-queue at the tail (FIFO) so the scaler loop re-dispatches it.

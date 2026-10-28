@@ -55,6 +55,33 @@ function esc(s: unknown): string {
     .replace(/"/g, '&quot;');
 }
 
+// Spec-authored prose (operation / parameter / response descriptions written on
+// the Fastify route schemas) uses backtick code spans, the convention already
+// used throughout those schemas. Escape first, then promote `...` to <code> so
+// field names and query params read as code rather than as literal backticks.
+function escInline(s: unknown): string {
+  return esc(s).replace(/`([^`]+)`/g, '<code>$1</code>');
+}
+
+// Block-level rendering for a multi-paragraph operation `description` from the
+// spec: blank lines separate paragraphs, and a run of lines starting `1.`, `2.`
+// … becomes an ordered list (used by the confirm-then-delete flow, issue #925).
+function renderProse(text: string): string {
+  return text
+    .split(/\n{2,}/)
+    .map((block) => {
+      const lines = block.split('\n');
+      if (lines.every((l) => /^\d+\.\s/.test(l.trim()))) {
+        const items = lines
+          .map((l) => `<li>${escInline(l.trim().replace(/^\d+\.\s*/, ''))}</li>`)
+          .join('');
+        return `<ol class="prose-steps">${items}</ol>`;
+      }
+      return `<p>${escInline(block.replace(/\n/g, ' ').trim())}</p>`;
+    })
+    .join('');
+}
+
 // ===========================================================================
 // 1. API reference data — grouping, descriptions, extraction from the spec
 // ===========================================================================
@@ -113,11 +140,15 @@ const GROUP_META: Record<string, [string, string]> = {
   ui: ['Ops UI', 'Built-in browser dashboard.']
 };
 
-// Hand-written per-endpoint descriptions. The spec has no operation-level
-// summary/description fields, so these are authored here, grounded in each
-// operation's own request/response schema (verified against openapi.json).
+// Hand-written per-endpoint one-line ledes, grounded in each operation's own
+// request/response schema (verified against openapi.json). Most operations have
+// no `description` in the spec, so this is all they get. Where a route schema
+// DOES author an operation-level `description` (see src/routes/*.ts), that text
+// is rendered underneath the lede as the long-form contract — so document an
+// endpoint's real behaviour on its route schema, not here.
 const DESCRIPTIONS: Record<string, string> = {
-  'GET /health': 'Liveness probe that also reports service identity.',
+  'GET /health':
+    'Liveness probe that also reports service identity, the build identity of the running image (`build`), resolver health, and per-method ingest availability.',
   'GET /healthz': 'Minimal liveness probe.',
   'POST /api/v1/provision/':
     'Provision a full OSC media stack (object storage, metadata store, queue) for a new workspace. Asynchronous — returns an operation to poll.',
@@ -179,6 +210,8 @@ const DESCRIPTIONS: Record<string, string> = {
   'DELETE /api/v1/assets/{id}/subtitle-tracks/{trackId}': 'Remove a subtitle track.',
   'POST /api/v1/assets/{id}/tags': 'Add a tag to an asset.',
   'DELETE /api/v1/assets/{id}/tags/{tag}': 'Remove a tag from an asset.',
+  'GET /api/v1/assets/{id}/review-state':
+    "Get an asset's editorial review state and the transitions that are legal from it.",
   'POST /api/v1/assets/{id}/review-state':
     "Transition an asset's editorial review state (draft / in-review / approved / rejected).",
   'POST /api/v1/assets/{id}/restore': "Restore a soft-deleted asset within its retention window.",
@@ -208,10 +241,11 @@ const DESCRIPTIONS: Record<string, string> = {
   'POST /api/v1/admin/watch-folder/start': 'Start the watch-folder ingest poller.',
   'POST /api/v1/admin/watch-folder/stop': 'Stop the watch-folder ingest poller.',
   'GET /api/v1/scaler/status':
-    'Current transcoder instance pool status (effective `maxInstances`, `idleTimeoutMs`).',
+    'Current transcoder instance pool status. `maxInstances` and `idleTimeoutMs` are the values in force in the serving process — a runtime `PATCH` if one has been sent since startup, otherwise the boot-time environment values.',
   'PATCH /api/v1/scaler/config':
-    'Update auto-scaler configuration at runtime (`maxInstances`, `minInstances`, `idleTimeoutMs`).',
-  'GET /api/v1/scaler/config': 'Get auto-scaler configuration.',
+    'Update auto-scaler configuration at runtime. `maxInstances` and `idleTimeoutMs` take effect on the next scaler tick with no restart; `minInstances` is persisted and echoed back but not applied to the already-running scaler — the persisted value is applied at the next boot, ahead of `ENCORE_MIN_INSTANCES`. The values are written to the parameter store before they are applied, so a `200` means saved and applied — `501` when no parameter store is configured and `503` when the write fails, with nothing applied in either case. The stored record is reloaded at boot, so a restart serves the persisted values; `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS` apply to a deployment never configured through the API, or to a boot where the store could not be read (warn-logged with the reason). There is no reset endpoint: send the environment values back explicitly.',
+  'GET /api/v1/scaler/config':
+    'Get the auto-scaler configuration in force in the serving process: the most recent runtime `PATCH` if one has been accepted since startup, otherwise the boot values — the persisted snapshot when the parameter store holds a readable one, else `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS`. It reads the live copy, never the parameter store; `sources` says per field whether a value is the deployment\'s environment value or an operator value (set by `PATCH` on this process, or restored at boot).',
   'GET /api/v1/retention/config': 'Get the soft-delete retention window configuration.',
   'PATCH /api/v1/retention/config': 'Update the soft-delete retention window configuration.',
   'GET /api/v1/logs/': 'Query structured application logs.',
@@ -223,7 +257,8 @@ const DESCRIPTIONS: Record<string, string> = {
   'POST /api/v1/collections/': 'Create a collection.',
   'GET /api/v1/collections/': 'List collections.',
   'GET /api/v1/collections/{id}': 'Get a collection.',
-  'DELETE /api/v1/collections/{id}': 'Delete a collection.',
+  'DELETE /api/v1/collections/{id}':
+    'Delete a collection. Empty ones delete outright; a non-empty one is refused with 409 until you confirm its member count.',
   'PUT /api/v1/collections/{id}/assets/{assetId}': 'Add an asset to a collection.',
   'DELETE /api/v1/collections/{id}/assets/{assetId}': 'Remove an asset from a collection.',
   'GET /api/v1/storage/buckets': 'List object storage buckets.',
@@ -233,6 +268,50 @@ const DESCRIPTIONS: Record<string, string> = {
   'GET /api/v1/storage/buckets/{bucket}/objects': 'List objects in a bucket.',
   'DELETE /api/v1/storage/buckets/{bucket}/objects/{*}': 'Delete an object from a bucket.',
   'GET /ui': 'Built-in ops dashboard for managing assets, jobs, profiles, and buckets.'
+};
+
+// Curated example bodies for documented error responses, keyed
+// `METHOD PATH STATUS`. Needed where one status carries several variants that a
+// generated example cannot distinguish — a schema-derived sample would pick the
+// first `reason` enum value and show a variant the endpoint never emits.
+//
+// Each body below is transcribed from the handler that sends it, not invented:
+// the two collection 409 variants come from the collections router's error
+// handler (src/routes/collections.ts — CollectionDeleteProtectedError and
+// CollectionInUseError branches), with `message` matching the text those error
+// classes build in src/data/collection-repo.ts.
+const ERROR_EXAMPLES: Record<string, [string, unknown][]> = {
+  'DELETE /api/v1/collections/{id} 409': [
+    [
+      'reason: member_of_collection — retry with ?confirmMemberCount=7',
+      {
+        error: 'delete_blocked',
+        message: 'collection 01J8ZK9F4Q is in use (7 member asset(s))',
+        reason: 'member_of_collection',
+        blockedBy: { jobIds: [], collectionIds: ['01J8ZK9F4Q'] },
+        memberCount: 7
+      }
+    ],
+    [
+      'reason: member_of_collection — stale confirmation, re-confirm with 8',
+      {
+        error: 'delete_blocked',
+        message: 'collection 01J8ZK9F4Q has 8 member asset(s), not the confirmed 7',
+        reason: 'member_of_collection',
+        blockedBy: { jobIds: [], collectionIds: ['01J8ZK9F4Q'] },
+        memberCount: 8
+      }
+    ],
+    [
+      'reason: delete_protected — clear the lock first (no memberCount)',
+      {
+        error: 'delete_blocked',
+        message: 'collection 01J8ZK9F4Q is protected from deletion by an explicit lock',
+        reason: 'delete_protected',
+        blockedBy: { jobIds: [], collectionIds: [] }
+      }
+    ]
+  ]
 };
 
 function groupFor(path: string): string {
@@ -277,6 +356,15 @@ for (const eps of groups.values()) {
   });
 }
 
+// True when a JSON Schema accepts no value at all (`{ "not": {} }` — what a
+// never/undefined-typed field compiles to). Such a field exists in the contract
+// only to be REJECTED, so it must not appear in a request example.
+function rejectsEveryValue(schema: JsonSchema | undefined): boolean {
+  if (!schema || typeof schema !== 'object') return false;
+  const not = (schema as JsonSchema)['not'];
+  return typeof not === 'object' && not !== null && Object.keys(not).length === 0;
+}
+
 function exampleForSchema(schema: JsonSchema | undefined, depth = 0): any {
   if (depth > 4 || !schema || typeof schema !== 'object') return null;
   if ('example' in schema) return schema.example;
@@ -288,6 +376,13 @@ function exampleForSchema(schema: JsonSchema | undefined, depth = 0): any {
     const keys = [...Object.keys(props).filter((k) => required.has(k)), ...Object.keys(props).filter((k) => !required.has(k))];
     const out: Record<string, any> = {};
     for (const k of keys.slice(0, 12)) {
+      // A property whose schema is `{ "not": {} }` accepts NO value — it is a
+      // field the API rejects (e.g. a removed field kept in the contract so
+      // supplying it is an error rather than silently ignored, issue #1022).
+      // Showing it in a request example would invite callers to send something
+      // that is guaranteed to 400, so it is omitted from the example; its
+      // `description` still appears in the field notes below the example.
+      if (rejectsEveryValue(props[k])) continue;
       out[k] = exampleForSchema(props[k], depth + 1);
     }
     return out;
@@ -318,8 +413,27 @@ function firstSuccessResponse(op: Operation): [string | null, any] {
   return [null, null];
 }
 
+// Error (4xx/5xx) responses whose route schema carries a real description.
+// fastify-swagger emits the placeholder "Default Response" for every response
+// nobody described, so only intentionally documented failures are rendered —
+// which is what lets a reader implement an error-handling flow (e.g. the
+// confirm-then-delete 409 on collections, issue #925) from the reference alone.
+function documentedErrorResponses(op: Operation): [string, any][] {
+  return Object.entries(op.responses ?? {})
+    .filter(([code, resp]: [string, any]) => {
+      if (!/^[45]/.test(code)) return false;
+      const d = resp?.description;
+      return typeof d === 'string' && d.trim() && d !== 'Default Response';
+    })
+    .sort(([a], [b]) => a.localeCompare(b));
+}
+
 function renderParamsTable(params: any[] | undefined): string {
   if (!params || !params.length) return '';
+  // The Description column is rendered only when at least one parameter carries
+  // a spec-authored description, so endpoints whose route schemas say nothing
+  // keep the original four-column table.
+  const anyDesc = params.some((p) => typeof p.description === 'string' && p.description.trim());
   const rows = params
     .map((p) => {
       const name = esc(p.name ?? '');
@@ -328,10 +442,12 @@ function renderParamsTable(params: any[] | undefined): string {
       const schema = p.schema ?? {};
       const enumVals = schema.enum;
       const typeStr = esc(schema.type ?? 'string') + (enumVals ? ` (${enumVals.join(', ')})` : '');
-      return `<tr><td><code>${name}</code></td><td><span class="tag-${loc}">${loc}</span></td><td>${typeStr}</td><td>${required}</td></tr>`;
+      const descCell = anyDesc ? `<td>${escInline(p.description ?? '')}</td>` : '';
+      return `<tr><td><code>${name}</code></td><td><span class="tag-${loc}">${loc}</span></td><td>${typeStr}</td><td>${required}</td>${descCell}</tr>`;
     })
     .join('');
-  return `<table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody>${rows}</tbody></table>`;
+  const descHead = anyDesc ? '<th>Description</th>' : '';
+  return `<table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th>${descHead}</tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function renderJsonBlock(label: string, obj: any): string {
@@ -348,7 +464,9 @@ function renderPropertyNotes(schema: JsonSchema | undefined): string {
   if (!schema || !schema.properties) return '';
   const notes = Object.entries(schema.properties as Record<string, any>).filter(([, v]) => v?.description);
   if (!notes.length) return '';
-  const items = notes.map(([k, v]) => `<li><code>${esc(k)}</code> — ${esc(v.description)}</li>`).join('');
+  const items = notes
+    .map(([k, v]) => `<li><code>${esc(k)}</code> — ${escInline(v.description)}</li>`)
+    .join('');
   return `<div class="field-notes"><strong>Field notes</strong><ul>${items}</ul></div>`;
 }
 
@@ -499,7 +617,7 @@ ${renderCurlBlock('Request', 'curl -X POST https://<your-instance>/api/v1/assets
 <h2 id="search">4. Search</h2>
 <p>One endpoint covers both free text and exact filters, ANDed together and paginated:</p>
 ${renderCurlBlock('Request', 'curl "https://<your-instance>/api/v1/search?q=keynote&tags=stage-a&page=1&pageSize=20"')}
-<p>Exact-filter fields: <code>tags</code>, <code>mimeType</code>, <code>metadata.&lt;key&gt;</code>, <code>tamsFlowId</code>, <code>tamsTimerange</code>. Free text (<code>q</code>) matches over name and description. Full shape in the <a href="ref-search.html">Search reference</a>.</p>
+<p>Exact-filter fields: <code>tags</code>, <code>mimeType</code>, <code>metadata.&lt;key&gt;</code>, <code>tamsFlowId</code>, <code>tamsTimerange</code>. Free text (<code>q</code>) matches over name and description. <code>mimeType</code> matches the container format extracted from the media and accepts either a container token (<code>mp4</code>) or a common media MIME type (<code>video/mp4</code>), which is resolved onto the container family it names. Full shape in the <a href="ref-search.html">Search reference</a>.</p>
 <div class="callout warn"><code>GET /api/v1/assets/search</code> is a deprecated, free-text-only alias kept for backward compatibility — new integrations should use <code>/api/v1/search</code> above.</div>
 
 <h2 id="tracks">5. Audio and subtitle tracks</h2>
@@ -538,6 +656,19 @@ ${renderCurlBlock('Path', 'GET /api/v1/assets/{id}/stream/*')}
 ${renderCurlBlock('Request', 'curl -X POST https://<your-instance>/api/v1/collections \\\n  -H "Content-Type: application/json" \\\n  -d \'{"name": "Q3 keynotes"}\'')}
 <p>Add and remove assets with ${refEx('PUT', '/api/v1/collections/{id}/assets/{assetId}')} / ${refEx('DELETE', '/api/v1/collections/{id}/assets/{assetId}')}. Full shape in the <a href="ref-collections.html">Collections reference</a>.</p>
 
+<h2 id="deleting-collections">Deleting a collection</h2>
+<p>Deleting a collection never deletes its member assets — membership lives on the collection, so the delete just unlinks them.</p>
+<p>An empty collection deletes outright. A non-empty one is refused, so you can't tear down a grouping you haven't looked at:</p>
+${renderCurlBlock('Request', 'curl -i -X DELETE https://<your-instance>/api/v1/collections/<id>')}
+${renderJsonBlock('Response 409', { error: 'delete_blocked', message: 'collection 01J8ZK9F4Q is in use (7 member asset(s))', reason: 'member_of_collection', blockedBy: { jobIds: [], collectionIds: ['01J8ZK9F4Q'] }, memberCount: 7 })}
+<p>Branch on <code>reason</code>, never on the status code alone. <code>member_of_collection</code> means the collection still holds <code>memberCount</code> assets. Show the user what they're about to unlink, then echo that number back to confirm:</p>
+${renderCurlBlock('Request', 'curl -i -X DELETE "https://<your-instance>/api/v1/collections/<id>?confirmMemberCount=7"')}
+<p>That answers <code>204</code>. The count must match the collection's <em>current</em> membership: if someone added or removed an asset in between, you get the same <code>409 member_of_collection</code> back carrying the new authoritative <code>memberCount</code> — re-confirm with that value and retry. The delete is never silent, so you can't destroy a set that changed under you. <code>?force=true</code> is the blind alternative; it skips the count check entirely.</p>
+<p>A <code>409</code> with <code>reason: "delete_protected"</code> is a different condition and needs a different fix. It means the collection carries an explicit delete lock. There is no <code>memberCount</code>, both <code>blockedBy</code> arrays are empty, and neither <code>?confirmMemberCount=</code> nor <code>?force=true</code> gets past it:</p>
+${renderJsonBlock('Response 409', { error: 'delete_blocked', message: 'collection 01J8ZK9F4Q is protected from deletion by an explicit lock', reason: 'delete_protected', blockedBy: { jobIds: [], collectionIds: [] } })}
+<p>Clear the lock with <code>DELETE /api/v1/collections/{id}/lock</code> first, then delete as normal. Treating <code>delete_protected</code> as a retryable confirmation prompt is the usual integration bug here — no number of retries will ever succeed.</p>
+<p>Every parameter and the full 409 shape are in the <a href="ref-collections.html#delete-api-v1-collections-id">Collections reference</a>.</p>
+
 <h2 id="webhooks">Webhooks</h2>
 <p>Register an HTTP endpoint to be notified as assets and jobs change state, instead of polling:</p>
 ${renderCurlBlock('Request', 'curl -X POST https://<your-instance>/api/v1/webhooks \\\n  -H "Content-Type: application/json" \\\n  -d \'{"url": "https://your-app.example.com/hooks/videocore", "events": ["asset.ready", "transcode.complete", "package.complete"]}\'')}
@@ -553,8 +684,11 @@ ${renderCurlBlock('Request', 'curl -X POST https://<your-instance>/api/v1/provis
 
 <h2 id="scaler">Tune the transcoder auto-scaler</h2>
 <p>The auto-scaler keeps a per-workspace pool of transcoder instances and scales it on demand. By default it scales to zero when idle, trading standing cost for cold-start latency on the first job of a burst.</p>
-${renderCurlBlock('Request', 'curl -X PATCH https://<your-instance>/api/v1/scaler/config \\\n  -H "Content-Type: application/json" \\\n  -d \'{"minInstances": 1, "maxInstances": 3, "idleTimeoutMs": 300000}\'')}
-<p>Set <code>minInstances</code> to 1 or more for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. See ${refEx('GET', '/api/v1/scaler/status')} for the pool's live state and the <a href="ref-scaler.html">Auto-scaler reference</a> for every field.</p>
+${renderCurlBlock('Request', 'curl -X PATCH https://<your-instance>/api/v1/scaler/config \\\n  -H "Content-Type: application/json" \\\n  -d \'{"maxInstances": 3, "idleTimeoutMs": 300000}\'')}
+<p>This changes <code>maxInstances</code> and <code>idleTimeoutMs</code> from the next scaler tick, with no restart.</p>
+<div class="callout"><strong>Runtime config is saved and reloaded at boot.</strong> The values are written to the parameter store first and applied to the serving process second, so a <code>200</code> means both: you get a <code>501</code> if no parameter store is configured and a <code>503</code> if the write fails, and in both cases nothing is applied. Precedence is three layers: the most recent accepted <code>PATCH</code> wins, otherwise the snapshot loaded from the parameter store at boot, otherwise the environment value. So a restart or redeploy keeps a persisted change — for the config endpoint and for the scaler loops — and falls back to <code>ENCORE_MAX_INSTANCES</code> and <code>ENCORE_IDLE_TIMEOUT_MS</code> only when nothing is stored or the store could not be read at boot (warn-logged with the reason). The applied value of a live <code>PATCH</code> still only reaches the replica that answered the request. There is no reset endpoint — send the environment values back explicitly, which overwrites the stored snapshot. For a change that must take effect everywhere after a restart, set the environment variable and redeploy.</div>
+<p>The warm floor is the exception: set <code>ENCORE_MIN_INSTANCES</code> to 1 or more (and restart) for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. A <code>minInstances</code> sent to the config endpoint is validated, persisted and echoed back, but the <em>already-running</em> scaler keeps enforcing the floor it read at boot; the persisted floor is applied at the next boot, ahead of the variable, so changing the enforced floor through the API takes one restart. See ${refEx('GET', '/api/v1/scaler/status')} for the pool's live state and the <a href="ref-scaler.html">Auto-scaler reference</a> for every field.</p>
+<div class="callout"><strong>A pool can be held below the queue on purpose.</strong> When an instance-create times out at the gateway (<code>504</code>), the platform is usually still building the instance — so the spawn keeps watching the name it already asked for and adopts that instance if it appears (<code>ENCORE_SPAWN_ADOPT_PROBE_TIMEOUT_MS</code>, default 90s), and scale-up for that workspace is then held off for about two minutes (<code>ENCORE_SPAWN_GATEWAY_BACKOFF_MS</code>, default <code>120000</code>; set <code>0</code> to disable) instead of starting a second create against a platform that just reported it was slow. Only a gateway timeout causes the hold-off. ${refEx('GET', '/api/v1/scaler/status')} reports <code>spawnFailure.httpCode</code>, so a <code>504</code> there identifies the pause as this back-off rather than a pool that has stopped growing for an unknown reason.</div>
 
 <h2 id="optional-services">Optional services</h2>
 <p>Add-on capabilities beyond the core stack are provisioned per workspace, on demand:</p>
@@ -568,6 +702,7 @@ ${renderCurlBlock('Request', 'curl -X POST https://<your-instance>/api/v1/option
 <p>Deleted assets are soft-deleted and recoverable within a configurable window:</p>
 ${renderCurlBlock('Request', 'curl https://<your-instance>/api/v1/retention/config')}
 <p>Restore an asset within that window with ${refEx('POST', '/api/v1/assets/{id}/restore')}. Full shape in the <a href="ref-retention.html">Retention reference</a>.</p>
+<p>To destroy one archived asset now, without widening the window for everything else, call ${refEx('DELETE', '/api/v1/assets/{id}/purge')}. It is irreversible: the asset's stored objects are removed, its document is replaced by a tombstone, and reads of its id return <code>410 Gone</code> from then on — there is no restore afterwards.</p>
 `
 };
 
@@ -670,6 +805,10 @@ table.params th, table.env th, table.model th{color:var(--text-dim); font-weight
 .endpoint h3 .path{background:none; padding:0; color:var(--text); font-size:14.5px}
 .endpoint-desc{color:var(--text-dim); margin:0 0 4px}
 .endpoint h4{font-size:12.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--text-dim); margin:18px 0 6px; border:none}
+.endpoint-detail{margin:8px 0 4px; font-size:14px}
+.endpoint-detail p{margin:0 0 8px}
+.prose-steps{margin:0 0 8px; padding-left:20px; font-size:14px}
+.prose-steps li{margin-bottom:4px}
 .field-notes{background:var(--bg-side); border-radius:8px; padding:10px 14px; margin:8px 0 4px; font-size:13px}
 .field-notes ul{margin:6px 0 0; padding-left:18px}
 .field-notes li{margin-bottom:4px}
@@ -971,7 +1110,11 @@ function renderGroupPage(key: string): string {
   const items = ops
     .map(([method, path, op]) => {
       const sid = slug(method, path);
-      const desc = DESCRIPTIONS[`${method} ${path}`] ?? '';
+      // Lede: the hand-written one if there is one, otherwise the route
+      // schema's own `summary` — which is better than the blank line endpoints
+      // missing from DESCRIPTIONS used to render.
+      const desc =
+        DESCRIPTIONS[`${method} ${path}`] ?? (typeof op.summary === 'string' ? op.summary : '');
       const paramsHtml = renderParamsTable(op.parameters);
 
       let reqHtml = '';
@@ -986,6 +1129,13 @@ function renderGroupPage(key: string): string {
       let respHtml = '';
       const [code, resp] = firstSuccessResponse(op);
       if (resp) {
+        // Same rule as the error responses below: "Default Response" is the
+        // fastify-swagger placeholder, so only a real route-schema description
+        // is worth printing.
+        const sd = resp.description;
+        if (typeof sd === 'string' && sd.trim() && sd !== 'Default Response') {
+          respHtml += renderProse(sd);
+        }
         const content = resp.content ?? {};
         if (Object.keys(content).length) {
           for (const [ctype, cval] of Object.entries(content)) {
@@ -998,13 +1148,32 @@ function renderGroupPage(key: string): string {
         }
       }
 
+      // Documented failures. Rendered as prose + field notes rather than a
+      // synthesized example, because a generated example would pick the first
+      // enum value for a discriminator like `reason` and could show a variant
+      // the endpoint never emits. Curated examples come from ERROR_EXAMPLES.
+      let errHtml = '';
+      for (const [ecode, eresp] of documentedErrorResponses(op)) {
+        errHtml += `<h4>Response ${esc(ecode)}</h4>${renderProse(String(eresp.description))}`;
+        for (const cval of Object.values(eresp.content ?? {})) {
+          errHtml += renderPropertyNotes((cval as any).schema);
+        }
+        for (const [label, body] of ERROR_EXAMPLES[`${method} ${path} ${ecode}`] ?? []) {
+          errHtml += renderJsonBlock(label, body);
+        }
+      }
+
+      const longDesc = typeof op.description === 'string' ? op.description.trim() : '';
+
       return `
 <article class="endpoint" id="${sid}">
   <h3><span class="badge badge-${method}">${method}</span> <code class="path">${esc(path)}</code></h3>
   <p class="endpoint-desc">${esc(desc)}</p>
+  ${longDesc ? `<div class="endpoint-detail">${renderProse(longDesc)}</div>` : ''}
   ${paramsHtml ? `<h4>Parameters</h4>${paramsHtml}` : ''}
   ${reqHtml ? `<h4>Request</h4>${reqHtml}` : ''}
   ${respHtml ? `<h4>Response</h4>${respHtml}` : ''}
+  ${errHtml}
 </article>
 `;
     })
@@ -1406,19 +1575,21 @@ Access Token as the OSC access token. Generate strong passwords for
 </ol>
 
 <h2 id="env-vars">Environment variables</h2>
-<p class="group-blurb">On Open Source Cloud only the settings exposed by the service's deploy form are configurable — the required credentials above plus the optional <code>ENCORE_*</code> tuning knobs. The others are injected automatically by the deploy step or fixed by the platform, and can only be set directly when you run open-videocore yourself (self-hosted). The <strong>OSC-configurable</strong> column below marks which is which.</p>
+<p class="group-blurb">On Open Source Cloud only the settings exposed by the service's deploy form are configurable — the required credentials above plus the optional transcoder-pool knobs (<code>ENCORE_MAX_INSTANCES</code>, <code>ENCORE_MIN_INSTANCES</code>, <code>ENCORE_IDLE_TIMEOUT_MS</code>). The others are injected automatically by the deploy step or fixed by the platform, and can only be set directly when you run open-videocore yourself (self-hosted). The <strong>OSC-configurable</strong> column below marks which is which.</p>
 <table class="env">
   <thead><tr><th>Variable</th><th>Required</th><th>OSC-configurable</th><th>Description</th></tr></thead>
   <tbody>
     <tr><td><code>OSC_ACCESS_TOKEN</code></td><td>Yes</td><td>Injected</td><td>Personal Access Token. Injected automatically at deploy time on OSC.</td></tr>
     <tr><td><code>PARAMETER_STORE_API_KEY</code></td><td>Yes</td><td>Yes</td><td>Config API key of the connected parameter store.</td></tr>
     <tr><td><code>PARAMETER_STORE_INSTANCE_NAME</code></td><td>Yes</td><td>Yes</td><td>Name of the parameter store (default <code>ovcconfig</code>). On OSC this is the <code>ParameterStore</code> deploy-form field.</td></tr>
-    <tr><td><code>MINIO_ROOT_PASSWORD</code></td><td>Yes</td><td>Yes</td><td>Admin password used when provisioning object storage instances.</td></tr>
+    <tr><td><code>MINIO_ROOT_PASSWORD</code></td><td>Yes</td><td>Yes</td><td>Deployment-level object-store credential material. Each provisioned stack gets its own object-store access key id and secret derived from this value, so a credential issued for one stack cannot read or write another stack&#39;s buckets. Use a high-entropy value (at least 32 characters, which is what reliably reaches the ~112-bit floor the API enforces — generated, not chosen, e.g. <code>openssl rand -base64 32</code>): the per-stack isolation holds only while this value is expensive to guess, and below that strength newly provisioned stacks keep the deployment-wide credential instead (logged as an error at startup and per affected stack; set ALLOW_SHARED_OBJECT_STORE_CREDENTIAL=true to acknowledge that deliberately and downgrade the startup line to a warning). A stack provisioned by an older build also keeps its original deployment-wide credential until it is migrated. Treat it as a root secret; rotating it invalidates the derived credentials of already-provisioned stacks.</td></tr>
     <tr><td><code>COUCHDB_ADMIN_PASSWORD</code></td><td>Yes</td><td>Yes</td><td>Admin password used when provisioning the metadata store.</td></tr>
     <tr><td><code>PORT</code></td><td>No</td><td>No</td><td>HTTP port (default <code>3000</code>). Fixed by the platform on OSC; self-hosted only.</td></tr>
-    <tr><td><code>ENCORE_MAX_INSTANCES</code></td><td>No</td><td>Yes</td><td>Max transcoder instances the auto-scaler may run per workspace (default <code>3</code>).</td></tr>
-    <tr><td><code>ENCORE_MIN_INSTANCES</code></td><td>No</td><td>Yes</td><td>Warm floor of transcoder instances kept running even when idle (default <code>0</code> — scale to zero). See <a href="guide-operating.html#scaler">Operating a workspace</a>.</td></tr>
-    <tr><td><code>ENCORE_IDLE_TIMEOUT_MS</code></td><td>No</td><td>Yes</td><td>Idle time before a transcoder instance is torn down (default <code>300000</code>).</td></tr>
+    <tr><td><code>ENCORE_MAX_INSTANCES</code></td><td>No</td><td>Yes</td><td>Max transcoder instances the auto-scaler may run per workspace (default <code>3</code>). Can be changed at runtime with <a href="ref-scaler.html">PATCH /api/v1/scaler/config</a>; that change is persisted and reloaded at boot, so this value applies to a deployment never configured through the API. See <a href="guide-operating.html#scaler">Operating a workspace</a>.</td></tr>
+    <tr><td><code>ENCORE_MIN_INSTANCES</code></td><td>No</td><td>Yes</td><td>Warm floor of transcoder instances kept running even when idle (default <code>0</code> — scale to zero). A <code>minInstances</code> sent to the runtime config endpoint is not applied to the already-running scaler, but it is persisted and reloaded at boot with precedence over this variable — so changing the enforced floor through the API takes one restart, and this variable is the floor for a deployment never configured through the API. See <a href="guide-operating.html#scaler">Operating a workspace</a>.</td></tr>
+    <tr><td><code>ENCORE_IDLE_TIMEOUT_MS</code></td><td>No</td><td>Yes</td><td>Idle time before a transcoder instance is torn down (default <code>300000</code>). Can be changed at runtime with <a href="ref-scaler.html">PATCH /api/v1/scaler/config</a>; like <code>ENCORE_MAX_INSTANCES</code> that change is persisted and reloaded at boot, so after a restart the persisted value wins and this variable is the value for a deployment never configured through the API.</td></tr>
+    <tr><td><code>ENCORE_SPAWN_ADOPT_PROBE_TIMEOUT_MS</code></td><td>No</td><td>No</td><td>How long a scale-up keeps asking for the transcoder instance name it already requested, after every create attempt ended in a gateway timeout (504/408), in milliseconds (default <code>90000</code>). A create that times out at the gateway usually completes behind it, so the spawn watches that same name for this long and adopts the instance if it appears, rather than requesting a new name on the next tick. An absent, unparseable or negative value falls back to the default; <code>0</code> does <strong>not</strong> disable the probe — only values above zero are honoured, so <code>0</code> leaves the default in force. <strong>Self-hosted only — not configurable on Open Source Cloud</strong> (the deploy form exposes no field for it). See <a href="guide-operating.html#scaler">Operating a workspace</a>.</td></tr>
+    <tr><td><code>ENCORE_SPAWN_GATEWAY_BACKOFF_MS</code></td><td>No</td><td>No</td><td>How long the next scale-up for a workspace is held off after a spawn that ended in a gateway timeout, in milliseconds (default <code>120000</code>, i.e. 2 minutes). Only a gateway timeout triggers it; any other spawn failure never delays the retry. An absent, unparseable or negative value falls back to the default; <code>0</code> <strong>disables</strong> the hold-off, so scale-up may retry on the next tick. <strong>Self-hosted only — not configurable on Open Source Cloud</strong> (the deploy form exposes no field for it). See <a href="guide-operating.html#scaler">Operating a workspace</a>.</td></tr>
     <tr><td><code>PUBLIC_BASE_URL</code></td><td>No</td><td>No</td><td>Publicly-reachable base URL of this instance, used to build the profile index URL handed to each transcoder. <strong>Self-hosted only — not configurable on Open Source Cloud</strong> (the OSC deploy form exposes no field for it, and OSC injects no self-URL). Left unset on OSC, transcoders fall back to the remote default profiles index.</td></tr>
   </tbody>
 </table>
@@ -1685,10 +1856,14 @@ function htmlToText(html: string): string {
   s = s.replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, '');
   s = s.replace(/<div class="crumb">[\s\S]*?<\/div>/gi, ''); // breadcrumb, redundant in plain text
   s = s.replace(/<\/(h1|h2|h3|h4|p|li|div|article|section|tr)>/gi, '\n');
+  // Table cells need a separator or a row collapses into one unreadable run
+  // (e.g. "forcequerybooleanoptionalBlind override…" in the parameter tables).
+  s = s.replace(/<\/(td|th)>/gi, ' | ');
   s = s.replace(/<li[^>]*>/gi, '- ');
   s = s.replace(/<br\s*\/?>/gi, '\n');
   s = s.replace(/<[^>]+>/g, '');
   s = decodeEntities(s);
+  s = s.replace(/\s*\|\s*\n/g, '\n');
   s = s.replace(/[ \t]+\n/g, '\n');
   s = s.replace(/\n{3,}/g, '\n\n');
   return s.trim();

@@ -12,6 +12,7 @@
 import nano from 'nano';
 import { Client as MinioClient } from 'minio';
 import {
+  CONFIG_LIST_PAGE_LIMIT,
   isReadyStack,
   type ParamStore,
   type StackConfig,
@@ -26,6 +27,8 @@ import { CouchWebhookRepository } from '../data/couch-webhook-repo.js';
 import { CouchCollectionRepository } from '../data/couch-collection-repo.js';
 import { CouchProfileRepository } from '../data/couch-profile-repo.js';
 import { CouchPipelineRepository } from '../data/couch-pipeline-repo.js';
+import { CouchCommentRepository } from '../data/couch-comment-repo.js';
+import { InMemoryCommentRepository, type CommentRepository } from '../data/comment-repo.js';
 import type { AuditEmitter } from '../data/audit-emit.js';
 import { InMemoryAssetRepository, type AssetRepository } from '../data/asset-repo.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
@@ -43,13 +46,25 @@ import {
   type AuditRepository,
   type AuditRetentionRepository
 } from '../data/audit-repo.js';
+// Operational log store (issue #996): durable CouchLogStore on the Couch paths,
+// in-memory LogStore on the no-Couch paths — the same Couch/in-memory pairing
+// `audit` uses above.
+import { CouchLogStore } from '../data/couch-log-repo.js';
+import {
+  LogStore,
+  type LogReader,
+  type LogRetentionStore,
+  type LogSink
+} from './log-store.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
+import { resolveObjectStoreCredential } from './object-store-credentials.js';
 import type { StorageFactory } from '../routes/asset-upload.js';
 import { makeHttpEncoreClient, type EncoreClient } from '../pipeline/encore-client.js';
 import type { SubtitleGenerator } from '../pipeline/subtitle-generator.js';
 import type { SceneDetector } from '../pipeline/scene-detector.js';
-import { listSubscriptions, type Context } from '@osaas/client-core';
+import type { Context } from '@osaas/client-core';
 import type { ResolverHealthSignal } from './resolver-health.js';
+import { logObjectStoreClient } from './object-store-stack-identity.js';
 
 // Builders that turn a stored optional-service instance name (from the stack
 // record) into the corresponding pipeline-step generator (issue #217). main.ts
@@ -65,6 +80,15 @@ export type OptionalStepBuilders = {
 };
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
+
+// Process-wide in-memory operational log store for the NO-COUCH paths only
+// (issue #996). Deliberately a module singleton rather than one per built
+// connection set: the resolver rebuilds connections on every cache miss (and the
+// no-parameter-store branch rebuilds on EVERY resolve), so a per-resolution store
+// would discard records that the pre-#996 wiring — one global `new LogStore()`
+// in main.ts, held for the process lifetime — kept. Couch-backed paths never
+// touch this; they get a durable CouchLogStore.
+const fallbackLogStore = new LogStore();
 
 // Minimal logger surface (compatible with Fastify's logger). Injected so the
 // read-path diagnostics (issue #415, info/warn) and a transient parameter-store
@@ -108,14 +132,45 @@ export type WorkspaceConnections = {
   // purge sweep drives per tick. Typed as the intersection so the single field
   // serves all three consumers; both concrete repos satisfy it.
   audit: AuditRepository & AuditEmitter & AuditRetentionRepository;
+  // Operational log store for this stack (issue #996). Backed by CouchLogStore
+  // on every Couch-backed path, so records written by the pipeline producer
+  // survive a restart and are still returned by GET /api/v1/logs; the in-memory
+  // LogStore backs the no-Couch dev/test paths. ALWAYS present, like `audit`.
+  // Carries the `append()` write primitive the pipeline producer uses
+  // (src/services/pipeline-log.ts), the `list()` read the logs router uses
+  // (src/routes/logs.ts), AND the retention surface (issue #1067,
+  // listOldestPage/purgeEntry) the log-retention purge sweep drives per tick —
+  // the same three-way intersection `audit` above carries. Typed as the
+  // intersection so the single field serves all three consumers; both concrete
+  // stores satisfy it.
+  logs: LogSink & LogReader & LogRetentionStore;
   profiles: ProfileRepository;
   pipelines: PipelineRepository;
+  // Asset comments for this stack (issue #135, made durable by issue #1046).
+  // ALWAYS present: CouchCommentRepository when the resolved stack (or the env
+  // override) has a CouchDB, InMemoryCommentRepository otherwise — the same
+  // always-present shape `audit` above uses, so PerWorkspaceCommentRepository
+  // never has to branch on undefined. Review comments are durable editorial
+  // content, so the Couch-backed implementation must be reachable on the
+  // PARAMETER-STORE path (a stack provisioned via POST /api/v1/provision sets no
+  // COUCHDB_URL), not only under the env override.
+  comments: CommentRepository;
   storageFor: StorageFactory | undefined;
   storageClient: MinioClient | undefined;
   encore: EncoreClient | undefined;
   sourceBucket: string;
   packagedBucket: string;
-  s3Config: { endpoint: string; accessKey: string; secretKey: string } | undefined;
+  // Object-store credential + endpoint for the resolved stack, TAGGED with the
+  // stack identity it was built for (issue #1093). The tag travels with the
+  // credential — not alongside it — so the submit path can assert that the
+  // bytes will be read with the credential of the stack the request routes to
+  // (objectStoreStackMismatch, services/object-store-stack-identity.ts) instead
+  // of discovering the split as an indistinguishable missing-object error from
+  // the transcoder. `stackName` is undefined on the paths that are not stack
+  // records (env override), exactly like WorkspaceConnections.stackName below.
+  s3Config:
+    | { endpoint: string; accessKey: string; secretKey: string; stackName: string | undefined }
+    | undefined;
   // Per-role storage backend metadata for the resolved stack (issue #211/#213).
   // Carried through so the delivery route can emit backend-appropriate URLs
   // (proxied for 'minio', public/derived object URLs for 'external') without a
@@ -132,6 +187,15 @@ export type WorkspaceConnections = {
   // `scene-detect` step skips gracefully — fire-and-forget, never throws.
   subtitleGenerator: SubtitleGenerator | undefined;
   sceneDetector: SceneDetector | undefined;
+  // The stack identity these connections were built from (issue #1058): the
+  // parameter-store stack name, i.e. the same identity `resolveStackName()`
+  // returns for the transcode control plane. Undefined on the env-override and
+  // in-memory fallback paths, which are not stack records. Callers compare this
+  // against the control plane's resolved stack to detect a data-plane /
+  // control-plane split; they MUST NOT compare endpoint hostnames, which
+  // legitimately differ for the same stack (in-cluster vs public ingress,
+  // issue #991).
+  stackName: string | undefined;
 };
 
 // A cached resolution. `fromReadyStack` records whether `connections` were
@@ -173,7 +237,18 @@ function buildConnectionsFromStack(
   minioPassword: string,
   couchPassword: string,
   oscContext: Context,
-  optionalSteps: OptionalStepBuilders
+  optionalSteps: OptionalStepBuilders,
+  // The parameter-store name this config was loaded under (issue #1058).
+  // Carried onto the connections as their stack identity.
+  stackName: string | undefined,
+  // Where the durable comment store (issue #1046) and the durable log store
+  // (#996 review finding 2) report their own failures instead of swallowing
+  // them, and where the object-store client construction below is logged
+  // (issue #1093) — stack id + endpoint host only, never the secret. Required,
+  // like the other module-private helpers here: the sole caller is the
+  // resolver, whose own `log` field always holds a logger (noopLogger when none
+  // was injected).
+  log: StackResolverLogger
 ): WorkspaceConnections | null {
   if (!isValidUrl(config.couchdbUrl) || !isValidUrl(config.minioEndpoint)) {
     return null;
@@ -186,14 +261,42 @@ function buildConnectionsFromStack(
   const server = couchServer(couchUrl);
   const wc = () => new StackCouch(server, dbName);
 
+  // THIS stack's object-store credential (issue #1094). Resolved alongside the
+  // endpoint from the stack's own stored config: when the config carries a
+  // per-stack access key id, the secret is re-derived from it and the
+  // deployment seed; otherwise this returns the legacy deployment-wide
+  // `admin` + password pair, byte-identically to the pre-#1094 behaviour, for a
+  // stack not yet migrated by #1096. `minioPassword` serves as BOTH the
+  // derivation seed and the legacy secret — it is the same
+  // MINIO_ROOT_PASSWORD env value in either role (see the SEED note in
+  // services/object-store-credentials.ts).
+  //
+  // The secret is never logged and never leaves this function except into the
+  // S3 client and `s3Config` below, which feed the object-store clients only.
+  const objectStoreCredential = resolveObjectStoreCredential({
+    storedAccessKeyId: config.objectStoreAccessKeyId,
+    seed: minioPassword,
+    legacySecretAccessKey: minioPassword
+  });
+
   const url = new URL(config.minioEndpoint);
   const useSSL = url.protocol === 'https:';
   const minioClient = new MinioClient({
     endPoint: url.hostname,
     port: url.port ? Number(url.port) : useSSL ? 443 : 80,
     useSSL,
-    accessKey: 'admin',
-    secretKey: minioPassword
+    accessKey: objectStoreCredential.accessKeyId,
+    secretKey: objectStoreCredential.secretAccessKey
+  });
+  // Record WHICH stack this object-store client was pointed at (issue #1093).
+  // Every stack's buckets carry the same literal names, so without this line a
+  // client aimed at the wrong instance is invisible in the logs until a read
+  // fails with a missing-object error that names nothing. Stack id + endpoint
+  // HOST only — `minioPassword` is never logged.
+  logObjectStoreClient(log, {
+    source: 'stack-resolver',
+    stackName,
+    endpoint: config.minioEndpoint
   });
 
   const assets = new CouchAssetRepository(wc);
@@ -206,8 +309,18 @@ function buildConnectionsFromStack(
   const webhooks = new CouchWebhookRepository(wc);
   const profiles = new CouchProfileRepository(wc);
   const pipelines = new CouchPipelineRepository(wc);
+  // Asset comments over the same per-stack CouchDB connection (issue #1046), so
+  // a stack provisioned through POST /api/v1/provision gets the DURABLE comment
+  // store without any COUCHDB_URL env var being set.
+  const comments = new CouchCommentRepository(wc, log);
   // Audit store over the same per-stack CouchDB connection (issue #564).
   const audit = new CouchAuditRepository(wc);
+  // Operational log store over the SAME per-stack CouchDB connection (issue
+  // #996), so log records land in the stack the request resolved to and survive
+  // a restart of this process.
+  // `log` so a failed overflow eviction or an over-cap read window is reported
+  // instead of swallowed (#996 review finding 2).
+  const logs = new CouchLogStore(wc, { log });
 
   const storageFor: StorageFactory = () =>
     new WorkspaceStorage(minioClient, config.sourceBucket);
@@ -239,20 +352,68 @@ function buildConnectionsFromStack(
     webhooks,
     collections,
     audit,
+    logs,
     profiles,
     pipelines,
+    comments,
     storageFor,
     storageClient: minioClient,
     encore,
     sourceBucket: config.sourceBucket,
     packagedBucket: config.packagedBucket,
-    s3Config: { endpoint: config.minioEndpoint, accessKey: 'admin', secretKey: minioPassword },
+    // Per-stack object-store credential (issue #1094) — the same pair the
+    // client above authenticates with, so every consumer of `s3Config` (the
+    // ephemeral per-job runners, pipeline/runner-option.ts) speaks to the stack
+    // with the stack's own key rather than a deployment-wide root credential.
+    // Tagged with the stack identity the credential was resolved from (issue
+    // #1093) so the submit path can assert credential/route agreement.
+    s3Config: {
+      endpoint: config.minioEndpoint,
+      accessKey: objectStoreCredential.accessKeyId,
+      secretKey: objectStoreCredential.secretAccessKey,
+      stackName
+    },
     // Carry the per-role storage backend metadata (issue #211) so the delivery
     // route can branch on backend type without re-reading the parameter store.
     storage: config.storage,
     subtitleGenerator,
-    sceneDetector
+    sceneDetector,
+    stackName
   };
+}
+
+// True when the explicit env-var override builder (`buildEnvConnections`) is the
+// active source of WorkspaceConnections — i.e. when COUCHDB_URL or MINIO_URL is
+// set, in which case `resolve()` returns env-built connections for ALL
+// workspaces and never consults the parameter store. This predicate MUST stay in
+// lockstep with `buildEnvConnections`'s own `if (!couchUrl && !minioUrl)` guard
+// below; it exists so callers can tell "this endpoint came from a provisioned
+// stack record" from "this endpoint is a local/ops override", which the
+// WorkspaceConnections shape itself does not distinguish (`s3Config.endpoint` is
+// populated from `StackConfig.minioEndpoint` on one path and verbatim from
+// MINIO_URL on the other).
+export function envOverrideConnectionsActive(): boolean {
+  return Boolean(process.env['COUCHDB_URL']) || Boolean(process.env['MINIO_URL']);
+}
+
+// The MinIO endpoint of a PROVISIONED stack (`StackConfig.minioEndpoint`, carried
+// on `s3Config.endpoint` by `buildConnectionsFromStack`), or undefined when the
+// resolved connections did not come from a stack record — the env-override path
+// (MINIO_URL, used verbatim) and the no-storage in-memory path (`s3Config:
+// undefined`).
+//
+// Consumed by the delivery/files routes to derive the packaged bucket's PUBLIC
+// origin (issue #859). That derivation is deliberately restricted to
+// stack-resolved connections: the anonymous-read bucket policy that makes the
+// derived URL fetchable is applied only when THIS codebase provisions the stack
+// (routes/provision.ts, issue #199). A local or ops-override MinIO gets no such
+// policy from us, so deriving a public origin there would advertise a URL that
+// very likely 403s in place of the working authorized proxy URL.
+export function stackResolvedMinioEndpoint(
+  connections: { s3Config?: { endpoint: string } | undefined } | null | undefined
+): string | undefined {
+  if (envOverrideConnectionsActive()) return undefined;
+  return connections?.s3Config?.endpoint;
 }
 
 // Build connections from explicit environment variables (local dev / ops
@@ -261,7 +422,14 @@ function buildConnectionsFromStack(
 // bypassing the parameter store. The env values are used verbatim — COUCHDB_URL
 // is expected to already carry any credentials it needs, and MinIO uses the
 // MINIO_ACCESS_KEY/MINIO_SECRET_KEY pair.
-function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefined {
+function buildEnvConnections(
+  oscContext: Context,
+  // Where the durable comment store (issue #1046) and the durable log store
+  // (#996 review finding 2) report their own failures instead of swallowing
+  // them, and where the env-override object-store client construction is logged
+  // on the same seam as the per-stack one (issue #1093).
+  log: StackResolverLogger
+): WorkspaceConnections | undefined {
   const couchUrl = process.env['COUCHDB_URL'];
   const minioUrl = process.env['MINIO_URL'];
   if (!couchUrl && !minioUrl) return undefined;
@@ -280,8 +448,15 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
   // (listOldestPage/purgeEntry) — so the retention sweep runs on the in-memory
   // env path too, not just Couch.
   let audit: AuditRepository & AuditEmitter & AuditRetentionRepository;
+  // Operational log store (issue #996): durable on the Couch env path so
+  // GET /api/v1/logs survives a restart there too, in-memory when no COUCHDB_URL
+  // is configured.
+  let logs: LogSink & LogReader & LogRetentionStore;
   let profiles: ProfileRepository;
   let pipelines: PipelineRepository;
+  // Asset comments: always present, Couch-backed on the couch env path and
+  // in-memory otherwise (issue #1046) — same always-present shape as `audit`.
+  let comments: CommentRepository;
 
   if (couchUrl) {
     const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
@@ -295,7 +470,11 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     webhooks = new CouchWebhookRepository(wc);
     profiles = new CouchProfileRepository(wc);
     pipelines = new CouchPipelineRepository(wc);
+    comments = new CouchCommentRepository(wc, log);
     audit = new CouchAuditRepository(wc);
+    // `log` so a failed overflow eviction or an over-cap read window is reported
+    // instead of swallowed (#996 review finding 2).
+    logs = new CouchLogStore(wc, { log });
   } else {
     const mem = new InMemoryAssetRepository();
     assets = mem;
@@ -303,10 +482,17 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     webhooks = new InMemoryWebhookRepository();
     collections = new InMemoryCollectionRepository();
     audit = new InMemoryAuditRepository();
+    // No COUCHDB_URL on the env-override path: nothing to persist to, so the
+    // process-local store (shared for the process, see fallbackLogStore).
+    logs = fallbackLogStore;
     // Search projects assets + collections (issue #561).
     search = new InMemorySearchRepository(mem, collections);
     profiles = new InMemoryProfileRepository();
     pipelines = new InMemoryPipelineRepository();
+    // MINIO_URL set but no COUCHDB_URL: nothing durable to store comments in on
+    // this path, so they are ephemeral. PerWorkspaceCommentRepository warns when
+    // it resolves to this implementation.
+    comments = new InMemoryCommentRepository();
   }
 
   let storageFor: StorageFactory | undefined;
@@ -325,6 +511,15 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     });
     const client = storageClient;
     storageFor = () => new WorkspaceStorage(client, sourceBucket);
+    // Same construction log as the per-stack path (issue #1093). `stackName` is
+    // undefined here because the env override is not a stack record, which is
+    // itself the useful signal: a deployment logging this line is not routing
+    // per stack at all. Endpoint HOST only; MINIO_SECRET_KEY is never logged.
+    logObjectStoreClient(log, {
+      source: 'env-override',
+      stackName: undefined,
+      endpoint: minioUrl
+    });
   }
 
   const encoreUrl = process.env['ENCORE_URL'];
@@ -336,10 +531,21 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     : undefined;
 
   return {
-    assets, jobs, search, webhooks, collections, audit, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, audit, logs, profiles, pipelines, comments,
     storageFor, storageClient, encore,
     sourceBucket, packagedBucket,
-    s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined,
+    s3Config: minioUrl
+      ? {
+          endpoint: minioUrl,
+          accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin',
+          secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '',
+          // Not a stack record, so there is no stack identity to tag the
+          // credential with (issue #1093) — and therefore nothing for the
+          // submit-time assertion to compare, which leaves the env-override
+          // path's behaviour unchanged.
+          stackName: undefined
+        }
+      : undefined,
     // The env-override path has no parameter-store record, so no per-role
     // backend metadata: delivery keeps its default (proxied) behaviour.
     storage: undefined,
@@ -348,7 +554,10 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     // OPTIONAL subtitles/scene-detect steps stay disabled here and skip
     // gracefully, exactly as when the name is absent from a record.
     subtitleGenerator: undefined,
-    sceneDetector: undefined
+    sceneDetector: undefined,
+    // Not a stack record: the env override is one global set of coordinates, so
+    // there is no stack identity to compare against (issue #1058).
+    stackName: undefined
   };
 }
 
@@ -358,12 +567,19 @@ function buildInMemoryConnections(): WorkspaceConnections {
   const webhooks = new InMemoryWebhookRepository();
   const collections = new InMemoryCollectionRepository();
   const audit = new InMemoryAuditRepository();
+  // No stack => no durable store: the process-local log store (issue #996),
+  // shared across rebuilds (see fallbackLogStore). The no-storage fallback
+  // persists nothing else either.
+  const logs = fallbackLogStore;
   // Search projects assets + collections (issue #561).
   const search = new InMemorySearchRepository(assets, collections);
   const profiles = new InMemoryProfileRepository();
   const pipelines = new InMemoryPipelineRepository();
+  // No stack resolved (no parameter store / non-ready / invalid config): comments
+  // are ephemeral here, which PerWorkspaceCommentRepository warns about.
+  const comments = new InMemoryCommentRepository();
   return {
-    assets, jobs, search, webhooks, collections, audit, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, audit, logs, profiles, pipelines, comments,
     storageFor: undefined, storageClient: undefined,
     encore: undefined,
     sourceBucket: 'openvideocore-source',
@@ -371,151 +587,79 @@ function buildInMemoryConnections(): WorkspaceConnections {
     s3Config: undefined,
     storage: undefined,
     subtitleGenerator: undefined,
-    sceneDetector: undefined
+    sceneDetector: undefined,
+    // No stack record behind the no-storage fallback (issue #1058).
+    stackName: undefined
   };
 }
 
-export const STACK_CONFIG_NAMESPACE = "default";
-
-// Explicit operator-set workspace id (12-factor: config via env). When set and
-// well-formed this WINS over every other source and is never persisted — an
-// operator who pins the namespace in the deployment's environment gets exactly
-// that namespace on every boot, with no OSC round-trip at all. Follows the
-// existing OVC_* convention (OVC_TRUST_ROLE_HEADER, src/main.ts:447).
-export const WORKSPACE_ID_ENV_VAR = 'OVC_WORKSPACE_ID';
-
-// Fixed key under which the deployment's workspace id is PINNED the first time
-// it is confidently derived (normally during provisioning), and read back on
-// every later boot. Deliberately NOT namespaced by the workspace id — it is the
-// value that yields the namespace — but prefixed with `openvideocore/` like
-// every other key this app writes (stackConfigKey, param-store.ts:131) so it is
-// distinguishable from any other consumer of the store.
+// The parameter-store namespace segment, for every read and every write.
 //
-// SECURITY (issue #712/#776): the config-service instance this key lives in is
-// the deployment's OWN (resolved from PARAMETER_STORE_INSTANCE_NAME against the
-// deployment's own authenticated Context, param-store.ts:724-740), so the pin is
-// only readable/writable by this deployment. Reading it back is NOT cross-tenant
-// probing: it yields this deployment's own id, and the only other namespace ever
-// read anywhere remains the literal `default` compatibility shim.
-export const WORKSPACE_ID_PIN_KEY = 'openvideocore/_meta/workspace-id';
-
-// Narrow read/write view over the parameter store used ONLY for the workspace-id
-// pin and for seeding it from this deployment's existing stack configs.
-// Structurally satisfied by ConfigKvStore (param-store.ts:602-608, get/set/
-// delete/listByPrefix over the same eyevinn-app-config-svc HTTP contract), so
-// main.ts can pass the store it already builds with configKvStoreFromEnv. Kept
-// narrow so a caller/test can supply a two- or three-method stub.
-export type WorkspaceIdStore = {
-  get(key: string): Promise<string | undefined>;
-  set(key: string, value: string): Promise<void>;
-  // Optional because the seed step degrades gracefully without it: a store that
-  // cannot enumerate keys simply skips seeding and falls through to deriving the
-  // id from OSC. Signature copied verbatim from ConfigKvStore.listByPrefix
-  // (param-store.ts:607 —
-  //   listByPrefix(prefix: string): Promise<Array<{ key: string; value: string }>>
-  // ), implemented against GET /api/v1/config?limit=N (param-store.ts:684-697).
-  listByPrefix?(prefix: string): Promise<Array<{ key: string; value: string }>>;
-};
+// `openvideocore/<namespace>/<stackName>` (stackConfigKey, param-store.ts:131-133)
+// has THREE segments, and the middle one is a CONSTANT — not a derived tenant id
+// (issue #804).
+//
+// Why it cannot be anything else. The store is a single eyevinn-app-config-svc
+// instance per deployment (DEFAULT_PARAM_STORE_INSTANCE_NAME = 'ovcconfig',
+// param-store.ts:704), resolved through the deployment's OWN authenticated
+// Context (param-store.ts:759). One deployment therefore sees exactly one store,
+// and one deployment serves exactly one tenant:
+//   - ADR-018 "Interaction with structural per-deployment tenant isolation":
+//     "One deployed stack == one tenant's workspace ... DEPLOYMENT_CONTEXT =
+//     'default' remains a fixed deployment-wide constant, not a request-derived
+//     identifier."
+//   - ADR-020 Decision 1: "One deployed open-videocore instance is one tenant",
+//     and #579/#580 "MUST NOT introduce a per-request tenant/workspace
+//     dimension".
+// So `<namespace>` can only ever hold ONE value inside any given store. It
+// cannot discriminate between tenants, now or ever, and deriving it correctly
+// would be machinery for a distinction that cannot exist.
+//
+// Many stacks in one store still do not collide: stacks are keyed by NAME in the
+// last segment, which is already the discriminator. Collapsing the middle
+// segment to this constant leaves stack separation intact.
+export const STACK_CONFIG_NAMESPACE = "default";
 
 // Shared prefix of every key this app writes to the config service. Both key
 // shapes in the store start with it:
-//   openvideocore/<workspaceId>/<stackName>          (stackConfigKey, param-store.ts:131-133)
+//   openvideocore/<namespace>/<stackName>          (stackConfigKey, param-store.ts:131-133)
 //   openvideocore/storagebackends/<workspaceId>/<id> (storage-backend-registry.ts:321)
 const OVC_KEY_PREFIX = 'openvideocore/';
 
 // First key segments after OVC_KEY_PREFIX that are FIXED literals rather than a
-// workspace id, and must therefore never be mistaken for one when seeding:
-//   `_meta`           — this module's own pin key (WORKSPACE_ID_PIN_KEY)
+// namespace, and must therefore never be mistaken for a stale one when scanning:
+//   `_meta`           — reserved for this app's own metadata keys
 //   `storagebackends` — the storage-backend registry's key space
 //                       (backendRecordKey, storage-backend-registry.ts:321), whose
 //                       workspace id is the SECOND segment, not the first.
 const RESERVED_KEY_SEGMENTS = new Set(['_meta', 'storagebackends']);
 
-// A workspace id must be usable as a single key segment in
-// `openvideocore/<workspaceId>/<name>` (param-store.ts:131) and in the
-// listStackNames prefix (param-store.ts:558). A value carrying `/` would break
-// both, so it is rejected rather than silently corrupting the key space.
-function isUsableWorkspaceId(value: unknown): value is string {
-  return (
-    typeof value === 'string' &&
-    value.trim().length > 0 &&
-    !value.includes('/')
-  );
-}
-
-// Read a tenant id from the OSC subscription list, or undefined when none can
-// be read (list unreachable, empty, or carrying no usable tenantId).
+// Narrow read view over the parameter store, used ONLY by the one-shot
+// stale-namespace migration below. Structurally satisfied by ConfigKvStore
+// (param-store.ts:602-608) over the same eyevinn-app-config-svc HTTP contract,
+// so main.ts can pass the store it already builds with configKvStoreFromEnv.
+// Kept to the single method the migration needs so a caller/test can supply a
+// one-method stub.
 //
-// DECLARED contract: @osaas/client-core admin.d.ts:2-5,42 —
-//   Subscription = { serviceId: string; tenantId: string }
-//   listSubscriptions(context: Context): Promise<Subscription[]>
+// `listByPrefix` signature copied verbatim from ConfigKvStore.listByPrefix
+// (param-store.ts:607 —
+//   listByPrefix(prefix: string): Promise<Array<{ key: string; value: string }>>
+// ), implemented against GET /api/v1/config?limit=N (param-store.ts).
 //
-// OBSERVED contract (read-only introspection against a live account,
-// 2026-09-24, logged in docs/osc-feedback/incoming-no-stable-deployment-identity-
-// in-sdk.md): the payload does NOT match the declaration. Of 13 returned
-// subscriptions, 10 carried NO `tenantId` field at all despite the type
-// declaring it non-optional, and the 3 that did carry it split across TWO
-// distinct values that look like the PUBLISHER/owner tenant of the subscribed
-// service rather than the subscriber's own identity.
-//
-// So this helper must be read for exactly what it is: a BEST-EFFORT last-resort
-// guess, not an identity lookup. The live API guarantees only that each entry
-// MAY carry some tenantId; it does not guarantee that value identifies the
-// caller, nor that the set is stable as the caller's subscriptions change. We
-// take the lexicographically smallest distinct value so the guess is at least
-// independent of list order, but subscribing to a service published by an
-// alphabetically-earlier tenant still changes it. That is precisely why
-// resolveWorkspaceId consults the pin and this deployment's own existing stack
-// configs FIRST, and only reaches this function when the store holds no evidence
-// at all.
-//
-// Returning undefined (rather than the `default` literal) is the point of this
-// helper: the caller can distinguish "OSC gave us something" from "OSC gave us
-// nothing", and decide separately whether it is safe to pin.
-async function readTenantIdFromOsc(osc: Context): Promise<string | undefined> {
-  try {
-    const subscriptions = await listSubscriptions(osc);
-    if (!Array.isArray(subscriptions)) return undefined;
-    const tenantIds = subscriptions
-      .map((s) => s?.tenantId)
-      .filter((id): id is string => isUsableWorkspaceId(id))
-      .map((id) => id.trim())
-      .sort();
-    return tenantIds[0];
-  } catch {
-    return undefined;
-  }
-}
-
-// Derive the deployment's workspace (tenant) id from the OSC Context alone.
-//
-// RETAINED as the last-resort derivation step of resolveWorkspaceId below and as
-// the pre-existing public helper. On its own it is NOT deterministic across
-// boots (issue #776): when the subscription list is momentarily empty or
-// unreachable it returns STACK_CONFIG_NAMESPACE instead of the id it returned on
-// the previous boot, and — per the live payload documented on readTenantIdFromOsc
-// — the ids it does see belong to the PUBLISHERS of the subscribed services, so
-// they can also change when this deployment subscribes to something new. Prefer
-// resolveWorkspaceId, which pins the namespace and, on an existing deployment,
-// seeds that pin from the stack configs already in this deployment's own store
-// rather than from OSC.
-//
-// FOLLOW-UP (issue #776 review): several read paths still address the parameter
-// store with the literal STACK_CONFIG_NAMESPACE instead of the resolved id —
-// src/main.ts (the /health + scaler/bootstrap reads), src/routes/storage.ts:260,
-// src/routes/export-destinations.ts:187, and src/routes/assets.ts:~1852/~2292.
-// They are unchanged here to keep this fix reviewable; converting them to
-// resolveWorkspaceId is tracked separately.
-export async function deriveWorkspaceId(osc: Context): Promise<string> {
-  return (await readTenantIdFromOsc(osc)) ?? STACK_CONFIG_NAMESPACE;
-}
+// BOUNDED. That implementation fetches ONE page of at most
+// CONFIG_LIST_PAGE_LIMIT entries — the service's schema maximum for `limit` —
+// and filters client-side, so a scan through this seam is a subset of the key
+// space, never a proof of absence. See the truncation check in
+// scanStaleNamespacedStacks.
+export type StackConfigKeyScanner = {
+  listByPrefix(prefix: string): Promise<Array<{ key: string; value: string }>>;
+};
 
 // True when a parsed store value looks like a persisted StackConfig
 // (param-store.ts:52-95: minioEndpoint / couchdbUrl / redisUrl are required
 // strings; storeStackConfig persists JSON.stringify(stackConfig),
-// param-store.ts:446). Used as EVIDENCE that a namespace belongs to this
-// deployment, so an unrelated record that happens to sit under the shared
-// `openvideocore/` prefix cannot seed the pin.
+// param-store.ts:446). Used so an unrelated record that happens to sit under the
+// shared `openvideocore/` prefix cannot be mistaken for a stack config.
 function looksLikeStackConfig(value: string): boolean {
   let parsed: unknown;
   try {
@@ -532,70 +676,122 @@ function looksLikeStackConfig(value: string): boolean {
   );
 }
 
-// Recover the workspace id this deployment ALREADY writes its stacks under, by
-// reading its own config-service instance (issue #776 review).
+// One stack config found under a NON-`default` namespace segment in this
+// deployment's own store.
+type StaleNamespacedStack = { namespace: string; stackName: string };
+
+// ---------------------------------------------------------------------------
+// ONE-SHOT MIGRATION — REMOVAL CONDITION
 //
-// This is the only trustworthy source of the id once OSC's subscription list is
-// known not to identify the caller (see readTenantIdFromOsc). If a previous boot
-// wrote `openvideocore/<ns>/<stack>` into THIS store, then `<ns>` is by
-// construction the namespace this deployment's read side must use — regardless
-// of what any derivation would produce today.
+// Everything from here to the end of `migrateStaleNamespacedStack` exists ONLY
+// to converge deployments that were provisioned BEFORE issue #804, when
+// provision.ts wrote stack configs under a derived namespace while main.ts read
+// them under the `default` constant.
+//
+// REMOVE THIS BLOCK (and its tests) once no deployment in the field still holds
+// a stack config under a non-`default` namespace segment. Concretely, the
+// condition is:
+//
+//   (a) every deployment running a pre-#804 build has been restarted at least
+//       once on a post-#804 build with its parameter store reachable — one boot
+//       is enough, because the migration rewrites under `default` and the stale
+//       key is thereafter never read; AND
+//   (b) a scan of the fleet's config-service instances for keys matching
+//       `openvideocore/<ns>/<name>` with `ns !== 'default'` returns nothing.
+//
+// CAVEAT ON (b): criterion (b) is itself subject to list truncation. The config
+// service caps `limit` at CONFIG_LIST_PAGE_LIMIT (param-store.ts) and this
+// client fetches a single page, so "the scan returned nothing" is only
+// authoritative for a store whose key count fits in one page.
+// scanStaleNamespacedStacks warns when a page comes back full; treat (b) as
+// UNSATISFIED for any store that logged that warning, and enumerate that store
+// exhaustively (paginating with `offset`, or inspecting it directly) before
+// counting it as clean. Do not remove this block on the strength of an empty
+// scan that may have been cut off.
+//
+// This is BOUNDED by construction, not open-ended: ADR-018/ADR-020 fix one
+// deployment to one tenant and one store, so each affected store contains
+// exactly ONE stale namespace value — never an unbounded set. If a store somehow
+// contains several, this code refuses to guess and reports a genuine miss.
+//
+// Do not "improve" this into a general cross-namespace resolver. Reading a
+// namespace this deployment does not own is the isolation risk #712 closed, and
+// a vague, unbounded migration bridge is how this class of bug survived three
+// prior PRs (#712, #733/#751, #776/#777).
+// ---------------------------------------------------------------------------
+
+// Scan this deployment's OWN store for stack configs sitting under a namespace
+// segment other than `default`.
 //
 // NOT cross-tenant probing: the instance is the deployment's own (resolved from
 // PARAMETER_STORE_INSTANCE_NAME against its own authenticated Context,
-// param-store.ts:706-740) and every key read here was written by this
-// deployment. Nothing outside this store is consulted.
+// param-store.ts:747-765) and every key returned was written by this deployment.
+// Nothing outside this store is consulted.
 //
-// Conservative by design. A key only counts as evidence when:
-//   - it has the exact stack-config shape `openvideocore/<ns>/<name>`
-//     (stackConfigKey, param-store.ts:131-133) — exactly two segments after the
-//     shared prefix, which also excludes the four-segment storage-backend keys;
-//   - its first segment is not a reserved literal (RESERVED_KEY_SEGMENTS);
+// Conservative by design. A key only counts when:
+//   - it has the exact stack-config shape `openvideocore/<ns>/<name>` — exactly
+//     two segments after the shared prefix, which also excludes the
+//     four-segment storage-backend keys;
+//   - `<ns>` is a non-empty, non-reserved literal other than `default`;
 //   - its value parses as a StackConfig (looksLikeStackConfig).
 //
-// Outcomes:
-//   'seeded'    exactly one candidate namespace, ignoring the literal `default`
-//               when a tenant-scoped one is also present: `default` entries are
-//               either pre-#712 writes or the copy the #751 read fallback makes,
-//               so they never override a deployment's own tenant-scoped id. A
-//               store holding ONLY `default` entries seeds `default`, which is
-//               that deployment's real namespace.
-//   'ambiguous' several tenant-scoped namespaces — a history this code cannot
-//               disambiguate. The caller must NOT pin; an operator resolves it
-//               with OVC_WORKSPACE_ID.
-//   'unknown'   the list call threw. Same treatment as 'ambiguous': serve
-//               something for this resolve, pin nothing, retry next time.
-//   'none'      the store is enumerable and holds no stack config (a genuinely
-//               fresh deployment), or cannot enumerate at all (a caller that
-//               supplied a get/set-only store). Pinning a derived value is safe
-//               here because there is no existing config to strand.
-type StoredNamespaceEvidence =
-  | { kind: 'seeded'; workspaceId: string }
-  | { kind: 'ambiguous'; candidates: string[] }
-  | { kind: 'unknown' }
-  | { kind: 'none' };
-
-async function seedWorkspaceIdFromStoredStacks(
-  store: WorkspaceIdStore,
+// Returns [] on any failure: the migration is best-effort and a store blip must
+// degrade to "genuine miss", never to a throw on the read path.
+async function scanStaleNamespacedStacks(
+  scanner: StackConfigKeyScanner,
   log: StackResolverLogger
-): Promise<StoredNamespaceEvidence> {
-  if (typeof store.listByPrefix !== 'function') return { kind: 'none' };
+): Promise<StaleNamespacedStack[]> {
   let entries: Array<{ key: string; value: string }>;
   try {
-    entries = await store.listByPrefix(OVC_KEY_PREFIX);
+    entries = await scanner.listByPrefix(OVC_KEY_PREFIX);
   } catch (err) {
     log.warn(
       {
         err: err instanceof Error ? { message: err.message } : String(err),
         prefix: OVC_KEY_PREFIX
       },
-      'workspace id: could not list this deployment\'s existing stack configs; resolving without pinning'
+      'stale-namespace migration: could not list this deployment\'s config keys; treating as a genuine miss'
     );
-    return { kind: 'unknown' };
+    return [];
   }
-  if (!Array.isArray(entries)) return { kind: 'unknown' };
+  if (!Array.isArray(entries)) return [];
 
-  const namespaces = new Set<string>();
+  // TRUNCATION CHECK (review follow-up on #804).
+  //
+  // listByPrefix reads ONE page of at most CONFIG_LIST_PAGE_LIMIT entries and
+  // filters by prefix client-side (param-store.ts). The config service caps
+  // `limit` at that value by schema and this client does not paginate, so a
+  // store holding more keys than one page cannot be fully enumerated here.
+  //
+  // `entries` is already prefix-filtered, so its length is <= the page size.
+  // That makes `length === CONFIG_LIST_PAGE_LIMIT` a SUFFICIENT but not
+  // NECESSARY signal: reaching the cap proves the page was full (and therefore
+  // that keys may have been cut off), while a shorter result does not prove the
+  // page was short. The check is deliberately one-directional — it can
+  // under-warn, but it never warns about a scan that was actually complete.
+  //
+  // Why this matters: every conclusion this migration draws from an EMPTY or
+  // PARTIAL scan ("nothing stale to adopt") is only as authoritative as the
+  // scan. Without this warning, a deployment whose stale key sits past the page
+  // boundary would never converge and would look identical in the logs to one
+  // with nothing to migrate. With it, a non-converging deployment is
+  // diagnosable from logs alone.
+  if (entries.length >= CONFIG_LIST_PAGE_LIMIT) {
+    log.warn(
+      {
+        prefix: OVC_KEY_PREFIX,
+        returned: entries.length,
+        pageLimit: CONFIG_LIST_PAGE_LIMIT
+      },
+      'stale-namespace migration: config-key scan filled the config service\'s maximum page ' +
+        'size, so it may be TRUNCATED and this migration result is NOT authoritative — a ' +
+        'reported "nothing to migrate" may simply be a stale key past the page boundary. ' +
+        'If a stack is still unresolvable, enumerate the store manually before concluding ' +
+        'the migration is complete.'
+    );
+  }
+
+  const found: StaleNamespacedStack[] = [];
   for (const entry of entries) {
     if (!entry || typeof entry.key !== 'string' || typeof entry.value !== 'string') {
       continue;
@@ -603,208 +799,86 @@ async function seedWorkspaceIdFromStoredStacks(
     if (!entry.key.startsWith(OVC_KEY_PREFIX)) continue;
     const segments = entry.key.slice(OVC_KEY_PREFIX.length).split('/');
     if (segments.length !== 2) continue;
-    const ns = segments[0];
-    if (!isUsableWorkspaceId(ns) || RESERVED_KEY_SEGMENTS.has(ns)) continue;
+    const namespace = segments[0]!;
+    const stackName = segments[1]!;
+    if (namespace.length === 0 || stackName.length === 0) continue;
+    if (namespace === STACK_CONFIG_NAMESPACE) continue;
+    if (RESERVED_KEY_SEGMENTS.has(namespace)) continue;
     if (!looksLikeStackConfig(entry.value)) continue;
-    namespaces.add(ns);
+    found.push({ namespace, stackName });
   }
-
-  const tenantScoped = [...namespaces]
-    .filter((ns) => ns !== STACK_CONFIG_NAMESPACE)
-    .sort();
-  if (tenantScoped.length === 1) {
-    return { kind: 'seeded', workspaceId: tenantScoped[0]! };
-  }
-  if (tenantScoped.length > 1) {
-    log.warn(
-      { namespaces: tenantScoped, prefix: OVC_KEY_PREFIX },
-      `workspace id: this store holds stack configs under several namespaces; refusing to pin from ambiguous evidence — set ${WORKSPACE_ID_ENV_VAR} to resolve it`
-    );
-    return { kind: 'ambiguous', candidates: tenantScoped };
-  }
-  if (namespaces.has(STACK_CONFIG_NAMESPACE)) {
-    return { kind: 'seeded', workspaceId: STACK_CONFIG_NAMESPACE };
-  }
-  return { kind: 'none' };
+  return found;
 }
 
-// Where a resolved workspace id came from. Surfaced on the diagnostic log line
-// so an operator can tell a pinned (deterministic) resolution from a seeded,
-// derived or fallback one without reading code.
-export type WorkspaceIdSource = 'env' | 'pinned' | 'seeded' | 'derived' | 'fallback';
-
-export type WorkspaceIdResolution = {
-  workspaceId: string;
-  source: WorkspaceIdSource;
-  // True when the value is guaranteed to repeat on the next boot with no config
-  // change: an explicit env var, a value read back from the pin, or a value the
-  // pin write for THIS resolve actually persisted.
-  //
-  // False when the value is served for this resolve only and nothing durable
-  // backs it: the `default` fallback, and — importantly — a seeded/derived value
-  // whose pin write THREW (the write is best-effort, workspace-stack.ts pinOnce).
-  // Reporting true there would advertise and memoise a value the next boot has no
-  // record of (issue #776 review, finding 2).
-  deterministic: boolean;
-};
-
-export type ResolveWorkspaceIdOptions = {
-  // Pin store. When omitted, resolution degrades to the pre-#776 derive-only
-  // behaviour (env var still wins) — used by callers/tests that have no store.
-  store?: WorkspaceIdStore;
-  log?: StackResolverLogger;
-};
-
-// Resolve the deployment's parameter-store namespace DETERMINISTICALLY.
+// Adopt a pre-#804 stack config and rewrite it under `default`.
 //
-// This is the SINGLE source of truth for the namespace and is called by BOTH
-// sides of the read/write contract so their keys provably agree:
-//   - the provision/deprovision routes (write side, src/routes/provision.ts)
-//     namespace every storeStackConfig/loadStackConfig/listStackNames by this id;
-//   - the runtime resolver below (read side) resolves the same namespace before
-//     every listStackNames/loadStackConfig.
+// Called only after a `default` read MISSED. Returns the adopted config, or
+// undefined when there is nothing unambiguous to adopt.
 //
-// Resolution order — each step is stable across boots of the SAME deployment:
-//   1. `OVC_WORKSPACE_ID` env var (explicit operator config, 12-factor). Never
-//      persisted; it is already deterministic by construction.
-//   2. The PINNED value read back from the deployment's own parameter store
-//      (WORKSPACE_ID_PIN_KEY). Written once and read back on every boot
-//      thereafter. This is what makes the namespace independent of the OSC
-//      subscription set (issue #776 cause): the pin does not change when service
-//      instances are created or destroyed between boots.
-//   3. SEED from this deployment's OWN existing stack configs
-//      (seedWorkspaceIdFromStoredStacks) when no pin exists yet. This step is
-//      what makes the pin safe to introduce on an UPGRADE path: a deployment
-//      already running post-#712 has its stack configs under some namespace X,
-//      and X — not whatever OSC would produce today — is the namespace its read
-//      side must keep using. Without this step the first boot after upgrading
-//      could derive a different Y, pin Y, and be permanently unable to resolve
-//      its own stack (issue #776 review, finding 1). Pinned best-effort.
-//   4. A tenant id derived from OSC (readTenantIdFromOsc) when step 3 found no
-//      stack config to seed from. Read its header: the live subscription payload
-//      does NOT reliably identify the caller, which is why this is last. It is
-//      PINNED only when the store is known to hold no stack config (a fresh
-//      deployment, where any self-consistent namespace is correct because nothing
-//      has been written yet); when the stored evidence was ambiguous or could not
-//      be read, the derived value is served for this resolve and NOT pinned.
-//   5. STACK_CONFIG_NAMESPACE (`default`) when nothing above produced a value.
-//      This branch deliberately does NOT pin: pinning a `default` we only chose
-//      because reads failed would permanently strand a deployment whose stacks
-//      live under a tenant-scoped key — the exact direction-2 failure issue #776
-//      reports, which the #751 read fallback does not cover. Leaving the pin
-//      unset lets the next healthy boot seed/derive the real id instead.
+// `stackName` narrows the scan to one stack name when the caller is looking for
+// a specific stack; when omitted, any single stale stack qualifies (the
+// "list the workspace's stacks" path).
 //
-// Every store read/write here is best-effort: a failure is logged and falls
-// through to the next step, so a parameter-store blip can never make the
-// namespace unresolvable. A failed pin WRITE additionally clears `deterministic`
-// so the caller neither memoises nor advertises a value nothing persisted.
-export async function resolveWorkspaceId(
-  osc: Context,
-  opts: ResolveWorkspaceIdOptions = {}
-): Promise<WorkspaceIdResolution> {
-  const log = opts.log ?? noopLogger;
+// Refuses to guess. Zero matches, or MORE than one distinct stale namespace,
+// both behave as a genuine miss — an ambiguous store is a history this code
+// cannot disambiguate, and picking one would strand the other.
+//
+// The rewrite is best-effort: if the write throws we still serve the adopted
+// config for this call and the next miss retries it.
+async function migrateStaleNamespacedStack(
+  ps: ParamStore,
+  scanner: StackConfigKeyScanner | undefined,
+  log: StackResolverLogger,
+  stackName?: string
+): Promise<{ name: string; config: StackConfig } | undefined> {
+  if (!scanner) return undefined;
+  const candidates = await scanStaleNamespacedStacks(scanner, log);
+  const matching = stackName
+    ? candidates.filter((c) => c.stackName === stackName)
+    : candidates;
+  if (matching.length === 0) return undefined;
 
-  // Best-effort pin write. Returns TRUE only when the value actually reached the
-  // store, which is what `deterministic` reports (issue #776 review, finding 2):
-  // a throw here means the next boot finds nothing pinned, so this resolve must
-  // not claim stability it does not have.
-  async function pinOnce(
-    store: WorkspaceIdStore | undefined,
-    value: string,
-    how: WorkspaceIdSource
-  ): Promise<boolean> {
-    if (!store) return false;
-    try {
-      await store.set(WORKSPACE_ID_PIN_KEY, value);
-      log.info(
-        { key: WORKSPACE_ID_PIN_KEY, workspaceId: value, source: how },
-        'workspace id: pinned; later boots read it back instead of re-resolving it'
-      );
-      return true;
-    } catch (err) {
-      // Non-fatal: serve the value now and retry the pin on the next resolve.
-      log.warn(
-        {
-          err: err instanceof Error ? { message: err.message } : String(err),
-          key: WORKSPACE_ID_PIN_KEY,
-          workspaceId: value,
-          source: how
-        },
-        'workspace id: pin write failed; serving the resolved id without pinning it and will retry on the next resolve'
-      );
-      return false;
-    }
-  }
-
-  // 1. Explicit operator config wins outright and costs no round-trip.
-  const configured = process.env[WORKSPACE_ID_ENV_VAR];
-  if (configured !== undefined && configured.trim().length > 0) {
-    if (isUsableWorkspaceId(configured)) {
-      return { workspaceId: configured.trim(), source: 'env', deterministic: true };
-    }
+  const namespaces = new Set(matching.map((c) => c.namespace));
+  if (namespaces.size > 1) {
     log.warn(
-      { env: WORKSPACE_ID_ENV_VAR },
-      'ignoring configured workspace id: it must not contain "/" (it is a single parameter-store key segment)'
+      { namespaces: [...namespaces].sort(), stackName: stackName ?? '(any)' },
+      'stale-namespace migration: this store holds stack configs under several non-default namespaces; refusing to guess which one to adopt'
+    );
+    return undefined;
+  }
+  const staleNamespace = matching[0]!.namespace;
+  // With a single stale namespace, an unnamed scan may still see several stacks
+  // in it. Adopt the first by name so the choice is order-independent, and let
+  // subsequent calls migrate the rest.
+  const names = [...new Set(matching.map((c) => c.stackName))].sort();
+  const name = stackName ?? names[0]!;
+
+  const config = await ps.loadStackConfig(staleNamespace, name);
+  if (!config) return undefined;
+
+  try {
+    await ps.storeStackConfig(STACK_CONFIG_NAMESPACE, name, config);
+    log.info(
+      {
+        op: 'migrateStackConfig',
+        from: staleNamespace,
+        to: STACK_CONFIG_NAMESPACE,
+        name
+      },
+      'migrated a pre-#804 stack config from its stale namespace segment to the constant namespace'
+    );
+  } catch (err) {
+    log.warn(
+      {
+        err: err instanceof Error ? { message: err.message } : String(err),
+        from: staleNamespace,
+        to: STACK_CONFIG_NAMESPACE,
+        name
+      },
+      'adopted a pre-#804 stack config but the rewrite under the constant namespace failed; will retry on the next miss'
     );
   }
-
-  // 2. Read back the pin written at provisioning time.
-  const store = opts.store;
-  if (store) {
-    try {
-      const pinned = await store.get(WORKSPACE_ID_PIN_KEY);
-      if (isUsableWorkspaceId(pinned)) {
-        return { workspaceId: pinned.trim(), source: 'pinned', deterministic: true };
-      }
-    } catch (err) {
-      log.warn(
-        {
-          err: err instanceof Error ? { message: err.message } : String(err),
-          key: WORKSPACE_ID_PIN_KEY
-        },
-        'workspace id: pin read failed; falling back to deriving it from OSC'
-      );
-    }
-  }
-
-  // 3. No pin yet: seed it from the namespace this deployment's OWN stack
-  // configs already live under, BEFORE considering any OSC-derived value. On an
-  // upgrade path this is the only correct answer — see the header note and
-  // seedWorkspaceIdFromStoredStacks.
-  const evidence = store
-    ? await seedWorkspaceIdFromStoredStacks(store, log)
-    : ({ kind: 'none' } as StoredNamespaceEvidence);
-  if (evidence.kind === 'seeded') {
-    const pinned = await pinOnce(store, evidence.workspaceId, 'seeded');
-    return {
-      workspaceId: evidence.workspaceId,
-      source: 'seeded',
-      deterministic: pinned
-    };
-  }
-
-  // 4. No existing stack config to seed from. Fall back to whatever OSC reports.
-  // It is pinned ONLY when the store is known to hold no stack config at all
-  // (`none`) — a genuinely fresh deployment, where any self-consistent namespace
-  // is correct because nothing has been written yet, so making this first choice
-  // durable is exactly right. When the evidence is ambiguous or could not be read
-  // (`ambiguous` / `unknown`) the derived value is served for this resolve but
-  // NOT pinned: turning a possibly-wrong guess into a permanent one is the
-  // upgrade-path hazard this step exists to avoid (issue #776 review, finding 1).
-  const tenantId = await readTenantIdFromOsc(osc);
-  if (tenantId) {
-    const pinned =
-      evidence.kind === 'none' ? await pinOnce(store, tenantId, 'derived') : false;
-    return { workspaceId: tenantId, source: 'derived', deterministic: pinned };
-  }
-
-  // 5. Nothing to pin at all. Serve `default` for this resolve WITHOUT pinning
-  // it (see the header note).
-  return {
-    workspaceId: STACK_CONFIG_NAMESPACE,
-    source: 'fallback',
-    deterministic: false
-  };
+  return { name, config };
 }
 
 export class WorkspaceStackResolver {
@@ -819,18 +893,10 @@ export class WorkspaceStackResolver {
   // last-known-good) so an operator can detect a degraded-but-not-crashed
   // instance via /health without logs.
   private resolverHealth: ResolverHealthSignal | undefined;
-  // Pin store for the deterministic workspace id (issue #776). Optional: when
-  // omitted the resolver degrades to derive-only namespace resolution, which is
-  // what every existing caller/test that wires no store already got.
-  private workspaceIdStore: WorkspaceIdStore | undefined;
-  // Memoised namespace for this process. Only a DETERMINISTIC resolution (env /
-  // pinned / seeded-or-derived AND successfully pinned) is memoised: the
-  // `default` fallback — and any resolution whose pin write threw — is
-  // deliberately NOT cached, so a boot that started before the pin existed
-  // re-resolves and picks the pin up instead of staying stuck on a value nothing
-  // persisted for the life of the process. Cleared by
-  // invalidate() so a provision that establishes the pin is seen immediately.
-  private namespaceMemo: string | undefined;
+  // Key scanner backing the one-shot pre-#804 stale-namespace migration.
+  // Optional: without it a `default` miss is simply a miss, which is the correct
+  // behaviour for every deployment provisioned after #804.
+  private staleNamespaceScanner: StackConfigKeyScanner | undefined;
   // Diagnostic/observability logger. `info`/`warn` carry the read-path
   // diagnostics (issue #415: (namespace, stack name) correlation on each
   // resolve); `error` surfaces a transient parameter-store refresh failure
@@ -841,6 +907,11 @@ export class WorkspaceStackResolver {
   constructor(opts: {
     paramStore: ParamStore | undefined;
     oscContext: Context;
+    // MINIO_ROOT_PASSWORD. Since #1094 this value has TWO roles, both handled
+    // by resolveObjectStoreCredential in buildConnectionsFromStack: it is the
+    // HMAC seed the per-stack object-store credential is derived from, and it is
+    // the legacy deployment-wide secret used for a stack provisioned before
+    // #1094 (i.e. one whose stored config carries no objectStoreAccessKeyId).
     minioPassword: string;
     couchPassword: string;
     // Builders that activate the OPTIONAL subtitles/scene-detect steps from the
@@ -852,12 +923,11 @@ export class WorkspaceStackResolver {
     // degraded fallback (no-storage / stale last-known-good) so an operator can
     // detect a degraded-but-not-crashed instance via /health without logs.
     resolverHealth?: ResolverHealthSignal;
-    // Pin store backing the deterministic workspace id (issue #776). The SAME
-    // store the provision route is given, so the namespace the resolver READS
-    // under is the one provisioning PINNED. Optional: without it the resolver
-    // falls back to deriving the namespace from OSC on every resolve (pre-#776
-    // behaviour), which is not stable across boots.
-    workspaceIdStore?: WorkspaceIdStore;
+    // Key scanner over this deployment's OWN config-service instance, used ONLY
+    // by the bounded one-shot migration of pre-#804 stack configs written under
+    // a derived namespace segment (see the REMOVAL CONDITION block above).
+    // Optional: omit it and a `default` miss stays a plain miss.
+    staleNamespaceScanner?: StackConfigKeyScanner;
     // Injected logger so read-path diagnostics (issue #415) and transient
     // parameter-store refresh failures (issue #419) are observable. Optional;
     // defaults to a noop for callers/tests that don't wire one.
@@ -869,103 +939,69 @@ export class WorkspaceStackResolver {
     this.couchPassword = opts.couchPassword;
     this.optionalSteps = opts.optionalSteps ?? {};
     this.resolverHealth = opts.resolverHealth;
-    this.workspaceIdStore = opts.workspaceIdStore;
+    this.staleNamespaceScanner = opts.staleNamespaceScanner;
     this.log = opts.log ?? noopLogger;
   }
 
-  // Resolve the parameter-store namespace for this deployment (issue #776).
-  //
-  // Delegates to the shared resolveWorkspaceId — the SAME function the provision
-  // route writes under — so the resolver's read key provably equals the provision
-  // write key. The result is memoised for the life of the process ONLY when it is
-  // deterministic (env / pinned / seeded-or-derived AND successfully pinned); a
-  // non-deterministic resolution is re-resolved every time so the process picks
-  // up the pin as soon as one actually exists.
-  private async resolveNamespace(): Promise<string> {
-    if (this.namespaceMemo !== undefined) return this.namespaceMemo;
-    const resolution = await resolveWorkspaceId(this.oscContext, {
-      ...(this.workspaceIdStore ? { store: this.workspaceIdStore } : {}),
-      log: this.log
-    });
-    if (resolution.deterministic) {
-      this.namespaceMemo = resolution.workspaceId;
-    }
-    return resolution.workspaceId;
-  }
-
-  // Read a stack config for the derived namespace, with a one-shot read-side
-  // compatibility fallback to the literal `default` namespace for stacks
-  // provisioned before the tenant-scoped namespace landed (issue #712/#733).
+  // Read a stack config under the CONSTANT namespace (issue #804), with a
+  // bounded one-shot fallback that adopts a pre-#804 config still sitting under
+  // a derived namespace segment and rewrites it under the constant.
   //
   // Order:
-  //   1. Read `loadStackConfig(namespace, name)` — the tenant-scoped key. A hit
-  //      returns immediately, so a stack provisioned AFTER #712 takes NO fallback
-  //      read on its hit path (issue #733 acceptance criterion).
-  //   2. On a miss, and only when the derived namespace is NOT already the literal
-  //      `default`, retry ONCE under `default`. This is the sole legacy namespace;
-  //      we never read another tenant's namespace and never scan across namespaces
-  //      (issue #733 security constraint — anything broader reintroduces the
-  //      cross-workspace leakage #712 closed).
-  //   3. On a legacy hit, migrate-on-read: write the config to the tenant-scoped
-  //      key and log at info, so the fallback is taken at most once per stack. The
-  //      migrate is best-effort — if the write throws, we still serve the resolved
-  //      config for this request and the next resolve retries the migrate.
-  private async loadStackConfigWithLegacyFallback(
+  //   1. `loadStackConfig(STACK_CONFIG_NAMESPACE, name)`. A hit returns
+  //      immediately — every stack provisioned on a post-#804 build takes NO
+  //      fallback read at all.
+  //   2. On a miss, the one-shot migration: scan THIS deployment's own store for
+  //      a config for `name` under a single non-`default` namespace, adopt it,
+  //      and rewrite it under the constant. Zero matches, or more than one stale
+  //      namespace, behave as a genuine miss — see the REMOVAL CONDITION block.
+  private async loadStackConfigWithMigration(
     ps: ParamStore,
-    namespace: string,
     name: string
   ): Promise<StackConfig | undefined> {
-    const direct = await ps.loadStackConfig(namespace, name);
+    const direct = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, name);
     if (direct) return direct;
-    // A deployment whose OWN namespace IS the literal `default` has already had
-    // it read above, so there is nothing to fall back to and no second read is
-    // issued. This guard is deliberately NOT widened (issue #776): the failure it
-    // used to expose — a tenant-scoped stack booting under a spuriously-derived
-    // `default` and finding nothing — is closed at the cause by the pinned,
-    // deterministic namespace (resolveWorkspaceId), not by reading a namespace
-    // this deployment does not own. Widening it would mean probing namespaces
-    // across tenants, which is the isolation risk #712 closed.
-    if (namespace === STACK_CONFIG_NAMESPACE) return undefined;
-    const legacy = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, name);
-    if (!legacy) return undefined;
-    try {
-      await ps.storeStackConfig(namespace, name, legacy);
-      this.log.info(
-        { op: 'migrateStackConfig', from: STACK_CONFIG_NAMESPACE, to: namespace, name },
-        'migrated legacy default-namespaced stack config to tenant-scoped key'
-      );
-    } catch (err) {
-      // A failed migrate is non-fatal: serve the legacy config this request and
-      // let the next resolve retry the write. Never fail the resolve on it.
-      this.log.warn(
-        {
-          err: err instanceof Error ? { message: err.message } : String(err),
-          from: STACK_CONFIG_NAMESPACE,
-          to: namespace,
-          name
-        },
-        'resolved legacy default-namespaced stack config but migrate-on-read write failed; will retry next resolve'
-      );
-    }
-    return legacy;
+    const migrated = await migrateStaleNamespacedStack(
+      ps,
+      this.staleNamespaceScanner,
+      this.log,
+      name
+    );
+    return migrated?.config;
   }
 
-  // List stack names for the derived namespace, with the same one-shot fallback
-  // to the literal `default` namespace (issue #733). Without this, a pre-#712
-  // stack whose names live only under `default/` stays invisible to the resolver's
-  // "first listed stack" path even when its config could be read directly. Falls
-  // back ONLY when the tenant-scoped listing is empty and the namespace is not
-  // already `default`; never scans other namespaces (issue #733 security
-  // constraint). Migration of the individual config happens on the subsequent
-  // load via loadStackConfigWithLegacyFallback.
-  private async listStackNamesWithLegacyFallback(
-    ps: ParamStore,
-    namespace: string
-  ): Promise<string[]> {
-    const direct = await ps.listStackNames(namespace);
+  // List stack names under the CONSTANT namespace, with the same bounded
+  // one-shot fallback (issue #804). Without this, a pre-#804 stack stays
+  // invisible to the resolver's "first listed stack" path. The subsequent
+  // per-name load goes through loadStackConfigWithMigration, which is what
+  // performs the rewrite.
+  //
+  // Order (issue #1165): the returned array is in creation order — oldest
+  // first, newest appended last — because that is ParamStore.listStackNames'
+  // documented contract (param-store.ts, `listStackNames` on the ParamStore
+  // interface) and the HTTP client imposes it with compareStackCreationOrder
+  // instead of passing the config service's unspecified `items` order through.
+  // Every default-stack resolution in this class takes element [0], so that
+  // ordering is the default-stack rule: the default is the first-created stack
+  // and provisioning another stack cannot change it. When an operator has set
+  // DEFAULT_STACK_NAME the client hoists that stack to element [0] instead, and
+  // the same "element [0] is the default" rule then honours the pin.
+  // Do not re-sort, reverse, or de-duplicate the result here.
+  //
+  // One caveat the contract states explicitly: stacks provisioned before
+  // creation times were recorded carry no instant, so several such stacks are
+  // ordered by name and their relative order is not the order they were created
+  // in. DEFAULT_STACK_NAME is the remedy for a deployment that needs a specific
+  // one of them to remain the default.
+  private async listStackNamesWithMigration(ps: ParamStore): Promise<string[]> {
+    const direct = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
     if (direct.length > 0) return direct;
-    if (namespace === STACK_CONFIG_NAMESPACE) return direct;
-    return ps.listStackNames(STACK_CONFIG_NAMESPACE);
+    const migrated = await migrateStaleNamespacedStack(
+      ps,
+      this.staleNamespaceScanner,
+      this.log
+    );
+    return migrated ? [migrated.name] : direct;
   }
 
   // Resolve the backing-service connections for a workspace. When `stackName`
@@ -981,7 +1017,7 @@ export class WorkspaceStackResolver {
     // Explicit env-var override (local dev / ops). When COUCHDB_URL or MINIO_URL
     // is set we build connections from the environment for ALL workspaces,
     // bypassing the parameter store entirely.
-    const envConnections = buildEnvConnections(this.oscContext);
+    const envConnections = buildEnvConnections(this.oscContext, this.log);
     if (envConnections) {
       // Explicit env override is an intended, healthy configuration — not a
       // degraded fallback. Clear any prior degraded gauge (issue #422).
@@ -1005,41 +1041,46 @@ export class WorkspaceStackResolver {
       return buildInMemoryConnections();
     }
 
-    // Resolve the parameter-store namespace via the SAME resolveWorkspaceId the
-    // provision route writes under (issue #712/#776), so the resolver read key
-    // provably equals the provision write key for this deployment AND does not
-    // change between boots when the tenant's subscription set does. Falls back to
-    // STACK_CONFIG_NAMESPACE identically on both sides when there is no pin and
-    // the OSC subscription list is unreachable/empty (test/offline environments).
-    const namespace = await this.resolveNamespace();
+    // The parameter-store namespace is the CONSTANT both sides use (issue #804).
+    // The provision route WRITES under STACK_CONFIG_NAMESPACE and this resolver
+    // READS under it, so the two keys are identical by construction rather than
+    // by two derivations agreeing. Bound to a local only so the diagnostic log
+    // lines below keep reporting the namespace they read with (issue #415).
+    const namespace = STACK_CONFIG_NAMESPACE;
 
     // Resolve the stack config: an explicit stack name addresses that stack
     // directly; otherwise use the first provisioned stack as the workspace
     // default.
     let config: StackConfig | undefined;
+    // The name the config was actually loaded under (issue #1058). Carried onto
+    // the built connections so the data plane's stack identity is observable
+    // and comparable with the control plane's (resolveStackName).
+    let resolvedName: string | undefined;
     try {
       if (stackName) {
         // READ-PATH diagnostic (issue #415): the resolver reads by the
-        // X-Stack-Name-derived name under the derived namespace. This is the
-        // (namespace, name) pair whose derived key must equal the key the
-        // provision route wrote; the param-store client logs the concrete key.
+        // X-Stack-Name-derived name under the constant namespace. This is the
+        // (namespace, name) pair whose key must equal the key the provision
+        // route wrote; the param-store client logs the concrete key.
         this.log?.info?.(
           { source: 'x-stack-name', namespace, stackName },
           'resolver reading stack config by requested name'
         );
-        config = await this.loadStackConfigWithLegacyFallback(ps, namespace, stackName);
+        config = await this.loadStackConfigWithMigration(ps, stackName);
+        if (config) resolvedName = stackName;
         // If the requested stack name isn't found, fall back to the default
         // (first provisioned) stack rather than degrading to in-memory
         // connections. This prevents stale UI stack selections from breaking
         // all storage/asset operations.
         if (!config) {
-          const names = await this.listStackNamesWithLegacyFallback(ps, namespace);
+          const names = await this.listStackNamesWithMigration(ps);
           this.log?.info?.(
             { namespace, requested: stackName, listed: names },
             'requested stack not found; falling back to first listed stack'
           );
           if (names.length > 0) {
-            config = await this.loadStackConfigWithLegacyFallback(ps, namespace, names[0]);
+            config = await this.loadStackConfigWithMigration(ps, names[0]!);
+            if (config) resolvedName = names[0]!;
           }
         }
       } else {
@@ -1047,13 +1088,19 @@ export class WorkspaceStackResolver {
         // resolver uses the FIRST listed stack as the default. If the list is
         // empty here but the provision route logged a successful write, the
         // write key and the list prefix disagree — a read-side namespace/key bug.
-        const names = await this.listStackNamesWithLegacyFallback(ps, namespace);
+        //
+        // "First listed" is now "first CREATED" (issue #1165): the listing is
+        // creation-ordered, so this default is STABLE across later provisions.
+        // The `listed` field below is therefore also the ordering evidence — if
+        // the default ever appears to move, compare consecutive log lines.
+        const names = await this.listStackNamesWithMigration(ps);
         this.log?.info?.(
           { source: 'default', namespace, listed: names },
           'resolver reading default stack config (no X-Stack-Name)'
         );
         if (names.length > 0) {
-          config = await this.loadStackConfigWithLegacyFallback(ps, namespace, names[0]);
+          config = await this.loadStackConfigWithMigration(ps, names[0]!);
+          if (config) resolvedName = names[0]!;
         }
       }
     } catch (err) {
@@ -1114,7 +1161,7 @@ export class WorkspaceStackResolver {
     // to no-op in-memory connections so /health and infra routes stay up.
     const built =
       config && isReadyStack(config)
-        ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext, this.optionalSteps)
+        ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext, this.optionalSteps, resolvedName, this.log)
         : null;
 
     // Emit the aggregate degraded-resolution signal (issue #422): a null build
@@ -1161,15 +1208,14 @@ export class WorkspaceStackResolver {
   async resolveStackName(requestedStackName?: string): Promise<string | undefined> {
     const ps = this.paramStore;
     if (!ps) return undefined;
-    // Resolve the namespace via the SAME resolveWorkspaceId the provision route
-    // writes under (issue #712/#776) so this read key equals the provision write
-    // key, on this boot and every later one.
-    const namespace = await this.resolveNamespace();
+    // Same CONSTANT namespace the provision route writes under (issue #804), so
+    // this read key equals the write key by construction. Bound to a local only
+    // so the error log below keeps reporting the namespace it read with.
+    const namespace = STACK_CONFIG_NAMESPACE;
     try {
       if (requestedStackName) {
-        const config = await this.loadStackConfigWithLegacyFallback(
+        const config = await this.loadStackConfigWithMigration(
           ps,
-          namespace,
           requestedStackName
         );
         // A requested name that resolves to a real config wins verbatim; the
@@ -1177,12 +1223,12 @@ export class WorkspaceStackResolver {
         // order. The legacy fallback also covers a pre-#712 stack whose config
         // exists only under `default` (issue #733) — after migrate-on-read it is
         // a direct hit next time. Only when the requested name has NO stored
-        // config (even under the legacy namespace) do we fall through to the
+        // config (even under a stale pre-#804 namespace) do we fall through to the
         // workspace default (a stale UI selection must not break routing),
         // matching resolve()'s fallback semantics.
         if (config) return requestedStackName;
       }
-      const names = await this.listStackNamesWithLegacyFallback(ps, namespace);
+      const names = await this.listStackNamesWithMigration(ps);
       return names.length > 0 ? names[0] : undefined;
     } catch (err) {
       // A parameter-store read failure is not authority to invent a stack: log
@@ -1210,10 +1256,10 @@ export class WorkspaceStackResolver {
   // which resolves nothing on any deployment whose derived namespace is a real
   // tenant id (issue #712), silently disabling the scaler.
   //
-  // Resolution is IDENTICAL to resolveStackName() above — the same
-  // deriveWorkspaceId namespace and the same one-shot legacy fallback helpers
-  // (loadStackConfigWithLegacyFallback / listStackNamesWithLegacyFallback,
-  // issue #733) — so the two paths cannot drift apart again: an explicit
+  // Resolution is IDENTICAL to resolveStackName() above — the same constant
+  // namespace and the same one-shot migration helpers
+  // (loadStackConfigWithMigration / listStackNamesWithMigration, issue #804) —
+  // so the two paths cannot drift apart again: an explicit
   // `stackName` addresses that stack, otherwise the first provisioned stack for
   // the namespace is the workspace default.
   //
@@ -1224,17 +1270,82 @@ export class WorkspaceStackResolver {
   async resolveStackConfig(stackName?: string): Promise<StackConfig | undefined> {
     const ps = this.paramStore;
     if (!ps) return undefined;
-    const namespace = await deriveWorkspaceId(this.oscContext);
     if (stackName) {
-      const requested = await this.loadStackConfigWithLegacyFallback(ps, namespace, stackName);
+      const requested = await this.loadStackConfigWithMigration(ps, stackName);
       // A requested name that has a stored config wins verbatim; only a name
       // with no config at all falls through to the workspace default, matching
       // resolve()/resolveStackName() semantics.
       if (requested) return requested;
     }
-    const names = await this.listStackNamesWithLegacyFallback(ps, namespace);
+    const names = await this.listStackNamesWithMigration(ps);
     if (names.length === 0) return undefined;
-    return this.loadStackConfigWithLegacyFallback(ps, namespace, names[0]!);
+    return this.loadStackConfigWithMigration(ps, names[0]!);
+  }
+
+  // The provisioned stack names, in parameter-store listing order (issue #1058).
+  //
+  // Exposes the SAME listing the resolution paths use — including the bounded
+  // one-shot migration fallback for a pre-#804 stack — so a caller that must run
+  // once per stack (the scaler-tick reconcilers, the stack-less packager
+  // callbacks) enumerates exactly the stacks `resolve()` can address. Empty when
+  // no parameter store is configured (env-override / bare local run), in which
+  // case callers fall back to the single default resolution.
+  //
+  // A read failure is logged and reported as "no stacks" rather than thrown: the
+  // callers are best-effort sweeps and unauthenticated callbacks, and a
+  // parameter-store blip must not break a tick or fail a callback.
+  async listStackNames(): Promise<string[]> {
+    const ps = this.paramStore;
+    if (!ps) return [];
+    try {
+      return await this.listStackNamesWithMigration(ps);
+    } catch (err) {
+      this.log.error(
+        {
+          err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+          namespace: STACK_CONFIG_NAMESPACE
+        },
+        'stack resolver: failed to list stack names'
+      );
+      return [];
+    }
+  }
+
+  // The provisioned stack names this resolver will actually CONNECT — i.e. the
+  // subset of `listStackNames()` whose stored config passes `isReadyStack`
+  // (issue #1098, #1141 review finding 1).
+  //
+  // WHY THIS EXISTS. `listStackNames()` applies NO status filter: it returns
+  // every key under the workspace prefix (ParamStore.listStackNames, src/services/
+  // param-store.ts), including the `status: 'provisioning'` record the provision
+  // route writes BEFORE creating services and the `status: 'failed'` record it
+  // writes on a failure path. `resolve()` deliberately refuses to connect those
+  // (`config && isReadyStack(config)` above) and falls back to no-op in-memory
+  // connections, and such a record is expected to PERSIST so the deprovision
+  // route can still read its `services[]` and clean up. A caller that must tell
+  // "this stack is simply not live" apart from "a live stack failed to resolve"
+  // therefore cannot infer it from the connections — both shapes have no
+  // `storageClient` — and must ask here instead. The deployment-wide
+  // storage-quota sum (src/data/storage-quota-stack-sum.ts) is that caller: it
+  // may only skip a non-ready stack, never a degraded one.
+  //
+  // Readiness is read from the SAME record `resolve()` gates on, through the
+  // same one-shot migration helpers (issue #804), so the two cannot drift.
+  //
+  // Unlike `listStackNames()`, a parameter-store failure THROWS rather than
+  // reporting "no stacks": callers use this to decide whether a sweep's result
+  // is complete, and a read failure must not be reported as "those stacks are
+  // not ready" — that would turn a transient outage into a silent skip.
+  async listReadyStackNames(): Promise<string[]> {
+    const ps = this.paramStore;
+    if (!ps) return [];
+    const names = await this.listStackNamesWithMigration(ps);
+    const ready: string[] = [];
+    for (const name of names) {
+      const config = await this.loadStackConfigWithMigration(ps, name);
+      if (config && isReadyStack(config)) ready.push(name);
+    }
+    return ready;
   }
 
   // Synchronous read of already-resolved connections from cache. Returns
@@ -1251,11 +1362,9 @@ export class WorkspaceStackResolver {
 
   // Invalidate all cached connections for a workspace (default + every named
   // stack), so a freshly provisioned/torn-down stack is picked up immediately.
-  // Also drops the memoised namespace (issue #776): a first provision is what
-  // normally PINS the workspace id, so a process that resolved before the pin
-  // existed must re-resolve here rather than keep serving the pre-pin namespace.
+  // There is no namespace memo to clear (issue #804): the namespace is a
+  // compile-time constant, so there is nothing that could go stale.
   invalidate(): void {
     this.cache.clear();
-    this.namespaceMemo = undefined;
   }
 }

@@ -31,7 +31,12 @@ import type { AssetRepository } from '../data/asset-repo.js';
 import type { Job, JobRepository } from '../data/job-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import type { EncoreClient } from './encore-client.js';
+import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { completeTranscode } from './transcode.js';
+import { dispatchTranscodeCompletionEvents } from './transcode-completion-events.js';
+// #1060: recognise a source-read failure in the Encore failure text and attach
+// the structured detail to the step we are about to fail.
+import { buildSourceReadErrorDetail } from './encore-source-read-failure.js';
 
 // Non-terminal statuses a transcode Job can sit in while waiting on Encore.
 // Terminal statuses (done/failed/cancelled) are skipped — nothing to reconcile.
@@ -69,6 +74,11 @@ export type ReconcileFailedTranscodesDeps = {
   now?: () => number;
   stallTimeoutMs?: number;
   logger?: Logger;
+  // Optional webhook dispatcher (#829). Forwarded to settleFailedTranscode so a
+  // transcode this sweep settles terminal emits `transcode.failed` /
+  // `asset.failed` exactly as the callback route and the completion poller do.
+  // Absent on deployments with webhooks disabled — emission is then a no-op.
+  webhookDispatcher?: WebhookDispatcher;
 };
 
 export type ReconcileFailedTranscodesResult = {
@@ -150,7 +160,7 @@ export async function reconcileFailedTranscodes(
 // path without depending on an EncoreClient/clock.
 export type SettleFailedDeps = Pick<
   ReconcileFailedTranscodesDeps,
-  'jobs' | 'assets' | 'pipeline' | 'logger'
+  'jobs' | 'assets' | 'pipeline' | 'logger' | 'webhookDispatcher'
 > & {
   // Optional EncoreClient (#746). When present, a genuine terminal settle
   // ('encore-error') also cancels the job on Encore AND drains every buffered
@@ -213,11 +223,54 @@ export async function settleFailedTranscode(
       { jobs: deps.jobs, assets: deps.assets }
     );
 
+    // #829: this is the THIRD production path that applies a transcode terminal
+    // state (the other two are POST /api/v1/internal/encore-callback and the
+    // completion poller). It drives the caller-facing Job to `failed` and the
+    // source asset to `failed`, so without this dispatch a subscriber to
+    // `transcode.failed` / `asset.failed` got the exact silence #829 reports:
+    // the state the API reports changed, and nothing was delivered. Emitted
+    // IMMEDIATELY behind completeTranscode (the shared join every terminal path
+    // pairs with a dispatch) so neither the pipeline-lock release nor the #746
+    // cancel/drain below can swallow the event by throwing first. The helper's
+    // `result.applied` guard means a job another path already settled emits
+    // nothing.
+    //
+    // Deliberate call on `reason` (the reviewer's open question on this PR): we
+    // emit for BOTH reasons, including the CONDITIONAL 'gone-from-active-set'
+    // drop (#709), rather than gating to 'encore-error' the way the #746
+    // cancel/drain below is gated. Two things separate the two decisions:
+    //   - Cancel is an IRREVERSIBLE destructive action against Encore — a job
+    //     that might still be succeeding must not be killed, hence that gate. A
+    //     webhook is a notification, and a wrong one is correctable.
+    //   - The correction is STRUCTURALLY guaranteed to be delivered, not merely
+    //     hoped for. A late SUCCESSFUL callback for a `droppedByScaler` job is
+    //     the one documented exception to first-terminal-write-wins
+    //     (transcode.ts — `isConditionalDropFailed`), and it returns
+    //     `applied: true`. Both paths that can carry that callback now dispatch,
+    //     so the subscriber receives `transcode.complete` + `asset.ready` +
+    //     `encode.completed` afterwards.
+    // So the delivered sequence for a reversed drop is
+    // `transcode.failed` -> `transcode.complete` (and `asset.failed` ->
+    // `asset.ready`), which mirrors the job/asset states GET /api/v1/jobs/:id
+    // reported at each moment. Staying silent here would instead reintroduce
+    // #829's actual defect for the common case where the drop is genuine and no
+    // late callback ever arrives: the job ends `failed` permanently and the
+    // subscriber is never told. Webhook delivery tracking observable API state
+    // is the property #829 asks for; last-event-wins on a contradiction is the
+    // lesser cost, and a subscriber can always re-read the job to settle it.
+    dispatchTranscodeCompletionEvents({
+      dispatcher: deps.webhookDispatcher,
+      job,
+      success: false,
+      error,
+      result
+    });
+
     // Only touch the pipeline lock when completeTranscode actually applied (i.e.
     // the job was still non-terminal). A no-op (already terminal) means another
     // path settled it first; don't re-fail the pipeline step.
     if (result.applied && deps.pipeline) {
-      await releasePipelineLock(deps.pipeline, job.assetId, error);
+      await releasePipelineLock(deps.pipeline, job.assetId, error, job);
     }
 
     // #746: on a genuine terminal settle, cancel the job on Encore and drain
@@ -264,10 +317,21 @@ export async function settleFailedTranscode(
 // (lines 113-133): find the running execution with a running transcode step and
 // fail it so the PipelineExecution is no longer RUNNING. No-op when no such
 // execution exists (e.g. a bare POST /:id/transcode, not a full pipeline).
+//
+// #1060: when `error` is a recognisable SOURCE-READ failure (the storage
+// answered 404/403 for the input object, or the connection to it failed), the
+// step also gets the structured `errorDetail` — the code, the redacted source
+// location, the HTTP status, and the transcoder job + asset ids. This is the
+// path that produced the symptom on #1060: the scaler's reconcile-detected drop
+// (main.ts onJobsDropped -> settleFailedTranscode) arrives here with
+// `dropped by Encore: ffprobe failed for input s3://<bucket>/<key>: Server
+// returned 404 Not Found` and, until now, could put nothing but that sentence on
+// the step. `error` itself is UNCHANGED.
 async function releasePipelineLock(
   pipeline: PipelineRepository,
   assetId: string,
-  error: string
+  error: string,
+  job: Job
 ): Promise<void> {
   const execution = await pipeline.findRunningByAssetAndStep(assetId, 'transcode');
   if (!execution) return;
@@ -275,10 +339,19 @@ async function releasePipelineLock(
   const steps: StepExecution[] = execution.steps.map((s) => ({ ...s }));
   const tIdx = steps.findIndex((s) => s.name === 'transcode');
   if (tIdx < 0) return;
+  // Prefer the step's own encoreJobId (stamped when the transcode was
+  // dispatched) and fall back to the job record's — they are the same value, but
+  // a bare POST /:id/transcode leaves the step's copy unset.
+  const errorDetail = buildSourceReadErrorDetail({
+    failureText: error,
+    encoreJobId: steps[tIdx].encoreJobId ?? job.encoreJobId,
+    assetId
+  });
   steps[tIdx] = {
     ...steps[tIdx],
     status: 'failed',
     error,
+    ...(errorDetail ? { errorDetail } : {}),
     completedAt: now
   };
   await pipeline.update(execution.id, { steps, status: 'failed' });

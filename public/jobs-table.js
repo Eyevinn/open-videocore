@@ -27,6 +27,13 @@
  *   #124/#126):
  *       'pending' | 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
  *
+ *   Asset identification on a job row (issue #988): each item carries
+ *   `assetId` (string, ALWAYS present — `jobSchema` in src/routes/jobs.ts:54)
+ *   and `assetName` (string, OPTIONAL — src/routes/jobs.ts:62-70, resolved at
+ *   read time from the asset repository and ABSENT when the asset has been
+ *   deleted or cannot be read). The name is therefore never assumed: every cell
+ *   that shows it falls back to the ULID.
+ *
  * IMPORTANT CONSEQUENCE: the jobs listing endpoint exposes NO server-side sort,
  * status filter, date-range, or text-search parameter. Per the contract-first
  * rule we must not invent query params the endpoint does not accept. So this
@@ -47,16 +54,44 @@
  * server's true total (res.total) exceeds that window, so counts like a
  * "Failed only" "N of N" are never mistaken for the complete system-wide set.
  *
+ * COLUMN VISIBILITY (issue #960, lifted from the assets table's #959). The
+ * operator chooses which of the eight declared columns are rendered. This is VIEW
+ * state and touches NO part of the request or of the client-side passes above:
+ * the bounded window is fetched with limit/offset alone, and the filter/sort/page
+ * passes read `snap.filters` / `snap.sort` / `snap.offset`, none of which the
+ * chooser writes. Hiding Created does not stop the table ordering by createdAt,
+ * and hiding Status does not stop the status filter narrowing the window — so the
+ * rows in hand, their order and the truncation banner's counts are unchanged by
+ * definition, not by convention. The precedence rule on load (URL `jobs.cols` ->
+ * this browser's stored default -> every declared column), the storage write and
+ * the chooser control all come from createColumnVisibility() in
+ * public/ops-ui-table.js; what is declared HERE is only what is jobs-specific —
+ * JOBS_COLUMN_KEYS and the lock rule in JOBS_REQUIRED_COLUMN_GROUPS.
+ *
  * Security note: mirrors app.js / the primitive's XSS posture — every dynamic
  * value is escaped (escHtml) before entering a cell's innerHTML string.
  */
 
-import { createOpsTable, escHtml, SORT_DESC } from './ops-ui-table.js';
+import {
+  createColumnVisibility,
+  createOpsTable,
+  escHtml,
+  SORT_DESC,
+} from './ops-ui-table.js';
+import { copyableIdCellHtml, wireCopyIdButtons } from './copy-id.js';
+// columnKeysOf is imported from the column model (not the table primitive)
+// because that is where "the keys a column set declares" is defined; JOBS_COLUMN_KEYS
+// below is derived through it so the key list has one source (issue #960).
+import { columnKeysOf } from './table-columns.js';
 import {
   decodeTableState,
   applyTableState,
   SORT_DIR,
 } from './table-url-state.js';
+// Muted empty state for placeholder-less filter controls (issue #984). The class
+// name is a CSS contract, so it is imported rather than restated — see
+// public/filter-unset.js.
+import { markUnset } from './filter-unset.js';
 
 // ─── Contract-grounded constants ──────────────────────────────────────────────
 
@@ -95,10 +130,48 @@ const SORTABLE_FIELDS = Object.freeze({
 
 // The table's natural default order matches the server's own default: newest
 // first by createdAt. Kept as the URL-state default so a pristine URL is clean.
+//
+// `cols` (issue #960) is deliberately left at the shared default of null
+// ("unspecified") rather than at the full column list: that is what lets the
+// encoder tell "this operator chose to show everything" from "this operator has
+// not chosen", and only the former belongs in a shared link.
 const JOBS_DEFAULTS = Object.freeze({
   sort: { field: SORTABLE_FIELDS.createdAt, dir: SORT_DIR.desc },
   size: JOBS_PAGE_SIZE,
 });
+
+// ─── Column visibility contract (issue #960) ─────────────────────────────────
+
+// The declared column keys, in render order. Exported so consumers and tests name
+// the same vocabulary the `jobs.cols` URL param and the stored preference use.
+//
+// DERIVED from buildColumns() rather than written out again (issue #960 review):
+// a hand-maintained copy is a second source of truth for the same list, and a
+// column added to buildColumns() without updating the copy — or renamed in only
+// one of the two — would drift silently, which is the exact failure this
+// vocabulary exists to prevent. Deriving it means the parity cannot be broken,
+// so there is no invariant left to assert.
+//
+// buildColumns() is defined further down the module; a `function` declaration is
+// hoisted, so calling it here is safe. It is called with inert renderers because
+// only the KEYS are wanted: every injected helper is used solely inside a cell
+// renderer's closure, never while the column list is being built.
+export const JOBS_COLUMN_KEYS = Object.freeze(
+  columnKeysOf(buildColumns({ fmtDate: () => '', renderBadge: () => '' }))
+);
+
+// This table's OWN lock rule — the primitive takes it as configuration precisely
+// because it cannot be guessed from the assets table (issue #960's first note).
+// A jobs row is identified differently: the job's own ULID (`id`) is the value
+// every /jobs/:id endpoint accepts, and the Asset column is the other way an
+// operator can say WHICH job a row is ("the transcode of the keynote"). Actions
+// carries the Cancel control. Hide all four and the table is a grid of anonymous
+// progress bars with no way to act on any of them, so at least one must stay —
+// and the chooser DISABLES the last survivor rather than letting an operator
+// reach that state and then explaining the mistake.
+export const JOBS_REQUIRED_COLUMN_GROUPS = Object.freeze([
+  Object.freeze(['id', 'assetId', 'actions']),
+]);
 
 // ─── Pure client-side sort / filter / search over the bounded window ──────────
 // These are exported for unit testing (no DOM, no fetch). They encode the
@@ -112,7 +185,12 @@ function includesCI(haystack, needle) {
 
 /**
  * Filter jobs by a status set, an inclusive date range on createdAt, and a
- * free-text needle matched against job id OR associated asset id.
+ * free-text needle matched against job id, associated asset id, OR asset name.
+ *
+ * The asset name joined the haystack with issue #988: once the Asset column
+ * shows a name, typing that name and getting nothing back would be a trap. It
+ * is matched tolerantly — `assetName` is OPTIONAL on the wire, so rows without
+ * one simply fail that clause and still match on their ids.
  *
  * @param {Array} jobs
  * @param {{ status?: string[], from?: string|null, to?: string|null, q?: string }} f
@@ -137,7 +215,8 @@ export function filterJobs(jobs, f) {
       if (!Number.isNaN(from) && !(t >= from)) return false;
       if (!Number.isNaN(to) && !(t <= to)) return false;
     }
-    if (q && !(includesCI(j.id, q) || includesCI(j.assetId, q))) return false;
+    if (q && !(includesCI(j.id, q) || includesCI(j.assetId, q) || includesCI(j.assetName, q)))
+      return false;
     return true;
   });
 }
@@ -175,10 +254,58 @@ export function pageJobs(jobs, offset, size) {
   return list.slice(o, o + s);
 }
 
+// ─── Asset cell ───────────────────────────────────────────────────────────────
+
+/**
+ * Render the Asset cell for one job row (issue #988).
+ *
+ * The column used to show the bare 26-char ULID, which is unscannable: nothing
+ * in the row said WHICH asset the job was working on. The backend now resolves
+ * `assetName` at read time (src/routes/jobs.ts:62 — OPTIONAL), so the name
+ * leads and the ULID stays with it as a secondary line.
+ *
+ * The ULID is NOT dropped, for two reasons: it is the value every asset-id
+ * endpoint accepts (see the contract-grounding block in public/copy-id.js), and
+ * asset names are not unique, so the id is the only way to tell two like-named
+ * assets apart. It is rendered with the shared click-to-copy affordance rather
+ * than a hover-only tooltip.
+ *
+ * Fallbacks, in order:
+ *   - name + id  — the asset resolved
+ *   - id only    — no `assetName` (asset deleted, or lookup degraded to
+ *                  undefined per the route's `.catch(() => undefined)`)
+ *   - em-dash    — no asset reference at all
+ *
+ * @param {{ assetId?: string, assetName?: string }} job
+ * @returns {string} escaped HTML
+ */
+export function renderAssetCell(job) {
+  const j = job || {};
+  const id = j.assetId == null ? '' : String(j.assetId);
+  const name = j.assetName == null ? '' : String(j.assetName);
+  if (!id && !name) return '<span class="cell-id">—</span>';
+  // No name resolved: the id IS the row's asset label, so it takes the primary
+  // slot (still copyable) instead of being demoted under a blank.
+  if (!name) return copyableIdCellHtml(id, 'Copy asset id');
+  return (
+    '<span class="job-asset-name">' + escHtml(name) + '</span>' +
+    '<span class="job-asset-id">' + copyableIdCellHtml(id, 'Copy asset id') + '</span>'
+  );
+}
+
 // ─── Filter controls (slot factories for the shared primitive) ────────────────
 // Each returns a DOM control that calls onChange(value) so the primitive's
 // state.setFilter(name, value) records it. We keep the control DOM minimal and
 // accessible (labelled inputs). Initial values come from the decoded URL state.
+
+// An UNSET filter control must read as unset (issue #984). The search box gets
+// that for free — it has a native `placeholder`, styled muted by
+// `.ops-filter-search::placeholder` in public/style.css. The select and the two
+// date inputs have no placeholder, so markUnset() toggles `.is-unset` on them;
+// the reasoning, and why pure CSS cannot cover the date case, now live once in
+// public/filter-unset.js (imported above) instead of in a private copy here and
+// an identical one in public/audit-table.js. Called on every change AND on first
+// render. Behaviour is unchanged — same class, same toggle condition.
 
 function labelled(labelText, control, forId) {
   const frag = document.createDocumentFragment();
@@ -221,7 +348,9 @@ function statusFilterControl(initialStatus) {
     if (Array.isArray(initialStatus) && initialStatus.length === 1) {
       sel.value = initialStatus[0];
     }
+    markUnset(sel);
     sel.addEventListener('change', () => {
+      markUnset(sel);
       // Empty string clears the filter (primitive treats '' as "unset").
       onChange(sel.value);
     });
@@ -239,7 +368,14 @@ function dateInput(id, labelText, initialValue, onValue) {
   input.id = id;
   input.className = 'ops-filter-date';
   if (initialValue) input.value = initialValue;
-  input.addEventListener('change', () => onValue(input.value));
+  markUnset(input);
+  input.addEventListener('change', () => {
+    markUnset(input);
+    onValue(input.value);
+  });
+  // A date input can also be cleared with the keyboard, which fires `input`
+  // without a `change` in some engines — keep the muted state in step either way.
+  input.addEventListener('input', () => markUnset(input));
   wrap.appendChild(labelled(labelText, input, id));
   return wrap;
 }
@@ -264,7 +400,8 @@ function searchControl(initial) {
     input.type = 'search';
     input.id = 'jobs-filter-q';
     input.className = 'ops-filter-search';
-    input.placeholder = 'Job id or asset id';
+    // Names the three fields the client-side pass actually searches (#988).
+    input.placeholder = 'Job id, asset id, or asset name';
     if (initial) input.value = initial;
     // Fire on input (debounced lightly) so text search feels live.
     let timer = null;
@@ -277,6 +414,76 @@ function searchControl(initial) {
   };
 }
 
+// ─── Column definitions ───────────────────────────────────────────────────────
+//
+// Lifted out of the createOpsTable() call (issue #960) because the column set is
+// now an input to the visibility wiring as well as to the table: both have to see
+// the SAME declarations. This function is the SINGLE source of the jobs column
+// vocabulary — JOBS_COLUMN_KEYS above is derived from its output, so adding,
+// renaming or removing a column here updates the exported key list by
+// construction and the two cannot drift. Cell renderers return escaped HTML
+// strings (the convention the primitive documents); every dynamic value passes
+// through escHtml.
+function buildColumns(renderCtx) {
+  const fmtDate = renderCtx.fmtDate;
+  const renderBadge = renderCtx.renderBadge;
+  return [
+    {
+      key: 'id',
+      label: 'ID',
+      sortable: true,
+      sortKey: SORTABLE_FIELDS.id,
+      render: (j) => '<span class="cell-id">' + escHtml(j.id) + '</span>',
+    },
+    { key: 'type', label: 'Type', render: (j) => escHtml(j.type || '—') },
+    {
+      key: 'status',
+      label: 'Status',
+      sortable: true,
+      sortKey: SORTABLE_FIELDS.status,
+      render: (j) => renderBadge(j.status),
+    },
+    {
+      key: 'assetId',
+      label: 'Asset',
+      render: (j) => renderAssetCell(j),
+    },
+    {
+      key: 'progress',
+      label: 'Progress',
+      render: (j) => (j.progress != null ? escHtml(j.progress + '%') : '—'),
+    },
+    {
+      key: 'createdAt',
+      label: 'Created',
+      sortable: true,
+      sortKey: SORTABLE_FIELDS.createdAt,
+      render: (j) => escHtml(fmtDate(j.createdAt)),
+    },
+    {
+      key: 'updatedAt',
+      label: 'Updated',
+      sortable: true,
+      sortKey: SORTABLE_FIELDS.updatedAt,
+      render: (j) => escHtml(fmtDate(j.updatedAt)),
+    },
+    {
+      key: 'actions',
+      // The header caption is empty by design (a column of one conditional
+      // button needs no word over it), so the column names itself for the chooser
+      // list, where an unlabelled entry would be unpickable (issue #960).
+      label: '',
+      chooserLabel: 'Actions',
+      render: (j) =>
+        j.status === 'running' || j.status === 'pending'
+          ? '<button class="btn-danger job-cancel-btn" data-id="' +
+            escHtml(j.id) +
+            '" style="font-size:12px;padding:3px 8px;">Cancel</button>'
+          : '',
+    },
+  ];
+}
+
 // ─── Factory ──────────────────────────────────────────────────────────────────
 //
 // createJobsTable(deps) -> { el, refresh, destroy, table }
@@ -287,6 +494,8 @@ function searchControl(initial) {
 //   renderBadge(status)     -> escaped HTML   (app.js status badge)
 //   onSelect(jobId)         -> void           (row click -> open detail panel)
 //   onCancel(jobId)         -> Promise|void   (cancel button click)
+//   onCancelError(err,id)   -> void           (a failed cancel; app.js renders it
+//                                              in app styling — issue #920)
 //   win                     -> Window|null    (for URL state; defaults to window)
 //
 // The consumer mounts `el`, then the table self-loads. Sort/filter/page changes
@@ -300,6 +509,13 @@ export function createJobsTable(deps) {
     : (s) => escHtml(s ?? '');
   const onSelect = typeof d.onSelect === 'function' ? d.onSelect : () => {};
   const onCancel = typeof d.onCancel === 'function' ? d.onCancel : () => {};
+  // A failed cancel is reported by the consumer, which owns the app's error
+  // rendering (app.js reportActionFailure -> errorToast). This module cannot
+  // import it — app.js imports this file, so the dependency is injected, the
+  // same pattern delete-blocked.js and lock-detail.js use. Absent it, the
+  // failure is surfaced on the table's own status line rather than silently
+  // swallowed; either way no native alert() is used (issue #920).
+  const onCancelError = typeof d.onCancelError === 'function' ? d.onCancelError : null;
   const win = 'win' in d ? d.win : (typeof window !== 'undefined' ? window : null);
 
   if (typeof apiFetch !== 'function') {
@@ -339,6 +555,33 @@ export function createJobsTable(deps) {
   if (initial.to) initialFilters.to = initial.to;
   if (initial.q) initialFilters.q = initial.q;
 
+  const columns = buildColumns({ fmtDate, renderBadge });
+
+  // Column visibility (issue #960) via the shared primitive: it owns the
+  // precedence rule (URL `jobs.cols` -> this browser's stored default -> every
+  // declared column), the storage write and the chooser control. This table
+  // supplies only what is ITS own — the column set, the lock rule above, and the
+  // URL sync below.
+  const columnVisibility = createColumnVisibility({
+    ns: JOBS_NS,
+    columns,
+    urlCols: initial.cols,
+    requireAtLeastOne: JOBS_REQUIRED_COLUMN_GROUPS,
+    label: 'Columns',
+    // Passed straight through, as the assets and logs tables do. Coercing a null
+    // `win` to undefined here would discard the caller's instruction: `win: null`
+    // means "there is no window, use no storage", and the primitive and the
+    // storage helpers both honour that distinction (issue #960 review).
+    win,
+    // Mirror the choice into the URL so the view stays shareable. syncUrl() and
+    // NOT a re-render of the view: the working set, the client-side filter/sort
+    // passes and the page window are all untouched by a column toggle, and the
+    // primitive has already repainted the header and body.
+    onChange: function () {
+      syncUrl();
+    },
+  });
+
   const table = createOpsTable({
     caption: 'Jobs',
     pagingMode: 'offset',
@@ -347,57 +590,11 @@ export function createJobsTable(deps) {
     initialFilters,
     emptyText: 'No jobs match the current filters.',
     rowKey: (row) => row && row.id,
-    columns: [
-      {
-        key: 'id',
-        label: 'ID',
-        sortable: true,
-        sortKey: SORTABLE_FIELDS.id,
-        render: (j) => '<span class="cell-id">' + escHtml(j.id) + '</span>',
-      },
-      { key: 'type', label: 'Type', render: (j) => escHtml(j.type || '—') },
-      {
-        key: 'status',
-        label: 'Status',
-        sortable: true,
-        sortKey: SORTABLE_FIELDS.status,
-        render: (j) => renderBadge(j.status),
-      },
-      {
-        key: 'assetId',
-        label: 'Asset ID',
-        render: (j) => '<span class="cell-id">' + escHtml(j.assetId || '—') + '</span>',
-      },
-      {
-        key: 'progress',
-        label: 'Progress',
-        render: (j) => (j.progress != null ? escHtml(j.progress + '%') : '—'),
-      },
-      {
-        key: 'createdAt',
-        label: 'Created',
-        sortable: true,
-        sortKey: SORTABLE_FIELDS.createdAt,
-        render: (j) => escHtml(fmtDate(j.createdAt)),
-      },
-      {
-        key: 'updatedAt',
-        label: 'Updated',
-        sortable: true,
-        sortKey: SORTABLE_FIELDS.updatedAt,
-        render: (j) => escHtml(fmtDate(j.updatedAt)),
-      },
-      {
-        key: 'actions',
-        label: '',
-        render: (j) =>
-          j.status === 'running' || j.status === 'pending'
-            ? '<button class="btn-danger job-cancel-btn" data-id="' +
-              escHtml(j.id) +
-              '" style="font-size:12px;padding:3px 8px;">Cancel</button>'
-            : '',
-      },
-    ],
+    columns,
+    columnChooser: columnVisibility.chooser,
+    // Re-wire row interactions after EVERY repaint, not just after a fetch: a
+    // column toggle rebuilds the tbody (and so every Cancel button) without one.
+    onRowsRendered: wireRowInteractions,
     filters: [
       { name: 'status', control: statusFilterControl(initial.status) },
       { name: 'from', control: fromDateControl(initial.from) },
@@ -444,6 +641,12 @@ export function createJobsTable(deps) {
       // 1-based page for the URL contract, derived from the offset page index.
       page: (snap.pageIndex || 0) + 1,
       size: JOBS_PAGE_SIZE,
+      // Visible column set (issue #960). Passed on EVERY sync, not only from the
+      // chooser: encodeTableState clears this namespace's params before rewriting
+      // them, so omitting it here would have the first render wipe a `jobs.cols`
+      // the URL arrived with. Null until a choice actually exists, which keeps a
+      // default view's query string clean.
+      cols: columnVisibility.urlCols(),
     };
   }
 
@@ -489,8 +692,10 @@ export function createJobsTable(deps) {
     // filtered length as the total so its indicator + prev/next stay correct.
     table.state.setPageInfo({ total: filtered.length });
     const pageRows = pageJobs(filtered, snap.offset, JOBS_PAGE_SIZE);
+    // setRows() repaints, and the primitive calls wireRowInteractions() for us via
+    // `onRowsRendered` — the same path a column toggle takes, so row handlers are
+    // attached exactly once per repaint however the repaint was provoked.
     table.setRows(pageRows);
-    wireRowInteractions();
     updateTruncationBanner();
     syncUrl();
   }
@@ -532,10 +737,17 @@ export function createJobsTable(deps) {
     }
   }
 
-  // ── Row click + cancel-button wiring (re-applied after each setRows) ──
-  function wireRowInteractions() {
-    const tbody = table.el.querySelector('tbody');
+  // ── Row click + cancel-button wiring (re-applied after EVERY repaint) ──
+  // Takes the tbody the primitive hands it rather than reaching back through
+  // `table`, which is still being constructed the first time the primitive paints.
+  function wireRowInteractions(tbodyEl) {
+    const tbody = tbodyEl || table.el.querySelector('tbody');
     if (!tbody) return;
+    // Click-to-copy for the asset ULID in the Asset cell (issue #988, reusing
+    // the #851 affordance). Idempotent, and the handler stops propagation so
+    // copying an id does not also open that row's detail panel. Bound before
+    // the row handler below, exactly as assets-table.js does it.
+    wireCopyIdButtons(tbody);
     tbody.querySelectorAll('tr[data-row-key]').forEach((tr) => {
       const id = tr.dataset.rowKey;
       if (id === selectedId) tr.classList.add('row-selected');
@@ -555,9 +767,16 @@ export function createJobsTable(deps) {
           await fetchWorkingSet();
         } catch (err) {
           btn.disabled = false;
-          // Surface via alert to match app.js's existing cancel-error UX.
-          if (typeof win !== 'undefined' && win && typeof win.alert === 'function') {
-            win.alert('Error: ' + (err && err.message ? err.message : String(err)));
+          // App-styled reporting, never a native alert (issue #920). The
+          // consumer's handler owns the copy; without one the table says so on
+          // its own status line rather than failing silently.
+          if (onCancelError) {
+            onCancelError(err, btn.dataset.id);
+          } else {
+            table.setStatus(
+              'error',
+              'Failed to cancel job: ' + (err && err.message ? err.message : String(err))
+            );
           }
         }
       });
@@ -579,5 +798,9 @@ export function createJobsTable(deps) {
     refresh: (silent) => fetchWorkingSet(silent),
     setSelected: (id) => { selectedId = id; },
     destroy: () => table.destroy(),
+    // Column visibility (issue #960), for consumers/tests that want to read or
+    // drive the chosen set without going through the chooser's DOM.
+    getVisibleColumns: table.getVisibleColumns,
+    setVisibleColumns: table.setVisibleColumns,
   };
 }

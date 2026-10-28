@@ -67,6 +67,7 @@ import {
   toTombstoneDocument
 } from './asset-tombstone.js';
 import { updateWithRetry, type StoredDoc, type StackCouch } from './couchdb.js';
+import { currentDocumentStackName } from '../services/request-stack-context.js';
 
 const RESOURCE_TYPE = 'asset';
 
@@ -112,6 +113,11 @@ export class CouchAssetRepository implements AssetRepository {
       sourceMethod: method,
       originUri: input.originUri,
       provenance: initialProvenance(now, method),
+      // Durable stack identity (issue #1097): the stack this asset is being
+      // created against, so post-upload work (metadata extraction, thumbnails)
+      // can re-enter it even with no ambient context. Undefined outside a
+      // request, which preserves the previous default-stack behaviour.
+      stackName: input.stackName ?? currentDocumentStackName(),
       createdAt: now,
       updatedAt: now
     };
@@ -379,6 +385,17 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.name !== undefined) next.name = patch.name;
     if (patch.description !== undefined) next.description = patch.description;
     if (patch.objectKey !== undefined) next.objectKey = patch.objectKey;
+    // Recorded ingest size (issue #1059) — same invariant as the in-memory repo
+    // (data/asset-repo.ts): the size describes the key, so a key change with no
+    // new size clears it.
+    if (patch.sourceSizeBytes !== undefined) {
+      // Non-positive == "nothing recorded" (same sentinel as the in-memory repo
+      // and as a stored `0` read back by fromAssetDocument), so a finalize that
+      // could not learn the length clears a stale one.
+      next.sourceSizeBytes = patch.sourceSizeBytes > 0 ? patch.sourceSizeBytes : undefined;
+    } else if (patch.objectKey !== undefined && patch.objectKey !== existing.objectKey) {
+      next.sourceSizeBytes = undefined;
+    }
     if (patch.technicalMetadata !== undefined) {
       next.technicalMetadata = patch.technicalMetadata;
       if (patch.technicalMetadata !== null) {
@@ -434,7 +451,16 @@ export class CouchAssetRepository implements AssetRepository {
       next.versionGroupId = patch.versionGroupId;
     }
     if (patch.status !== undefined) {
-      const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
+      // `patch.statusReason` (issue #1085) annotates the appended history entry
+      // so a background settle says WHY — see UpdateAssetInput.statusReason,
+      // src/data/asset-repo.ts.
+      const applied = applyStatus(
+        existing.status,
+        patch.status,
+        existing.statusHistory,
+        now,
+        patch.statusReason
+      );
       next.status = applied.status;
       next.statusHistory = applied.statusHistory;
     }
@@ -728,6 +754,41 @@ function buildSelector(opts: ListOptions): Record<string, unknown> {
   if (opts.versionGroupId !== undefined) {
     // Mirror of structural.versionGroupId for indexable Mango filtering (#118).
     selector['versionGroupId'] = opts.versionGroupId;
+  }
+  // Created-at range (issue #833), pushed DOWN into Mango rather than applied to
+  // the fetched page. `list()` paginates in the database (limit/skip) and counts
+  // with the same selector, so filtering after the fetch would only ever narrow
+  // the page in hand and leave `total` wrong — the range has to be part of the
+  // selector for it to hold across every page.
+  //
+  // CONTRACT (verified, not assumed) — Apache CouchDB 3.5 documentation,
+  // `ddocs/mango.rst`:
+  //   - "Condition Operators" table: `$gte` = "The field is greater than or
+  //     equal to the argument", `$lte` = "The field is less than or equal to
+  //     the argument", both taking "Any JSON" as the argument, so a string
+  //     bound is valid ("Strict type matching is used" — both sides are
+  //     strings here).
+  //   - `find/subfields`: dot notation addresses a nested field, which is how
+  //     `structural.tams.*` is already pushed down in couch-search-repo.ts.
+  //   - Note under "Condition Operators": the field "must exist in the document
+  //     for the selector to match". `administrative.createdAt` is REQUIRED by
+  //     AssetDocumentSchema (asset-document.ts), so it exists on every asset
+  //     document and nothing is silently dropped.
+  // The bound arrives normalised to the canonical `new Date().toISOString()`
+  // shape (created-range.ts) — identical fixed-width form to the stored value —
+  // so the comparison is between equally-shaped strings and orders
+  // chronologically. There is deliberately no top-level `createdAt` mirror
+  // added here: documents written before this change carry no such mirror, and
+  // filtering on one would silently exclude every pre-existing asset.
+  if (opts.createdFrom !== undefined || opts.createdTo !== undefined) {
+    const range: Record<string, string> = {};
+    if (opts.createdFrom !== undefined) {
+      range['$gte'] = opts.createdFrom;
+    }
+    if (opts.createdTo !== undefined) {
+      range['$lte'] = opts.createdTo;
+    }
+    selector['administrative.createdAt'] = range;
   }
   return selector;
 }

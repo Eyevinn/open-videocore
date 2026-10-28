@@ -18,6 +18,13 @@
 //      completion. On success it writes `manifestUrls` (HLS + DASH) onto the
 //      asset; on failure it records `packagingError`. Packaging NEVER changes
 //      the asset's lifecycle status — it only annotates the record.
+//   3. Both of the above keep an observable `package` Job in step (issue #976):
+//      created at enqueue time and settled from the completion callbacks, so the
+//      step that produces the customer-facing output is listed by
+//      GET /api/v1/jobs like every other step. The lifecycle lives in
+//      src/pipeline/package-job.ts, shared with the OSC-native handoff in
+//      encore-callback-poller.ts, the packager failure callback, and #336's
+//      stalled-package sweep.
 //
 // DECOUPLING NOTE: the eyevinn-encore-packager already consumes the Valkey
 // queue populated by the callback-listener, so in a fully reference-wired stack
@@ -29,8 +36,17 @@
 // the OSC catalog — see docs/osc-feedback/incoming-issue9-packaging.md.
 
 import type { AssetRepository, ManifestUrls, PackagedOutput } from '../data/asset-repo.js';
+import type { JobRepository } from '../data/job-repo.js';
+import type { PipelineRepository } from '../data/pipeline-repo.js';
 import type { StorageBackendConfig } from '../services/param-store.js';
 import { emitAudit, originActor, type AuditEmitter, type AuditErrorLog } from '../data/audit-emit.js';
+import { logPipelineEvent, type PipelineLogSink } from '../services/pipeline-log.js';
+import {
+  completePackageJob,
+  failPackageJob,
+  startPackageJob,
+  type PackageJobDeps
+} from './package-job.js';
 
 // The bucket the packager writes streaming output into (mirrors PACKAGED_BUCKET
 // in routes/provision.ts and the packager's OutputFolder).
@@ -185,10 +201,15 @@ export interface PackageQueue {
 // features decoupled: #8 calls triggerPackaging when a transcode succeeds and
 // never needs to know how packaging is wired.
 export interface PackagingTrigger {
+  // Resolves to the id of the `package` Job recorded for this enqueue (issue
+  // #976), or undefined when no job repository is wired. Callers that own the
+  // execution record use it to populate `steps[].jobId`; callers that have
+  // already persisted a running `package` step can ignore it — the service
+  // stamps those itself (see `startPackageJob`).
   triggerPackaging(
     assetId: string,
     encoreJobUrl: string
-  ): Promise<void>;
+  ): Promise<string | undefined>;
 }
 
 // Success callback payload from the packager (POST .../packagerCallback/success).
@@ -211,6 +232,13 @@ export type PackagerFailurePayload = {
 export type PackagingDeps = {
   assets: AssetRepository;
   queue: PackageQueue;
+  // Job + execution records for the `package` step (issue #976). Optional so
+  // existing callers/tests that only assert enqueue behaviour are unaffected;
+  // when absent, no Job is created and behaviour is exactly as before. See
+  // src/pipeline/package-job.ts for the lifecycle (create at enqueue, settle
+  // from the completion callbacks).
+  jobs?: JobRepository;
+  pipeline?: PipelineRepository;
   // Public origin for the packaged bucket (MinIO/CDN). Used to build manifest
   // URLs. Config via env; defaults to a relative path so a missing origin still
   // yields a usable, resolvable manifest reference.
@@ -222,8 +250,22 @@ export type PackagingDeps = {
   // is logged, never propagated — packaging never becomes newly failable.
   audit?: AuditEmitter;
   auditLog?: AuditErrorLog;
+  // Best-effort operational log emission (issue #995). Optional exactly like
+  // `audit` above: when absent no log record is appended and behaviour is
+  // unchanged. Wired to the log store that backs GET /api/v1/logs
+  // (src/main.ts, `logStore`), so the `package` stage of a run is visible in the
+  // Logs tab.
+  pipelineLog?: PipelineLogSink;
 };
 
+// The base the packaging pipeline WRITES manifest URLs against. Stays
+// origin-agnostic (a bucket-relative `/<packagedBucket>` path) when
+// PACKAGED_PUBLIC_BASE_URL is unset: packaging runs from the packager callback,
+// which has no resolved stack connections, and a stored relative path keeps the
+// record portable. The public origin is resolved at READ time instead, from the
+// resolved stack's own MinIO endpoint — see `packagedPublicOrigin()` /
+// `stackPackagedPublicOrigin()` (issue #859), which also upgrades assets that
+// were packaged before an origin was known.
 export function packagingPublicBaseUrl(): string {
   return process.env['PACKAGED_PUBLIC_BASE_URL'] ?? `/${packagedBucket()}`;
 }
@@ -287,15 +329,81 @@ export class PublicManifestBaseUrlError extends Error {
   }
 }
 
-// The configured public-facing origin for the packaged bucket (MinIO/CDN), or
-// undefined when `PACKAGED_PUBLIC_BASE_URL` is unset. Unlike
+// The resolved stack's OWN public origin for its packaged objects (issue #859).
+//
+// On a default, zero-config deployment nothing sets PACKAGED_PUBLIC_BASE_URL, yet
+// the stack already HAS a public origin: the per-stack MinIO endpoint it was
+// provisioned with. `minioEndpoint` is a REQUIRED field of the persisted stack
+// config (services/param-store.ts StackConfig.minioEndpoint) and is resolved per
+// request onto `connections.s3Config.endpoint`
+// (services/workspace-stack.ts buildConnectionsFromStack), so a caller holding
+// resolved connections can derive the origin without a global env read.
+//
+// Callers MUST source the argument from
+// `services/workspace-stack.ts stackResolvedMinioEndpoint(connections)`, NOT from
+// `s3Config.endpoint` directly: that same field is also populated verbatim from
+// MINIO_URL on the env-override path, where no anonymous-read bucket policy has
+// been applied by this codebase and a derived "public" URL would 403.
+//
+// Returns the endpoint WITHOUT a bucket path segment: a stored manifest URL for
+// the zero-config case is already bucket-prefixed (`/<packagedBucket>/...`,
+// baked in by `packagingPublicBaseUrl()` at packaging time), and
+// `resolvePublicManifestUrl` joins that stored path onto the origin — appending
+// the bucket here too would duplicate it. Path-style addressing
+// (`<endpoint>/<bucket>/<key>`) is what MinIO serves, mirroring how
+// `externalPublicBaseUrl` derives an S3-compatible object URL above.
+//
+// Returns undefined when no endpoint is available (no PROVISIONED stack resolved —
+// callers pass `stackResolvedMinioEndpoint(connections)`, which is undefined on the
+// env-override and in-memory paths) or when the value is not an absolute http(s)
+// URL — a non-absolute origin is not usable and must fall through to the caller's
+// existing fallback rather than be handed to `resolvePublicManifestUrl` (which
+// would reject it as a misconfiguration).
+//
+// The returned origin is REBUILT from the parsed URL — scheme + host(+port) +
+// path only — so it can never carry userinfo (`https://user:pw@host` would
+// otherwise echo an operator credential into a public API response) and never
+// carries a query or fragment (either would make the `origin + '/' + key` join in
+// `resolvePublicManifestUrl` malformed). `minioEndpoint` is operator-writable via
+// the parameter store, so this is enforced here rather than assumed.
+export function stackPackagedPublicOrigin(
+  minioEndpoint: string | undefined
+): string | undefined {
+  const endpoint = minioEndpoint?.trim();
+  if (!endpoint) {
+    return undefined;
+  }
+  const parsed = tryParseUrl(endpoint);
+  if (!parsed || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
+    return undefined;
+  }
+  const path = parsed.pathname.replace(/\/+$/, '');
+  return `${parsed.protocol}//${parsed.host}${path}`;
+}
+
+// The public-facing origin for the packaged bucket (MinIO/CDN), or undefined when
+// neither an explicit origin nor a resolved stack endpoint is available. Unlike
 // `packagingPublicBaseUrl()` this does NOT fall back to a relative bucket path:
 // callers that require a genuinely public origin (the delivery endpoint) must be
 // able to distinguish "configured" from "unset".
-export function packagedPublicOrigin(): string | undefined {
+//
+// Precedence (issue #859):
+//   1. `PACKAGED_PUBLIC_BASE_URL` — the explicit operator override — wins when
+//      set, verbatim (an operator-fronted CDN origin beats the raw MinIO host).
+//   2. the PROVISIONED stack's own `minioEndpoint` (see
+//      stackPackagedPublicOrigin), so a zero-config stack still has an ABSOLUTE
+//      public origin instead of degrading to a root-relative path.
+//   3. undefined — every other deployment shape: no provisioned stack resolved,
+//      the env-override path (COUCHDB_URL/MINIO_URL), or in-memory connections.
+//      The caller keeps its pre-#859 behaviour (relative value, then the
+//      authorized stream proxy). Only the explicit PACKAGED_PUBLIC_BASE_URL makes
+//      those deployments advertise a public origin.
+export function packagedPublicOrigin(
+  stackMinioEndpoint?: string
+): string | undefined {
   const raw = process.env['PACKAGED_PUBLIC_BASE_URL'];
   if (!raw || raw.trim().length === 0) {
-    return undefined;
+    return stackPackagedPublicOrigin(stackMinioEndpoint);
   }
   return raw;
 }
@@ -388,7 +496,15 @@ export class PackagingService implements PackagingTrigger {
   async triggerPackaging(
     assetId: string,
     encoreJobUrl: string
-  ): Promise<void> {
+  ): Promise<string | undefined> {
+    // Record the observable `package` Job BEFORE the enqueue (issue #976), so a
+    // packager that consumes the queue entry immediately still finds a job to
+    // settle, and so the enqueue-failure path below has a record to fail. This
+    // also stamps `steps[].jobId` on an already-running `package` step, which is
+    // why it precedes the enqueue rather than following it: stamping afterwards
+    // would race the packager's own completion callback. Best-effort — never
+    // throws (src/pipeline/package-job.ts).
+    const packageJobId = await startPackageJob(this.packageJobDeps(), assetId);
     try {
       const job: PackagingJob = {
         jobId: assetId,
@@ -397,30 +513,75 @@ export class PackagingService implements PackagingTrigger {
       await this.deps.queue.enqueue(job);
       // Audit: package job submitted (issue #564). One entry on a SUCCESSFUL
       // enqueue only — the catch path below is a failed submission that records
-      // `packagingError` instead. targetId is the packaging correlation id
-      // (= assetId; packaging carries no separate Job record).
+      // `packagingError` instead. targetId is the `package` Job id when one was
+      // recorded (issue #976 — matching how transcode audits its own job id,
+      // src/pipeline/transcode.ts), falling back to the packaging correlation id
+      // (= assetId) on a deployment with no job repository wired.
       emitAudit(
         this.deps.audit,
         {
           actor: originActor('system'),
           action: 'job.submitted',
           targetType: 'job',
-          targetId: assetId,
+          targetId: packageJobId ?? assetId,
           detail: { jobType: 'package', assetId }
+        },
+        this.deps.auditLog
+      );
+      // Operational log: the `package` stage started (issue #995). Emitted at the
+      // SAME point as the audit entry — a successful enqueue — so the Logs tab
+      // shows the stage beginning, and the failure branch below reports the
+      // enqueue that never happened instead.
+      logPipelineEvent(
+        this.deps.pipelineLog,
+        {
+          stage: 'package',
+          level: 'info',
+          message: `enqueued job ${packageJobId ?? assetId} for asset ${assetId}`
         },
         this.deps.auditLog
       );
     } catch (err) {
       this.deps.onError?.(err);
       const message = err instanceof Error ? err.message : String(err);
+      const reason = `failed to enqueue packaging job: ${message}`;
+      // The enqueue never happened, so no packager callback can ever settle this
+      // job: fail it here with the same reason written onto the asset, so the
+      // failure is readable from GET /api/v1/jobs (issue #976).
+      await failPackageJob(this.packageJobDeps(), { jobId: packageJobId, assetId }, reason);
+      // Operational log: the enqueue failed, so no packager callback can ever
+      // settle this job (issue #995). There is no audit entry here (a failed
+      // submission is not a submission), but it is exactly the event an operator
+      // opens the Logs tab for.
+      logPipelineEvent(
+        this.deps.pipelineLog,
+        {
+          stage: 'package',
+          level: 'error',
+          message: `asset ${assetId}: ${reason}`
+        },
+        this.deps.auditLog
+      );
       try {
         await this.deps.assets.update(assetId, {
-          packagingError: `failed to enqueue packaging job: ${message}`
+          packagingError: reason
         });
       } catch {
         // Detached safety: nothing more we can do if the error write also fails.
       }
     }
+    return packageJobId;
+  }
+
+  // The package-job bookkeeping dependencies (issue #976). Absent repositories
+  // make every helper a no-op, so a PackagingService constructed without them
+  // behaves exactly as it did before package jobs existed.
+  private packageJobDeps(): PackageJobDeps {
+    return {
+      jobs: this.deps.jobs,
+      pipeline: this.deps.pipeline,
+      logger: this.deps.auditLog
+    };
   }
 
   // Invoked by POST /api/v1/internal/packagerCallback/success when the packager
@@ -448,6 +609,9 @@ export class PackagingService implements PackagingTrigger {
       manifestUrls,
       ...(packagedOutput ? { packagedOutput } : {})
     });
+    // Settle the observable `package` Job (issue #976). Idempotent: an
+    // at-least-once packager callback for an already-settled job is a no-op.
+    const packageJobId = await completePackageJob(this.packageJobDeps(), { assetId });
     // Audit: package job reached terminal success (issue #564). One entry;
     // emitted only when the asset resolved (a callback for an unknown asset
     // returns false above and records nothing).
@@ -457,8 +621,22 @@ export class PackagingService implements PackagingTrigger {
         actor: originActor('system'),
         action: 'job.completed',
         targetType: 'job',
-        targetId: assetId,
+        // Same target as the submission entry: the `package` Job id when one
+        // exists (issue #976), else the packaging correlation id (= assetId).
+        targetId: packageJobId ?? assetId,
         detail: { jobType: 'package', assetId }
+      },
+      this.deps.auditLog
+    );
+    // Operational log: the `package` stage reached terminal success (issue #995).
+    // Same guard as the audit entry — a callback for an unknown asset returned
+    // false above and records nothing.
+    logPipelineEvent(
+      this.deps.pipelineLog,
+      {
+        stage: 'package',
+        level: 'info',
+        message: `job ${packageJobId ?? assetId} for asset ${assetId} completed; HLS and DASH manifests published`
       },
       this.deps.auditLog
     );
@@ -470,6 +648,10 @@ export class PackagingService implements PackagingTrigger {
     const asset = await this.deps.assets.get(assetId);
     if (!asset) return false;
     await this.deps.assets.update(assetId, { packagingError: message });
+    // Settle the observable `package` Job as failed WITH the reason (issue
+    // #976), so the failure is readable from the Jobs tab without opening the
+    // asset record. Idempotent, and a no-op when no job repository is wired.
+    const packageJobId = await failPackageJob(this.packageJobDeps(), { assetId }, message);
     // Audit: package job reached terminal failure (issue #564). One entry;
     // emitted only when the asset resolved (unknown asset returns false above).
     emitAudit(
@@ -478,8 +660,19 @@ export class PackagingService implements PackagingTrigger {
         actor: originActor('system'),
         action: 'job.failed',
         targetType: 'job',
-        targetId: assetId,
+        // Same target as the submission entry (see handleSuccess).
+        targetId: packageJobId ?? assetId,
         detail: { jobType: 'package', assetId, error: message }
+      },
+      this.deps.auditLog
+    );
+    // Operational log: the `package` stage reached terminal failure (issue #995).
+    logPipelineEvent(
+      this.deps.pipelineLog,
+      {
+        stage: 'package',
+        level: 'error',
+        message: `job ${packageJobId ?? assetId} for asset ${assetId} failed: ${message}`
       },
       this.deps.auditLog
     );
