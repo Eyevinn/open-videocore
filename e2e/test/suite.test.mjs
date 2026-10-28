@@ -26,23 +26,32 @@ test('green against a contract-conformant instance, and cleans up its asset', as
   assert.equal(result.build.commit, 'abc1234');
 });
 
-test('a fully open service (no ingress wall, no application gate) fails both auth cases', async () => {
+test('a fully open service (no ingress wall, no application gate) fails the anonymous auth case', async () => {
   const { result } = await run({ openAuth: true, appOpen: true });
   assert.equal(result.status, 'red');
   assert.equal(byId(result)['auth-required'].status, 'fail');
-  assert.equal(byId(result)['app-auth-required'].status, 'fail');
+  // x-jwt-accepted only asks that x-jwt alone is accepted (#1256), which an open service also does.
+  assert.equal(byId(result)['x-jwt-accepted'].status, 'pass');
 });
 
-test('ingress open but the application still gates: auth-required passes only because the app rejects, app-auth-required passes', async () => {
+test('ingress open but the application still gates: auth-required passes only because the app rejects, x-jwt-accepted passes', async () => {
   const { result } = await run({ openAuth: true });
-  assert.equal(byId(result)['app-auth-required'].status, 'pass');
+  assert.equal(byId(result)['auth-required'].status, 'pass');
+  assert.equal(byId(result)['x-jwt-accepted'].status, 'pass');
 });
 
-test('application without its own auth gate -> app-auth-required fails (regression guard for #711)', async () => {
+// Issue #1256 limitation, pinned on purpose. The suite used to tell an application with an auth gate from one without
+// (the #711 regression) by sending x-jwt alone and expecting the application's own 401. The application now accepts
+// x-jwt, and every request that clears the ingress carries a token the application accepts, so from behind the ingress
+// a gated and an un-gated application answer alike and that distinction cannot be observed here. What stays pinned is
+// the anonymous 401 (`auth-required`): a service with no ingress wall AND no application gate still fails (see the
+// 'fully open service' test above). The application-level gate itself is covered by the unit tests in
+// test/auth-x-jwt-header-fallback.test.ts.
+test('an application without its own auth gate is indistinguishable from behind the ingress (limitation after #1256)', async () => {
   const { result } = await run({ appOpen: true });
-  assert.equal(result.status, 'red');
-  assert.equal(byId(result)['app-auth-required'].status, 'fail');
   assert.equal(byId(result)['auth-required'].status, 'pass');
+  assert.equal(byId(result)['x-jwt-accepted'].status, 'pass');
+  assert.equal(result.status, 'green');
 });
 
 test('ingest job failure fails ingest and skips the rest of the chain', async () => {
@@ -79,7 +88,7 @@ test('wrong build commit fails health; "unknown" commit is not a mismatch', asyn
   } finally { await mock.close(); }
 });
 
-test('the client sends both x-jwt (ingress) and Authorization (application); x-jwt alone reaches the application gate', async () => {
+test('the client sends both x-jwt (ingress) and Authorization (application); x-jwt alone clears both layers (#1256), and neither header reaches the application gate', async () => {
   const mock = await startMock();
   try {
     assert.equal((await createClient({ baseUrl: mock.baseUrl }).request('GET', '/health')).status, 401);
@@ -87,10 +96,18 @@ test('the client sends both x-jwt (ingress) and Authorization (application); x-j
     assert.equal((await createClient({ baseUrl: mock.baseUrl, token: mock.token, authHeader: 'authorization' }).request('GET', '/health')).status, 401);
     const full = await createClient({ baseUrl: mock.baseUrl, token: mock.token }).request('GET', '/api/v1/assets/');
     assert.equal(full.status, 200);
+    // Since #1256 the application accepts x-jwt on its own, so x-jwt alone clears BOTH layers.
     const ingressOnly = await createClient({ baseUrl: mock.baseUrl, token: mock.token, appToken: '' }).request('GET', '/api/v1/assets/');
-    assert.equal(ingressOnly.status, 401);
-    assert.equal(ingressOnly.body.message, 'missing access token');
+    assert.equal(ingressOnly.status, 200);
   } finally { await mock.close(); }
+  // The application's own gate still answers 401 `missing access token` when NEITHER header carries a token. Reached
+  // with the ingress wall open, because behind the real ingress an anonymous call never gets that far.
+  const open = await startMock({ faults: { openAuth: true } });
+  try {
+    const neither = await createClient({ baseUrl: open.baseUrl }).request('GET', '/api/v1/assets/');
+    assert.equal(neither.status, 401);
+    assert.equal(neither.body.message, 'missing access token');
+  } finally { await open.close(); }
 });
 
 test('results never contain the token', async () => {
@@ -108,7 +125,8 @@ test('sweep deletes only old e2e- assets, keeps recent and foreign ones, and run
     mock.seed({ id: 'new-e2e', name: 'e2e-now', createdAt: new Date().toISOString() });
     mock.seed({ id: 'product', name: 'Real asset', createdAt: old });
     const client = createClient({ baseUrl: mock.baseUrl, token: mock.token });
-    const result = await runSuite({ client, anon: createClient({ baseUrl: mock.baseUrl }), config: fastCfg });
+    const ingress = createClient({ baseUrl: mock.baseUrl, token: mock.token, appToken: '' }); // x-jwt alone, as in run() above
+    const result = await runSuite({ client, anon: createClient({ baseUrl: mock.baseUrl }), ingress, config: fastCfg });
     assert.equal(result.swept, 1);
     assert.ok(['new-e2e', 'old-e2e', 'product'].every((id) => mock.assets.has(id)), 'nothing is removed, deletion is soft');
     assert.equal(mock.assets.get('old-e2e').status, 'archived');
@@ -270,9 +288,10 @@ test('a gateway answer on another job read is unchanged: ingest still fails as b
 });
 
 test('one platform failure plus one real failure is red, not infra-error', async () => {
-  const { result } = await run({ transcodeGateway: 504, appOpen: true });
+  // A fully open service gives a real (non-infra) failure on the anonymous auth case.
+  const { result } = await run({ transcodeGateway: 504, openAuth: true, appOpen: true });
   assert.equal(result.status, 'red');
-  assert.equal(byId(result)['app-auth-required'].status, 'fail');
+  assert.equal(byId(result)['auth-required'].status, 'fail');
   assert.equal(byId(result).transcode.failureClass, 'infra');
 });
 
