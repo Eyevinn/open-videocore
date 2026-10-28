@@ -15,6 +15,7 @@ import {
   publishedProfilesIndexUrl,
   profilesBucketAnonymousReadPolicy,
   renderPublishedProfileIndex,
+  countPublishedProfileIndexEntries,
   type ProfilesBucketClient
 } from './profile-index-publisher.js';
 import {
@@ -292,5 +293,34 @@ describe('resolveEncoreProfilesUrlWithOrigin tier order (ADR-026 D2)', () => {
 
   it('leaves a published bucket URL unscoped by the stack-scoping rewrite (#1164)', () => {
     expect(stackScopedProfilesIndexUrl(PUBLISHED, 'mystack')).toBe(PUBLISHED);
+  });
+});
+
+// The index COUNTER used by the boot-time publish verification (ADR-026 D4,
+// issue #1209). It is the inverse of renderPublishedProfileIndex, so the two are
+// tested as a round trip: whatever the publisher writes, the probe must count
+// back to the same number the publisher reported — otherwise the verification
+// would raise false "stale bucket" alarms (or miss real ones).
+describe('countPublishedProfileIndexEntries (ADR-026 D4, issue #1209)', () => {
+  it('round-trips the rendered index: counted entries == published profile count', () => {
+    const profiles = [
+      { name: 'b', yaml: RUNNABLE_YAML },
+      { name: 'a', yaml: RUNNABLE_YAML },
+      // Filtered out of the index by isProfileRunnable (#286), so it must NOT be
+      // counted — this is exactly the number PublishOutcome.profileCount carries.
+      { name: 'gpu', yaml: GPU_YAML }
+    ];
+    const body = renderPublishedProfileIndex(profiles);
+    expect(countPublishedProfileIndexEntries(body)).toBe(2);
+  });
+
+  it('counts the empty-store body ({}, issue #459) as zero', () => {
+    expect(countPublishedProfileIndexEntries(renderPublishedProfileIndex([]))).toBe(0);
+    expect(countPublishedProfileIndexEntries('{}\n')).toBe(0);
+    expect(countPublishedProfileIndexEntries('')).toBe(0);
+  });
+
+  it('ignores blank lines and a missing trailing newline', () => {
+    expect(countPublishedProfileIndexEntries('a: a.yml\n\nb: b.yml')).toBe(2);
   });
 });

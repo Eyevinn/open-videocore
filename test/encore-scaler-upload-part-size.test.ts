@@ -64,7 +64,6 @@ vi.mock('@osaas/client-core', async () => {
 import { spawnInstance, ENCORE_SERVICE_ID } from '../src/encore-scaler/instance-pool.js';
 import type { EncoreScalerConfig } from '../src/encore-scaler/types.js';
 import {
-  DEFAULT_UPLOAD_PART_SIZE_BYTES,
   S3_MAX_PART_SIZE_BYTES,
   S3_MAX_PARTS,
   S3_MIN_PART_SIZE_BYTES,
@@ -74,10 +73,14 @@ import {
 } from '../src/encore-scaler/upload-part-size.js';
 
 // The part size the transcoder service defaults to when the option is omitted —
-// verbatim from the instance API schema's `"default": "104857600"`. This is the
-// value #1221's uploads actually ran on, so it is what a spawn must no longer
-// leave in place.
+// verbatim from the instance API schema's `"default": "104857600"`. The scaler
+// sends nothing unless an operator sets a value, so this stays the effective
+// part size (and, via the CRT client's threshold default, the multipart
+// threshold) on every instance by default.
 const SERVICE_DEFAULT_PART_SIZE_BYTES = 104_857_600;
+
+// An arbitrary operator-chosen value for the tests below. It is NOT a default.
+const SAMPLE_PART_SIZE_BYTES = 16 * 1024 * 1024;
 
 // Only the commands spawnInstance's create + failure-recording path touches.
 class TinyRedis {
@@ -154,22 +157,35 @@ function transcoderCreateBody(): Record<string, string> | undefined {
 }
 
 describe('resolveUploadPartSizeBytes (issue #1221)', () => {
-  it('defaults to a part size well below the service default that stranded large uploads', () => {
-    expect(resolveUploadPartSizeBytes(undefined)).toBe(DEFAULT_UPLOAD_PART_SIZE_BYTES);
-    expect(resolveUploadPartSizeBytes('')).toBe(DEFAULT_UPLOAD_PART_SIZE_BYTES);
-    expect(resolveUploadPartSizeBytes('   ')).toBe(DEFAULT_UPLOAD_PART_SIZE_BYTES);
-    expect(DEFAULT_UPLOAD_PART_SIZE_BYTES).toBeLessThan(SERVICE_DEFAULT_PART_SIZE_BYTES);
-    expect(DEFAULT_UPLOAD_PART_SIZE_BYTES).toBeGreaterThanOrEqual(S3_MIN_PART_SIZE_BYTES);
+  it('resolves to undefined when unset, so the service default is left untouched', () => {
+    expect(resolveUploadPartSizeBytes(undefined)).toBeUndefined();
+    expect(resolveUploadPartSizeBytes('')).toBeUndefined();
+    expect(resolveUploadPartSizeBytes('   ')).toBeUndefined();
   });
 
-  it('keeps the default part count for a realistic archive master far under the 10 000-part cap', () => {
+  it('documents the threshold coupling: a part size below the service default also lowers the multipart threshold', () => {
+    // The transcoder passes thresholdInBytes(multipart.threshold) with threshold
+    // null, and the CRT client defaults the threshold to the minimum part size.
+    // So any operator value below the service default moves outputs between that
+    // value and 100 MB onto the multipart path. This asserts the arithmetic the
+    // README and upload-part-size.ts warn about; it does not assert service
+    // behaviour, which is not reachable from this repo.
+    const operatorValue = resolveUploadPartSizeBytes(String(SAMPLE_PART_SIZE_BYTES));
+    expect(operatorValue).toBe(SAMPLE_PART_SIZE_BYTES);
+    expect(operatorValue).toBeLessThan(SERVICE_DEFAULT_PART_SIZE_BYTES);
+    const outputBytes = 50 * 1024 * 1024; // a delivery-class rendition
+    const multipartOnServiceDefault = outputBytes >= SERVICE_DEFAULT_PART_SIZE_BYTES;
+    const multipartOnOperatorValue = outputBytes >= (operatorValue ?? Infinity);
+    expect(multipartOnServiceDefault).toBe(false);
+    expect(multipartOnOperatorValue).toBe(true);
+  });
+
+  it('keeps the part count for a realistic archive master far under the 10 000-part cap', () => {
     // The reported output: a 740 MB 4K source encoded to one ~3.4 GiB file.
     const archiveOutputBytes = 3.4 * 1024 * 1024 * 1024;
-    const parts = Math.ceil(archiveOutputBytes / DEFAULT_UPLOAD_PART_SIZE_BYTES);
+    const parts = Math.ceil(archiveOutputBytes / SAMPLE_PART_SIZE_BYTES);
     expect(parts).toBeLessThan(S3_MAX_PARTS);
-    expect(maxUploadBytesForPartSize(DEFAULT_UPLOAD_PART_SIZE_BYTES)).toBeGreaterThan(
-      archiveOutputBytes
-    );
+    expect(maxUploadBytesForPartSize(SAMPLE_PART_SIZE_BYTES)).toBeGreaterThan(archiveOutputBytes);
   });
 
   it('accepts an operator override inside the S3 part-size bounds', () => {
@@ -186,7 +202,7 @@ describe('resolveUploadPartSizeBytes (issue #1221)', () => {
     expect(onInvalid).not.toHaveBeenCalled();
   });
 
-  it('falls back to the default and SAYS SO on a value that cannot be a part size', () => {
+  it('falls back to the service default (undefined) and SAYS SO on a value that cannot be a part size', () => {
     for (const bad of [
       '16MiB', // a unit suffix parseInt would silently truncate to 16 bytes
       '-1',
@@ -197,15 +213,13 @@ describe('resolveUploadPartSizeBytes (issue #1221)', () => {
       'not-a-number'
     ]) {
       const onInvalid = vi.fn();
-      expect(resolveUploadPartSizeBytes(bad, onInvalid)).toBe(DEFAULT_UPLOAD_PART_SIZE_BYTES);
+      expect(resolveUploadPartSizeBytes(bad, onInvalid)).toBeUndefined();
       expect(onInvalid).toHaveBeenCalledTimes(1);
-      expect(String(onInvalid.mock.calls[0]?.[0])).toContain(
-        String(DEFAULT_UPLOAD_PART_SIZE_BYTES)
-      );
+      expect(String(onInvalid.mock.calls[0]?.[0])).toContain('service default');
     }
   });
 
-  it('never throws, so a typo cannot stop an API that transcodes fine on the default', () => {
+  it('never throws, so a typo cannot stop an API that transcodes fine on the service default', () => {
     expect(() => resolveUploadPartSizeBytes('garbage')).not.toThrow();
   });
 });
@@ -228,17 +242,15 @@ describe('spawned transcoder output-upload configuration (issue #1221)', () => {
   });
 
   it('sends the configured part size as the decimal-string option the service declares', async () => {
-    const config = makeConfig({ uploadPartSizeBytes: DEFAULT_UPLOAD_PART_SIZE_BYTES });
+    const config = makeConfig({ uploadPartSizeBytes: SAMPLE_PART_SIZE_BYTES });
     await expect(spawnInstance(config, 1)).rejects.toThrow();
 
     const body = transcoderCreateBody();
     expect(body).toBeDefined();
     // The option's declared type is string, not number: a JSON number would be
     // rejected by the instance API's body schema.
-    expect(body?.[UPLOAD_PART_SIZE_OPTION]).toBe(String(DEFAULT_UPLOAD_PART_SIZE_BYTES));
+    expect(body?.[UPLOAD_PART_SIZE_OPTION]).toBe(String(SAMPLE_PART_SIZE_BYTES));
     expect(typeof body?.[UPLOAD_PART_SIZE_OPTION]).toBe('string');
-    // ...and it is NOT the service default the failing uploads ran on.
-    expect(body?.[UPLOAD_PART_SIZE_OPTION]).not.toBe(String(SERVICE_DEFAULT_PART_SIZE_BYTES));
   });
 
   it('carries an operator override through to the create body', async () => {
@@ -254,11 +266,11 @@ describe('spawned transcoder output-upload configuration (issue #1221)', () => {
     // sent. (Here s3Config is absent entirely, the narrowest case.)
     const config = makeConfig({
       s3Config: undefined,
-      uploadPartSizeBytes: DEFAULT_UPLOAD_PART_SIZE_BYTES
+      uploadPartSizeBytes: SAMPLE_PART_SIZE_BYTES
     });
     await expect(spawnInstance(config, 1)).rejects.toThrow();
     const body = transcoderCreateBody();
-    expect(body?.[UPLOAD_PART_SIZE_OPTION]).toBe(String(DEFAULT_UPLOAD_PART_SIZE_BYTES));
+    expect(body?.[UPLOAD_PART_SIZE_OPTION]).toBe(String(SAMPLE_PART_SIZE_BYTES));
     expect(body?.['s3Endpoint']).toBeUndefined();
   });
 
@@ -273,7 +285,7 @@ describe('spawned transcoder output-upload configuration (issue #1221)', () => {
   it('does not disturb the options a spawn already sets', async () => {
     const config = makeConfig({
       profilesUrl: 'https://api.example/api/v1/profiles/index.yml',
-      uploadPartSizeBytes: DEFAULT_UPLOAD_PART_SIZE_BYTES
+      uploadPartSizeBytes: SAMPLE_PART_SIZE_BYTES
     });
     await expect(spawnInstance(config, 1)).rejects.toThrow();
     const body = transcoderCreateBody();

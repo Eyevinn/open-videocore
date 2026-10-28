@@ -1,12 +1,20 @@
-// Multipart part size for a spawned transcoder's OUTPUT upload (issue #1221).
+// Operator-tunable multipart part size for a spawned transcoder's OUTPUT upload
+// (issue #1221).
 //
-// WHY THIS EXISTS
-// ---------------
+// WHAT THIS IS
+// ------------
+// A tunable, not a fix. Unset (the default) the option is NOT sent and every
+// instance keeps the transcoder service's own default (104 857 600 bytes,
+// 100 MB), i.e. no behaviour change on upgrade. An operator who sets
+// ENCORE_S3_MULTIPART_PART_SIZE_BYTES gets that value sent on every newly spawned
+// instance.
+//
+// WHY IT EXISTS (OBSERVATION, NOT CAUSE)
+// --------------------------------------
 // An archive-class profile writes ONE very large output (a single mastering-codec
 // file, ~3.4 GiB from a 740 MB 4K source). The encode succeeds, and then the
-// upload of that output to the stack's object store fails deterministically —
-// 3 of 3 attempts, nothing written to the bucket — about 10 seconds after the
-// encode finishes, with:
+// upload of that output to the stack's object store fails — 3 of 3 attempts,
+// nothing written to the bucket — about 10 seconds after the encode finishes, with:
 //
 //   SdkClientException: Unable to execute HTTP request: Acquire operation took
 //   longer than the configured maximum time. This indicates that a request
@@ -14,35 +22,44 @@
 //   ("Acquire operation took longer than 10000 milliseconds")
 //
 // A delivery-class profile on the SAME source, stack and object store uploads in
-// about a second. The discriminator is output size, not connectivity: the
-// endpoint is the in-cluster Service address (issue #991), so no ingress is in
-// the path, and the small-output upload proves the route works.
+// about a second (re-observed 2026-10-28: `program` passes, `archive` fails twice,
+// same source). The discriminator is output size or output shape, not
+// connectivity: the endpoint is the in-cluster Service address (issue #991).
 //
-// ~10 s to failure is the connection-acquisition timeout elapsing with NO
-// progress: the upload client never got going, rather than stalling partway
-// through a long queue of parts. The one thing that distinguishes the failing
-// upload is that it is the only one big enough to engage MULTIPART at all — and
-// the part size it engages with is the transcoder service's default of
-// 104 857 600 bytes (100 MB), 12.5x the upload SDK's own 8 MiB default. At that
-// part size each in-flight part reserves a 100 MB buffer from the upload client's
-// default memory budget (the client is built with no concurrency and no
-// throughput override — see the contract sources below), which leaves very few
-// slots, so part requests sit waiting on connection acquisition and trip the
-// 10 s bound before the first part lands.
+// THE HYPOTHESIS THIS WAS BUILT ON, AND WHY IT IS NOT ESTABLISHED
+// ---------------------------------------------------------------
+// The first version of this change argued that the service's 100 MB default part
+// size leaves too few buffer slots, so part requests starve for a connection. That
+// is a hypothesis; it was never reproduced. The deployed service's own source
+// argues against it applying here:
+//   - the credentialed upload path builds the CRT client
+//     (`S3AsyncClient.crtBuilder()` + transfer manager) and passes
+//     `minimumPartSizeInBytes` AND `thresholdInBytes` to it;
+//   - the "Acquire operation took longer than ..." text is the Netty standard
+//     async HTTP client's connectionAcquisitionTimeout message, and that client is
+//     built only on the ANONYMOUS branch, which sets `multipartEnabled(false)` and
+//     never reads any multipart property.
+// So on the path the error text points at, this option may be a no-op. Which
+// branch a provisioned instance actually takes is unanswered here and is tracked
+// on #1221; it needs a reproduction on a real provisioned instance or an OSC-side
+// answer. Do not read this module as having fixed #1221.
 //
-// So: send a part size in the range the upload SDK itself defaults to and is
-// tested at. Smaller parts mean smaller per-part buffers, many admissible
-// in-flight slots, and short part requests that acquire a connection
-// immediately; the transfer as a whole stays inside the service's one-hour
-// upload timeout.
+// THRESHOLD COUPLING (operators: read this before lowering the value)
+// ------------------------------------------------------------------
+// The service passes `thresholdInBytes(multipart.threshold)` with `threshold`
+// defaulting to null, and OSC exposes no option for it, so the threshold takes the
+// CRT default, which equals the minimum part size (AWS SDK `S3CrtAsyncClientBuilder
+// .thresholdInBytes`: "By default, it is the same as `minimumPartSizeInBytes`").
+// Lowering this value therefore also lowers the size at which an output goes
+// multipart. With the 100 MB default, outputs under 100 MB are single PUTs; set to
+// 16 MiB, every output from 16 MiB up goes multipart. Outputs that upload
+// reliably today would move onto the multipart path. Lower it only to test the
+// hypothesis above on a scratch instance, not as a blanket setting.
 //
 // The connection pool size and the acquisition timeout themselves are NOT
-// reachable from a consumer: they are built inside the transcoder image. The
-// part size is the one upload tunable the service does expose, which is why the
-// fix is shaped this way and why it is also operator-overridable — if a
-// deployment's object store prefers fewer, larger parts, an operator can raise
-// this without a release. The remaining gap is logged in the agents repo under
-// docs/osc-feedback/.
+// reachable from a consumer: they are built inside the transcoder image. The part
+// size is the one upload tunable the service exposes. The remaining gap is logged
+// in the agents repo under docs/osc-feedback/.
 //
 // CONTRACT SOURCES VERIFIED BEFORE WRITING (CLAUDE.md rule 7, all fetched live
 // 2026-10-16)
@@ -99,17 +116,6 @@ export const S3_MIN_PART_SIZE_BYTES = 5 * 1024 * 1024; // 5 MiB
 export const S3_MAX_PART_SIZE_BYTES = 5 * 1024 * 1024 * 1024; // 5 GiB
 export const S3_MAX_PARTS = 10_000;
 
-// Default part size handed to every spawned transcoder (16 MiB).
-//
-// Chosen as the smallest value that is comfortably inside the upload SDK's own
-// default range (8 MiB) while keeping the part count low for a realistic archive
-// master: 16 MiB x 10 000 parts is a 160 GB ceiling, so no plausible single
-// output can exhaust the part limit, and a 3.4 GiB output becomes a few hundred
-// short part requests whose buffers are ~6x smaller than the service default's.
-// It is deliberately NOT the 5 MiB floor: that would triple the request count
-// for no buffer-pressure benefit.
-export const DEFAULT_UPLOAD_PART_SIZE_BYTES = 16 * 1024 * 1024;
-
 // Largest single output this part size can carry, for log/error text.
 export function maxUploadBytesForPartSize(partSizeBytes: number): number {
   return partSizeBytes * S3_MAX_PARTS;
@@ -117,42 +123,39 @@ export function maxUploadBytesForPartSize(partSizeBytes: number): number {
 
 // Resolve the configured part size, in bytes, from a raw env value.
 //
-// Absent/blank => the default above. An unparseable or out-of-bounds value =>
-// the default, with `onInvalid` called naming the reason: an upload tunable that
-// silently did something other than what the operator wrote is how #1221 cost
-// three full 4K encodes to diagnose in the first place, so the fallback is
-// always announced. It does NOT throw: a typo'd tunable must not stop an API
-// that transcodes correctly on the default.
+// Absent/blank => undefined: the option is not sent and the service keeps its own
+// default. An unparseable or out-of-bounds value => undefined too, with
+// `onInvalid` called naming the reason: an upload tunable that silently did
+// something other than what the operator wrote is how #1221 cost three full 4K
+// encodes to diagnose in the first place, so the fallback is always announced. It
+// does NOT throw: a typo'd tunable must not stop an API that transcodes correctly
+// on the service default.
 export function resolveUploadPartSizeBytes(
   raw: string | undefined,
   onInvalid?: (reason: string) => void
-): number {
+): number | undefined {
   const trimmed = (raw ?? '').trim();
-  if (trimmed.length === 0) return DEFAULT_UPLOAD_PART_SIZE_BYTES;
+  if (trimmed.length === 0) return undefined;
 
   // Strict decimal byte count: the option is sent to the service as a decimal
   // string, so anything parseInt would silently truncate ("16MiB" -> 16) is
   // rejected instead of becoming a part size below the S3 floor.
   if (!/^\d+$/.test(trimmed)) {
-    onInvalid?.(
-      `"${trimmed}" is not a whole number of bytes — using the default ${DEFAULT_UPLOAD_PART_SIZE_BYTES}`
-    );
-    return DEFAULT_UPLOAD_PART_SIZE_BYTES;
+    onInvalid?.(`"${trimmed}" is not a whole number of bytes — using the service default`);
+    return undefined;
   }
 
   const parsed = Number(trimmed);
   if (!Number.isSafeInteger(parsed)) {
-    onInvalid?.(
-      `${trimmed} bytes is not a representable byte count — using the default ${DEFAULT_UPLOAD_PART_SIZE_BYTES}`
-    );
-    return DEFAULT_UPLOAD_PART_SIZE_BYTES;
+    onInvalid?.(`${trimmed} bytes is not a representable byte count — using the service default`);
+    return undefined;
   }
   if (parsed < S3_MIN_PART_SIZE_BYTES || parsed > S3_MAX_PART_SIZE_BYTES) {
     onInvalid?.(
       `${parsed} bytes is outside the S3 multipart part-size bounds ` +
-        `[${S3_MIN_PART_SIZE_BYTES}, ${S3_MAX_PART_SIZE_BYTES}] — using the default ${DEFAULT_UPLOAD_PART_SIZE_BYTES}`
+        `[${S3_MIN_PART_SIZE_BYTES}, ${S3_MAX_PART_SIZE_BYTES}] — using the service default`
     );
-    return DEFAULT_UPLOAD_PART_SIZE_BYTES;
+    return undefined;
   }
   return parsed;
 }

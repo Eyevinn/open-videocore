@@ -202,7 +202,7 @@ describe('DELETE /api/v1/provision/:name (param store, issue #29)', () => {
     const app = await buildApp(paramStore);
     const op = await deprovisionAndWait(app, 'mystack');
 
-    expect(op.status).toBe('done');
+    expect(op.status).toBe('failed');
     expect(op.result.status).toBe('failed');
     // Entry retained so a retry can re-read services[] and finish teardown.
     expect(paramStore.deleteStackConfig).not.toHaveBeenCalled();
@@ -221,7 +221,7 @@ describe('DELETE /api/v1/provision/:name (param store, issue #29)', () => {
     const app = await buildApp(paramStore);
     const op = await deprovisionAndWait(app, 'mystack');
 
-    expect(op.status).toBe('done');
+    expect(op.status).toBe('failed');
     // Unverifiable, therefore failed — NOT the old silent not_found success.
     expect(op.result.status).toBe('failed');
     const services = (op.result.services ?? []) as { status: string }[];
@@ -266,7 +266,7 @@ describe('DELETE /api/v1/provision/:name (no param store, legacy)', () => {
     const app = await buildApp();
     const op = await deprovisionAndWait(app, 'mystack');
 
-    expect(op.status).toBe('done');
+    expect(op.status).toBe('failed');
     const result = op.result as { status: string; services: { serviceId: string; status: string }[] };
     expect(result.status).toBe('failed');
     expect(
@@ -321,7 +321,7 @@ describe('DELETE /api/v1/provision/:name folds the on-demand packager outcome in
     const app = await buildApp(paramStore);
     const op = await deprovisionAndWait(app, 'mystack');
 
-    expect(op.status).toBe('done');
+    expect(op.status).toBe('failed');
     // Previously 'removed': the packager outcome was not in the aggregate.
     expect(op.result.status).toBe('failed');
 
@@ -385,7 +385,7 @@ describe('DELETE /api/v1/provision/:name folds the on-demand packager outcome in
     const app = await buildApp(paramStore);
     const op = await deprovisionAndWait(app, 'mystack');
 
-    expect(op.status).toBe('done');
+    expect(op.status).toBe('failed');
     expect(op.result.status).toBe('failed');
     expect(
       servicesOf(op.result).find((s) => s.serviceId === PACKAGER_SERVICE_ID)
@@ -412,7 +412,7 @@ describe('DELETE /api/v1/provision/:name folds the on-demand packager outcome in
     const app = await buildApp();
     const op = await deprovisionAndWait(app, 'mystack');
 
-    expect(op.status).toBe('done');
+    expect(op.status).toBe('failed');
     expect(op.result.status).toBe('failed');
 
     const services = servicesOf(op.result);

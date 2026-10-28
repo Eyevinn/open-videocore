@@ -4,7 +4,7 @@ import { ensureStack } from './stack.mjs';
 import { slackNotifier } from '../lib/notify.mjs';
 import { fileStore } from './store-file.mjs';
 import { s3Store } from './store-s3.mjs';
-import { createClient, runSuite } from '../suite/run.mjs';
+import { createClient, runSuite, timeoutsFromEnv } from '../suite/run.mjs';
 
 export class ConfigError extends Error {}
 
@@ -16,6 +16,9 @@ export async function buildDeps(env) {
     ? await s3Store({ bucket: need('E2E_S3_BUCKET'), endpoint: env.E2E_S3_ENDPOINT, accessKeyId: need('E2E_S3_ACCESS_KEY'), secretAccessKey: need('E2E_S3_SECRET_KEY') })
     : fileStore(need('E2E_RESULTS_DIR'));
   const sourceUrl = need('E2E_SOURCE_URL');
+  // Per-instance budget overrides (E2E_TIMEOUT_TRANSCODE_MS and friends). A set-but-unusable value is a config error.
+  let timeouts;
+  try { timeouts = timeoutsFromEnv(env); } catch (e) { throw new ConfigError(e.message); }
   return {
     secrets,
     registry: registryAdapter({ user: need('GHCR_USER'), token: need('GHCR_TOKEN') }),
@@ -28,7 +31,7 @@ export async function buildDeps(env) {
       client: createClient({ baseUrl: inst.baseUrl, token: inst.token }),
       anon: createClient({ baseUrl: inst.baseUrl }),
       ingress: createClient({ baseUrl: inst.baseUrl, token: inst.token, appToken: '' }),
-      config: { secrets, runId: new Date().toISOString().replace(/\D/g, '').slice(0, 14), sourceUrl, expectCommit: expected.commit, transcodeProfile: env.E2E_TRANSCODE_PROFILE },
+      config: { secrets, runId: new Date().toISOString().replace(/\D/g, '').slice(0, 14), sourceUrl, expectCommit: expected.commit, transcodeProfile: env.E2E_TRANSCODE_PROFILE, timeouts },
     }),
   };
 }

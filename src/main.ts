@@ -37,6 +37,7 @@ import {
   type SecretStore
 } from './services/storage-backend-registry.js';
 import { PACKAGER_SERVICE_ID } from './services/stack.js';
+import { resolveScalerBootConfig } from './services/scaler-boot-config.js';
 import { assetsRouter } from './routes/assets.js';
 import { assetUploadRouter, type StorageFactory } from './routes/asset-upload.js';
 import { jobsRouter } from './routes/jobs.js';
@@ -168,6 +169,10 @@ import { healthRouter } from './routes/health.js';
 import { resolveBuildInfo } from './build-info.js';
 import { startEncoreCallbackPoller, type PollerDeps } from './pipeline/encore-callback-poller.js';
 import {
+  RemovedStackQueues,
+  StackCallbackPollerRegistry
+} from './pipeline/stack-callback-poller-registry.js';
+import {
   reconcileFailedTranscodes,
   settleFailedTranscode
 } from './pipeline/failed-transcode-reconciler.js';
@@ -184,10 +189,10 @@ import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
 import {
   resolvePublicBaseUrl,
   resolveEncoreProfilesUrlWithOrigin,
-  resolveEncoreProfilesUrlFromParamStore,
-  stackScopedProfilesIndexUrl
+  resolveEncoreProfilesUrlFromParamStore
 } from './services/public-base-url.js';
 import { makeStackScopedProfileIndexPublisher } from './services/profile-index-publisher.js';
+import { makePerStackProfilesUrlResolver } from './services/per-stack-profiles-url.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
 import { Client as MinioClient } from 'minio';
@@ -642,12 +647,50 @@ await app.register(provisionRouter, {
   // failure and does not fail the provision). Declared below (const
   // profileRepository / encoreProfilesUrl); this closure is only invoked at
   // provision-request time, long after those bindings initialise.
-  seedProfiles: () =>
-    bootstrapProfiles({
+  //
+  // The republish below closes issue #1167 review finding 2. `bootstrapProfiles`
+  // MUTATES stored profile YAML (it seeds the index and adds level-safe bounding
+  // widths to already-stored ladders — services/profile-bootstrap.ts), and since
+  // ADR-026 the document the transcoding service actually reads is the
+  // object-store MIRROR, not this store. The other two bootstrap call sites
+  // refresh that mirror (the boot path awaits `publishProfileIndexToObjectStore`
+  // below; `POST /api/v1/profiles/bootstrap` fires `onProfilesChanged`), but this
+  // one did neither — so a stack provisioned after a ladder fix was seeded with
+  // correct profiles whose published mirror was stale (or, on a fresh stack,
+  // absent). The publish is scoped to the stack this seed ran against:
+  // `currentRequestStackName()` is set by the provision route, which invokes this
+  // callback inside `runWithRequestStack(name, ...)`
+  // (routes/provision.ts:368 `seedProfiles?: () => Promise<void>`, :1863), so it
+  // is the SAME stack `profileRepository` just resolved — the same pairing
+  // `onProfilesChanged` uses. AWAITED (the publisher is fail-soft and never
+  // throws, returning a PublishOutcome) so the provision does not report success
+  // until the newly-seeded index is on the stack's object store, before the
+  // scaler can spawn an instance that fetches it.
+  seedProfiles: async () => {
+    await bootstrapProfiles({
       repository: profileRepository,
       indexUrl: encoreProfilesUrl,
       log: app.log
-    }).then(() => undefined),
+    });
+    await publishProfileIndexToObjectStore(currentRequestStackName());
+  },
+  // Release the background work bound to a stack's Valkey before that Valkey is
+  // removed (#1213). Declared below (stopCallbackPollersForStack); the route
+  // only calls this at teardown time, long after the binding initialises.
+  onStackTeardownStart: (name) => stopCallbackPollersForStack(name),
+  // Remember what a teardown that KEPT the stored config established about the
+  // stack's Valkey (#1213), so the reconcile that follows does not re-arm a
+  // poller against a store that teardown already removed. Declared below
+  // (removedStackQueues); only invoked at request time.
+  onStackQueuePresence: (name, present) => {
+    if (!removedStackQueues.record(name, present)) return;
+    app.log.info(
+      { stackKey: name, queuePresent: present },
+      present
+        ? 'encore-callback-poller: stack Valkey reported present again; it may be polled'
+        : 'encore-callback-poller: stack Valkey reported removed; not polling it until the stack is gone'
+    );
+  },
   // Late-bound accessor for the scaler registry. scalerRegistry is a
   // module-level binding created lazily by reconcileScaler() only once a stack
   // exists (and reset to undefined on the last deprovision), which is *after*
@@ -947,7 +990,47 @@ const clipRunner = storageAvailable
 // cap the pool at a single instance (equivalent to the previous static behaviour).
 // Requires a Redis connection (resolved from the parameter store after provisioning).
 // When Redis is unavailable transcoding degrades to 501.
-const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 10);
+const encoreMaxInstancesFromEnv = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 10);
+const encoreMinInstancesFromEnv = parseInt(process.env['ENCORE_MIN_INSTANCES'] || '0', 10);
+const encoreIdleTimeoutMsFromEnv = parseInt(
+  process.env['ENCORE_IDLE_TIMEOUT_MS'] || String(5 * 60 * 1000),
+  10
+);
+
+// Boot-time restore of an operator's persisted scaler config (issue #1078).
+//
+// The env values above are the FALLBACK, not the winner. A PATCH
+// /api/v1/scaler/config has been written durably since #1077, but nothing read
+// it back, so every restart silently reverted an operator's cap to
+// ENCORE_MAX_INSTANCES. Boot now loads the stored snapshot first and the
+// resolved values feed BOTH the scaler registry/loops (below) and the config
+// endpoint (scalerRouterOptions), so GET /api/v1/scaler/config and the effective
+// instance cap cannot disagree.
+//
+// Contract sources verified (CLAUDE.md rule 7):
+//   - services/param-store.ts `makeScalerConfigStore(kv)` /
+//     `ScalerConfigStore.load(): Promise<ScalerRuntimeConfig | undefined>` and
+//     `SCALER_CONFIG_KEY` ('openvideocore/scalerconfig') — the complete
+//     {maxInstances,minInstances,idleTimeoutMs} snapshot PATCH persists.
+//   - services/scaler-boot-config.ts `resolveScalerBootConfig` — precedence,
+//     the never-reject fallback contract and the logged fallback reasons.
+//   - `backendKvStore` (configKvStoreFromEnv, above) is the same KV handle the
+//     PATCH route writes through, so read and write cannot diverge on key, auth
+//     or instance.
+// Undefined store (parameter store unconfigured) => env values, and PATCH
+// answers 501, so there is nothing persisted to miss.
+const scalerBootConfig = await resolveScalerBootConfig({
+  env: {
+    maxInstances: encoreMaxInstancesFromEnv,
+    minInstances: encoreMinInstancesFromEnv,
+    idleTimeoutMs: encoreIdleTimeoutMsFromEnv
+  },
+  store: backendKvStore ? makeScalerConfigStore(backendKvStore) : undefined,
+  log: app.log
+});
+const encoreMaxInstances = scalerBootConfig.maxInstances;
+const encoreMinInstances = scalerBootConfig.minInstances;
+const encoreIdleTimeoutMs = scalerBootConfig.idleTimeoutMs;
 // Optional operator-configured job-throughput cap (issue #580, ADR-020). Caps the
 // number of OUTSTANDING transcode/package jobs (pending in the scaler queue +
 // being dispatched) the deployment will admit at once; an over-limit submission
@@ -957,7 +1040,6 @@ const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 
 // cost) — it reuses the scaler's own Valkey queue state, NOT a second counter.
 // Unset/0/invalid => no cap (opt-in; submission behaviour unchanged).
 const encoreMaxQueuedJobs = resolveJobThroughputCap(process.env);
-const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] || String(5 * 60 * 1000), 10);
 // Bounded wait (issue #463) for the outbound TLS-trust probe to a freshly
 // spawned instance's per-instance callback-listener ingress before that instance
 // is eligible for its FIRST job. Closes the race between the ingress certificate
@@ -1010,13 +1092,19 @@ const encoreSpawnReadyTimeoutMs =
     ? encoreSpawnReadyTimeoutMsRaw
     : undefined;
 // Multipart part size (bytes) every spawned transcoder uploads its OUTPUTS with
-// (issue #1221). The transcoder service's own default of 100 MB makes a single
-// multi-GB output (an archive/mastering profile's one large file) fail its
-// upload deterministically with a connection-pool acquisition timeout after a
-// complete, successful encode, while many-small-output profiles on the same
-// source and object store upload in about a second. Override with
-// ENCORE_S3_MULTIPART_PART_SIZE_BYTES; invalid or out-of-bounds values fall back
-// to the default and say so. See src/encore-scaler/upload-part-size.ts.
+// (issue #1221). OBSERVED: a single multi-GB output (an archive/mastering
+// profile's one large file) fails its upload after a complete, successful
+// encode with a connection-pool acquisition timeout, while many-small-output
+// profiles on the same source and object store upload in about a second.
+// HYPOTHESIS, NOT ESTABLISHED: that the transcoder's default multipart part size
+// (100 MB) causes it. The deployed service's own source says the credentialed
+// upload path is the CRT client, whereas that error text comes from the standard
+// client (built only on the anonymous branch, which never reads this option), so
+// this setting may have no effect on the path that fails. It is a tunable, not a
+// fix for #1221. The default sent is the service's own 100 MB, i.e. no behaviour
+// change unless an operator sets ENCORE_S3_MULTIPART_PART_SIZE_BYTES. Invalid or
+// out-of-bounds values fall back to the default and say so. See
+// src/encore-scaler/upload-part-size.ts.
 const encoreUploadPartSizeBytes = resolveUploadPartSizeBytes(
   process.env['ENCORE_S3_MULTIPART_PART_SIZE_BYTES'],
   (reason) =>
@@ -1025,6 +1113,35 @@ const encoreUploadPartSizeBytes = resolveUploadPartSizeBytes(
       'ENCORE_S3_MULTIPART_PART_SIZE_BYTES ignored — transcoder output uploads use the built-in part size'
     )
 );
+// Issue #1286. Two bounds on how a create that timed out AT THE GATEWAY is
+// handled, both optional and both defaulted in the scaler itself
+// (DEFAULT_SPAWN_ADOPT_PROBE_TIMEOUT_MS / DEFAULT_SPAWN_GATEWAY_BACKOFF_MS):
+//   ENCORE_SPAWN_ADOPT_PROBE_TIMEOUT_MS — how long the spawn keeps asking for the
+//     SAME instance name after every attempt 504'd, because the create behind a
+//     504 usually completes and the instance that lands is the one we want (the
+//     alternative is a new name next tick and an extra instance for the reaper).
+//   ENCORE_SPAWN_GATEWAY_BACKOFF_MS — how long the next scale-up is held off
+//     after such a spawn, so the scaler does not start a second create against a
+//     platform that just told us it was slow. 0 disables the hold-off.
+// Invalid/absent => the built-in default. Negative is treated as absent; 0 is
+// honoured for the back-off only, where it has a meaning.
+const encoreSpawnAdoptProbeTimeoutMsRaw = parseInt(
+  process.env['ENCORE_SPAWN_ADOPT_PROBE_TIMEOUT_MS'] || '',
+  10
+);
+const encoreSpawnAdoptProbeTimeoutMs =
+  Number.isFinite(encoreSpawnAdoptProbeTimeoutMsRaw) &&
+  encoreSpawnAdoptProbeTimeoutMsRaw > 0
+    ? encoreSpawnAdoptProbeTimeoutMsRaw
+    : undefined;
+const encoreSpawnGatewayBackoffMsRaw = parseInt(
+  process.env['ENCORE_SPAWN_GATEWAY_BACKOFF_MS'] || '',
+  10
+);
+const encoreSpawnGatewayBackoffMs =
+  Number.isFinite(encoreSpawnGatewayBackoffMsRaw) && encoreSpawnGatewayBackoffMsRaw >= 0
+    ? encoreSpawnGatewayBackoffMsRaw
+    : undefined;
 // Bounded timeout (issue #273) for the failed-transcode reconciliation sweep: a
 // transcode still non-terminal after this long whose Encore record has been
 // garbage-collected (getJobStatus -> 404/undefined) is declared failed rather
@@ -1180,9 +1297,17 @@ const publishedProfilesIndexUrl = publishedProfilesIndex.ok
 // awaited (see paramStore above). Undefined when there is no store, no stack, or
 // the field is unset — in which case resolveEncoreProfilesUrl falls through to
 // the remote default, byte-identical to pre-#315 behaviour.
+//
+// Read even when a PUBLISHED index exists (issue #1271): the published URL is
+// the DEFAULT stack's, and the per-stack resolver below re-runs this same tier
+// chain for each stack. A stack that cannot publish to its own bucket must be
+// able to fall through to tier 4 for THIS deployment rather than skipping
+// straight to the remote default seed index — so the value has to be resolved
+// at boot, where the parameter store is awaited. The two env-var tiers above
+// still short-circuit it: they outrank tier 4 for every stack alike.
 const paramStoreProfilesUrl =
-  publishedProfilesIndexUrl || publicBaseUrl || process.env['ENCORE_PROFILES_URL_OVERRIDE']
-    ? undefined // a higher tier (override / published object-store index / app path) wins; skip the param-store read entirely
+  publicBaseUrl || process.env['ENCORE_PROFILES_URL_OVERRIDE']
+    ? undefined // a higher tier (override / app path) wins for every stack; skip the param-store read entirely
     : await resolveEncoreProfilesUrlFromParamStore({
         paramStore,
         namespace: STACK_CONFIG_NAMESPACE,
@@ -1236,8 +1361,20 @@ let stopEncoreCallbackPoller: (() => void) | undefined;
 let callbackPollerOptions: Omit<PollerDeps, 'redis'> | undefined;
 let activationConnectionId: string | undefined;
 // Callback pollers for every stack Valkey other than the activation one, keyed
-// by connectionId. See syncStackCallbackPollers.
-const stackCallbackPollers = new Map<string, () => void>();
+// by connectionId and tracking which stacks each one serves (#1213). See
+// syncStackCallbackPollers and stopCallbackPollersForStack.
+const stackCallbackPollers = new StackCallbackPollerRegistry();
+// Stacks a teardown reported as having lost their Valkey while their stored
+// config survives (#1213). Fed by the DELETE route's onStackQueuePresence hook
+// and consulted by syncStackCallbackPollers, which refuses to arm a poller
+// against a store a teardown has already removed.
+const removedStackQueues = new RemovedStackQueues();
+// The stack whose Valkey the activation poller (stopEncoreCallbackPoller) is
+// bound to, when that connection is a stack's OWN store (#1213). Set by
+// syncStackCallbackPollers, which is the only place a stack is matched to the
+// activation connectionId; undefined on a single-Valkey env-override
+// deployment, where no stack owns the connection.
+let activationPollerStackKey: string | undefined;
 
 // The Valkey a stack's scaler state lives on. Since #615 each provisioned stack
 // has its own Valkey and its scaler loop, the callback listeners paired with its
@@ -1471,7 +1608,12 @@ function activateScaler(redisUrl: string): void {
       if (!paramStore) return [];
       return paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
     },
-    minInstances: parseInt(process.env['ENCORE_MIN_INSTANCES'] || '0', 10),
+    // Warm floor. Resolved at boot (#1078): a persisted minInstances from a
+    // previous PATCH wins over ENCORE_MIN_INSTANCES, which stays the value for a
+    // deployment never configured through the API. This is the floor the loops
+    // actually enforce, so a restored config reaches the live loops rather than
+    // only being echoed by GET /scaler/config.
+    minInstances: encoreMinInstances,
     oscContext,
     maxInstances: encoreMaxInstances,
     // Optional opt-in job-throughput cap (issue #580, ADR-020). Forwarded to
@@ -1491,26 +1633,45 @@ function activateScaler(redisUrl: string): void {
     // Readiness budget for a freshly created instance (issue #1071): sized for
     // OSC provisioning a new worker node, not just a pod start.
     spawnReadyTimeoutMs: encoreSpawnReadyTimeoutMs,
+    // Gateway-timeout handling for a create that 504'd (issue #1286): adopt the
+    // instance the platform is still building instead of asking for a new name
+    // next tick, and hold the next create off while the platform is slow.
+    spawnAdoptProbeTimeoutMs: encoreSpawnAdoptProbeTimeoutMs,
+    spawnGatewayBackoffMs: encoreSpawnGatewayBackoffMs,
     // Point each spawned Encore instance at our own public profile index so it
     // loads the operator-managed profiles from CouchDB (issue #84).
     profilesUrl: encoreScalerProfilesUrl,
-    // Size each spawned instance's OUTPUT upload (issue #1221) so a single
-    // multi-GB output — an archive/mastering profile's one large file — does not
-    // fail its upload on the service's default multipart part size after a
-    // complete encode.
+    // Size each spawned instance's OUTPUT upload (issue #1221): an operator-set
+    // tunable for the transcoder's multipart part size. Unset sends the service's
+    // own default (no behaviour change). Whether it affects the large-output
+    // upload failure is not established; see upload-part-size.ts.
     uploadPartSizeBytes: encoreUploadPartSizeBytes,
-    // …and point it at THAT STACK's profile index (issue #1164). The scaler's
-    // loop key is the EFFECTIVE stack identity the transcode request resolved to
-    // (issue #615), and a spawned instance fetches its profilesUrl with a
-    // header-less, tokenless GET — so unless the stack is in the URL, every
-    // stack's Encore reads the FIRST listed stack's profile store and a profile
-    // created against a non-first stack cannot be used by the stack it was
-    // created on. Rewrites ONLY this app's own index URL and ONLY for a
-    // syntactically valid stack name (see stackScopedProfilesIndexUrl), so an
-    // external index and the single-stack/env-override deployments keep the
-    // process-global URL unchanged.
-    resolveProfilesUrl: (stackKey: string) =>
-      stackScopedProfilesIndexUrl(encoreScalerProfilesUrl, stackKey),
+    // …and point it at THAT STACK's profile index (issue #1164), resolved from
+    // the stack itself on EVERY boot (issue #1271). The scaler's loop key is the
+    // EFFECTIVE stack identity the transcode request resolved to (issue #615),
+    // and a spawned instance fetches its profilesUrl with a header-less,
+    // tokenless GET — so unless the stack is in the URL, every stack's Encore
+    // reads the FIRST listed stack's profile store and a profile created against
+    // a non-first stack cannot be used by the stack it was created on.
+    //
+    // Rewriting the process-global `encoreScalerProfilesUrl` was only ever
+    // sufficient while that URL was the app-path form: once the boot-time
+    // publish into the DEFAULT stack's bucket succeeds (which is what a RESTART
+    // changes — on a fresh instance no bucket exists yet), the global URL is the
+    // default stack's bucket index and has no stack-scoped rewrite, so every
+    // stack inherited it (#1271). The resolver below re-runs the whole ADR-026
+    // tier chain per stack with THAT stack's own published index as tier 2, and
+    // returns undefined for a loop key that is not a stack name — leaving the
+    // single-stack/env-override deployments on the process-global URL unchanged.
+    resolveProfilesUrl: makePerStackProfilesUrlResolver({
+      defaultProfilesUrl: encoreProfilesUrl,
+      ...(paramStoreProfilesUrl ? { paramStoreProfilesUrl } : {}),
+      // The stack-scoped publisher already wired above: ONE stack name selects
+      // both the bucket written to and the profile store read from, so a
+      // per-stack resolution can never mix two stacks' scopes (#1207 BLOCKING 1).
+      publishForStack: (stackName: string) => publishProfileIndexToObjectStore(stackName),
+      log: app.log
+    }),
     // Local-dev fallback only: ENCORE_S3_ENDPOINT is used verbatim for all
     // workspaces when set. On OSC this is unset and resolveS3Config below
     // resolves the MinIO endpoint per workspace from the parameter store.
@@ -2255,8 +2416,12 @@ async function deactivateScaler(): Promise<void> {
 
   stopEncoreCallbackPoller?.();
   stopEncoreCallbackPoller = undefined;
-  for (const stop of stackCallbackPollers.values()) stop();
-  stackCallbackPollers.clear();
+  activationPollerStackKey = undefined;
+  stackCallbackPollers.stopAll();
+  // No stack is being polled any more, so the per-stack "its Valkey is gone"
+  // records have nothing to gate (#1213). A later activation re-enumerates from
+  // the parameter store and starts clean.
+  removedStackQueues.clear();
   callbackPollerOptions = undefined;
   activationConnectionId = undefined;
 
@@ -2352,23 +2517,119 @@ function inScalerStack<T>(stackKey: string | undefined, fn: () => Promise<T>): P
 // stack that was just provisioned is not missed for its lifetime.
 async function syncStackCallbackPollers(): Promise<void> {
   if (!scalerRegistry || !sharedRedis || !callbackPollerOptions) return;
-  const live = new Set<string>();
+  const options = callbackPollerOptions;
+  const connections: Array<{ stackKey: string; connectionId: string }> = [];
+  // The connection object each poller must drain, by connectionId. Always the
+  // identical client the stack's scaler loop uses (resolveStackRedis), never a
+  // second socket to the same store.
+  const redisByConnection = new Map<string, IORedis>();
+  // Which stack OWNS the activation Valkey, if any (#1213). Recomputed on every
+  // sync from the same enumeration, so a stack whose own store is the
+  // activation connection can have its poller stopped at teardown time instead
+  // of polling a removed Valkey until the next reconcile.
+  activationPollerStackKey = undefined;
+  const listedStackKeys: string[] = [];
   for (const connection of await scalerRegistry.listStackConnections({ fresh: true })) {
     const { connectionId, redis, stackKey } = connection;
-    if (!connectionId || !redis || connectionId === activationConnectionId) continue;
-    live.add(connectionId);
-    if (stackCallbackPollers.has(connectionId)) continue;
-    stackCallbackPollers.set(
-      connectionId,
-      startEncoreCallbackPoller({ ...callbackPollerOptions, redis })
-    );
-    app.log.info({ stackKey, connectionId }, 'encore-callback-poller: started for stack Valkey');
+    listedStackKeys.push(stackKey);
+    if (!connectionId || !redis) continue;
+    // #1213: a stack whose Valkey a teardown already removed is NOT pollable,
+    // however healthy its stored config still looks. The config is kept on the
+    // failed-teardown path precisely so the DELETE can be retried, and
+    // TEARDOWN_ORDER removes the queue second, so `redis` here can be a
+    // connection to a store that is gone — arming a poller on it would re-create
+    // the once-a-second ECONNREFUSED loop this issue is about, against a Valkey
+    // the same process just removed. Skipped entirely: no poller, and no claim
+    // on the activation connection either, so a live stack sharing that store
+    // owns it instead. The record is dropped (below) as soon as the stack stops
+    // being enumerated, or when a later run reports the queue present again.
+    if (removedStackQueues.isRemoved(stackKey)) continue;
+    if (connectionId === activationConnectionId) {
+      // Only a real stack can OWN this connection. The fixed DEPLOYMENT_CONTEXT
+      // ('default', src/auth/workspace.ts) also resolves to it — it is the
+      // fallback identity of a single-Valkey env-override deployment, not a
+      // provisioned stack — and must never claim it, or a DELETE of the stack
+      // that genuinely owns the store would not stop this poller. First real
+      // stack wins; a second stack on the same store is the shared-Valkey case,
+      // where the owner is whichever one was enumerated first.
+      if (stackKey !== DEPLOYMENT_CONTEXT && activationPollerStackKey === undefined) {
+        activationPollerStackKey = stackKey;
+      }
+      // #1213: re-arm the activation poller when it was stopped for a teardown
+      // that then left this Valkey IN PLACE — a teardown whose Valkey removal
+      // itself failed, or one that failed before reaching it. Without this the
+      // deployment would stay active with nothing draining its completions
+      // until a restart. Reaching this line already means the store survived:
+      // the removedStackQueues gate above skipped the stack otherwise.
+      if (!stopEncoreCallbackPoller) {
+        stopEncoreCallbackPoller = startEncoreCallbackPoller({ ...options, redis });
+        app.log.info(
+          { stackKey, connectionId },
+          'encore-callback-poller: re-started for the activation stack Valkey'
+        );
+      }
+      continue;
+    }
+    connections.push({ stackKey, connectionId });
+    redisByConnection.set(connectionId, redis);
   }
-  for (const [connectionId, stop] of stackCallbackPollers) {
-    if (live.has(connectionId)) continue;
-    stop();
-    stackCallbackPollers.delete(connectionId);
+  const { started, stopped } = stackCallbackPollers.sync(connections, (connection) =>
+    startEncoreCallbackPoller({
+      ...options,
+      redis: redisByConnection.get(connection.connectionId)!
+    })
+  );
+  for (const connectionId of started) {
+    app.log.info({ connectionId }, 'encore-callback-poller: started for stack Valkey');
+  }
+  for (const connectionId of stopped) {
     app.log.info({ connectionId }, 'encore-callback-poller: stopped for stack Valkey');
+  }
+  // A stack that is no longer enumerated has had its stored config deleted —
+  // the retry finished the teardown — so the "its Valkey is gone" record has
+  // nothing left to protect and must not outlive the name (#1213).
+  for (const stackKey of removedStackQueues.forgetUnlisted(listedStackKeys)) {
+    app.log.info(
+      { stackKey },
+      'encore-callback-poller: forgot the removed-Valkey record for a stack that is gone'
+    );
+  }
+}
+
+// Stop the callback pollers bound to a stack's Valkey BEFORE that Valkey is
+// removed (#1213).
+//
+// Wired to the provision router's onStackTeardownStart hook, so it runs at the
+// start of DELETE /api/v1/provision/:name — ahead of the scaler teardown and
+// of every instance removal. Previously the only thing that stopped a stack's
+// poller was the reconcile at the END of a SUCCESSFUL teardown, so from the
+// moment the stack's Valkey instance was removed the poller's dedicated
+// blocking connection retried it about once a second with ECONNREFUSED, and a
+// teardown that reported failures (which never reaches that reconcile) left it
+// retrying for the lifetime of the process.
+//
+// Stops are exact: a per-stack poller is released only when this stack was the
+// last one using its connection (StackCallbackPollerRegistry.stopForStack), and
+// the activation poller only when this stack is the one whose own store that
+// connection is. Both stop functions are idempotent, and the reconcile that
+// follows the teardown re-arms whatever is still needed.
+function stopCallbackPollersForStack(stackName: string): void {
+  for (const connectionId of stackCallbackPollers.stopForStack(stackName)) {
+    app.log.info(
+      { stackKey: stackName, connectionId },
+      'encore-callback-poller: stopped for a stack being torn down'
+    );
+  }
+  if (stopEncoreCallbackPoller && activationPollerStackKey === stackName) {
+    stopEncoreCallbackPoller();
+    stopEncoreCallbackPoller = undefined;
+    // Drop the ownership claim with the poller: the next sync re-establishes it
+    // (and re-arms the poller) only if this Valkey is still there.
+    activationPollerStackKey = undefined;
+    app.log.info(
+      { stackKey: stackName, connectionId: activationConnectionId },
+      'encore-callback-poller: stopped for the activation stack being torn down'
+    );
   }
 }
 
@@ -2864,9 +3125,23 @@ const scalerRouterOptions: Parameters<typeof scalerRouter>[1] & { prefix: string
   // is off, which leaves the response reporting the process-global connection
   // only — and `connections` states that explicitly.
   listStackConnections: async () => (scalerRegistry ? scalerRegistry.listStackConnections() : []),
+  // Boot values, already resolved by resolveScalerBootConfig (#1078): the
+  // persisted snapshot when one exists, else the environment. The SAME three
+  // numbers the registry/loops above were initialised from, so the endpoint
+  // reports the cap the scaler is really enforcing.
+  //
+  // minInstances: before #1078 this was a hardcoded 0 (ENCORE_MIN_INSTANCES was
+  // never forwarded here). It still is for an unconfigured deployment —
+  // scalerBootConfig.minInstances falls back to ENCORE_MIN_INSTANCES, which
+  // defaults to 0 — but a RESTORED snapshot's minInstances is now reported, and
+  // was applied to the registry above.
   maxInstances: encoreMaxInstances,
-  minInstances: 0,
+  minInstances: encoreMinInstances,
   idleTimeoutMs: encoreIdleTimeoutMs,
+  // Provenance for `sources` (#1079 + #1078): 'persisted' makes a restored
+  // operator value report source "runtime" instead of masquerading as an env
+  // value. See the bootSource comment in routes/scaler.ts.
+  configSource: scalerBootConfig.source === 'persisted' ? 'persisted' : 'env',
   // Durable scaler runtime config (#1077). Reuses the SAME generic
   // eyevinn-app-config-svc key/value store the storage-backend registry writes
   // through (`backendKvStore`, built with configKvStoreFromEnv above) — one
@@ -3317,22 +3592,35 @@ if (routeDumpPath) {
 // confirms, at boot, whether OSC's 2026-07-08 promise to make /api/v1/profiles
 // publicly accessible for the app actually took effect (this environment cannot
 // reach live OSC to confirm it ahead of time).
-// ADR-026 D2/D4 (issue #1207): the probe now follows the RESOLVED TIER instead
-// of inferring it from `Boolean(publicBaseUrl)`. With the published
+// ADR-026 D2/D4 (issues #1207, #1209): the probe follows the RESOLVED TIER
+// instead of inferring it from `Boolean(publicBaseUrl)`. With the published
 // object-store index as the new primary, `publicBaseUrl` being set no longer
 // means the resolved URL is this app's own index — so the login-wall/#284
-// wording this probe emits would be plainly wrong for an object-store origin.
-// Gating on `origin === 'app-path'` keeps the probe doing exactly what it did
-// before for the app-served index and makes it a no-op for the other origins.
-// EXTENDING the boot check to verify the published object-store index (and
-// scoping its message per origin) is issue #1209 / ADR-026 D4, which ships
-// alongside this change; nothing about this probe's lifecycle, cost,
-// non-fatality, scoped TLS relaxation (#337) or `ReachabilityOutcome` shape is
-// altered here.
+// wording would be plainly wrong for an object-store origin — and on a catalog
+// deploy, where `PUBLIC_BASE_URL` is unsettable (ADR-026 C9), the old boolean
+// skipped the check entirely and left the new primary unverified. The resolved
+// `origin` is therefore passed straight through: the probe keeps its exact
+// pre-ADR-026 behaviour and wording for `app-path`, additionally verifies the
+// `object-store` primary (fetchable unauthenticated AND serving the profile
+// count the publisher wrote — ADR-026 D4 publish verification, fed by the
+// `PublishOutcome` fields below), and stays a no-op for the operator-typed /
+// third-party tiers. Lifecycle is untouched: still one-shot (no periodic probe
+// — #1103's interval scope is rejected by D4), still non-fatal, still the
+// scoped TLS relaxation (#337) and the same `ReachabilityOutcome` shape.
 void checkProfilesIndexReachable({
   profilesIndexUrl: encoreScalerProfilesUrl,
-  usingLocalIndex: resolvedProfilesUrl.origin === 'app-path',
-  log: app.log
+  origin: resolvedProfilesUrl.origin,
+  log: app.log,
+  // Only present when the boot publish succeeded — i.e. exactly when the
+  // resolved origin can be 'object-store'. `profileCount` is what makes the
+  // check a publish VERIFICATION rather than a bare fetchability probe.
+  ...(publishedProfilesIndex.ok
+    ? {
+        expectedProfileCount: publishedProfilesIndex.profileCount,
+        bucket: publishedProfilesIndex.bucket,
+        endpointKind: publishedProfilesIndex.endpointKind
+      }
+    : {})
 }).catch((err) => app.log.error({ err }, 'profiles-index reachability check errored unexpectedly'));
 
 // Start watch-folder ingest only after the server is listening and every router

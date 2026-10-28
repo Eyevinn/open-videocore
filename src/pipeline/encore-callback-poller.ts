@@ -1647,13 +1647,34 @@ export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
 
   void loop();
 
+  // #1213: stop() is idempotent. It is now called from two places — the stack
+  // teardown path (before the stack's Valkey is removed) and the poller sync /
+  // deactivation that follows it — and a second call must not re-disconnect a
+  // released connection or log a second "stopped" line.
+  let stopped = false;
   return () => {
+    if (stopped) return;
+    stopped = true;
     controller.abort();
     clearInterval(sweepTimer);
     // Release the dedicated blocking connection. The in-flight BZPOPMIN (if
     // any) will still resolve/timeout server-side, but .disconnect() drops
     // our end immediately rather than waiting on it — deactivateScaler
     // callers expect stop() to return promptly (issue #103).
+    //
+    // disconnect() also stops ioredis reconnecting (ioredis README, "disconnect":
+    // it closes the connection and does NOT retry), which is what makes stopping
+    // this poller before its Valkey is deprovisioned the cure for the
+    // once-a-second ECONNREFUSED retry loop reported in #1213.
     blockingRedis.disconnect();
+    // Release our 'error' listener with the connection. Without this, an error
+    // event emitted while the socket tears down (the Valkey of a stack being
+    // deleted is gone, so the close path can still surface ECONNREFUSED) logs a
+    // warning for a poller the caller has already stopped, which is exactly the
+    // noise #1213 was reported from.
+    // Optional-called for the same reason as sweepTimer.unref?.() above: the
+    // duplicated client is whatever deps.redis.duplicate() returned, which for
+    // a test double need not implement the full EventEmitter surface.
+    blockingRedis.removeAllListeners?.('error');
   };
 }

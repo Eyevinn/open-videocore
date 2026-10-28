@@ -58,6 +58,9 @@
 //     resolves `currentRequestStackName()` per call (issue #1164).
 //   - src/services/request-stack-context.ts — `runWithRequestedStack`,
 //     `normaliseStackName` (the untrusted-name boundary).
+//   - src/pipeline/profile-level-fit.ts — `levelSafeProfileYaml(yaml: string):
+//     string` (pure, never throws, returns its input when nothing needs fitting),
+//     applied on the per-profile YAML read path (issue #1167 review, finding 3).
 
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
@@ -70,6 +73,7 @@ import {
 import { bootstrapProfiles } from '../services/profile-bootstrap.js';
 import { isProfileRunnable } from '../services/profile-runnability.js';
 import { validateProfileColourSignalling } from '../pipeline/profile-colour-guard.js';
+import { levelSafeProfileYaml } from '../pipeline/profile-level-fit.js';
 import {
   normaliseStackName,
   runWithRequestedStack
@@ -216,13 +220,25 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
 
   // The ONE rendering of a single profile's raw YAML, shared by the unscoped and
   // stack-scoped routes (issue #1164).
+  //
+  // This is the document the transcoding service itself fetches (each index
+  // entry resolves to `:name/yaml`), so the level-safe bounding widths are
+  // applied HERE rather than only when a profile is seeded (issue #1167 review,
+  // finding 3). A height-only rung that declares an H.264 level is served with
+  // its bounding width added, which is what keeps an approximately-16:9 source
+  // inside the level the profile declares — whether that rung arrived from the
+  // remote index, from `POST /`, or from `PUT /:name`. The STORED document is
+  // untouched: the management reads (`GET /`, `GET /:name`) still return exactly
+  // what the operator authored. `levelSafeProfileYaml` never throws and returns
+  // its input unchanged when there is nothing to fit, so the response contract
+  // (200, `text/yaml`, 404 for unknown) is unchanged.
   const sendProfileYaml = async (name: string, reply: FastifyReply) => {
     const profile = await repo.get(name);
     if (!profile) {
       return reply.code(404).send({ error: 'not_found' });
     }
     reply.header('content-type', 'text/yaml; charset=utf-8');
-    return reply.code(200).send(profile.yaml);
+    return reply.code(200).send(levelSafeProfileYaml(profile.yaml));
   };
 
   // Public Encore-format profile index. Served WITHOUT authentication so the
