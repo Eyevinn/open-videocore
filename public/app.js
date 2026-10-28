@@ -805,6 +805,39 @@ function renderStorageBackendsList(backends) {
 // the UI (a stricter-than-API client constraint is safe — the API still accepts
 // it). Everything is framework-free so the field/validation logic is directly
 // unit-testable.
+//
+// ─── The three remaining registration fields (issue #870) ────────────────────
+//
+// Re-verified against the CURRENT contract (per CLAUDE.md rule 7) — the six
+// fields above are only two thirds of what the endpoint accepts:
+//   - POST /api/v1/storage/backends body = `registerBackendSchema`,
+//     src/routes/storage.ts:129-141 (nine properties, mirrored verbatim in
+//     openapi.json "/api/v1/storage/backends".post.requestBody; required there
+//     is exactly name/bucket/accessKeyId/secretAccessKey). The three this form
+//     never offered:
+//       role          storage.ts:133  z.enum(['source','packaged','both','archive']).default('both')
+//       sessionToken  storage.ts:139  z.string().min(1).optional()   — SECRET
+//       publicBaseUrl storage.ts:140  z.string().url().optional()
+//   - PATCH /api/v1/storage/backends/{id} = `updateBackendSchema`,
+//     src/routes/storage.ts:179-189 — carries the same three, all optional, so
+//     the edit form can offer them too; its `.refine` (:193-201) constrains only
+//     the accessKeyId/secretAccessKey pair, never the session token.
+//   - The redacted view `backendViewSchema` (src/routes/storage.ts:150-168)
+//     returns `role`, `publicBaseUrl` and `hasSessionToken`, and models a
+//     registered session token as the SAME `'***redacted***'` marker as the
+//     secret key (`credentials.sessionToken`, :166) — so the token gets exactly
+//     the secret-field treatment: password input, never seeded from a response,
+//     never cached.
+//   - `publicBaseUrl` is what makes packaged output publicly playable from a
+//     backend: GET /api/v1/assets/{id}/delivery resolves the packaged-role
+//     backend's public origin through `externalPublicBaseUrl(stackStorage
+//     ?.packaged)` (src/routes/assets.ts:4751) and emits URLs on that origin
+//     instead of falling through to the authorized stream proxy. The help text
+//     says so, because an operator cannot infer it from the field name.
+//
+// All three are optional in the schema, so an operator who ignores them
+// registers exactly what they register today (an omitted `role` is defaulted to
+// 'both' server-side, which is also what the select pre-selects).
 const STORAGE_SECRET_PLACEHOLDER = '••••••••  (unchanged)';
 
 // The six form fields in render order. `secret:true` marks the password input
@@ -819,6 +852,61 @@ const STORAGE_BACKEND_FORM_FIELDS = [
   { key: 'secretAccessKey', label: 'Secret access key', type: 'password', secret: true, placeholder: '' },
 ];
 
+// The four documented `role` values, in schema order, with operator-facing
+// copy. Mirrors `registerBackendSchema.role` (src/routes/storage.ts:133) and
+// `backendViewSchema.role` (:153) exactly — a value not in this list is a value
+// the API would 422.
+const STORAGE_BACKEND_ROLE_OPTIONS = [
+  { value: 'source', label: 'source — holds ingested source bytes' },
+  { value: 'packaged', label: 'packaged — holds packaged/delivery output' },
+  { value: 'both', label: 'both — source and packaged (default)' },
+  { value: 'archive', label: 'archive — cold destination for relocated sources' },
+];
+const STORAGE_BACKEND_ROLE_VALUES = STORAGE_BACKEND_ROLE_OPTIONS.map((o) => o.value);
+const STORAGE_BACKEND_DEFAULT_ROLE = 'both';
+
+// The three optional fields added by issue #870, rendered as their own group
+// after the required six. They deliberately do NOT carry the
+// `storage-backend-input` class: that class names the required core six (the
+// submit path reads every control by `[data-field]`, so the group is fully
+// wired either way), and keeping it stable means a form with these three
+// untouched is byte-for-byte the registration it is today.
+//   control: 'select' | 'input'; `secret:true` gets the secretAccessKey
+//   treatment; `help` renders as an aria-describedby hint.
+const STORAGE_BACKEND_OPTIONAL_FIELDS = [
+  {
+    key: 'role',
+    label: 'Role',
+    control: 'select',
+    options: STORAGE_BACKEND_ROLE_OPTIONS,
+    defaultValue: STORAGE_BACKEND_DEFAULT_ROLE,
+    help: 'Which side of the pipeline this backend serves. Defaults to "both"; '
+      + 'pick "archive" for a cold tier that only receives relocated sources.',
+  },
+  {
+    key: 'publicBaseUrl',
+    label: 'Public base URL (optional)',
+    control: 'input',
+    type: 'url',
+    placeholder: 'https://cdn.example.com/media',
+    help: 'The public origin this bucket is served from — a CDN or gateway in '
+      + 'front of it. Setting it is what makes packaged output playable '
+      + 'directly from this backend: /delivery then advertises URLs on this '
+      + 'origin instead of proxying the stream. Leave blank if the bucket is '
+      + 'not publicly readable.',
+  },
+  {
+    key: 'sessionToken',
+    label: 'Session token (optional)',
+    control: 'input',
+    type: 'password',
+    secret: true,
+    placeholder: '',
+    help: 'For temporary credentials (STS-style). Handled exactly like the '
+      + 'secret access key: never echoed back by the API and never cached here.',
+  },
+];
+
 // Pure, network-free validation of the raw field values (issue #681). `mode` is
 // 'add' | 'edit'. Returns { valid, errors, patch/body }. Error messages are
 // actionable per the acceptance criteria. On 'edit' an untouched secret (empty
@@ -827,7 +915,7 @@ const STORAGE_BACKEND_FORM_FIELDS = [
 // one without the other — updateBackendSchema.refine, storage.ts:190-201).
 function validateStorageBackendForm(mode, values) {
   const v = {};
-  for (const f of STORAGE_BACKEND_FORM_FIELDS) {
+  for (const f of STORAGE_BACKEND_FORM_FIELDS.concat(STORAGE_BACKEND_OPTIONAL_FIELDS)) {
     v[f.key] = typeof values[f.key] === 'string' ? values[f.key].trim() : '';
   }
   const errors = {};
@@ -864,21 +952,60 @@ function validateStorageBackendForm(mode, values) {
     errors.secretAccessKey = 'Secret access key is required.';
   }
 
+  // ── The three optional fields (issue #870) ──────────────────────────────────
+  // None of them is ever required, in either mode: all three are `.optional()`
+  // (or `.default()`) in registerBackendSchema (src/routes/storage.ts:133,139,
+  // 140), so an empty value must produce no error AND must not appear in the
+  // body — an omitted field is exactly today's registration.
+
+  // role: only the four enum members are sendable. An empty value is "let the
+  // server default it to 'both'" (storage.ts:133), which is what the select
+  // pre-selects anyway, so both paths register identically.
+  if (v.role && !STORAGE_BACKEND_ROLE_VALUES.includes(v.role)) {
+    errors.role = 'Role must be one of: ' + STORAGE_BACKEND_ROLE_VALUES.join(', ') + '.';
+  }
+
+  // publicBaseUrl: z.string().url() server-side (storage.ts:140). Same
+  // friendlier, protocol-specific message as endpointUrl.
+  if (v.publicBaseUrl && !/^https?:\/\/.+/i.test(v.publicBaseUrl)) {
+    errors.publicBaseUrl = 'Public base URL must start with http:// or https://';
+  } else if (v.publicBaseUrl && !errors.publicBaseUrl) {
+    try {
+      // eslint-disable-next-line no-new
+      new URL(v.publicBaseUrl);
+    } catch (_) {
+      errors.publicBaseUrl = 'Public base URL is not a valid URL.';
+    }
+  }
+
+  // sessionToken: z.string().min(1).optional() (storage.ts:139) — no format to
+  // check, and (like secretAccessKey) a blank value on edit means "leave the
+  // stored token alone", so there is nothing to reject.
+  const sessionTokenTyped = v.sessionToken.length > 0;
+
   const valid = Object.keys(errors).length === 0;
   if (!valid) return { valid: false, errors: errors };
+
+  // Append the optional trio to a body, each only when the operator supplied it.
+  function withOptional(target) {
+    if (v.role) target.role = v.role;
+    if (v.publicBaseUrl) target.publicBaseUrl = v.publicBaseUrl;
+    if (sessionTokenTyped) target.sessionToken = v.sessionToken;
+    return target;
+  }
 
   if (isAdd) {
     return {
       valid: true,
       errors: {},
-      body: {
+      body: withOptional({
         name: v.name,
         endpointUrl: v.endpointUrl,
         bucket: v.bucket,
         region: v.region,
         accessKeyId: v.accessKeyId,
         secretAccessKey: v.secretAccessKey,
-      },
+      }),
     };
   }
 
@@ -894,7 +1021,7 @@ function validateStorageBackendForm(mode, values) {
     body.accessKeyId = v.accessKeyId;
     body.secretAccessKey = v.secretAccessKey;
   }
-  return { valid: true, errors: {}, body: body };
+  return { valid: true, errors: {}, body: withOptional(body) };
 }
 
 // Pure render of the add/edit form (issue #681). Framework-free and network-free
@@ -970,6 +1097,93 @@ function renderStorageBackendForm(mode, backend) {
 
     form.appendChild(fieldWrap);
   });
+
+  // ── Optional registration fields (issue #870) ───────────────────────────────
+  // role / publicBaseUrl / sessionToken. Grouped in their own <fieldset> with a
+  // <legend> so AT announces them as one set of optional extras rather than
+  // three more required-looking inputs, and so an operator who does not need
+  // them can skip the group in one go. Every control is labelled, and every
+  // help text is wired through aria-describedby (WCAG 2.1 AA: 1.3.1, 3.3.2).
+  const optionalGroup = document.createElement('fieldset');
+  optionalGroup.className = 'storage-backend-optional-group';
+  const legend = document.createElement('legend');
+  legend.textContent = 'Optional';
+  optionalGroup.appendChild(legend);
+
+  STORAGE_BACKEND_OPTIONAL_FIELDS.forEach(function(f) {
+    const fieldWrap = document.createElement('div');
+    fieldWrap.className = 'form-field storage-backend-field storage-backend-optional-field';
+
+    const inputId = 'sbf-' + f.key;
+    const hintId = inputId + '-hint';
+    const label = document.createElement('label');
+    label.setAttribute('for', inputId);
+    label.textContent = f.label;
+    fieldWrap.appendChild(label);
+
+    let control;
+    if (f.control === 'select') {
+      control = document.createElement('select');
+      f.options.forEach(function(o) {
+        const opt = document.createElement('option');
+        opt.value = o.value;
+        opt.textContent = o.label;
+        control.appendChild(opt);
+      });
+      // Pre-select the backend's current role on edit (it is in the redacted
+      // view, backendViewSchema.role storage.ts:153); on add, the schema default
+      // 'both' — so a form the operator never touches registers what it does
+      // today.
+      const current = isEdit && typeof b.role === 'string'
+        && STORAGE_BACKEND_ROLE_VALUES.includes(b.role)
+        ? b.role
+        : (f.defaultValue || STORAGE_BACKEND_DEFAULT_ROLE);
+      control.value = current;
+    } else {
+      control = document.createElement('input');
+      control.type = f.type;
+      if (f.secret) {
+        // Same treatment as secretAccessKey: never seeded from a response (the
+        // API returns the token as the '***redacted***' marker, storage.ts:166),
+        // never offered to the password manager, blank on edit = leave stored
+        // token unchanged.
+        control.value = '';
+        control.autocomplete = 'new-password';
+        control.placeholder = isEdit && b.hasSessionToken === true
+          ? STORAGE_SECRET_PLACEHOLDER
+          : (f.placeholder || '');
+      } else {
+        control.value = isEdit && b[f.key] != null ? String(b[f.key]) : '';
+        control.placeholder = f.placeholder || '';
+      }
+    }
+    control.id = inputId;
+    control.name = f.key;
+    // NOT `storage-backend-input`: that class names the required core six.
+    control.className = 'storage-backend-optional-input';
+    control.dataset.field = f.key;
+    control.required = false;
+    control.setAttribute('aria-describedby', hintId);
+    fieldWrap.appendChild(control);
+
+    const hint = document.createElement('div');
+    hint.id = hintId;
+    hint.className = 'form-hint';
+    hint.textContent = f.secret && isEdit && b.hasSessionToken === true
+      ? 'Leave blank to keep the stored session token. Type a new value to replace it. ' + f.help
+      : f.help;
+    fieldWrap.appendChild(hint);
+
+    const errEl = document.createElement('div');
+    errEl.className = 'form-error';
+    errEl.dataset.errorFor = f.key;
+    errEl.setAttribute('role', 'alert');
+    fieldWrap.appendChild(errEl);
+
+    optionalGroup.appendChild(fieldWrap);
+  });
+
+  form.appendChild(optionalGroup);
 
   // Actions row: Save, Test connection, Cancel + inline result/status areas.
   const actions = document.createElement('div');
@@ -7222,10 +7436,12 @@ async function renderStorageTab(container) {
       addBtn.focus();
     }
 
-    // Read the six field values off the rendered inputs.
+    // Read every field value off the rendered controls — the required core six
+    // AND the optional role/publicBaseUrl/sessionToken group (issue #870), which
+    // is why this selects on `[data-field]` rather than on one class.
     function readValues() {
       const out = {};
-      form.querySelectorAll('.storage-backend-input').forEach(function(inp) {
+      form.querySelectorAll('[data-field]').forEach(function(inp) {
         out[inp.dataset.field] = inp.value;
       });
       return out;
@@ -7242,6 +7458,16 @@ async function renderStorageTab(container) {
       testResultEl.className = 'storage-backend-test-result';
       const values = readValues();
       const secret = (values.secretAccessKey || '').trim();
+      // A backend registered with temporary credentials only authenticates with
+      // its session token, and the stored token is never recoverable
+      // (`credentials.sessionToken` comes back as the redacted marker,
+      // storage.ts:166) — so the probe has to carry whatever the operator typed
+      // into this form. testConnectionBodySchema (storage.ts:207-210) accepts
+      // `sessionToken` as an optional min(1) string and the route forwards it
+      // (storage.ts:501-508) into the probe target
+      // (storage-backend-registry.ts:830-837). Blank stays absent: the body
+      // builder drops a falsy value (app.js:2299-2301).
+      const sessionToken = (values.sessionToken || '').trim();
       if (!backendId) {
         testResultEl.textContent =
           'Save the backend first, then use Test connection to probe it.';
@@ -7258,7 +7484,11 @@ async function renderStorageTab(container) {
       testResultEl.textContent = 'Testing…';
       try {
         // Shared probe helper (issue #683) — same call the per-row action uses.
-        const result = await testStorageBackendConnection(backendId, secret);
+        const result = await testStorageBackendConnection(
+          backendId,
+          secret,
+          { sessionToken: sessionToken }
+        );
         // Response contract: { status: 'connected' | 'unreachable', message }.
         const ok = result && result.status === 'connected';
         testResultEl.textContent =
@@ -7281,7 +7511,9 @@ async function renderStorageTab(container) {
       const firstErr = applyStorageBackendFormErrors(form, result.errors);
       if (!result.valid) {
         if (firstErr) {
-          const el = form.querySelector('.storage-backend-input[data-field="' + firstErr + '"]');
+          // `[data-field]` so an error on one of the optional fields (#870) is
+          // focusable too.
+          const el = form.querySelector('[data-field="' + firstErr + '"]');
           if (el) el.focus();
         }
         return;
@@ -7427,12 +7659,14 @@ async function renderStorageTab(container) {
   // spinner while in flight, then Connected / Unreachable (+ message on failure
   // or timeout). Disables the row's Test button for the duration so a double
   // click can't launch two probes.
-  async function runRowTest(row, backendId, secret) {
+  // `extra` is the optional { sessionToken } passed straight to the probe
+  // helper, which drops it when blank (app.js:2299-2301).
+  async function runRowTest(row, backendId, secret, extra) {
     const btn = row.querySelector('.storage-backend-test-conn');
     if (btn) btn.disabled = true;
     setStorageBackendRowProbing(row);
     try {
-      const result = await testStorageBackendConnection(backendId, secret);
+      const result = await testStorageBackendConnection(backendId, secret, extra);
       applyStorageBackendRowTestResult(row, result);
     } catch (err) {
       // Network / HTTP failure or the client-side 10s timeout: render as an
@@ -7473,6 +7707,38 @@ async function renderStorageTab(container) {
       label.appendChild(input);
       body.appendChild(label);
 
+      // Temporary credentials: a backend registered with a session token only
+      // authenticates with that token, and the stored one is not recoverable
+      // server-side (the view returns the redacted marker, storage.ts:166;
+      // registry.testConnection builds the probe target from the CALLER's
+      // `secret.sessionToken` alone, storage-backend-registry.ts:830-837). So
+      // when the row's view reports `hasSessionToken === true` we offer an
+      // optional token field and forward it; without it such a backend could
+      // never pass its own Test connection. Rows without a stored token get no
+      // extra field, so their probe body is unchanged.
+      let tokenInput = null;
+      if (cached.hasSessionToken === true) {
+        const tokenLabel = document.createElement('label');
+        tokenLabel.className = 'form-field';
+        tokenLabel.textContent = 'Session token';
+        tokenInput = document.createElement('input');
+        tokenInput.type = 'password';
+        tokenInput.className = 'storage-test-session-token';
+        tokenInput.autocomplete = 'off';
+        tokenLabel.appendChild(tokenInput);
+        body.appendChild(tokenLabel);
+
+        const tokenHint = document.createElement('div');
+        tokenHint.id = 'storage-test-session-token-hint';
+        tokenInput.setAttribute('aria-describedby', tokenHint.id);
+        tokenHint.className = 'form-hint storage-test-session-token-hint';
+        tokenHint.textContent =
+          'This backend was registered with a session token. The stored token ' +
+          'cannot be read back, so re-enter it to probe with temporary ' +
+          'credentials. Leave blank to probe with the key pair alone.';
+        body.appendChild(tokenHint);
+      }
+
       const errEl = document.createElement('div');
       errEl.className = 'storage-test-error';
       errEl.setAttribute('role', 'alert');
@@ -7502,8 +7768,11 @@ async function renderStorageTab(container) {
           input.focus();
           return;
         }
+        // Optional: absent for rows with no stored token, and dropped by the
+        // body builder when the operator leaves it blank.
+        const sessionToken = tokenInput ? tokenInput.value.trim() : '';
         close();
-        runRowTest(row, backendId, secret);
+        runRowTest(row, backendId, secret, { sessionToken: sessionToken });
       });
       input.focus();
     });
@@ -10233,6 +10502,12 @@ export {
   validateStorageBackendForm,
   applyStorageBackendFormErrors,
   STORAGE_SECRET_PLACEHOLDER,
+  // The role / publicBaseUrl / sessionToken group (issue #870). Exported so a
+  // test can assert the select offers exactly the four documented role values
+  // and that each optional field is omitted from the body when left untouched.
+  STORAGE_BACKEND_OPTIONAL_FIELDS,
+  STORAGE_BACKEND_ROLE_OPTIONS,
+  STORAGE_BACKEND_DEFAULT_ROLE,
   // Remove-with-confirmation flow (issue #682). Exported so a DOM/unit test can
   // exercise the confirmation dialog + the 409 in-use message formatter.
   openStorageBackendRemoveDialog,
