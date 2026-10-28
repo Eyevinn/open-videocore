@@ -592,3 +592,150 @@ describe('#1219: a cancel Encore honours must not cost the instance its idle lif
     expect(destroyInstanceMock.mock.calls[0][0]).toBe(INSTANCE_ID);
   });
 });
+
+// #1219 review 2: the release that clears a cancel-set drain used to sit BELOW
+// the `activeCount <= minInstances` short-circuit in scale-down, so on a pool
+// sitting at its warm floor it could never run: `recordOperatorCancel` set
+// `draining` + `cancelDrainingSince`, nothing could take them off again,
+// dispatch skips a draining instance unconditionally, and there is no operator
+// un-drain route. With ENCORE_MIN_INSTANCES == ENCORE_MAX_INSTANCES == 1 (a
+// documented single-instance deployment) one routine cancel therefore stalled
+// transcoding for the workspace for ever.
+//
+// Contract sources verified before writing (CLAUDE.md rule 7):
+//   - minInstances/maxInstances are EncoreScalerConfig fields and the floor is
+//     a floor on DESTROYING — src/encore-scaler/types.ts:EncoreScalerConfig,
+//     src/encore-scaler/scaler-loop.ts tick() step 4.
+//   - Dispatch claims from keys.queue via rpoplpush -> keys.inflight and POSTs
+//     `${inst.url}/encoreJobs`, skipping any instance with draining === true —
+//     src/encore-scaler/scaler-loop.ts tick() step 5 + dispatch().
+//   - QueuedJob = { jobId, payload, enqueuedAt, notBefore?, attempts? } —
+//     src/encore-scaler/types.ts:391-402.
+//   - callbackTrustReady short-circuits the first-dispatch trust probe —
+//     src/encore-scaler/scaler-loop.ts ensureCallbackTrust().
+describe('#1219: a cancel must not strand a pool that is sitting at its warm floor', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    destroyInstanceMock.mockReset();
+  });
+
+  const FLOOR_UUID = '7f1e0000-0000-0000-0000-0000000f1007';
+
+  // Answers the Encore cancel POST, the findByStatus probes, and the dispatch
+  // POST, so one test can run a real cancel() and then a real tick() that both
+  // releases the drain and dispatches the next job.
+  function floorPoolFetchMock(active: string[]): ReturnType<typeof vi.fn> {
+    return vi.fn(async (input: unknown, init?: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/cancel')) {
+        return { ok: true, status: 200, text: async () => 'Ok' } as unknown as Response;
+      }
+      if (url.includes('status=QUEUED')) return encorePage([]);
+      if (url.includes('status=IN_PROGRESS')) return encorePage(active);
+      if (url.endsWith('/encoreJobs') && (init as { method?: string } | undefined)?.method === 'POST') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: 'encore-assigned-uuid' })
+        } as unknown as Response;
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+  }
+
+  async function seedFloorPoolWithCancelledJob(redis: FakeRedis): Promise<void> {
+    await seedPool(redis, {
+      instanceId: INSTANCE_ID,
+      url: INSTANCE_URL,
+      activeJobs: 1,
+      lastIdleAt: Date.now(),
+      // Already proved it can reach its callback listener, so the first-dispatch
+      // trust probe is not what decides this test.
+      callbackTrustReady: true
+    });
+    await redis.set(
+      keys.jobEncoreUrl('job-floor'),
+      `${INSTANCE_URL}/encoreJobs/${FLOOR_UUID}`
+    );
+    await redis.hset(keys.jobInstance(WS), 'job-floor', INSTANCE_ID);
+  }
+
+  it('releases the cancel-set drain on a minInstances=maxInstances=1 pool, and dispatches the next job to that same instance without a spawn', async () => {
+    const redis = new FakeRedis();
+    await seedFloorPoolWithCancelledJob(redis);
+    // Encore honours the cancel: nothing active by the time the tick asks.
+    const fetchSpy = floorPoolFetchMock([]);
+    vi.stubGlobal('fetch', fetchSpy);
+    destroyInstanceMock.mockResolvedValue(undefined);
+
+    // The single-instance shape: the pool can neither grow nor shrink, so the
+    // drain released here is the only way this workspace keeps transcoding.
+    const config = makeConfig(redis, {
+      minInstances: 1,
+      maxInstances: 1,
+      idleTimeoutMs: 600_000
+    });
+    await makeScalingEncoreClient(config).cancel('job-floor');
+
+    // The operator's next transcode, waiting in the queue.
+    await redis.rpush(
+      keys.queue(WS),
+      JSON.stringify({
+        jobId: 'job-next',
+        payload: { externalId: 'job-next' },
+        enqueuedAt: Date.now()
+      })
+    );
+
+    await new EncoreScalerLoop(config).tick();
+
+    // The floor instance is still there and was never torn down.
+    expect(destroyInstanceMock).not.toHaveBeenCalled();
+    const pool = await redis.hgetall(keys.pool(WS));
+    expect(Object.keys(pool)).toEqual([INSTANCE_ID]);
+
+    // The drain the cancel wrote is gone, so the instance is routable again.
+    const record = JSON.parse(pool[INSTANCE_ID]) as EncoreInstanceRecord;
+    expect(record.draining).toBeUndefined();
+    expect(record.cancelDrainingSince).toBeUndefined();
+
+    // And the queued job actually went to that same warm instance: claimed off
+    // the queue, POSTed to its Encore, and mapped to it — no cold spawn, and
+    // nothing left waiting.
+    expect(await redis.llen(keys.queue(WS))).toBe(0);
+    expect(await redis.llen(keys.inflight(WS))).toBe(0);
+    const dispatchCalls = fetchSpy.mock.calls.filter(
+      ([url, init]) =>
+        String(url).endsWith('/encoreJobs') &&
+        (init as { method?: string } | undefined)?.method === 'POST'
+    );
+    expect(dispatchCalls).toHaveLength(1);
+    expect(String(dispatchCalls[0][0])).toBe(`${INSTANCE_URL}/encoreJobs`);
+    expect(await redis.hget(keys.jobInstance(WS), 'job-next')).toBe(INSTANCE_ID);
+  });
+
+  it('still refuses to destroy the floor instance when its cancelled job is the frozen kind', async () => {
+    const redis = new FakeRedis();
+    await seedFloorPoolWithCancelledJob(redis);
+    await redis.hset(keys.jobStatus(WS), 'job-floor', 'CANCELLED');
+    await redis.set(
+      keys.jobCancelRequested('job-floor'),
+      String(Date.now() - CANCEL_RECLAIM_GRACE_MS * 2)
+    );
+    // Encore ignored the cancel and still reports the job IN_PROGRESS. Above
+    // the floor this is the reclaim case (the instance is destroyed to stop
+    // it); AT the floor, destroying the only instance is not on the table.
+    vi.stubGlobal('fetch', floorPoolFetchMock(['job-floor']));
+    destroyInstanceMock.mockResolvedValue(undefined);
+
+    const config = makeConfig(redis, {
+      minInstances: 1,
+      maxInstances: 1,
+      idleTimeoutMs: 600_000
+    });
+    await new EncoreScalerLoop(config).tick();
+
+    expect(destroyInstanceMock).not.toHaveBeenCalled();
+    expect(Object.keys(await redis.hgetall(keys.pool(WS)))).toEqual([INSTANCE_ID]);
+  });
+});

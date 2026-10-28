@@ -552,7 +552,19 @@ export class EncoreScalerLoop {
         !idleAndAged &&
         !stuckCancelledHosts.has(inst.instanceId);
 
-      if (!isTeardownCandidate || activeCount <= minInstances) {
+      // #1219 review 2: `activeCount <= minInstances` is a floor on DESTROYING,
+      // not on evaluating. It is therefore applied at the destroy site below
+      // rather than here, for one case only: an instance whose sole reason for
+      // candidacy is a cancel-set drain. The release that clears that drain
+      // (the only code in this repo that ever clears `draining`) sits below the
+      // authoritative real-state read, so short-circuiting here would make it
+      // unreachable for any pool sitting at its warm floor — and with dispatch
+      // skipping draining instances and no operator un-drain route, one routine
+      // cancel would pin a floor-sized pool out of service for ever. Every
+      // other candidate still short-circuits exactly as before, so a pool at its
+      // floor is never torn down below it.
+      const belowFloor = activeCount <= minInstances;
+      if (!isTeardownCandidate || (belowFloor && !cancelDrainOnlyCandidate)) {
         survivors.push(inst);
         continue;
       }
@@ -662,6 +674,24 @@ export class EncoreScalerLoop {
         );
         await updateInstance(redis, workspaceId, releasedRecord);
         survivors.push(releasedRecord);
+        continue;
+      }
+
+      // #1219 review 2: the warm floor, enforced at the point it actually
+      // means something. Only a cancel-drain-only candidate can reach here with
+      // the pool at `minInstances` (every other candidate short-circuited
+      // above), and such an instance must never be destroyed below the floor —
+      // it got this far solely so its drain could be re-evaluated. Reaching
+      // here means that re-evaluation did not end in a release (an abandoned
+      // cancelled job turned up in the real active set), so keep the instance
+      // and let the next tick, or the stuck-cancel host path once the pool is
+      // above its floor, deal with it.
+      if (belowFloor) {
+        console.warn(
+          `[encore-scaler] scale-down: instance ${inst.instanceId} would be reclaimed but the ` +
+            `pool is at its floor (minInstances=${minInstances}); keeping it`
+        );
+        survivors.push(inst);
         continue;
       }
 
