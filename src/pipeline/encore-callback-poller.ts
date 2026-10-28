@@ -53,6 +53,9 @@ import {
   runWithRequestStack
 } from '../services/request-stack-context.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
+// #1288: the statuses that mean "this Encore attempt has not stopped yet", so a
+// still-running attempt is never mistaken for a terminal failure.
+import { ENCORE_ACTIVE_STATUSES } from '../encore-scaler/encore-paging-contract.js';
 import { DEFAULT_RECONCILE_GRACE_MS } from '../encore-scaler/scaler-loop.js';
 import { decideRetry, clearRetryState, makePriorAttemptCanceler } from '../encore-scaler/retry-store.js';
 import { pinInstanceForPackaging, unpinInstanceForPackaging } from '../encore-scaler/packaging-pin.js';
@@ -532,6 +535,16 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   );
 }
 
+// #1288: Encore statuses that mean the attempt is still in flight, i.e. its
+// outcome is NOT yet known. Taken from Encore's Status.kt enum as pinned in
+// src/encore-scaler/encore-paging-contract.ts: ENCORE_ACTIVE_STATUSES
+// ('QUEUED' | 'IN_PROGRESS') plus 'NEW' (a submitted job Encore has not queued
+// yet) — the complement of the terminal SUCCESSFUL | FAILED | CANCELLED.
+const IN_FLIGHT_ENCORE_STATUSES: ReadonlySet<string> = new Set<string>([
+  'NEW',
+  ...ENCORE_ACTIVE_STATUSES
+]);
+
 async function handleMessageInStack(deps: PollerDeps, raw: string): Promise<void> {
   let message: { jobId?: string; url?: string };
   try {
@@ -603,9 +616,47 @@ async function handleMessageInStack(deps: PollerDeps, raw: string): Promise<void
     return;
   }
 
+  const upper = status.toUpperCase();
+
+  // #1288: a NON-TERMINAL status is not a completion — never settle on it.
+  //
+  // The document we just fetched is the one at keys.jobEncoreUrl for this
+  // externalId (resolveUrlFromEncoreUuid above), and the retry re-dispatch
+  // OVERWRITES that key with the CURRENT attempt's URL. So a stale queue message
+  // for a superseded attempt (re-queued by the sweep from attempt 1's FAILED
+  // record, or a duplicate callback) resolves to the attempt that is RUNNING
+  // right now. Falling through here sent that running attempt's IN_PROGRESS
+  // status into the failure branch below, where the failure message is
+  // SYNTHESISED from the status itself (`encore status: ${status}`) — the retry
+  // gate classified "encore status: IN_PROGRESS" as deterministic, settled
+  // `not-retryable`, and the job ended permanently `failed` with
+  // "encore status: IN_PROGRESS" while Encore kept encoding for nobody. A
+  // transient failure then got two attempts instead of three.
+  //
+  // So: leave a running attempt alone. It settles when it actually ends — via
+  // its own callback, or via the sweep, which re-queues any local job that is
+  // still non-terminal once Encore reports its record terminal (sweepTerminalJobs
+  // below). Returning (rather than throwing) is deliberate: this message carries
+  // no new information, so re-queueing it would only re-ask the same question.
+  //
+  // Terminal statuses are SUCCESSFUL | FAILED | CANCELLED; NEW, QUEUED and
+  // IN_PROGRESS are still in flight — Encore's own Status.kt enum, pinned as
+  // ENCORE_STATUS_ENUM / ENCORE_ACTIVE_STATUSES in
+  // src/encore-scaler/encore-paging-contract.ts.
+  if (IN_FLIGHT_ENCORE_STATUSES.has(upper)) {
+    deps.logger.info({
+      msg: 'encore-callback-poller: encore job is still running — not settling (a retry may be in flight)',
+      jobId: found.job.id,
+      externalId,
+      encoreUuid,
+      status,
+      localStatus: found.job.status
+    });
+    return;
+  }
+
   deps.logger.info({ msg: 'encore-callback-poller: completing transcode', jobId: found.job.id, externalId, status });
 
-  const upper = status.toUpperCase();
   const success = upper === 'SUCCESSFUL' || upper === 'SUCCESS';
 
   // #707: on a SUCCESSFUL (terminal) callback, atomically stamp a TERMINAL value
