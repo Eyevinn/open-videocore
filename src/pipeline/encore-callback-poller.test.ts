@@ -1821,3 +1821,120 @@ describe('encore-callback-poller — profiles-index 401/403 is retried, not sett
     expect(attempt.classification).toBe('deterministic');
   });
 });
+
+// A RUNNING attempt is never a final failure (#1288).
+//
+// The race: attempt 1 fails transiently, the retry gate re-dispatches attempt 2,
+// and the sweep then re-queues attempt 1's still-unreconciled FAILED record. The
+// handler resolves the job URL from keys.jobEncoreUrl — which the re-dispatch
+// rewrote to attempt 2 — so it fetches the RUNNING attempt and used to settle the
+// whole job terminal on its IN_PROGRESS status (error "encore status: IN_PROGRESS",
+// reason not-retryable), burning the job's third attempt while Encore kept
+// encoding.
+//
+// Contract sources verified before writing (per CLAUDE.md rule 7):
+//   - Encore status enum: ENCORE_STATUS_ENUM / ENCORE_ACTIVE_STATUSES
+//     ('QUEUED' | 'IN_PROGRESS') in src/encore-scaler/encore-paging-contract.ts:93-104,
+//     pinned from Encore's own Status.kt:7-13 — terminal is SUCCESSFUL | FAILED |
+//     CANCELLED.
+//   - Job record shape: Job.status / Job.error / Job.encodeAttempts /
+//     Job.encodeAttemptLog (src/data/job-repo.ts:93-150), appendEncodeAttempt /
+//     finalizeEncodeAttempt (job-repo.ts:399-414).
+//   - keys.jobEncoreUrl / keys.uuidToExternalId / keys.queue
+//     (src/encore-scaler/types.ts) and recordDispatch (retry-store.ts).
+describe('encore-callback-poller — a still-running retry is not settled failed (#1288)', () => {
+  let redis: FakeRedis;
+  let jobs: InMemoryJobRepository;
+  let assets: InMemoryAssetRepository;
+  let pipelines: InMemoryPipelineRepository;
+
+  const PAYLOAD = { profile: 'vod-compat', inputs: [{ uri: 's3://b/k' }] };
+  // The #292 transport signature that makes attempt 1 retryable in the first place.
+  const TRANSPORT_FAILURE =
+    'software.amazon.awssdk.core.exception.SdkClientException: Unable to execute HTTP request';
+
+  beforeEach(() => {
+    redis = new FakeRedis();
+    jobs = new InMemoryJobRepository();
+    assets = new InMemoryAssetRepository();
+    pipelines = new InMemoryPipelineRepository();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function deps(fetchFn: ReturnType<typeof vi.fn>) {
+    vi.stubGlobal('fetch', fetchFn);
+    return {
+      redis: redis as unknown as import('ioredis').Redis,
+      jobRepository: jobs,
+      assetRepository: assets,
+      pipelineRepository: pipelines,
+      oscContext: OSC_CONTEXT_STUB,
+      queueKey: QUEUE_KEY,
+      logger: NOOP_LOGGER
+    };
+  }
+
+  it('leaves the job running when the stale FAILED record for attempt 1 resolves to an IN_PROGRESS attempt 2', async () => {
+    const attempt1Uuid = 'uuid-1288-attempt-1';
+    const attempt2Uuid = 'uuid-1288-attempt-2';
+    const { externalId, assetId } = await seedScenario(redis, jobs, assets, pipelines, {
+      encoreUuid: attempt1Uuid
+    });
+    const localId = externalId.slice(externalId.indexOf('__') + 2);
+    await jobs.update(localId, { status: 'running' });
+    await jobs.appendEncodeAttempt(localId, { index: 1 });
+
+    // Attempt 2 was re-dispatched and is live: dispatch rewrote the UUID mapping
+    // and keys.jobEncoreUrl to ITS document, and the retry counter stands at 2.
+    await redis.set(keys.uuidToExternalId(attempt2Uuid), externalId);
+    await redis.set(keys.jobEncoreUrl(externalId), `${BASE_URL}/encoreJobs/${attempt2Uuid}`);
+    await recordDispatch(redis as unknown as import('ioredis').Redis, externalId, PAYLOAD, 2);
+
+    // Attempt 1's record is still FAILED on the instance; attempt 2 is encoding.
+    // No uuid is advertised by findByStatus, so only the stale message below
+    // drives the handler (the sweep must not add a second copy mid-assertion).
+    const fetchFn = makeFetch({
+      jobDocs: {
+        [attempt1Uuid]: { externalId, status: 'FAILED', message: TRANSPORT_FAILURE },
+        [attempt2Uuid]: { externalId, status: 'IN_PROGRESS' }
+      }
+    });
+    const d = deps(fetchFn);
+    const stale = JSON.stringify({
+      jobId: attempt1Uuid,
+      url: `${BASE_URL}/encoreJobs/${attempt1Uuid}`
+    });
+    await redis.zadd(QUEUE_KEY, Date.now(), stale);
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      // Wait until the handler has both FETCHED the live attempt and finished
+      // with the message (phase 2 removes it from the processing set, which it
+      // was moved into before handleMessage ran) — so the assertions below see
+      // the handler's final decision, not a mid-flight state.
+      await waitFor(
+        async () =>
+          fetchFn.mock.calls.some(([u]) => String(u).includes(attempt2Uuid)) &&
+          (await redis.zscore(PROCESSING_KEY, stale)) === null &&
+          (await redis.zscore(QUEUE_KEY, stale)) === null
+      );
+    } finally {
+      stop();
+    }
+
+    // The job is NOT terminal and carries no error — this is the #1288 regression.
+    const job = await jobs.get(localId);
+    expect(job?.status).toBe('running');
+    expect(job?.error).toBeUndefined();
+    expect((await assets.get(assetId))?.status).toBe('processing');
+
+    // Attempt 2 is left to finish: no third dispatch was queued behind it, and
+    // the open attempt log entry is not closed out by this stale signal.
+    expect(await redis.lrange(keys.queue(WORKSPACE), 0, -1)).toHaveLength(0);
+    expect(job?.encodeAttemptLog?.[0]?.endedAt).toBeUndefined();
+    expect(job?.encodeAttemptLog?.[0]?.classification).toBeUndefined();
+  });
+});
