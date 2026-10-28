@@ -37,6 +37,20 @@ export type EncoreSubmitInput = {
   // undefined we omit the field entirely so Encore uses its `{}` default and
   // output is unchanged (backward compatible).
   profileParams?: Record<string, string>;
+  // Optional flat string map populating the `params` field of EACH input object
+  // this submit creates (issue #1222). These are ffmpeg INPUT options — the
+  // transcoder emits them as `-<key> <value>` immediately before `-i <uri>` —
+  // so this is where the source-read reconnect/timeout behaviour is set. Verified
+  // against the deployed transcoder build (github.com/Eyevinn/encore @ tag
+  // v0.2.8-3): `Input.params: LinkedHashMap<String, String?>`
+  // (encore-common/.../model/input/Input.kt:41, defaulted to `linkedMapOf()` on
+  // `AudioVideoInput` at :217) rendered by `List<Input>.inputParams` (Input.kt:253-259).
+  // When undefined we omit the field entirely so the transcoder uses its `{}`
+  // default and the submitted job is byte-identical to the pre-#1222 one.
+  // Resolved per input URI by encoreInputParamsFor (src/pipeline/encore-input-params.ts),
+  // which is also why it is NOT defaulted here: only a network input may carry
+  // these keys.
+  inputParams?: Record<string, string>;
 };
 
 export type EncoreSubmitResult = {
@@ -92,7 +106,20 @@ export function toEncorePayload(input: EncoreSubmitInput): Record<string, unknow
     ...(input.profileParams ? { profileParams: input.profileParams } : {}),
     outputFolder: input.outputUri,
     baseName: 'rendition',
-    inputs: [{ uri: input.inputUri, type: 'AudioVideo' }]
+    // Each input carries its own `params` map (issue #1222) when one was
+    // resolved for its URI — the reconnect + read-timeout options that let a
+    // dropped source read recover instead of failing the job. Absent map => the
+    // key is omitted and the input object is exactly what it was before, so the
+    // transcoder applies its own `{}` default (Input.kt:217).
+    inputs: [
+      {
+        uri: input.inputUri,
+        type: 'AudioVideo',
+        ...(input.inputParams && Object.keys(input.inputParams).length > 0
+          ? { params: input.inputParams }
+          : {})
+      }
+    ]
     // NOTE: no `outputs` field — Encore profiles are server-side only.
   };
 }

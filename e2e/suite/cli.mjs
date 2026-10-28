@@ -1,19 +1,22 @@
 #!/usr/bin/env node
 // Usage: BASE_URL=... TOKEN=... SOURCE_URL=... [EXPECT_COMMIT=...] [RUN_ID=...] node suite/cli.mjs
-// Prints the suite result as JSON on stdout; exit 0 when green, 1 when red, 2 on bad config.
-import { createClient, runSuite } from './run.mjs';
+// Prints the suite result as JSON on stdout; exit 0 when green, 1 when red or infra-error, 2 on bad config.
+// Budgets: E2E_TIMEOUT_TRANSCODE_MS and the other variables in TIMEOUT_ENV (suite/run.mjs) override the defaults.
+import { createClient, runSuite, timeoutsFromEnv } from './run.mjs';
 
 const need = (k) => { if (!process.env[k]) { console.error(`missing env ${k}`); process.exit(2); } return process.env[k]; };
 const baseUrl = need('BASE_URL');
 const token = need('TOKEN');
 const sourceUrl = need('SOURCE_URL');
 const runId = process.env.RUN_ID ?? new Date().toISOString().replace(/\D/g, '').slice(0, 14);
+let timeouts;
+try { timeouts = timeoutsFromEnv(process.env); } catch (e) { console.error(e.message); process.exit(2); }
 
 const result = await runSuite({
   client: createClient({ baseUrl, token }),
   anon: createClient({ baseUrl }),
   ingress: createClient({ baseUrl, token, appToken: '' }),
-  config: { runId, sourceUrl, expectCommit: process.env.EXPECT_COMMIT, transcodeProfile: process.env.E2E_TRANSCODE_PROFILE },
+  config: { runId, sourceUrl, expectCommit: process.env.EXPECT_COMMIT, transcodeProfile: process.env.E2E_TRANSCODE_PROFILE, timeouts },
 });
 console.log(JSON.stringify(result, null, 2));
-process.exit(result.status === 'green' ? 0 : 1);
+process.exit(result.status === 'green' ? 0 : 1); // red and infra-error both exit 1: only green is a pass

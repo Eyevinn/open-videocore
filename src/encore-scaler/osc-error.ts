@@ -135,6 +135,48 @@ export function isRouteNotFoundError(err: unknown): boolean {
   return ROUTE_NOT_FOUND_MESSAGE.test(message.trim());
 }
 
+// Did an instance REMOVAL fail because the instance is already gone?
+//
+// `removeInstance` has no "already absent" success path: it DELETEs the instance
+// URL through `createFetch`, so a control plane that no longer knows the
+// instance answers 404 and the SDK rejects with a `FetchError` carrying
+// `httpCode: 404` (lib/core.js:106-116 removeInstance -> lib/fetch.js
+// defaultErrorFactory). From a teardown's standpoint that is a SUCCESS: the
+// thing we were asked to remove is not there.
+//
+// Classified on the status, for the same reason as isTransientOscError above:
+// the FetchError's `message` is the server's own body text (or an HTML error
+// page), so it may not contain the number at all. The message markers are
+// consulted ONLY when there is no status — the transport-level case
+// `createFetch` re-wraps with no httpCode (lib/fetch.js:38-44), plus
+// `getService`'s "Service X not found in your subscriptions" (lib/core.js
+// getService), which is thrown INSIDE removeInstance before any request is sent
+// and means the instance cannot exist either.
+//
+// NOTE: this answers "is the RESOURCE gone?", which is a different question
+// from isRouteNotFoundError above ("does the API even serve this route?"). A
+// route-level 404 satisfies both predicates, so a caller that must not read a
+// missing route as a missing instance has to exclude it explicitly — which is
+// what the stack teardown does (src/services/deprovision.ts `removedAlready`,
+// #1211). The scaler's instance pool (#1213) deliberately does not: there the
+// 404 comes from the instance URL of a service whose DELETE route is known to
+// exist, so only the resource can be missing.
+export function isInstanceAlreadyGoneError(err: unknown): boolean {
+  const httpCode = oscHttpCode(err);
+  // 410 Gone is included for the same reason as 404: it states the resource is
+  // no longer there, which is the outcome a removal wants.
+  if (httpCode !== undefined) return httpCode === 404 || httpCode === 410;
+  const message = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase();
+  return (
+    message.includes('not found') ||
+    message.includes('no such instance') ||
+    message.includes('does not exist') ||
+    // An ingress/gateway error page quoting the status in its body, which is the
+    // only place the status appears once httpCode is absent.
+    message.includes('404')
+  );
+}
+
 // Did createInstance fail because an instance of that name ALREADY EXISTS?
 //
 // This is the signal that a previous attempt landed even though it reported a

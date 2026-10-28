@@ -86,7 +86,27 @@ export type InstanceReadinessOptions = {
   // raised before the loop (e.g. getServiceAccessToken failing) still
   // propagates unchanged.
   makeTimeoutError?: (message: string) => Error;
+  // Cancel the wait early. #1170 runs two readiness waits CONCURRENTLY (an
+  // Encore instance and its paired callback listener, instance-pool.ts
+  // spawnPooledInstance); when one of them fails the other has nothing left to
+  // wait for, and a poll loop that keeps probing after its caller has already
+  // rejected is exactly the probe flood this helper was written to stop
+  // (#778 review round 2). The signal is checked after every sleep and before
+  // every health probe, so no probe is issued once it is aborted. An aborted
+  // wait rejects with a plain Error — never through `makeTimeoutError`, because
+  // a cancellation is not a readiness timeout and must not be classified as one
+  // by a caller keying off the timeout type (#1071's SpawnReadyTimeoutError).
+  signal?: AbortSignal;
 };
+
+// The rejection for a wait cancelled through `options.signal` (#1170).
+// Deliberately a plain Error: a cancellation is not a readiness timeout.
+function abortedError(serviceId: string, name: string): Error {
+  return new Error(
+    `readiness wait for OSC instance ${name} (service ${serviceId}) was ` +
+      'cancelled before it completed'
+  );
+}
 
 // Wait for an OSC instance to report `running`, with a hard deadline.
 //
@@ -123,6 +143,7 @@ export async function waitForInstanceReadyBounded(
   let lastError: unknown;
   let lastStatus: string | undefined;
   for (;;) {
+    if (options.signal?.aborted) throw abortedError(serviceId, name);
     // Sleep first, as the SDK helper does: a just-created instance is never
     // healthy on the same tick it was created.
     const remaining = deadline - Date.now();
@@ -131,6 +152,9 @@ export async function waitForInstanceReadyBounded(
       const timer = setTimeout(resolve, Math.min(pollIntervalMs, remaining));
       timer.unref?.();
     });
+    // Re-check after the sleep: the sibling wait may have failed while we
+    // slept, and no further probe may be issued once that has happened (#1170).
+    if (options.signal?.aborted) throw abortedError(serviceId, name);
 
     try {
       const status = await getInstanceHealth(context, serviceId, name, sat);

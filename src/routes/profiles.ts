@@ -58,6 +58,9 @@
 //     resolves `currentRequestStackName()` per call (issue #1164).
 //   - src/services/request-stack-context.ts — `runWithRequestedStack`,
 //     `normaliseStackName` (the untrusted-name boundary).
+//   - src/pipeline/profile-level-fit.ts — `levelSafeProfileYaml(yaml: string):
+//     string` (pure, never throws, returns its input when nothing needs fitting),
+//     applied on the per-profile YAML read path (issue #1167 review, finding 3).
 
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
@@ -70,6 +73,7 @@ import {
 import { bootstrapProfiles } from '../services/profile-bootstrap.js';
 import { isProfileRunnable } from '../services/profile-runnability.js';
 import { validateProfileColourSignalling } from '../pipeline/profile-colour-guard.js';
+import { levelSafeProfileYaml } from '../pipeline/profile-level-fit.js';
 import {
   normaliseStackName,
   runWithRequestedStack
@@ -80,6 +84,18 @@ export type ProfilesRouterOptions = {
   repository: ProfileRepository;
   // The default Encore profile index URL used to seed the DB on bootstrap.
   bootstrapIndexUrl: string;
+  // Called after EVERY successful mutation of the profile store
+  // (create/update/delete/bootstrap) so the object-store-published profile index
+  // can be republished (ADR-026 D1, issue #1207 — see
+  // src/services/profile-index-publisher.ts). Optional: a deployment with no
+  // provisioned object store simply omits it.
+  //
+  // Contract: synchronous, non-throwing and fire-and-forget. The handlers below
+  // invoke it AFTER the mutation has been persisted and never await it, so the
+  // FIXED HTTP contract of this router — status codes, bodies, the
+  // `x-profile-count` header (#460) and the `{}`-for-empty index body (#459) —
+  // is unaffected by publish latency or publish failure (ADR-026 §6).
+  onProfilesChanged?: () => void;
 };
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
@@ -129,6 +145,17 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
 ) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const repo = opts.repository;
+
+  // Fire-and-forget republish notification (ADR-026 D1). Wrapped so a throwing
+  // callback can never turn a successful profile mutation into a 500 — the
+  // published index is a derived artefact, the store is the source of truth.
+  const notifyProfilesChanged = (): void => {
+    try {
+      opts.onProfilesChanged?.();
+    } catch (err) {
+      app.log.warn({ err }, 'profile index republish notification failed (ignored)');
+    }
+  };
 
   app.setErrorHandler((err, _request, reply) => {
     if (err instanceof ProfileExistsError) {
@@ -193,13 +220,25 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
 
   // The ONE rendering of a single profile's raw YAML, shared by the unscoped and
   // stack-scoped routes (issue #1164).
+  //
+  // This is the document the transcoding service itself fetches (each index
+  // entry resolves to `:name/yaml`), so the level-safe bounding widths are
+  // applied HERE rather than only when a profile is seeded (issue #1167 review,
+  // finding 3). A height-only rung that declares an H.264 level is served with
+  // its bounding width added, which is what keeps an approximately-16:9 source
+  // inside the level the profile declares — whether that rung arrived from the
+  // remote index, from `POST /`, or from `PUT /:name`. The STORED document is
+  // untouched: the management reads (`GET /`, `GET /:name`) still return exactly
+  // what the operator authored. `levelSafeProfileYaml` never throws and returns
+  // its input unchanged when there is nothing to fit, so the response contract
+  // (200, `text/yaml`, 404 for unknown) is unchanged.
   const sendProfileYaml = async (name: string, reply: FastifyReply) => {
     const profile = await repo.get(name);
     if (!profile) {
       return reply.code(404).send({ error: 'not_found' });
     }
     reply.header('content-type', 'text/yaml; charset=utf-8');
-    return reply.code(200).send(profile.yaml);
+    return reply.code(200).send(levelSafeProfileYaml(profile.yaml));
   };
 
   // Public Encore-format profile index. Served WITHOUT authentication so the
@@ -323,6 +362,7 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
           force: request.query.force ?? false,
           log: app.log
         });
+        notifyProfilesChanged();
         return reply.code(200).send(result);
       } catch (err) {
         app.log.warn({ err, indexUrl: opts.bootstrapIndexUrl }, 'profile bootstrap failed');
@@ -355,6 +395,7 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
         return reply.code(422).send({ error: 'profile_colour_uncarriable', message: colour.reason });
       }
       const profile = await repo.create(request.body);
+      notifyProfilesChanged();
       return reply.code(201).send({ ...profile, runnable: isProfileRunnable(profile.yaml) });
     }
   );
@@ -411,6 +452,7 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      notifyProfilesChanged();
       return reply.code(200).send({ ...updated, runnable: isProfileRunnable(updated.yaml) });
     }
   );
@@ -426,6 +468,7 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
     },
     async (request, reply) => {
       await repo.delete(request.params.name);
+      notifyProfilesChanged();
       return reply.code(204).send(null);
     }
   );

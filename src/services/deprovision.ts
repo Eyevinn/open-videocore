@@ -15,6 +15,14 @@ import {
   TEARDOWN_ORDER,
   type StackService
 } from './stack.js';
+import {
+  isTeardownCallError,
+  resolveTeardownBounds,
+  runBoundedOscCall,
+  type TeardownBounds,
+  type TeardownBoundsOverrides,
+  type TeardownFailureKind
+} from './teardown-bounds.js';
 
 // A stored service entry as persisted in the parameter store (StackConfig
 // .services[]). Carries the serviceId and the instance name actually
@@ -35,6 +43,14 @@ export type ServiceTeardownResult = {
   role: string;
   status: TeardownStatus;
   error?: string;
+  // How many OSC calls were attempted for this service in this run, retries
+  // included (issue #1212). Lets an operator see at a glance that a `failed`
+  // service was retried rather than given up on after one blip.
+  attempts?: number;
+  // How a `failed` service failed: the budget ran out (`timeout`), the error
+  // was retryable and the bounded retries were exhausted (`transient`), or it
+  // will fail the same way every time (`permanent`). Absent on success.
+  failure?: TeardownFailureKind;
 };
 
 // Aggregate stack-level status.
@@ -148,18 +164,33 @@ export async function confirmInstanceAbsentVia(
 // the other direction). We resolve `false`: nothing was confirmed, so fall
 // through to the removal and let the DELETE — the authoritative read — decide.
 // Every other failure still propagates and reports `failed`.
+//
+// The confirming read is passed in already BOUNDED (issue #1212): teardown runs
+// every OSC call through runBoundedOscCall, so this wrapper must sit OUTSIDE
+// that bound, not inside it. A missing route is permanent, so the bounded call
+// fails on attempt 1 without burning any of the service's budget before the
+// classification below gets to see it.
 async function absenceConfirmed(
-  osc: Context,
-  serviceId: string,
-  name: string,
-  sat: string
+  confirm: () => Promise<boolean>
 ): Promise<boolean> {
   try {
-    return await confirmInstanceAbsent(osc, serviceId, name, sat);
+    return await confirm();
   } catch (err) {
-    if (!isRouteNotFoundError(err)) throw err;
+    if (!isRouteNotFoundError(oscCause(err))) throw err;
     return false;
   }
+}
+
+// The OSC error underneath a bounded teardown call.
+//
+// runBoundedOscCall ALWAYS rejects with a TeardownCallError (issue #1212),
+// carrying the original rejection on `.cause` — so the status-based
+// classifications below have to read through the wrapper or they would see a
+// local Error with no httpCode and classify every 404 as a generic failure.
+// A deadline breach puts a TeardownTimeoutError here instead, which carries no
+// httpCode and is therefore correctly classified as neither of the 404 cases.
+function oscCause(err: unknown): unknown {
+  return isTeardownCallError(err) ? err.cause : err;
 }
 
 // Did the removal 404 because the instance is ALREADY GONE?
@@ -171,7 +202,8 @@ async function absenceConfirmed(
 // cannot perform the removal at all, which stays a failure so the stored config
 // is kept and the instance is surfaced as a leftover.
 function removedAlready(err: unknown): boolean {
-  return oscHttpCode(err) === 404 && !isRouteNotFoundError(err);
+  const cause = oscCause(err);
+  return oscHttpCode(cause) === 404 && !isRouteNotFoundError(cause);
 }
 
 // Tear down a single OSC service instance, tolerating the already-removed case.
@@ -181,18 +213,62 @@ function removedAlready(err: unknown): boolean {
 // not_found, so a retry of a partially-completed teardown still converges while
 // a teardown attempted during a network fault or a 5xx reports failed — keeping
 // the stored config and surfacing the instance as a leftover (issue #1039).
+// BOUNDED AND RETRYABLE (issue #1212). Every OSC call runs under a shared
+// per-service deadline (`bounds.serviceTimeoutMs`), so a control-plane call that
+// never answers costs ONE service instead of hanging the whole operation —
+// @osaas/client-core takes no timeout or AbortSignal, so this is the only place
+// a bound can be applied (see services/teardown-bounds.ts for the contract).
+// Transient faults (`ORCHESTRATOR_UNAVAILABLE`, `fetch failed`, 5xx/408/429) are
+// retried within that deadline: the reads once more immediately, the destructive
+// removeInstance up to `bounds.removeAttempts` times with backoff. A confirmed
+// absence short-circuits before any removal, so a retry of a partially completed
+// teardown SKIPS what is already gone and spends its budget on what is left.
 async function teardownService(
   osc: Context,
   service: StackService,
-  name: string
+  name: string,
+  bounds: TeardownBounds
 ): Promise<ServiceTeardownResult> {
   const { serviceId, role } = service;
-  try {
-    const sat = await osc.getServiceAccessToken(serviceId);
+  const deadlineAt = bounds.now() + bounds.serviceTimeoutMs;
+  const target = `${serviceId}/${name}`;
+  let attempts = 0;
+  const countAttempt = () => {
+    attempts += 1;
+  };
 
-    const existing = await getInstance(osc, serviceId, name, sat);
-    if (!existing && (await absenceConfirmed(osc, serviceId, name, sat))) {
-      return { serviceId, role, status: 'not_found' };
+  // A read (token mint, instance probe, confirming list): bounded attempts, no
+  // backoff — see DEFAULT_TEARDOWN_READ_ATTEMPTS for why an unverifiable read
+  // must not hold the operation open.
+  const read = <T>(label: string, op: () => Promise<T>): Promise<T> =>
+    runBoundedOscCall(op, {
+      attempts: bounds.readAttempts,
+      backoffMs: [],
+      deadlineAt,
+      label: `${label} ${target}`,
+      sleep: bounds.sleep,
+      now: bounds.now,
+      onAttempt: countAttempt
+    });
+
+  try {
+    const sat = await read('getServiceAccessToken', () =>
+      osc.getServiceAccessToken(serviceId)
+    );
+
+    const existing = await read('getInstance', () =>
+      getInstance(osc, serviceId, name, sat)
+    );
+    if (
+      !existing &&
+      (await absenceConfirmed(() =>
+        read('listInstances', () =>
+          confirmInstanceAbsent(osc, serviceId, name, sat)
+        )
+      ))
+    ) {
+      // Already gone — nothing to retry for this service.
+      return { serviceId, role, status: 'not_found', attempts };
     }
 
     // Either the probe returned the instance, or the probe came back empty but
@@ -201,17 +277,45 @@ async function teardownService(
     // (#1211). All three mean there is something to remove — or, when the
     // DELETE itself answers 404, nothing left to remove.
     try {
-      await removeInstance(osc, serviceId, name, sat);
+      await runBoundedOscCall(
+        () => removeInstance(osc, serviceId, name, sat),
+        {
+          attempts: bounds.removeAttempts,
+          backoffMs: bounds.backoffMs,
+          deadlineAt,
+          label: `removeInstance ${target}`,
+          sleep: bounds.sleep,
+          now: bounds.now,
+          onAttempt: countAttempt
+        }
+      );
     } catch (err) {
+      // A 404 from the DELETE is the authoritative "nothing at that name", so
+      // it converges to not_found instead of failing every retry (#1211). It is
+      // never transient, so runBoundedOscCall has already given up on attempt 1
+      // and the attempt count reported here is honest.
       if (removedAlready(err)) {
-        return { serviceId, role, status: 'not_found' };
+        return { serviceId, role, status: 'not_found', attempts };
       }
       throw err;
     }
-    return { serviceId, role, status: 'removed' };
+    return { serviceId, role, status: 'removed', attempts };
   } catch (err) {
+    // runBoundedOscCall always throws a TeardownCallError whose message already
+    // names the call, the attempt count, the classification and the underlying
+    // error; anything else is an unexpected local fault, reported as permanent.
+    const kind: TeardownFailureKind = isTeardownCallError(err)
+      ? err.kind
+      : 'permanent';
     const message = err instanceof Error ? err.message : String(err);
-    return { serviceId, role, status: 'failed', error: message };
+    return {
+      serviceId,
+      role,
+      status: 'failed',
+      error: message,
+      attempts,
+      failure: kind
+    };
   }
 }
 
@@ -328,14 +432,18 @@ export function foldTeardownResults(
 // as success (an unconfirmable probe is a failure, not a success — issue #1039).
 export async function deprovisionStack(
   osc: Context,
-  name: string
+  name: string,
+  options: TeardownBoundsOverrides = {}
 ): Promise<StackTeardownResult> {
+  const bounds = resolveTeardownBounds(options);
   const services: ServiceTeardownResult[] = [];
 
   // Sequential teardown: respecting dependency order requires that a consumer
   // is fully removed before the producer it depends on, so we do not parallelise.
+  // Each service carries its OWN deadline (issue #1212), so the run is bounded
+  // by services × serviceTimeoutMs and always reaches a terminal state.
   for (const service of TEARDOWN_ORDER) {
-    services.push(await teardownService(osc, service, name));
+    services.push(await teardownService(osc, service, name, bounds));
   }
 
   return aggregate(name, services);
@@ -399,12 +507,22 @@ function optionalStoredServices(
 // sort ahead of the known producers in orderStoredServices) and torn down early.
 // Idempotency is unchanged: a not-found optional instance during a retry reports
 // not_found rather than erroring, so a partial teardown converges on retry.
+//
+// RETRYING A PARTIAL TEARDOWN (issue #1212). The stored services[] is not pruned
+// when a teardown fails, so the retry re-enumerates every service — including
+// the ones the first DELETE already removed. Each of those is CONFIRMED absent
+// and returns not_found without a removal and without consuming retry budget,
+// so the retry's work (and its time) goes to the instances that are still
+// there. `options` bounds that work: each service gets its own deadline, so the
+// run always reaches a terminal state instead of hanging on one stuck call.
 export async function deprovisionStackFromConfig(
   osc: Context,
   name: string,
   stored: readonly StoredService[],
-  optional?: OptionalStackInstances
+  optional?: OptionalStackInstances,
+  options: TeardownBoundsOverrides = {}
 ): Promise<StackTeardownResult> {
+  const bounds = resolveTeardownBounds(options);
   // Merge the optional instances into the stored list, deduped by
   // serviceId+instanceName so an instance recorded in BOTH places (services[]
   // and an optional field) is not enumerated — and thus not torn down — twice.
@@ -422,7 +540,7 @@ export async function deprovisionStackFromConfig(
   const services: ServiceTeardownResult[] = [];
 
   for (const { service, instanceName } of orderStoredServices(merged)) {
-    services.push(await teardownService(osc, service, instanceName));
+    services.push(await teardownService(osc, service, instanceName, bounds));
   }
 
   return aggregate(name, services);

@@ -7,8 +7,8 @@ The end-to-end suite and the runner that tests the beta image on OSC (eng-open-v
 | Path | What |
 |---|---|
 | `suite/cases.mjs` | the 12 cases (health, auth-required, app-auth-required, auth-accepted, ingest-url, metadata, thumbnails, transcode, package, search, tags-roundtrip, delete) |
-| `suite/run.mjs`, `suite/cli.mjs` | runs the cases in order; a failed chain case marks the rest `skipped`; deletes its asset on the way out |
-| `runner/cycle.mjs` | one runner cycle: read the commit from the `:latest` image label; skip if that commit already has a green or red result, create-or-restart the instance, wait for `/health` `build.commit` to equal `main`'s head, run the suite, record. Statuses: `green`, `red`, `stale`, `infra-error` |
+| `suite/run.mjs`, `suite/cli.mjs` | runs the cases in order; a failed chain case marks the rest `skipped`; deletes its asset on the way out. Status `infra-error` when every failure was a platform failure, `red` as soon as one failure is the image's own |
+| `runner/cycle.mjs` | one runner cycle: read the commit from the `:latest` image label; skip if that commit already has a green or red result, create-or-restart the instance, wait for `/health` `build.commit` to equal `main`'s head, run the suite (once more if the first run ends `infra-error`), record. Statuses: `green`, `red`, `stale`, `infra-error` |
 | `runner/stack.mjs` | makes sure the instance has a provisioned stack (`GET`/`POST /api/v1/provision/`): a fresh instance has no backing storage and ingest answers `500 object storage is not configured for this stack` |
 | `runner/adapters.mjs` | the `:latest` image's digest and commit (registry label), OSC instance create/restart (beta channel), `/health` probe |
 | `runner/store-s3.mjs`, `runner/store-file.mjs` | result store on an S3-compatible bucket (MinIO) or a directory; same keys (`results/by-commit/<sha>.json`, `results/latest.json`); the commit is validated (40 hex) before it becomes a key |
@@ -28,6 +28,50 @@ GHCR_USER=... GHCR_TOKEN=... OSC_ACCESS_TOKEN=... E2E_INSTANCE_OSC_ACCESS_TOKEN=
   E2E_PARAMETER_STORE=... E2E_PARAMETER_STORE_API_KEY=... E2E_MINIO_ROOT_PASSWORD=... \
   E2E_COUCHDB_ADMIN_PASSWORD=... E2E_SOURCE_URL=... E2E_RESULTS_DIR=./out npm run cycle
 ```
+
+## Platform failures are not red (#1248)
+
+`green` and `red` are final per commit: once a commit has one, `runCycle` skips it, and a red one blocks promotion
+until someone deletes the record by hand. A platform hiccup must therefore not record red. `infra-error` is not
+final, so the next cycle tries the same commit again.
+
+- **In the `transcode` case.** Infrastructure:
+  - a 502/503/504 on the transcode request or on a read of its job. On `POST /api/v1/assets/{id}/transcode`,
+    openapi.json v1.5.0 documents **504** as `{error: "dependency_unreachable", dependency:
+    "queue"|"encore"|"storage", endpoint, message}` — `dependency` is 504's alone — and **502** as the generic
+    `{error, message}`; **503** is not documented, it is the ingress answering for the instance (an HTML page with no
+    JSON at all). `GET /api/v1/jobs/{id}` documents only 200 and 404, so any of the three on a job read is the
+    ingress too.
+  - a job read that is never answered at all — a dropped connection (`TypeError: fetch failed`), a TLS failure, the
+    `AbortError` from the 30 s per-request budget. A single blip does not end the wait: the read is retried on the
+    next tick and only three unanswered reads **in a row** end it, as `infra-error` (`observed.readErrors`,
+    `observed.lastReadError`). Any other error that breaks the wait itself is infrastructure whatever the job was
+    last seen doing — a transport error is no evidence about the encode.
+  - a timeout while the job reported `interrupted: true` or any `interruptionReason`. openapi.json v1.5.0
+    `GET /api/v1/jobs/{id}` describes `interrupted` as "an infrastructure/topology event (not a media failure)" with
+    the job "being auto-retried" and staying `running`, and `interruptionReason: interrupted_by_scaledown` as
+    "RECOVERABLE and typically AUTO-RETRIED by the service". Such a job gets its own phase word, `interrupted`.
+  - a timeout while the job never left `pending`/`queued` — nothing ever picked the job up.
+
+  Still red: a job that reaches a terminal `failed` state, a **non-interrupted** job that ran and stopped
+  progressing (reported as `stalled` or `running`), and a job that completes with no renditions. A deterministic
+  encode failure (#1167) stays red.
+- **What the timeout saw.** A transcode failure carries `observed` in the verdict — `jobStatus`, `progress`,
+  `maxProgress`, `phase` (`queued`, `running`, `stalled`, `interrupted` or the terminal status), `polls`, and
+  `attempts` / `interrupted` / `interruptionReason` / `readErrors` / `lastReadError` when there are any — and repeats
+  it in the case `detail`, so the verdict says whether the job was queued, running, stalled or interrupted rather
+  than only that 900 s went by. `observed` goes through the same credential masking as `detail`, because its
+  `error`/`message` fields are copied from an upstream response body.
+- **One retry.** When a suite run ends `infra-error` the cycle runs the whole suite once more (`opts.suiteRetries`,
+  default 1) before recording anything. Only the last run is the verdict; `suiteAttempts` says how many runs it took
+  and `retriedAfter` keeps the failure that was retried away.
+- **Budgets.** `timeouts.transcodeMs` is **900 s**. Cold starts of 343 s and 382 s were measured on 2026-10-19
+  because every run spawns a fresh encode instance, which left no room under the old 600 s. Every budget is
+  overridable per instance: `E2E_TIMEOUT_TRANSCODE_MS`, `E2E_TIMEOUT_PACKAGE_MS`, `E2E_TIMEOUT_INGEST_MS`,
+  `E2E_TIMEOUT_READY_MS`, `E2E_TIMEOUT_METADATA_MS`, `E2E_TIMEOUT_SEARCH_MS` (ms; a value that is set but is not a
+  positive number is a configuration error, exit 2).
+- **The alert** for `infra-error` says it is an infrastructure problem, that it is not a verdict on the code, and
+  that the commit is retried on the next cycle. It never calls it red.
 
 ## What the first live runs taught us (2026-10-08)
 
@@ -51,7 +95,8 @@ Verified: every path, field and enum in the suite against `openapi.json` v1.5.0;
 - The mock server proves the suite's logic, not that the real service behaves as the contract says. No instance existed in the workspace to run against.
 - Whether a new instance created this way lands on the beta image. The cycle guards it: if `/health` `build.commit` is not `main`'s head the result is `stale`, never green.
 - The `instance.url` field name (documented in the client's `createInstance` example only).
-- Encore reachability from the runner's tenant, and how long transcode and package take (the 600 s timeouts are a guess).
+- Encore reachability from the runner's tenant. Transcode now has a measured basis: 343 s and 382 s on 2026-10-19,
+  both cold starts, hence the 900 s budget. The 600 s package budget is still a guess.
 
 ## Scheduling (OSC My Job)
 
@@ -67,9 +112,10 @@ Variables: `GHCR_USER`, `GHCR_TOKEN` (read:packages), `OSC_ACCESS_TOKEN`, `E2E_I
 `E2E_PARAMETER_STORE`, `E2E_PARAMETER_STORE_API_KEY`, `E2E_MINIO_ROOT_PASSWORD`, `E2E_COUCHDB_ADMIN_PASSWORD`,
 `E2E_S3_ENDPOINT`, `E2E_S3_BUCKET`, `E2E_S3_ACCESS_KEY`, `E2E_S3_SECRET_KEY`, and
 `E2E_SOURCE_URL=https://raw.githubusercontent.com/Eyevinn/open-videocore/main/e2e/fixtures/clip.mp4`
-(optional `GITHUB_TOKEN`, `E2E_INSTANCE_NAME`, default `ovce2e`, `E2E_SLACK_BOT_TOKEN`, `E2E_SLACK_CHANNEL`).
+(optional `GITHUB_TOKEN`, `E2E_INSTANCE_NAME`, default `ovce2e`, `E2E_SLACK_BOT_TOKEN`, `E2E_SLACK_CHANNEL`, and the
+`E2E_TIMEOUT_*_MS` budget overrides above).
 
-**Slack alert.** With `E2E_SLACK_BOT_TOKEN` set (a bot token with `chat:write`, kept in the parameter store; the bot must be a member of the channel), to `E2E_SLACK_CHANNEL` (default `#internal-dev-mediaconvert`), the runner posts when a verdict is `green` or `red` (each is final, so once per commit), or the first time a commit ends `infra-error`. `stale` is silent, and a skipped cycle never posts. A failed post is logged in the cycle output (`notifyError`) and does not change the exit code.
+**Slack alert.** With `E2E_SLACK_BOT_TOKEN` set (a bot token with `chat:write`, kept in the parameter store; the bot must be a member of the channel), to `E2E_SLACK_CHANNEL` (default `#internal-dev-mediaconvert`), the runner posts when a verdict is `green` or `red` (each is final, so once per commit), or the first time a commit ends `infra-error` (worded as an infrastructure problem that will be retried, not as red). `stale` is silent, and a skipped cycle never posts. A failed post is logged in the cycle output (`notifyError`) and does not change the exit code.
 
 ## Not built / not verified yet
 

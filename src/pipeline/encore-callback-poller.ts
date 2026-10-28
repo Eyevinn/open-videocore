@@ -39,6 +39,8 @@ import type { AssetRepository } from '../data/asset-repo.js';
 import { isStepComplete } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { completeTranscode, type CallbackRendition } from './transcode.js';
+// #1226: object-storage surface for reclaiming a cancelled job's late output.
+import type { CancelledJobOutputStorage } from './cancelled-transcode-completion.js';
 import type { PipelineLogSink } from '../services/pipeline-log.js';
 import { dispatchTranscodeCompletionEvents } from './transcode-completion-events.js';
 // #1060: structured source-read failure detail for the failed `transcode` step.
@@ -51,6 +53,9 @@ import {
   runWithRequestStack
 } from '../services/request-stack-context.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
+// #1288: the statuses that mean "this Encore attempt has not stopped yet", so a
+// still-running attempt is never mistaken for a terminal failure.
+import { ENCORE_ACTIVE_STATUSES } from '../encore-scaler/encore-paging-contract.js';
 import { DEFAULT_RECONCILE_GRACE_MS } from '../encore-scaler/scaler-loop.js';
 import { decideRetry, clearRetryState, makePriorAttemptCanceler } from '../encore-scaler/retry-store.js';
 import { pinInstanceForPackaging, unpinInstanceForPackaging } from '../encore-scaler/packaging-pin.js';
@@ -217,6 +222,17 @@ export type PollerDeps = {
   // src/routes/logs.ts:94). Optional: absent => no log record, behaviour
   // unchanged. Emission never throws (src/services/pipeline-log.ts).
   pipelineLog?: PipelineLogSink;
+  // #1226: resolves object storage for the transcode OUTPUT bucket of the stack
+  // the completion belongs to. Called ONLY when a completion arrives for a job
+  // the user already CANCELLED, so the output of the stopped run is reclaimed
+  // and the job record (`cancelled`), renditionCount (0) and the files in the
+  // bucket agree — the state #1226 was reported from was a cancelled job
+  // reporting 0 renditions over a complete output. Invoked inside the job's
+  // persisted stack (handleMessageInStack runs under runWithPersistedStack), so
+  // the handle is for THAT stack's packaged/output bucket. Optional: absent =>
+  // the discard is still recorded durably on the job and the objects are left
+  // for an operator, exactly as the rule's own fallback describes.
+  resolveTranscodeOutputStorage?: () => Promise<CancelledJobOutputStorage | undefined>;
   logger: Logger;
 };
 
@@ -519,6 +535,16 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   );
 }
 
+// #1288: Encore statuses that mean the attempt is still in flight, i.e. its
+// outcome is NOT yet known. Taken from Encore's Status.kt enum as pinned in
+// src/encore-scaler/encore-paging-contract.ts: ENCORE_ACTIVE_STATUSES
+// ('QUEUED' | 'IN_PROGRESS') plus 'NEW' (a submitted job Encore has not queued
+// yet) — the complement of the terminal SUCCESSFUL | FAILED | CANCELLED.
+const IN_FLIGHT_ENCORE_STATUSES: ReadonlySet<string> = new Set<string>([
+  'NEW',
+  ...ENCORE_ACTIVE_STATUSES
+]);
+
 async function handleMessageInStack(deps: PollerDeps, raw: string): Promise<void> {
   let message: { jobId?: string; url?: string };
   try {
@@ -590,9 +616,47 @@ async function handleMessageInStack(deps: PollerDeps, raw: string): Promise<void
     return;
   }
 
+  const upper = status.toUpperCase();
+
+  // #1288: a NON-TERMINAL status is not a completion — never settle on it.
+  //
+  // The document we just fetched is the one at keys.jobEncoreUrl for this
+  // externalId (resolveUrlFromEncoreUuid above), and the retry re-dispatch
+  // OVERWRITES that key with the CURRENT attempt's URL. So a stale queue message
+  // for a superseded attempt (re-queued by the sweep from attempt 1's FAILED
+  // record, or a duplicate callback) resolves to the attempt that is RUNNING
+  // right now. Falling through here sent that running attempt's IN_PROGRESS
+  // status into the failure branch below, where the failure message is
+  // SYNTHESISED from the status itself (`encore status: ${status}`) — the retry
+  // gate classified "encore status: IN_PROGRESS" as deterministic, settled
+  // `not-retryable`, and the job ended permanently `failed` with
+  // "encore status: IN_PROGRESS" while Encore kept encoding for nobody. A
+  // transient failure then got two attempts instead of three.
+  //
+  // So: leave a running attempt alone. It settles when it actually ends — via
+  // its own callback, or via the sweep, which re-queues any local job that is
+  // still non-terminal once Encore reports its record terminal (sweepTerminalJobs
+  // below). Returning (rather than throwing) is deliberate: this message carries
+  // no new information, so re-queueing it would only re-ask the same question.
+  //
+  // Terminal statuses are SUCCESSFUL | FAILED | CANCELLED; NEW, QUEUED and
+  // IN_PROGRESS are still in flight — Encore's own Status.kt enum, pinned as
+  // ENCORE_STATUS_ENUM / ENCORE_ACTIVE_STATUSES in
+  // src/encore-scaler/encore-paging-contract.ts.
+  if (IN_FLIGHT_ENCORE_STATUSES.has(upper)) {
+    deps.logger.info({
+      msg: 'encore-callback-poller: encore job is still running — not settling (a retry may be in flight)',
+      jobId: found.job.id,
+      externalId,
+      encoreUuid,
+      status,
+      localStatus: found.job.status
+    });
+    return;
+  }
+
   deps.logger.info({ msg: 'encore-callback-poller: completing transcode', jobId: found.job.id, externalId, status });
 
-  const upper = status.toUpperCase();
   const success = upper === 'SUCCESSFUL' || upper === 'SUCCESS';
 
   // #707: on a SUCCESSFUL (terminal) callback, atomically stamp a TERMINAL value
@@ -792,7 +856,30 @@ async function handleMessageInStack(deps: PollerDeps, raw: string): Promise<void
       // state (enumerated in src/pipeline/transcode-completion-events.ts) and it
       // is the OSC-native one a normal run settles through, so it must append too
       // or the Logs tab shows a stage that started and never finished.
-      pipelineLog: deps.pipelineLog
+      pipelineLog: deps.pipelineLog,
+      // #1226: lets completeTranscode reclaim the output of a run that was
+      // CANCELLED before this completion arrived. Resolved lazily inside the
+      // rule, so a normal completion never builds a storage handle.
+      resolveOutputStorage: deps.resolveTranscodeOutputStorage,
+      // #1226: a completion for a job the user had cancelled. Log the reclaim
+      // explicitly — the symptom this issue was reported from was the summary
+      // line at the end of this function saying only `applied false
+      // renditionCount 0`, which read as "nothing was produced" while a complete
+      // output sat in the bucket. The job stays `cancelled` (cancel wins) and
+      // the output of the stopped run is removed, so the three now agree.
+      onCancelledCompletionDiscarded: (reclaim) =>
+        deps.logger.info({
+          msg: 'encore-callback-poller: discarded a completion for a cancelled job and reclaimed its output',
+          jobId: found.job.id,
+          externalId,
+          status,
+          outputPrefix: reclaim.outputPrefix,
+          discardedRenditionCount: reclaim.discardedRenditionCount,
+          outputRemoved: reclaim.outputRemoved,
+          ...(reclaim.removalError ? { removalError: reclaim.removalError } : {}),
+          ...(reclaim.assetStatus ? { assetStatus: reclaim.assetStatus } : {})
+        }),
+      logWarn: (detail) => deps.logger.warn(detail)
     }
   );
 
@@ -1611,13 +1698,34 @@ export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
 
   void loop();
 
+  // #1213: stop() is idempotent. It is now called from two places — the stack
+  // teardown path (before the stack's Valkey is removed) and the poller sync /
+  // deactivation that follows it — and a second call must not re-disconnect a
+  // released connection or log a second "stopped" line.
+  let stopped = false;
   return () => {
+    if (stopped) return;
+    stopped = true;
     controller.abort();
     clearInterval(sweepTimer);
     // Release the dedicated blocking connection. The in-flight BZPOPMIN (if
     // any) will still resolve/timeout server-side, but .disconnect() drops
     // our end immediately rather than waiting on it — deactivateScaler
     // callers expect stop() to return promptly (issue #103).
+    //
+    // disconnect() also stops ioredis reconnecting (ioredis README, "disconnect":
+    // it closes the connection and does NOT retry), which is what makes stopping
+    // this poller before its Valkey is deprovisioned the cure for the
+    // once-a-second ECONNREFUSED retry loop reported in #1213.
     blockingRedis.disconnect();
+    // Release our 'error' listener with the connection. Without this, an error
+    // event emitted while the socket tears down (the Valkey of a stack being
+    // deleted is gone, so the close path can still surface ECONNREFUSED) logs a
+    // warning for a poller the caller has already stopped, which is exactly the
+    // noise #1213 was reported from.
+    // Optional-called for the same reason as sweepTimer.unref?.() above: the
+    // duplicated client is whatever deps.redis.duplicate() returned, which for
+    // a test double need not implement the full EventEmitter surface.
+    blockingRedis.removeAllListeners?.('error');
   };
 }

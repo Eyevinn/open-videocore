@@ -16,7 +16,17 @@
     module state with the opener window.
   -->
   <main>
-    <div id="detail-stack-label" class="detail-standalone-context"></div>
+    <!--
+      Issue #828: a detached window is its own JS realm and targets a stack via
+      ?stack=, so it carries its own build indicator — an operator screenshotting
+      a pop-out must be able to identify the build without going back to the main
+      window. Both halves of the strip are spans inside the context row so the
+      stack label and the build identity read as one line.
+    -->
+    <div class="detail-standalone-context">
+      <span id="detail-stack-label"></span>
+      <div id="build-indicator" class="build-indicator"></div>
+    </div>
     <div id="content" class="content-fullbleed">
       <div class="assets-side" id="detail-root" style="display:flex;"></div>
     </div>

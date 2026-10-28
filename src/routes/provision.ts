@@ -34,7 +34,8 @@ import {
   type StorageBackendConfig,
   NonRetryableParamStoreError,
   isReadyStack,
-  stripCredentials
+  stripCredentials,
+  LEGACY_STACK_CREATED_AT
 } from '../services/param-store.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 // Re-enter the just-provisioned stack when seeding its profile store (issue
@@ -45,6 +46,7 @@ import {
   AUTO_SUBTITLES_SERVICE_ID,
   OBJECT_STORE_SERVICE_ID,
   PACKAGER_SERVICE_ID,
+  QUEUE_SERVICE_ID,
   SCENE_DETECT_SERVICE_ID,
   STACK_SERVICES
 } from '../services/stack.js';
@@ -63,6 +65,14 @@ import {
   teardownOnDemandPackager,
   type PackagerTeardownResult
 } from '../services/packager-provisioning.js';
+// The profiles bucket name and its anonymous-read policy document are owned by
+// the publisher module (ADR-026 D1/D3, issue #1207) and imported here rather
+// than re-declared, so the bucket provisioning below and the publish path can
+// never drift about which bucket is served or which policy it carries.
+import {
+  PROFILES_BUCKET,
+  profilesBucketAnonymousReadPolicy
+} from '../services/profile-index-publisher.js';
 import { computeStackReadiness } from '../services/stack-readiness.js';
 import {
   checkStackReachability,
@@ -77,6 +87,11 @@ import {
   ffmpegS3CredentialMapping
 } from '../services/external-storage-credentials.js';
 import type { OperationStore } from '../services/operation-store.js';
+import {
+  resolveTeardownBounds,
+  withTeardownTimeout,
+  type TeardownBoundsOverrides
+} from '../services/teardown-bounds.js';
 import type { WorkspaceEncoreScalerRegistry } from '../encore-scaler/workspace-registry.js';
 
 // Buckets created on the freshly provisioned MinIO instance. These names are
@@ -84,6 +99,13 @@ import type { WorkspaceEncoreScalerRegistry } from '../encore-scaler/workspace-r
 // packager (OutputFolder) when packaging is first executed (epic #226).
 const SOURCE_BUCKET = 'openvideocore-source';
 const PACKAGED_BUCKET = 'openvideocore-packaged';
+
+// The two buckets a provisioned stack CANNOT work without: ingest lands in the
+// source bucket and packaged output lands in the packaged bucket, so a failure
+// to create either must fail the provision. The profiles bucket
+// (PROFILES_BUCKET, issue #1208) is deliberately NOT in this list — it has a
+// working fallback (ADR-026 D2) and is therefore created best-effort below.
+const REQUIRED_BUCKETS = [SOURCE_BUCKET, PACKAGED_BUCKET] as const;
 
 // Sensitive credentials are supplied by the operator as environment variables
 // (ADR-002, 12-factor config) — never in the request body. During provisioning
@@ -268,6 +290,43 @@ type ProvisionRouterOptions = {
   // derived identifier. Optional: when omitted no cache invalidation is
   // signalled.
   onStackChange?: (workspaceId: string) => void;
+  // Invoked with the STACK NAME at the very start of DELETE /:name's teardown —
+  // before the scaler teardown and before any instance is removed (#1213).
+  //
+  // This is where a caller releases everything it is running AGAINST that
+  // stack's backing services, while they still exist. main.ts stops the Encore
+  // callback poller(s) bound to the stack's Valkey here: the poller's dedicated
+  // blocking connection otherwise retried the removed Valkey about once a
+  // second with ECONNREFUSED, and the reconcile that used to be the only thing
+  // that stopped it runs at the END of a successful teardown only, so a
+  // teardown reporting failures left it retrying for the process's lifetime.
+  //
+  // Best-effort and bounded by the caller's per-service teardown budget: a hook
+  // that throws or hangs is logged and the teardown continues, because leaving
+  // a stack provisioned is worse than leaving a poller running.
+  onStackTeardownStart?: (name: string) => void | Promise<void>;
+  // Report whether the stack's QUEUE (Valkey) instance is still there, for the
+  // paths that leave the stored StackConfig in place (#1213).
+  //
+  // A caller that binds background work to a stack's Valkey cannot read that
+  // from the stored config: the config is the stack's COORDINATES, and a
+  // teardown that reported failures deliberately keeps it (so the DELETE can be
+  // retried) even though the services it points at are being removed one by
+  // one. TEARDOWN_ORDER (services/stack.ts) removes the queue SECOND, so a run
+  // that removed the Valkey and then failed on the database or the storage ends
+  // as `failed` with a stored config whose `redisUrl` now points at nothing.
+  // Anything re-derived from that config — a poller re-armed by a post-teardown
+  // reconcile, say — would bind straight back to the removed store.
+  //
+  // Called with `present: false` when a run that is KEEPING the config
+  // established the queue instance is gone (removed by this run, or confirmed
+  // already absent), and with `present: true` when the queue is known to be
+  // there: its removal failed, or the stack has just been provisioned. Not
+  // called on a fully successful teardown — the config is deleted there, so the
+  // stack stops being enumerable at all.
+  //
+  // Synchronous and best-effort: it only updates the caller's own bookkeeping.
+  onStackQueuePresence?: (name: string, present: boolean) => void;
   // Late-bound accessor for the scaler registry. The registry is created lazily
   // in main.ts *after* this router registers (only once a stack exists), so it
   // cannot be passed by value at registration time. This getter reads the
@@ -316,6 +375,12 @@ type ProvisionRouterOptions = {
   // Cadence (ms) between health probes inside that wait. Unset uses
   // DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS (1s, the SDK's own cadence).
   readyPollIntervalMs?: number;
+  // Bounds applied to stack teardown (issue #1212): the per-service deadline,
+  // the whole-operation deadline, and the bounded retry/backoff for transient
+  // OSC failures. Unset resolves from the environment
+  // (STACK_TEARDOWN_* in services/teardown-bounds.ts) and falls back to the
+  // defaults there; tests inject millisecond budgets and a fake sleep.
+  teardownBounds?: TeardownBoundsOverrides;
 };
 
 // Async operation view returned by GET /operations and GET /operations/:id.
@@ -357,6 +422,55 @@ const acceptedSchema = z.object({
   status: z.literal('pending')
 });
 
+// Map a finished teardown onto the async operation's TERMINAL state (issue
+// #1210).
+//
+// The DELETE route used to close every teardown as `status: 'done'` and leave
+// the real outcome buried in `result.status`. A teardown that left the
+// packager, the database and the object store running therefore reported the
+// operation as done — and every consumer that switches on the operation state
+// (public/app.js pollDeprovisionOp: `op.status === 'done'` -> "✓ removed" and
+// it drops the row) read a partial failure as a clean removal.
+//
+// So: an operation whose teardown reports `failed` (StackTeardownResult.status,
+// services/deprovision.ts:42 — set when ANY service failed to tear down or its
+// absence could not be confirmed) is itself `failed`. Every other teardown
+// status ('removed' | 'partial' | 'not_found') means nothing is left running,
+// which is a `done` operation.
+//
+// The full StackTeardownResult is carried on `result` either way, so the
+// per-service statuses (ServiceTeardownResult[], deprovision.ts:29 — serviceId,
+// role, status, error) are available for both outcomes; `error` additionally
+// names the services still in place, because that is the only field the
+// existing failure-rendering consumers show (`op.error`).
+//
+// Reuses the EXISTING OperationStatus enum ('pending' | 'running' | 'done' |
+// 'failed', services/operation-store.ts:3, mirrored by the operationSchema
+// above): no new operation state is introduced, so every existing poller keeps
+// working and already distinguishes this case.
+function teardownOperationPatch(result: StackTeardownResult): {
+  status: 'done' | 'failed';
+  completedAt: number;
+  result: StackTeardownResult;
+  error?: string;
+} {
+  if (result.status !== 'failed') {
+    return { status: 'done', completedAt: Date.now(), result };
+  }
+  const stillThere = result.services
+    .filter((s) => s.status === 'failed')
+    .map((s) => `${s.role} (${s.serviceId})`);
+  return {
+    status: 'failed',
+    completedAt: Date.now(),
+    result,
+    error:
+      `stack teardown did not complete: ${stillThere.length} service(s) ` +
+      `still in place: ${stillThere.join(', ')}. The stack remains listed as ` +
+      `delete_failed; retry the delete to finish removing them.`
+  };
+}
+
 // Non-secret storage backend metadata for one role, mirrors
 // StorageBackendConfig in param-store.ts. NO secret fields (issue #211).
 const storageBackendSchema = z.object({
@@ -377,8 +491,19 @@ const storedConfigSchema = z.object({
   // it is NOT the raw stored StackConfig.status. 'ready' means the stack can
   // complete the full ingest -> transcode -> package -> deliver flow; 'degraded'
   // means a required capability (e.g. packaging) is missing; the lifecycle
-  // states 'provisioning'/'failed' mean the stack never finished coming up.
-  status: z.enum(['provisioning', 'ready', 'failed', 'degraded']).optional(),
+  // states 'provisioning'/'failed' mean the stack never finished coming up;
+  // 'deleting'/'delete_failed' mean a teardown is in flight or left services
+  // behind (issue #1210) — the stack stays listed until every service is gone.
+  status: z
+    .enum([
+      'provisioning',
+      'ready',
+      'failed',
+      'degraded',
+      'deleting',
+      'delete_failed'
+    ])
+    .optional(),
   // Machine-readable explanation, present ONLY when status !== 'ready' (issue
   // #338). `code` is a stable enum a consumer switches on; `capability` names
   // the specific missing capability for the *_capability_missing codes.
@@ -387,6 +512,8 @@ const storedConfigSchema = z.object({
       code: z.enum([
         'stack_provisioning',
         'stack_provisioning_failed',
+        'stack_deleting',
+        'stack_delete_failed',
         'core_capability_missing',
         'packaging_capability_missing'
       ]),
@@ -513,6 +640,38 @@ async function redisUrlFrom(
 // failure therefore leaves nothing to read back and every storage endpoint
 // reports "object storage is not configured for this stack".
 //
+// Decide the `createdAt` a provision write should persist, or undefined to omit
+// the field entirely (issue #1165 review, blocking finding 2).
+//
+// Exported because this one decision is the whole of the "a retried provision
+// must not move the default stack" guarantee, and it is worth testing directly
+// rather than only through a full provision run.
+//
+// The three cases, in precedence:
+//   1. An instant is already recorded for this stack (read at pre-flight, or
+//      re-read immediately before the write) — carry it forward verbatim. This
+//      is what keeps a retry in the same listing position.
+//   2. No instant recorded and the store DEFINITIVELY has no record for this
+//      stack (`storedRecordKnownAbsent`, set only when a completed read
+//      returned a 404 miss) — stamp this run's instant. The stack is new, so
+//      appending it last is correct.
+//   3. No instant recorded and we could not establish whether a record exists
+//      (the pre-flight threw and was swallowed so provisioning could continue)
+//      — write NOTHING. `undefined` here means "omit `createdAt`", which leaves
+//      the stack unstamped and ordered with the legacy stacks. That is strictly
+//      better than stamping "now": a fresh stamp on an existing stack rewrites
+//      its position to the end of the listing, and since the listing has no
+//      status filter, a stack that is still provisioning can land at element 0
+//      and become the no-X-Stack-Name default.
+export function decideStackCreatedAt(input: {
+  recordedCreatedAt?: string;
+  storedRecordKnownAbsent: boolean;
+  provisionStartedAt: string;
+}): string | undefined {
+  if (input.recordedCreatedAt !== undefined) return input.recordedCreatedAt;
+  return input.storedRecordKnownAbsent ? input.provisionStartedAt : undefined;
+}
+
 // This helper AWAITS the write and RETRIES a bounded number of times on
 // transient failure. If every attempt fails it RE-THROWS so the caller marks
 // the provision operation `failed` rather than `done` — the failure is surfaced
@@ -555,6 +714,30 @@ export async function persistStackConfig(opts: {
   );
 }
 
+// What a teardown run established about the stack's QUEUE (Valkey) instance
+// (#1213), read off the per-service results the run reports.
+//
+// `false` — the queue instance is gone: this run removed it, or confirmed it
+//           was already absent. `not_found` counts, because it is the
+//           CONFIRMED-absent status (deprovision.ts TeardownStatus), not a
+//           "could not check" — an unconfirmable absence is reported `failed`.
+// `true`  — the queue instance is still there: its own removal failed, so the
+//           store is (as far as this run could tell) alive.
+// `undefined` — this run says nothing about the queue: it never reached it
+//           (the stored services[] did not include it, or the run was
+//           store-less). The caller must not change its mind on no evidence.
+//
+// Matching is by serviceId identity (QUEUE_SERVICE_ID, services/stack.ts), not
+// by role string or by position, so it holds for both the stored-config
+// teardown and the static TEARDOWN_ORDER one.
+export function queueInstancePresentAfterTeardown(
+  result: StackTeardownResult
+): boolean | undefined {
+  const queue = result.services.find((s) => s.serviceId === QUEUE_SERVICE_ID);
+  if (!queue) return undefined;
+  return queue.status === 'failed';
+}
+
 export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async (
   fastify,
   opts
@@ -564,6 +747,8 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
     osc,
     paramStore,
     onStackChange,
+    onStackTeardownStart,
+    onStackQueuePresence,
     getScalerRegistry,
     operationStore: ops,
     publicBaseUrl,
@@ -571,6 +756,13 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
     readyTimeoutMs,
     readyPollIntervalMs
   } = opts;
+
+  // Teardown bounds (issue #1212), resolved ONCE at registration so the DELETE
+  // route, the on-demand packager teardown, the scaler teardown and the
+  // provision-rollback teardown all run under one policy. Environment-driven by
+  // default (12-factor); explicit overrides win, which is how tests collapse the
+  // budgets to milliseconds.
+  const teardownBounds = resolveTeardownBounds(opts.teardownBounds);
 
   // Readiness-wait budget shared by every backing instance this route creates
   // (issue #1038). Resolved once here so all five waits use one bound, and so
@@ -843,6 +1035,86 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         };
         let objectStorePlan: ObjectStoreCredentialPlan = legacyObjectStorePlan;
 
+        // The stack's creation instant (issue #1165), decided ONCE for this
+        // provision run and reused by every write below — the 'provisioning'
+        // marker, the final 'ready' config and the partial 'failed' config — so
+        // all three agree and a retried provision does not re-stamp the stack to
+        // "now" and shuffle it to the end of the listing.
+        //
+        // Seeded from the EXISTING stored config when there is one (a retry, or
+        // a 'provisioning'/'failed' record from an earlier attempt), so the
+        // original instant survives. `undefined` here means "no stored stack
+        // yet", and the writes below stamp it with stackCreatedAtFor().
+        let existingCreatedAt: string | undefined;
+        const provisionStartedAt = new Date().toISOString();
+
+        // Whether we actually KNOW there is no stored record (issue #1165
+        // review, blocking finding 2).
+        //
+        // `existingCreatedAt === undefined` conflates two very different
+        // states: "the store definitively has no record for this stack" (a 404
+        // on the exact key) and "we could not find out" (the pre-flight threw
+        // and the failure was swallowed to keep provisioning, or the read
+        // returned a spurious miss). Stamping a fresh instant is only correct in
+        // the first case. In the second, a retry of a stack that IS already
+        // stored would rewrite its record with "now", move it to the end of the
+        // listing, and — because listStackNames has no status filter — a
+        // not-yet-ready stack can be element 0 and become the no-header
+        // default. So an ambiguous read stamps NOTHING: the write omits
+        // `createdAt` and the stack stays unstamped, which orders it with the
+        // legacy stacks and is recoverable by the next successful write.
+        let storedRecordKnownAbsent = false;
+
+        // The value to persist on this write, or undefined to omit the field.
+        // Kept a function (rather than a precomputed constant) so a write that
+        // happens after the pre-flight read still picks up whatever the read
+        // found, including the re-read performed just before the final write.
+        const stackCreatedAtFor = (): string | undefined =>
+          decideStackCreatedAt({
+            recordedCreatedAt: existingCreatedAt,
+            storedRecordKnownAbsent,
+            provisionStartedAt
+          });
+
+        // Spread helper so every write site states the same thing: carry the
+        // recorded instant, stamp a new one only for a definitively new stack,
+        // and otherwise write no `createdAt` at all (the field is optional for
+        // exactly this back-compat reason, param-store.ts `createdAt?`).
+        const createdAtPatch = (): { createdAt?: string } => {
+          const createdAt = stackCreatedAtFor();
+          return createdAt === undefined ? {} : { createdAt };
+        };
+
+        // Re-read the persisted record immediately before a final write (issue
+        // #1165 review, blocking finding 2). The pre-flight read happens long
+        // before provisioning finishes; between the two, a concurrent attempt or
+        // a marker write may have recorded the instant this run failed to see.
+        // Re-reading makes the LAST writer carry forward whatever is actually
+        // stored instead of trusting a stale (or never-populated) local value.
+        //
+        // Read failures here are non-fatal and deliberately do not change
+        // `storedRecordKnownAbsent`: a failed re-read is ambiguous, so it must
+        // not license a fresh stamp.
+        const refreshExistingCreatedAt = async (): Promise<void> => {
+          if (!paramStore) return;
+          try {
+            const persisted = await paramStore.loadStackConfig(
+              STACK_CONFIG_NAMESPACE,
+              name
+            );
+            if (persisted?.createdAt !== undefined) {
+              existingCreatedAt = persisted.createdAt;
+            }
+          } catch (err) {
+            app.log.warn(
+              { err, name },
+              'could not re-read the stored stack config before the final ' +
+                'write; preserving whatever creation instant this run already ' +
+                'observed rather than re-stamping (issue #1165)'
+            );
+          }
+        };
+
         // Reset the plan to the legacy credential when the per-stack access key
         // id could NOT be persisted (issue #1094 review, blocking finding 3).
         //
@@ -881,10 +1153,70 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             try {
               const wsId = STACK_CONFIG_NAMESPACE;
               const existing = await paramStore.loadStackConfig(wsId, name);
+              // Carry a previously recorded creation instant forward (issue
+              // #1165) so a retried provision keeps this stack's position in the
+              // listing instead of being re-stamped to "now" and jumping to the
+              // end. Read before the converge-and-return below so it is set on
+              // every path that reaches a write.
+              existingCreatedAt = existing?.createdAt;
+              // The read COMPLETED, so its answer is authoritative: a miss here
+              // is the store's definitive 404 on this exact key (loadStackConfig
+              // returns undefined only for a 404) and this stack may be stamped
+              // with a fresh instant. Anything that throws instead leaves this
+              // false and suppresses the stamp (issue #1165 review, finding 2).
+              // A SPURIOUS 404 is indistinguishable from a real one here, which
+              // is why refreshExistingCreatedAt() re-reads before the final
+              // write and lets the persisted value win.
+              storedRecordKnownAbsent = existing === undefined;
               // A completed stack: converge, return its coordinates, create
               // nothing. isReadyStack treats a legacy status-less config as
               // ready (param-store.ts:102).
               if (existing && isReadyStack(existing)) {
+                // BACKFILL (issue #1165 review, blocking finding 1). This early
+                // return is the path every already-provisioned stack takes
+                // forever, so without a write here a stack created before
+                // creation times were recorded would never acquire an ordering
+                // key — it would be re-derived from absence on every single
+                // listing. Stamp the explicit legacy marker instead.
+                //
+                // LEGACY_STACK_CREATED_AT, not "now": this run did not create
+                // the stack and has no way to learn when it was created (the
+                // config service stores no creation metadata — ConfigObject =
+                // { key, value, secret? }), so recording "now" would be a false
+                // instant that also moves the stack to the END of the listing
+                // and changes the default. compareStackCreationOrder classes the
+                // marker with absence ("creation time unknown"), so the marker
+                // sorts exactly where absence sorted — including while only SOME
+                // of several legacy stacks have been backfilled, which is the
+                // normal state here because this write is best-effort per stack.
+                //
+                // Best-effort: a failed backfill must not turn a converging,
+                // idempotent provision of a healthy stack into an error. The
+                // stack simply stays unstamped and the next converge retries.
+                if (existing.createdAt === undefined) {
+                  try {
+                    await paramStore.storeStackConfig(wsId, name, {
+                      ...existing,
+                      createdAt: LEGACY_STACK_CREATED_AT
+                    });
+                    app.log.info(
+                      { name, createdAt: LEGACY_STACK_CREATED_AT },
+                      'backfilled the stack ordering key for a stack ' +
+                        'provisioned before creation times were recorded; the ' +
+                        'marker records an unknown creation time and orders as ' +
+                        'absence did, so this stack and the default stack keep ' +
+                        'their listing positions whether or not the other ' +
+                        'legacy stacks have been backfilled yet (issue #1165)'
+                    );
+                  } catch (backfillErr) {
+                    app.log.warn(
+                      { err: backfillErr, name },
+                      'could not backfill the stack ordering key; the stack ' +
+                        'remains unstamped and keeps its current listing ' +
+                        'position (issue #1165)'
+                    );
+                  }
+                }
                 ops.update(op.id, {
                   status: 'done',
                   completedAt: Date.now(),
@@ -979,6 +1311,13 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               try {
                 await paramStore.storeStackConfig(wsId, name, {
                   status: 'provisioning',
+                  // Creation instant (issue #1165). The marker is normally the
+                  // first write that creates this stack's key, so this is where
+                  // the stack's position in the listing is fixed. Omitted
+                  // entirely when the pre-flight could not establish that the
+                  // stack is new, so a retry cannot re-stamp an existing stack
+                  // and move the default (review finding 2).
+                  ...createdAtPatch(),
                   minioEndpoint: '',
                   couchdbUrl: '',
                   redisUrl: '',
@@ -1167,7 +1506,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         });
         const delay = (ms: number) =>
           new Promise((resolve) => setTimeout(resolve, ms));
-        for (const bucket of [SOURCE_BUCKET, PACKAGED_BUCKET]) {
+        for (const bucket of REQUIRED_BUCKETS) {
           let attempts = 0;
           while (true) {
             try {
@@ -1184,8 +1523,72 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           }
         }
 
+        // 1b-ii. Create the DEDICATED profiles bucket (issue #1208, ADR-026
+        // D1/D3). This is the bucket the profile-index publisher writes
+        // `index.yml` + one `<name>.yml` per runnable profile into, and whose
+        // anonymous-read `index.yml` URL becomes the PRIMARY Encore
+        // `profilesUrl` — so each spawned Encore instance fetches its profiles
+        // with a plain tokenless GET of an origin this app configures itself,
+        // instead of depending on an orchestrator-level auth-gate exemption
+        // that no OSC contract can set, read, or assert (ADR-026 C3).
+        //
+        // Dedicated bucket rather than a prefix on the packaged bucket, so the
+        // profiles policy and the media policy stay independently auditable and
+        // a profile object can never collide with a packaged key. The name and
+        // the policy document both come from the publisher module, so the two
+        // halves of ADR-026 D3 cannot disagree.
+        //
+        // BEST-EFFORT, unlike the required buckets above: the resolver keeps a
+        // working fallback tier (the app's own
+        // `GET /api/v1/profiles/index.yml`, ADR-026 D2), and `publishProfileIndex`
+        // already treats a missing bucket as `bucket-missing` -> "fall through
+        // to the pre-ADR-026 tiers". A profiles-bucket hiccup must therefore
+        // never fail the provision of an otherwise-healthy stack, exactly like
+        // the CORS and packaged-policy steps below.
+        //
+        // TEARDOWN: nothing to add. The bucket lives INSIDE this stack's
+        // `minio-minio` instance, which is a member of STACK_SERVICES and is
+        // removed by the stack teardown path (services/deprovision.ts, via
+        // TEARDOWN_ORDER), so the bucket and its objects are destroyed with the
+        // stack and a re-provision under the same name starts from an empty
+        // bucket with the policy re-applied below.
+        let profilesBucketReady = false;
+        {
+          let attempts = 0;
+          while (true) {
+            try {
+              // bucketExists-then-makeBucket (not makeBucket alone) keeps a
+              // re-provision idempotent: an existing profiles bucket, already
+              // holding a published index, is left exactly as it is.
+              const exists = await minioClient.bucketExists(PROFILES_BUCKET);
+              if (!exists) {
+                await minioClient.makeBucket(PROFILES_BUCKET);
+              }
+              profilesBucketReady = true;
+              break;
+            } catch (err) {
+              attempts++;
+              if (attempts >= 5) {
+                app.log.warn(
+                  { err, bucket: PROFILES_BUCKET, stack: name },
+                  'could not create the profiles bucket; the Encore profilesUrl ' +
+                    'will fall back to this API\'s own /api/v1/profiles/index.yml ' +
+                    '(re-provision to retry)'
+                );
+                break;
+              }
+              await delay(3000);
+            }
+          }
+        }
+
         // 1c. Set CORS on both buckets so browsers can PUT presigned URLs
         // directly from the ops UI without cross-origin errors.
+        // Deliberately NOT applied to the profiles bucket: nothing in a browser
+        // reads it (the ops UI reads profiles through this API's own
+        // /api/v1/profiles routes) and its only consumer is Encore's
+        // server-side, same-process `UrlResource` GET, which is not subject to
+        // the browser's cross-origin rules.
         // MinIO supports the S3 PutBucketCors API; we call it via the MinIO
         // client's makeRequestAsync (which handles AWS Signature V4 signing)
         // because the minio JS SDK does not expose a setBucketCors helper.
@@ -1204,7 +1607,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           '</CORSConfiguration>'
         ].join('');
         const corsPayload = Buffer.from(corsXml, 'utf-8');
-        for (const bucket of [SOURCE_BUCKET, PACKAGED_BUCKET]) {
+        for (const bucket of REQUIRED_BUCKETS) {
           let attempts = 0;
           while (true) {
             try {
@@ -1256,6 +1659,54 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             } catch {
               attempts++;
               if (attempts >= 5) break; // best-effort — don't block provision
+              await delay(3000);
+            }
+          }
+        }
+
+        // 1e. Apply the SAME anonymous read-only policy shape to the PROFILES
+        // bucket (issue #1208, ADR-026 D3), so Encore's tokenless
+        // `UrlResource` GET of `<minio>/openvideocore-profiles/index.yml`
+        // succeeds. The document comes from
+        // `profilesBucketAnonymousReadPolicy()` — the exact JSON the publisher
+        // re-asserts after each publish — so there is one policy definition for
+        // this bucket, not a hand-copied second one: `s3:GetObject` only, for
+        // principal '*', scoped to `arn:aws:s3:::openvideocore-profiles/*`. No
+        // ListBucket and no write, so objects are readable by exact key and the
+        // bucket is not browsable/enumerable.
+        //
+        // The exposure is accepted explicitly in ADR-026 D3: the objects are
+        // encoder configuration (codec, bitrate ladder, container settings),
+        // never customer media and never credentials, and this is a strictly
+        // NARROWER exposure than the anonymous-read packaged bucket above
+        // (#199), which serves actual media. The SOURCE bucket's privacy and
+        // the PACKAGED bucket's existing policy are both untouched — changing
+        // either is out of scope (ADR-026 §6).
+        //
+        // Skipped when the bucket is not there (creation failed above): a
+        // policy on a non-existent bucket cannot succeed, and retrying it would
+        // only add 4 pointless sleeps to the provision. Same best-effort
+        // retry/backoff as the packaged policy; `setBucketPolicy` overwrites,
+        // so a re-provision converges rather than accumulating statements.
+        if (profilesBucketReady) {
+          const profilesPolicy = profilesBucketAnonymousReadPolicy();
+          let attempts = 0;
+          while (true) {
+            try {
+              await minioClient.setBucketPolicy(PROFILES_BUCKET, profilesPolicy);
+              break;
+            } catch (err) {
+              attempts++;
+              if (attempts >= 5) {
+                app.log.warn(
+                  { err, bucket: PROFILES_BUCKET, stack: name },
+                  'could not apply the anonymous-read policy to the profiles ' +
+                    'bucket; the publisher re-asserts it best-effort on the next ' +
+                    'publish, and until it holds the Encore profilesUrl falls ' +
+                    "back to this API's own /api/v1/profiles/index.yml"
+                );
+                break; // best-effort — don't block provision
+              }
               await delay(3000);
             }
           }
@@ -1493,8 +1944,20 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // 'failed'-status partial here — the OSC instances remain and a retry of
         // the provision (idempotent) can re-attempt the write.
         if (paramStore) {
+          // Re-read the persisted record first (issue #1165 review, finding 2):
+          // this write is the one that makes the stack live and listable, so it
+          // must carry the instant that is ACTUALLY stored — not a stale local
+          // value from a pre-flight that may have failed or missed spuriously.
+          await refreshExistingCreatedAt();
           const stackConfig: StackConfig = {
             status: 'ready',
+            // Creation instant (issue #1165) — the same value the
+            // 'provisioning' marker carried, preserved across the status
+            // transition so the stack keeps its place in the listing. If the
+            // marker write failed and the stack is definitively new, this write
+            // creates the key and stamps it; if this run never established that
+            // the stack is new, no instant is written at all.
+            ...createdAtPatch(),
             minioEndpoint,
             couchdbUrl: stripCredentials(couchdbUrl),
             redisUrl,
@@ -1553,6 +2016,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           }
           // The new stack is now discoverable: drop any cached connections so
           // the next request resolves it immediately.
+          //
+          // Its queue instance is live by construction — the provision above
+          // created it and waited for it to be ready — so say so before the
+          // reconcile runs (#1213). A stack name can carry a "queue is gone"
+          // report from an earlier failed teardown that kept the stored config;
+          // re-provisioning under the same name is exactly the case where that
+          // report stops being true, and without this the new stack's callback
+          // poller would never be armed.
+          onStackQueuePresence?.(name, true);
           onStackChange?.(workspaceId);
 
           // Seed the newly-provisioned stack's profile store (issue #701). This
@@ -1635,7 +2107,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 created.map((c) => ({
                   serviceId: c.serviceId,
                   instanceName: c.name
-                }))
+                })),
+                // No optional opt-in instances exist on a failed provision.
+                undefined,
+                // Same bounds as the DELETE route (issue #1212): a rollback must
+                // not hang the provision operation on a stuck teardown call.
+                teardownBounds
               );
               if (rollback.status === 'failed') {
                 app.log.error(
@@ -1695,8 +2172,19 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           if (paramStore && provisioned.length > 0) {
             try {
               const workspaceId = STACK_CONFIG_NAMESPACE;
+              // Re-read before the partial write too (issue #1165 review,
+              // finding 2). This is the write a FAILED run leaves behind, so it
+              // is the one a later retry reads back; rewriting it with a fresh
+              // instant is exactly how a retried provision moved the stack to
+              // the end of the listing.
+              await refreshExistingCreatedAt();
               await paramStore.storeStackConfig(workspaceId, name, {
                 status: 'failed',
+                // Preserve the creation instant on the partial write (issue
+                // #1165), for the same reason the per-stack access key id is
+                // preserved below: a retry must read back the original value
+                // rather than re-stamping and reordering the listing.
+                ...createdAtPatch(),
                 minioEndpoint: '',
                 couchdbUrl: '',
                 redisUrl: '',
@@ -1786,14 +2274,48 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   );
 
   // GET /api/v1/provision — list all stack names provisioned for this workspace.
-  //   200  array of stack name strings
+  //   200  array of stack name strings, in CREATION ORDER (issue #1165):
+  //        oldest stack first, newly provisioned stacks appended LAST. Element
+  //        [0] is the workspace DEFAULT stack — the stack a request with no
+  //        X-Stack-Name header resolves to (WorkspaceStackResolver.resolve /
+  //        resolveStackName / resolveStackConfig all take names[0]) and the one
+  //        whose profile index the transcoder reads. Provisioning another stack
+  //        therefore does NOT change the default. The order comes from
+  //        ParamStore.listStackNames' contract (param-store.ts), not from this
+  //        route, so this listing and the resolver can never disagree.
   //   501  parameter store not configured
   app.get(
     '/',
     {
       schema: {
+        description:
+          'List the stacks provisioned on this deployment. Order is part of ' +
+          'the contract: stacks are returned in creation order — the oldest ' +
+          'stack first, each newly provisioned stack appended last. The first ' +
+          'element is the default stack: a request that sends no X-Stack-Name ' +
+          'header is routed to it, and it is the stack whose transcode profile ' +
+          'index is served as the deployment default. Provisioning or ' +
+          'deprovisioning another stack never changes which stack is first, ' +
+          'and a new stack never appears in the middle of this list. Stacks ' +
+          'provisioned before this deployment began recording creation times ' +
+          'carry no recorded creation time: they sort before every stack ' +
+          'created after it, ordered among themselves by name. A deployment ' +
+          'that had exactly one such stack therefore keeps it as the default, ' +
+          'but a deployment that had several has no stored record of their ' +
+          'original order, so its default may change once — to the ' +
+          'name-first of them — when it starts recording creation times. Set ' +
+          'the DEFAULT_STACK_NAME environment variable to pin a specific ' +
+          'stack as the default; a pinned stack is returned first regardless ' +
+          'of creation order, and the pin is ignored if no stack of that name ' +
+          'is provisioned.',
         response: {
-          200: z.array(z.string()),
+          200: z
+            .array(z.string())
+            .describe(
+              'Provisioned stack names in creation order, oldest first. ' +
+                'Element 0 is the default stack for requests without an ' +
+                'X-Stack-Name header.'
+            ),
           501: notConfiguredSchema
         }
       }
@@ -1804,6 +2326,8 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       }
       try {
         const workspaceId = STACK_CONFIG_NAMESPACE;
+        // Creation-ordered by contract (ParamStore.listStackNames,
+        // param-store.ts) — passed through verbatim, never re-sorted here.
         const names = await opts.paramStore.listStackNames(workspaceId);
         return reply.send(names);
       } catch (err) {
@@ -1995,12 +2519,23 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   // DELETE /api/v1/provision/:name — tear down a named stack.
   //
   // Removes every OSC instance that makes up the stack in dependency-safe
-  // order (consumers before producers). Behaviour:
-  //   - 200 status=removed    every instance was removed this call
-  //   - 200 status=partial    some removed, some already gone (no failures)
-  //   - 404 status=not_found  no instances existed for this name
-  //   - 502 status=failed     one or more instances failed to remove; the
-  //                           call is safe to retry (idempotent)
+  // order (consumers before producers). The teardown result reports:
+  //   - status=removed    every instance was removed this call
+  //   - status=partial    some removed, some already gone (no failures)
+  //   - status=not_found  no instances existed for this name
+  //   - status=failed     one or more instances failed to remove; the
+  //                       call is safe to retry (idempotent)
+  //
+  // The teardown runs asynchronously: the route answers 202 with an
+  // operationId and the caller polls GET /operations/:id. That operation's own
+  // terminal state mirrors the outcome (issue #1210): `failed` when the
+  // teardown reports `failed` — with the surviving services named in
+  // `error` and every per-service status on `result.services[]` — and `done`
+  // only when nothing is left running. While the teardown is in flight the
+  // stored config is marked 'deleting', and a failed teardown leaves it marked
+  // 'delete_failed', so GET /api/v1/provision keeps listing the stack and
+  // GET /api/v1/provision/:name reports what state it is in until every
+  // service is gone.
   app.delete(
     '/:name',
     {
@@ -2020,9 +2555,113 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       const op = ops.create('deprovision', name);
       reply.code(202).send({ operationId: op.id, name, status: 'pending' });
 
-      setImmediate(async () => {
+      // Mark the stored config with a teardown lifecycle state (issue #1210).
+      // The stack MUST stay in the listing (GET /api/v1/provision reads
+      // ParamStore.listStackNames, which lists every stored entry regardless of
+      // status) until every service is gone — the entry is also the only record
+      // of what is left to remove — but it must not read as a live stack while
+      // it is going away. 'deleting' is written before teardown starts and
+      // 'delete_failed' when teardown leaves services in place; the entry is
+      // deleted only on a clean teardown. StackConfig.status is the existing
+      // lifecycle field (services/param-store.ts) and the write goes through
+      // the same storeStackConfig + constant namespace the provision path uses.
+      //
+      // Best-effort, exactly like the post-teardown deleteStackConfig: a failed
+      // marker write is logged and must never abort the teardown — the worst
+      // case is the stack staying listed with its previous status, which is
+      // strictly better than an unlisted stack with services still running.
+      const markStackTeardownStatus = async (
+        config: StackConfig,
+        status: 'deleting' | 'delete_failed'
+      ): Promise<void> => {
+        if (!paramStore) return;
         try {
-          ops.update(op.id, { status: 'running' });
+          await paramStore.storeStackConfig(STACK_CONFIG_NAMESPACE, name, {
+            ...config,
+            status
+          });
+        } catch (err) {
+          app.log.error(
+            { err, name, status },
+            'failed to mark stored stack config with its teardown state'
+          );
+        }
+      };
+
+      // Hoisted so the failure paths can still mark a stack whose teardown threw or
+      // timed out (issue #1210): an unexpected failure mid-teardown must leave the
+      // stack listed as delete_failed, not stranded mid-'deleting'.
+      let loadedConfig: StackConfig | undefined;
+
+      // Exactly one TERMINAL update per operation (issue #1212). The closure
+      // below runs under a deadline; when that fires the operation is reported
+      // `failed` immediately, and the abandoned background work — which cannot
+      // be cancelled, @osaas/client-core takes no AbortSignal — must not later
+      // overwrite that with a stale `done`.
+      let settled = false;
+      const settle = (patch: Parameters<typeof ops.update>[1]): void => {
+        if (settled) return;
+        settled = true;
+        ops.update(op.id, patch);
+      };
+
+      // Tear down a hung-prone OSC step under the per-service budget so one
+      // unanswered call cannot consume the whole operation deadline. Used for
+      // the steps that do NOT already carry their own budget (the scaler
+      // registry teardown and the on-demand packager reconciliation); the
+      // stored-service teardown bounds itself (services/deprovision.ts).
+      const bounded = <T>(label: string, run: () => Promise<T>): Promise<T> =>
+        withTeardownTimeout(run, {
+          label,
+          timeoutMs: teardownBounds.serviceTimeoutMs
+        });
+
+      // The packager reconciliation, bounded. teardownOnDemandPackager reports
+      // its own failures as a `failed` result rather than throwing, so the only
+      // thing that can escape here is the deadline — converted to the same
+      // `failed` shape so a hung packager probe is folded into the reported
+      // result (issue #1056) instead of stranding the operation.
+      const boundedPackagerTeardown =
+        async (): Promise<PackagerTeardownResult> => {
+          try {
+            return await bounded(`packager teardown "${name}"`, () =>
+              teardownOnDemandPackager(packagerOscApiFromContext(osc), name)
+            );
+          } catch (err) {
+            return {
+              serviceId: PACKAGER_SERVICE_ID,
+              status: 'failed',
+              error: err instanceof Error ? err.message : String(err)
+            };
+          }
+        };
+
+      // The teardown itself. Extracted from the setImmediate closure so the
+      // WHOLE flow — scaler teardown, packager reconciliation, stored-service
+      // teardown and the parameter-store cleanup — sits under one operation
+      // deadline below and always reaches a terminal state (issue #1212).
+      const runTeardown = async (): Promise<void> => {
+          // Release everything this process is running AGAINST the stack's
+          // backing services while those services still exist (#1213) — the
+          // Encore callback poller(s) bound to the stack's Valkey above all.
+          // FIRST, ahead of the scaler teardown and of every instance removal,
+          // and on every branch below (including the already-gone stack), so no
+          // path can leave a poller retrying a removed Valkey once a second.
+          //
+          // Bounded like the other hung-prone steps and never fatal: a hook that
+          // throws or outruns its budget is logged, and the teardown proceeds.
+          if (onStackTeardownStart) {
+            try {
+              await bounded(`stack teardown prepare "${name}"`, async () =>
+                onStackTeardownStart(name)
+              );
+            } catch (err) {
+              app.log.warn(
+                { err, name },
+                'releasing stack-bound pollers before teardown failed; continuing teardown'
+              );
+            }
+          }
 
           // Without a parameter store there is no per-workspace ownership record
           // to consult, so fall back to the legacy hardcoded-list teardown. This
@@ -2033,10 +2672,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             // it consumes), reconciling via introspection (issue #246). Safe
             // whether or not packaging ever ran: not_found when no packager
             // exists. A failure is logged but does not abort the static teardown.
-            const packagerTeardown = await teardownOnDemandPackager(
-              packagerOscApiFromContext(osc),
-              name
-            );
+            const packagerTeardown = await boundedPackagerTeardown();
             if (packagerTeardown.status === 'failed') {
               app.log.error(
                 { packagerTeardown, name },
@@ -2049,13 +2685,16 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             // static TEARDOWN_ORDER also covers PACKAGER_SERVICE_ID, so the
             // fold MERGES onto that entry instead of reporting two packagers.
             const result = foldTeardownResults(
-              await deprovisionStack(osc, name),
+              await deprovisionStack(osc, name, teardownBounds),
               packagerTeardownAsServiceResults(packagerTeardown)
             );
             if (result.status === 'failed') {
               app.log.error({ result }, 'stack teardown reported failures');
             }
-            ops.update(op.id, { status: 'done', completedAt: Date.now(), result });
+            // The operation state mirrors the teardown outcome (issue #1210):
+            // nothing to mark in a store on this path (there is no store), but
+            // a teardown that left services running must not close as `done`.
+            settle(teardownOperationPatch(result));
             return;
           }
 
@@ -2080,7 +2719,9 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             const staleRegistry = getScalerRegistry?.();
             if (staleRegistry) {
               try {
-                await staleRegistry.teardown(name);
+                await bounded(`scaler teardown "${name}"`, () =>
+                  staleRegistry.teardown(name)
+                );
               } catch (err) {
                 app.log.warn(
                   { err, name },
@@ -2088,13 +2729,25 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 );
               }
             }
-            ops.update(op.id, {
+            // Converge the stack-bound background work for this name too
+            // (#1213): the pollers released above are re-armed by the reconcile
+            // this triggers if, and only if, their Valkey is still there.
+            onStackChange?.(workspaceId);
+            settle({
               status: 'done',
               completedAt: Date.now(),
               result: { name, status: 'not_found', services: [] }
             });
             return;
           }
+
+          // The stack exists and is about to be torn down: mark the stored
+          // entry 'deleting' so it stays listed, but not as a live stack, for
+          // the whole teardown (issue #1210). Done before the first destructive
+          // call below so a teardown that dies part-way never leaves a
+          // half-removed stack still advertising itself as ready.
+          loadedConfig = config;
+          await markStackTeardownStatus(config, 'deleting');
 
           // Stop the per-workspace Encore scaler and destroy every pooled
           // Encore/callback-listener instance *before* removing the static
@@ -2114,7 +2767,9 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           const scalerRegistry = getScalerRegistry?.();
           if (scalerRegistry) {
             try {
-              await scalerRegistry.teardown(name);
+              await bounded(`scaler teardown "${name}"`, () =>
+                scalerRegistry.teardown(name)
+              );
             } catch (err) {
               app.log.error(
                 { err, name },
@@ -2151,10 +2806,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // double-count it (see packagerTeardownAsServiceResults).
           let packagerTeardown: PackagerTeardownResult | undefined;
           if (!packagerInStoredServices) {
-            packagerTeardown = await teardownOnDemandPackager(
-              packagerOscApiFromContext(osc),
-              name
-            );
+            packagerTeardown = await boundedPackagerTeardown();
             if (packagerTeardown.status === 'failed') {
               app.log.error(
                 { packagerTeardown, name, workspaceId },
@@ -2191,7 +2843,8 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 ...(config.sceneDetectInstanceName
                   ? { sceneDetectInstanceName: config.sceneDetectInstanceName }
                   : {})
-              }
+              },
+              teardownBounds
             ),
             packagerTeardownAsServiceResults(packagerTeardown)
           );
@@ -2199,8 +2852,39 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           if (result.status === 'failed') {
             app.log.error({ result }, 'stack teardown reported failures');
             // The parameter-store entry is intentionally NOT removed so a retry
-            // can re-read the services[] and finish the teardown.
-            ops.update(op.id, { status: 'done', completedAt: Date.now(), result });
+            // can re-read the services[] and finish the teardown. That retry is
+            // cheap and converges (issue #1212): the services this run already
+            // removed are confirmed absent and reported not_found without a
+            // second removal, so the next DELETE spends its budget only on what
+            // is still there.
+            //
+            // #1213: this is the one terminal path that KEEPS the stored config
+            // while the stack's services are (partly) gone, so it is also the
+            // one path where the config stops describing reality. Report what
+            // this run established about the queue instance BEFORE signalling
+            // the change: the reconcile the signal triggers re-derives the
+            // stack's Valkey from the config that is being kept, and
+            // TEARDOWN_ORDER (services/stack.ts) removes the queue second — so
+            // a run that removed the Valkey and then failed on the database or
+            // the storage would otherwise re-arm a poller against the store it
+            // had just removed. With the report in hand the reconcile re-arms
+            // only for a stack whose Valkey survived (its removal failed), and
+            // leaves one whose Valkey is gone released until the retry finishes
+            // the teardown and the config is deleted.
+            // Since issue #1210 the entry is also re-marked 'delete_failed': the
+            // stack is still (partly) there, so it must stay listed AND say so,
+            // rather than sitting at 'deleting' with nothing running.
+            await markStackTeardownStatus(config, 'delete_failed');
+            //
+            const queuePresent = queueInstancePresentAfterTeardown(result);
+            if (queuePresent !== undefined) {
+              onStackQueuePresence?.(name, queuePresent);
+            }
+            onStackChange?.(workspaceId);
+            // ...and the operation itself reports the partial failure instead of
+            // closing as `done` with a failed result buried inside it (issue
+            // #1210). Per-service statuses stay on result.services[].
+            settle(teardownOperationPatch(result));
             return;
           }
 
@@ -2237,11 +2921,45 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // not served from cache after teardown.
           onStackChange?.(workspaceId);
 
-          ops.update(op.id, { status: 'done', completedAt: Date.now(), result });
+          // Clean teardown: nothing is left running, so the operation is done
+          // and the stored entry is gone (deleted above) — the stack drops out
+          // of the listing, which is the only case where that is correct.
+          settle(teardownOperationPatch(result));
+      };
+
+      setImmediate(async () => {
+        try {
+          ops.update(op.id, { status: 'running' });
+
+          // ONE deadline over the whole teardown (issue #1212). Every OSC call
+          // inside is individually bounded, but this is the backstop that makes
+          // the terminal state unconditional: whatever stalls — a registry
+          // teardown, a parameter-store read, an SDK call that ignores every
+          // other bound — the operation stops being `running` and says why.
+          await withTeardownTimeout(runTeardown, {
+            label: `stack teardown "${name}"`,
+            timeoutMs: teardownBounds.operationTimeoutMs
+          });
+
+          // Defensive: a teardown path that returned without reporting must
+          // still leave a terminal operation rather than a permanent `running`.
+          settle({
+            status: 'failed',
+            completedAt: Date.now(),
+            error: `deprovisioning "${name}" finished without reporting a result`
+          });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           app.log.error({ err, name }, 'deprovisioning failed');
-          ops.update(op.id, {
+          // An unexpected throw or a deadline mid-teardown is a partial failure
+          // too: whatever was reached may be half-removed, so the stack stays
+          // listed and is marked 'delete_failed' rather than left mid-'deleting'
+          // (issue #1210). Only possible once the config was loaded; a throw
+          // before that never touched any instance.
+          if (loadedConfig) {
+            await markStackTeardownStatus(loadedConfig, 'delete_failed');
+          }
+          settle({
             status: 'failed',
             completedAt: Date.now(),
             error: `deprovisioning failed: ${message}`

@@ -1,6 +1,6 @@
 # ADR-026: Source of the Encore `profilesUrl` — derived app base URL vs. object-store-served profiles
 
-**Status:** PROPOSED 2026-10-04 — decision record only; no product code changes in this PR
+**Status:** ACCEPTED 2026-10-15 (maintainer decision) — decision record only; no product code changes in this PR
 **Date:** 2026-10-04 (catalog facts re-confirmed live 2026-10-08; renumbered from the
 draft's ADR-025 after `ADR-025-audit-scope-boundary.md` merged to `main` on 2026-10-05)
 **Author agent:** architect

@@ -182,3 +182,107 @@ test('delete: a purged asset (404/410 on read) is also accepted, and an asset th
   const hard = await run({ hardDelete: true });
   assert.equal(byId(hard.result).delete.status, 'pass');
 });
+
+// #1248: a platform failure in the transcode case is infra-error (not final, so the commit is retried), the
+// product's own encode failures stay red.
+for (const code of [502, 503, 504]) {
+  test(`HTTP ${code} on the transcode request is an infrastructure failure, not red`, async () => {
+    const { result } = await run({ transcodeGateway: code });
+    assert.equal(result.status, 'infra-error');
+    const c = byId(result);
+    assert.equal(c.transcode.status, 'fail');
+    assert.equal(c.transcode.failureClass, 'infra');
+    assert.match(c.transcode.detail, new RegExp(`HTTP ${code}`));
+    assert.equal(c.transcode.observed.httpStatus, code);
+    assert.equal(c.package.status, 'skipped');
+    assert.equal(result.cases.length, 12);
+  });
+}
+
+test('a 504 that arrives as an HTML page (the ingress answering, no JSON) is still infra-error', async () => {
+  const { result } = await run({ transcodeGateway: 504, transcodeGatewayHtml: true });
+  assert.equal(result.status, 'infra-error');
+  assert.equal(byId(result).transcode.failureClass, 'infra');
+  assert.match(byId(result).transcode.detail, /HTTP 504/);
+});
+
+test('a transcode timeout with the job still queued is infra-error and the verdict says what the job was doing', async () => {
+  const { result } = await run({ transcodeJobStatus: 'queued' });
+  assert.equal(result.status, 'infra-error');
+  const c = byId(result).transcode;
+  assert.equal(c.status, 'fail');
+  assert.equal(c.failureClass, 'infra');
+  assert.match(c.detail, /timed out/);
+  assert.match(c.detail, /last job status queued, progress 0 \(queued\)/);
+  assert.equal(c.observed.jobStatus, 'queued');
+  assert.equal(c.observed.progress, 0);
+  assert.equal(c.observed.phase, 'queued');
+  assert.ok(c.observed.polls > 0);
+});
+
+test('a transcode job that ends failed stays red (regression guard for #1167) and carries the last job status', async () => {
+  const { result } = await run({ transcodeJobFails: true });
+  const c = byId(result).transcode;
+  assert.equal(result.status, 'red');
+  assert.equal(c.status, 'fail');
+  assert.equal(c.failureClass, undefined);
+  assert.match(c.detail, /transcode job ended failed: encore job failed/);
+  assert.match(c.detail, /last job status failed/);
+  assert.equal(c.observed.jobStatus, 'failed');
+  assert.equal(byId(result).package.status, 'skipped');
+});
+
+test('a transcode job that completes with no renditions is red', async () => {
+  const { result } = await run({ noRenditions: true });
+  const c = byId(result).transcode;
+  assert.equal(result.status, 'red');
+  assert.equal(c.failureClass, undefined);
+  assert.match(c.detail, /no renditions after transcode/);
+  assert.equal(c.observed.jobStatus, 'done');
+});
+
+test('a transcode job that ran and then stopped progressing is red, reported as stalled', async () => {
+  const { result } = await run({ transcodeJobStatus: 'running', transcodeProgress: 40 });
+  const c = byId(result).transcode;
+  assert.equal(result.status, 'red');
+  assert.equal(c.failureClass, undefined);
+  assert.match(c.detail, /timed out/);
+  assert.match(c.detail, /last job status running, progress 40 \(running\)/);
+  const stalled = await run({ transcodeJobStatus: 'running' }); // never progressed past 0 but did leave the queue
+  assert.equal(stalled.result.status, 'red');
+  assert.match(byId(stalled.result).transcode.detail, /\(stalled\)/);
+});
+
+test('a gateway answer while the transcode job is polled is infra-error, not red', async () => {
+  const { result } = await run({ transcodeJobGateway: 502 });
+  const c = byId(result).transcode;
+  assert.equal(result.status, 'infra-error');
+  assert.equal(c.failureClass, 'infra');
+  assert.match(c.detail, /reading transcode job answered HTTP 502/);
+  assert.equal(c.observed.httpStatus, 502);
+  assert.equal(c.observed.request, 'job-status');
+});
+
+test('a gateway answer on another job read is unchanged: ingest still fails as before', async () => {
+  const { result } = await run({ ingestJobFails: true }); // the ingest case has no infra classification of its own
+  assert.equal(result.status, 'red');
+  assert.equal(byId(result)['ingest-url'].failureClass, undefined);
+});
+
+test('one platform failure plus one real failure is red, not infra-error', async () => {
+  const { result } = await run({ transcodeGateway: 504, appOpen: true });
+  assert.equal(result.status, 'red');
+  assert.equal(byId(result)['app-auth-required'].status, 'fail');
+  assert.equal(byId(result).transcode.failureClass, 'infra');
+});
+
+import { DEFAULT_TIMEOUTS, timeoutsFromEnv } from '../suite/run.mjs';
+
+test('the transcode budget is 900 s by default and is overridable per instance from the environment', () => {
+  assert.equal(DEFAULT_TIMEOUTS.transcodeMs, 900_000);
+  assert.deepEqual(timeoutsFromEnv({}), {});
+  assert.deepEqual(timeoutsFromEnv({ E2E_TIMEOUT_TRANSCODE_MS: '1200000' }), { transcodeMs: 1_200_000 });
+  assert.deepEqual(timeoutsFromEnv({ E2E_TIMEOUT_TRANSCODE_MS: '' }), {}, 'an empty value keeps the default');
+  assert.deepEqual(timeoutsFromEnv({ E2E_TIMEOUT_PACKAGE_MS: '60000', E2E_TIMEOUT_READY_MS: '1000' }), { readyMs: 1000, packageMs: 60_000 });
+  for (const bad of ['abc', '0', '-5']) assert.throws(() => timeoutsFromEnv({ E2E_TIMEOUT_TRANSCODE_MS: bad }), /positive number of milliseconds/, bad);
+});

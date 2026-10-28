@@ -56,7 +56,12 @@ import {
   type AssignmentOutcome,
   type ProbeOutcome
 } from './assignment-log.js';
-import { spawnFailureSecrets } from './spawn-failure.js';
+import {
+  DEFAULT_SPAWN_GATEWAY_BACKOFF_MS,
+  readSpawnFailure,
+  spawnFailureSecrets,
+  spawnGatewayBackoffRemainingMs
+} from './spawn-failure.js';
 import { hasPendingPackaging } from './packaging-pin.js';
 import {
   ACTIVE_PAGE_SIZE,
@@ -453,28 +458,67 @@ export class EncoreScalerLoop {
       // workspace by GET /scaler/status, so swallowing it here loses no signal:
       // it is precisely what makes "at cap" distinguishable from "cannot spawn"
       // without pod logs.
-      try {
-        const spawned = await spawnInstance(this.config);
-        instances = [...instances, spawned];
-      } catch (err) {
-        console.error(
-          '[encore-scaler] scale-up: spawn failed (workspace=%s pending=%d instances=%d max=%d); ' +
-            'continuing the tick with the existing pool:',
+      //
+      // #1286: ...but a spawn that ended in a GATEWAY TIMEOUT is not simply
+      // retried on the next tick either. A 504 on createInstance is the platform
+      // telling us it is too slow to answer inside the ingress' 60s limit, while
+      // the create itself usually keeps going behind it. Starting another create
+      // 10s later therefore does two unhelpful things at once: it adds load to
+      // the thing that is already struggling, and it asks for a SECOND instance
+      // while the first one is still being built (under a new name, so the first
+      // one is nobody's — the extra instance #1223 reported). The spawn path's
+      // own adopt probe has just spent up to 90s watching for that instance
+      // (probeForGatewayTimedOutInstance, instance-pool.ts); this holds the next
+      // attempt off for a while longer so the platform, the orphan reaper and
+      // reconcile all get a chance to settle first.
+      //
+      // Read from pool state (keys.spawnFailure), not process memory, so it
+      // survives a restart and is the same for every replica. readSpawnFailure
+      // is total — it never throws — so this cannot be what breaks a tick.
+      const gatewayBackoffMs = spawnGatewayBackoffRemainingMs(
+        await readSpawnFailure(redis, workspaceId),
+        Date.now(),
+        this.config.spawnGatewayBackoffMs ?? DEFAULT_SPAWN_GATEWAY_BACKOFF_MS
+      );
+      if (gatewayBackoffMs > 0) {
+        console.warn(
+          '[encore-scaler] scale-up: holding off (workspace=%s pending=%d instances=%d ' +
+            'max=%d) — the last spawn timed out at the gateway and the platform may ' +
+            'still be creating that instance; next attempt in %dms (#1286)',
           workspaceId,
           pending,
           instances.length,
           maxInstances,
-          err
+          gatewayBackoffMs
         );
-        // #998: this is the signal that distinguishes "pool is at maxInstances"
-        // from "OSC will not create the instance" — the exact ambiguity #1071
-        // described — so it must reach the API/UI, not only pod logs.
-        this.logFailure(
-          'spawn',
-          `scale-up spawn failed (pending=${pending} instances=${instances.length} ` +
-            `max=${maxInstances}); continuing the tick with the existing pool`,
-          err
-        );
+        // Not logFailure: nothing has failed on this tick, and the failure that
+        // caused the back-off is already recorded (keys.spawnFailure) and served
+        // with its status code by GET /scaler/status. Everything after this gate
+        // — scale-down, the orphan sweep, dispatch — runs exactly as usual.
+      } else {
+        try {
+          const spawned = await spawnInstance(this.config);
+          instances = [...instances, spawned];
+        } catch (err) {
+          console.error(
+            '[encore-scaler] scale-up: spawn failed (workspace=%s pending=%d instances=%d max=%d); ' +
+              'continuing the tick with the existing pool:',
+            workspaceId,
+            pending,
+            instances.length,
+            maxInstances,
+            err
+          );
+          // #998: this is the signal that distinguishes "pool is at maxInstances"
+          // from "OSC will not create the instance" — the exact ambiguity #1071
+          // described — so it must reach the API/UI, not only pod logs.
+          this.logFailure(
+            'spawn',
+            `scale-up spawn failed (pending=${pending} instances=${instances.length} ` +
+              `max=${maxInstances}); continuing the tick with the existing pool`,
+            err
+          );
+        }
       }
     }
 
@@ -1127,13 +1171,13 @@ export class EncoreScalerLoop {
           }
         } else {
           // Payload unavailable (e.g. TTL expired): cannot rebuild the job, so
-          // leave it for reconcile()'s generic dropped-job path rather than fake
-          // a payload. Observable so the gap is diagnosable (issue #451 style).
+          // it cannot be re-enqueued and must be RESOLVED here instead (#1228).
           console.warn(
             `[encore-scaler] scale-down: job ${jobId} interrupted by scale-down of ` +
               `instance ${instanceId} but its payload is unavailable — cannot ` +
-              `re-enqueue; leaving for dropped-job reconciliation`
+              `re-enqueue; resolving it terminally (#1228)`
           );
+          await this.resolveUnrequeueableScaleDownLoss(instanceId, jobId);
         }
       }
     } catch (err) {
@@ -1147,6 +1191,160 @@ export class EncoreScalerLoop {
         'reap',
         `scale-down interruption re-enqueue failed for instance ${instanceId}; ` +
           'jobs lost to this teardown may not have been re-queued',
+        err
+      );
+    }
+  }
+
+  // #1228: resolve a job that was lost to a scale-down / vanished-instance
+  // eviction and CANNOT be re-enqueued because its dispatch payload is gone
+  // (keys.jobPayload carries a 24h TTL — retry-store.ts recordDispatch /
+  // PAYLOAD_TTL_SECONDS — so a job interrupted after that window has nothing
+  // left to rebuild from).
+  //
+  // WHY THIS EXISTS AT ALL. Before #1228 this case only logged "leaving for
+  // dropped-job reconciliation" and returned, on the assumption that
+  // reconcile()'s generic dropped-job diff would pick the job up. It cannot:
+  // that diff only ever iterates instances present in keys.pool (reconcile()
+  // reads keys.pool and returns early when it is empty) and classifies drops
+  // for jobs mapped to THOSE instances — while the instance this job is mapped
+  // to has just been destroyed or evicted, so it has no pool record any more.
+  // Nothing therefore ever looked at the job again: keys.jobStatus stayed
+  // RUNNING, keys.jobInstance kept pointing at a dead instance, and the
+  // caller-facing Job stayed `running` indefinitely with no retry pending and
+  // no terminal outcome — the ambiguous limbo state #1228 reports. Resolution
+  // happens HERE because this is the one place that has both the identity of
+  // the lost job and the knowledge that it is unrecoverable.
+  //
+  // RESOLUTION RULES
+  //   - A job whose local status is ALREADY TERMINAL is left completely alone —
+  //     including a CANCELLED one (keys.jobStatus 'CANCELLED', written by
+  //     index.ts cancel() and encore-scaler-router.ts). The outcome was already
+  //     decided; overwriting it with FAILED would erase a deliberate cancel and
+  //     push a spurious failure through onJobsDropped. The status is RE-READ
+  //     here instead of reused from the caller's hgetall snapshot so a cancel
+  //     that landed during this sweep still wins the race.
+  //   - Anything else resolves to FAILED, definitively: there is no payload to
+  //     re-run, the job is not in Encore's active set, and no callback can
+  //     arrive for it. The local status is overwritten so getJobStatus() stops
+  //     reporting `running` (index.ts maps FAILED -> `failed`), the dead
+  //     keys.jobInstance mapping is removed so the job cannot linger as a drop
+  //     candidate against an instance that no longer exists, and the drop is
+  //     raised through the SAME onJobsDropped hook reconcile() uses so main.ts
+  //     drives the caller-facing Job terminal via the shared idempotent settle.
+  //
+  // Either way the outcome is logged explicitly (FAILED / left CANCELLED /
+  // left terminal) so an operator reading the scaler log can see how every
+  // payload-unavailable job ended, and the FAILED case is also appended to the
+  // operational log sink — it is a job that will never run again and no retry
+  // is pending.
+  //
+  // CONTRACT SOURCES VERIFIED (CLAUDE.md rule 7)
+  //   - keys.jobStatus / keys.jobInstance / keys.jobPayload semantics and TTL:
+  //     src/encore-scaler/types.ts keys (jobStatus, jobInstance, jobPayload).
+  //   - Terminal status vocabulary DONE/SUCCESSFUL/FAILED/CANCELLED and the
+  //     FAILED -> `failed` mapping: src/encore-scaler/index.ts getJobStatus
+  //     (`if (s === 'FAILED' || s === 'CANCELLED') return 'failed'`).
+  //   - CANCELLED is the cancel path's terminal write: index.ts cancel() and
+  //     encore-scaler-router.ts (redis.hset(keys.jobStatus(...), id,
+  //     'CANCELLED')).
+  //   - DroppedJob shape { encoreJobId, reason? } and the onJobsDropped
+  //     signature `(drops: DroppedJob[]) => Promise<void>`:
+  //     src/encore-scaler/types.ts DroppedJob / EncoreScalerConfig.
+  //   - Terminal settle performed by the hook (reason text -> failureText ->
+  //     settleFailedTranscode with 'gone-from-active-set'): src/main.ts
+  //     onJobsDropped.
+  //
+  // Best-effort per job: a failure resolving one job must never break the
+  // teardown or the rest of the sweep, so everything here is wrapped.
+  private async resolveUnrequeueableScaleDownLoss(
+    instanceId: string,
+    jobId: string
+  ): Promise<void> {
+    const { redis, workspaceId } = this.config;
+    try {
+      // Re-read, don't trust the snapshot: a cancel may have landed since.
+      const current = ((await redis.hget(keys.jobStatus(workspaceId), jobId)) ?? '')
+        .toUpperCase();
+      if (
+        current === 'CANCELLED' ||
+        current === 'FAILED' ||
+        current === 'DONE' ||
+        current === 'SUCCESSFUL'
+      ) {
+        console.warn(
+          '[encore-scaler] scale-down: job %s (lost with instance %s, payload ' +
+            'unavailable) is already terminal (%s) — leaving it alone, no ' +
+            'resolution needed (#1228)',
+          jobId,
+          instanceId,
+          current
+        );
+        return;
+      }
+
+      // Definite terminal outcome: FAILED.
+      await redis.hset(keys.jobStatus(workspaceId), jobId, 'FAILED');
+      try {
+        await redis.hdel(keys.jobInstance(workspaceId), jobId);
+      } catch {
+        // A surviving stale mapping is harmless now the status is terminal:
+        // every drop-candidate filter requires a RUNNING/QUEUED status.
+      }
+
+      const reason =
+        `interrupted by scale-down of instance ${instanceId} and could not be ` +
+        're-enqueued: the stored dispatch payload had expired, so the encode ' +
+        'cannot be rebuilt or retried';
+      console.warn(
+        '[encore-scaler] scale-down: job %s RESOLVED FAILED — lost with instance ' +
+          '%s and its dispatch payload is unavailable, so it is unrecoverable; ' +
+          'no retry is pending (#1228)',
+        jobId,
+        instanceId
+      );
+      this.logFailure(
+        'reap',
+        `job ${jobId} was lost when instance ${instanceId} was torn down and its ` +
+          'stored dispatch payload had already expired, so it could not be ' +
+          're-queued; resolved FAILED (no retry pending) — re-submit the encode ' +
+          'to run it again'
+      );
+
+      if (this.config.onJobsDropped) {
+        try {
+          await this.config.onJobsDropped([{ encoreJobId: jobId, reason }]);
+        } catch (hookErr) {
+          // The local status is already terminal, so the job is no longer in
+          // limbo for the scaler's own bookkeeping; surface the repo-side gap.
+          console.error(
+            '[encore-scaler] onJobsDropped failed while resolving payload-' +
+              'unavailable job %s (workspace=%s):',
+            jobId,
+            workspaceId,
+            hookErr
+          );
+          this.logFailure(
+            'reap',
+            `terminal settle of unrecoverable job ${jobId} failed; the scaler ` +
+              'marked it FAILED but the job record may still read running',
+            hookErr
+          );
+        }
+      }
+    } catch (err) {
+      console.error(
+        '[encore-scaler] failed to resolve payload-unavailable job %s ' +
+          '(workspace=%s, instance=%s):',
+        jobId,
+        workspaceId,
+        instanceId,
+        err
+      );
+      this.logFailure(
+        'reap',
+        `could not resolve unrecoverable job ${jobId} lost with instance ` +
+          `${instanceId}; it may still read running`,
         err
       );
     }
