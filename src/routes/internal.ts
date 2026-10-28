@@ -65,6 +65,7 @@ import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js
 import { completeTranscode, type CallbackRendition } from '../pipeline/transcode.js';
 // #1226: object-storage surface for reclaiming a cancelled job's late output.
 import type { CancelledJobOutputStorage } from '../pipeline/cancelled-transcode-completion.js';
+import type { SupersededOutputStorage } from '../pipeline/superseded-output.js';
 // #1060: structured source-read failure detail for a failed `transcode` step.
 import { buildSourceReadErrorDetail } from '../pipeline/encore-source-read-failure.js';
 import type { PipelineLogSink } from '../services/pipeline-log.js';
@@ -206,7 +207,15 @@ type InternalRouterOptions = {
   // other), so it is wired here too and the SAME rule applies whichever path
   // observed the completion. Absent => the discard is still recorded durably on
   // the job record and the objects are left for an operator.
-  resolveTranscodeOutputStorage?: () => Promise<CancelledJobOutputStorage | undefined>;
+  //
+  // #1044 widened the signature with an optional bucket so the SAME binding also
+  // serves the superseded-output delete path below (a successful RE-RUN removing
+  // the renditions of the generation it replaced). Omitting the bucket keeps the
+  // #1226 meaning — the stack's own output bucket; an explicit bucket covers a
+  // rendition recorded as `s3://<other-bucket>/<key>`.
+  resolveTranscodeOutputStorage?: (
+    bucket?: string
+  ) => Promise<(CancelledJobOutputStorage & SupersededOutputStorage) | undefined>;
 };
 
 // The provisioned stack names, never throwing (issue #1058). These callbacks are
@@ -686,6 +695,12 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
             // src/pipeline/cancelled-transcode-completion.ts). Resolved lazily
             // inside the rule, so a normal completion builds no storage handle.
             resolveOutputStorage: opts.resolveTranscodeOutputStorage,
+            // #1044: delete the output this run SUPERSEDED — the renditions of
+            // the previous generation that the new `renditions` array no longer
+            // references — once the asset is confirmed repointed at the new ones.
+            // Same handle as above; completeTranscode only calls it on a
+            // successful re-run over an asset that already had renditions.
+            resolveSupersededStorage: opts.resolveTranscodeOutputStorage,
             // #1226: a completion for a job the user had cancelled. Log the
             // reclaim explicitly — a cancelled job reporting 0 renditions over a
             // complete output in the bucket is exactly the state this issue was
