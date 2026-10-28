@@ -45,6 +45,7 @@ import {
   completePackageJob,
   failPackageJob,
   inFlightPackageJob,
+  packagingAbandonedByStallSweep,
   startPackageJob,
   type PackageJobDeps
 } from './package-job.js';
@@ -82,12 +83,24 @@ export function packagingId(assetId: string): string {
 // completion callbacks).
 //   - 'in-flight' — a non-terminal `package` job exists: a run IS awaiting a
 //                   callback, so an arriving callback is plausibly its.
-//   - 'settled'   — no non-terminal `package` job exists: nothing is awaiting a
-//                   callback, so an arriving callback belongs to a run that was
-//                   already settled.
+//   - 'abandoned' — no non-terminal `package` job exists BECAUSE the
+//                   stalled-package sweep gave up on the newest run
+//                   (`packagingAbandonedByStallSweep`, src/pipeline/package-job.ts).
+//                   A run WAS awaiting a callback and we stopped waiting, so an
+//                   arriving callback is that run's and is still genuine.
+//   - 'settled'   — no non-terminal `package` job exists and no run was
+//                   abandoned: a completion already settled this asset's
+//                   packaging, so an arriving callback belongs to a run that was
+//                   superseded by it.
 //   - 'unknown'   — no job repository wired, or the lookup failed. No evidence
 //                   either way; the callback is handled exactly as before.
-export type PackagingRunLiveness = 'in-flight' | 'settled' | 'unknown';
+//
+// 'abandoned' vs 'settled' is the whole point of the split (#1044 review,
+// BLOCKING 5): the sweep settles a package job `failed` after
+// DEFAULT_PACKAGE_STALL_TIMEOUT_MS precisely for lost/slow callbacks, so reading
+// its `failed` as "a newer run replaced this one" discarded the genuine late
+// success it was designed to tolerate.
+export type PackagingRunLiveness = 'in-flight' | 'abandoned' | 'settled' | 'unknown';
 
 // Is this packager success callback for a run that was already SUPERSEDED?
 // Returns the reason to ignore it, or undefined to handle it normally.
@@ -107,6 +120,17 @@ export type PackagingRunLiveness = 'in-flight' | 'settled' | 'unknown';
 // handled exactly as before, so the normal re-run path — and #1044's cleanup with
 // it — is untouched.
 //
+// NOT "settled" IN THE SENSE OF "GIVEN UP ON" (#1044 review, BLOCKING 5): a
+// `package` job the stalled-package sweep failed (src/pipeline/
+// stalled-package-reconciler.ts, after DEFAULT_PACKAGE_STALL_TIMEOUT_MS) leaves
+// nothing in flight either, but that failure exists precisely BECAUSE the
+// callback was lost or slow — the run may still succeed and report it. Treated as
+// 'settled' this guard discarded that genuine late success whole, leaving the
+// asset on the previous generation and the fresh output orphaned. Such a run
+// reports liveness 'abandoned' instead, which is handled normally: the repoint of
+// manifestUrls/packagedOutput applies, and the previous generation it really did
+// supersede is cleaned up under the usual confirm-then-delete order.
+//
 // RESIDUAL GAP, recorded rather than guessed at: a redelivery that lands while a
 // LATER run is still in flight is indistinguishable from that run's own callback,
 // because `packagingId` is the asset id and the packager reports only its own
@@ -123,6 +147,8 @@ export function packagedCallbackSupersededRun(input: {
   // compared as locations and not as spellings (see samePackagedLocation).
   defaultBucket?: string;
 }): string | undefined {
+  // Only 'settled' is evidence of supersession. 'in-flight', 'abandoned' and
+  // 'unknown' all leave the callback to be handled normally.
   if (input.liveness !== 'settled') return undefined;
   if (!input.recorded?.prefix || !input.incoming?.prefix) return undefined;
   if (samePackagedLocation(input.recorded, input.incoming, input.defaultBucket)) {
@@ -664,11 +690,21 @@ export class PackagingService implements PackagingTrigger {
   // settle helpers use (src/pipeline/package-job.ts). Degrades to 'unknown' when
   // no job repository is wired or the lookup fails, so a bookkeeping gap can
   // never turn into a dropped callback.
+  //
+  // Nothing in flight is NOT by itself "a completion already settled this asset"
+  // (#1044 review, BLOCKING 5): the stalled-package sweep settles the job
+  // `failed` for exactly the lost/slow callback this method is asked about. That
+  // case answers 'abandoned', and only a run nothing abandoned answers 'settled'.
+  // The extra lookup is positive-evidence-only and best-effort — it can return
+  // `false` but never throw — so the pre-#1044 reading is what a missing or
+  // failing pipeline repository falls back to.
   private async packagingRunLiveness(assetId: string): Promise<PackagingRunLiveness> {
     if (!this.deps.jobs) return 'unknown';
     try {
       const inFlight = await inFlightPackageJob(this.deps.jobs, assetId);
-      return inFlight ? 'in-flight' : 'settled';
+      if (inFlight) return 'in-flight';
+      const abandoned = await packagingAbandonedByStallSweep(this.packageJobDeps(), assetId);
+      return abandoned ? 'abandoned' : 'settled';
     } catch (err) {
       this.deps.logWarn?.({
         msg: 'could not resolve the asset package job liveness; packager callback handled as before',

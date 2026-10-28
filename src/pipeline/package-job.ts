@@ -40,7 +40,11 @@ import {
   type Job,
   type JobRepository
 } from '../data/job-repo.js';
-import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
+import type {
+  PipelineExecution,
+  PipelineRepository,
+  StepExecution
+} from '../data/pipeline-repo.js';
 // The correlation id + deterministic prefix are derived from the ONE definition
 // of each (packaging.ts), never re-implemented here. packaging.ts imports this
 // module back; both imported symbols are hoisted function declarations
@@ -108,6 +112,85 @@ export async function inFlightPackageJob(
   assetId: string
 ): Promise<Job | undefined> {
   return findActivePackageJob(jobs, assetId);
+}
+
+// The invariant part of the stalled-package sweep's diagnostic (issue #336,
+// src/pipeline/stalled-package-reconciler.ts buildDiagnostic, which composes its
+// message from THIS constant so the two can never drift). It lives here, beside
+// the settle helper the sweep writes it through (`failPackageJob`), because the
+// string is what makes a sweep-declared failure recognisable afterwards.
+//
+// WHY IT HAS TO BE RECOGNISABLE (#1044 review, BLOCKING 5): the sweep's `failed`
+// is NOT a verdict that the run failed. It is us giving up on a callback that has
+// not arrived within the bound (DEFAULT_PACKAGE_STALL_TIMEOUT_MS, 15 min) —
+// explicitly for the lost/slow-callback case. The run may still complete and
+// report success afterwards. So "no package job in flight" has two causes that
+// must not be conflated: a NEWER run already settled this asset's packaging
+// (an arriving older callback is stale), or the sweep abandoned the run whose
+// callback is arriving now (it is genuine and must be applied).
+export const PACKAGE_STALL_DIAGNOSTIC_MARKER = 'packager never signalled completion within';
+
+// Was this failure written by the stalled-package sweep? Text-matched rather
+// than flagged on the record because the sweep's own write is the only trace it
+// leaves (it patches `steps[].error` and the job's `error`, both with the same
+// message — stalled-package-reconciler.ts), and the marker above is the single
+// definition both the writer and this reader share.
+export function isPackageStallDiagnostic(error: string | undefined): boolean {
+  return typeof error === 'string' && error.includes(PACKAGE_STALL_DIAGNOSTIC_MARKER);
+}
+
+// Did the stalled-package sweep ABANDON this asset's most recent packaging
+// episode (#1044 review, BLOCKING 5)? Positive evidence only: true exactly when
+// the newest PipelineExecution that has a `package` step carries that step
+// `failed` with the sweep's own diagnostic.
+//
+// Read off the EXECUTION's step rather than the package Job because the step is
+// the write the sweep always makes (`steps[idx] = { status: 'failed', error }`,
+// stalled-package-reconciler.ts) while the job settle after it is conditional on
+// a job repository being wired and on the step carrying a `jobId` — and because
+// the terminal job is not reachable by asset: `findActiveByAssetId` returns the
+// NON-TERMINAL set only (CONTRACT: JobRepository, src/data/job-repo.ts).
+//
+// Ordering is computed here (createdAt desc, id as tiebreak) rather than taken
+// from the repository: `listByAsset` is specified only as "the asset's
+// executions" (CONTRACT: PipelineRepository.listByAsset, src/data/pipeline-repo.ts)
+// and the in-memory backend returns them ASCENDING.
+//
+// Best-effort like everything else here: any repository error, or no pipeline
+// repository wired, answers `false`, which leaves the caller's behaviour exactly
+// as it was before this check existed.
+export async function packagingAbandonedByStallSweep(
+  deps: PackageJobDeps,
+  assetId: string
+): Promise<boolean> {
+  if (!deps.pipeline) return false;
+  try {
+    const executions = await deps.pipeline.listByAsset(assetId);
+    let newest: { execution: PipelineExecution; step: StepExecution } | undefined;
+    for (const execution of executions) {
+      const step = execution.steps.find((s) => s.name === 'package');
+      if (!step) continue;
+      if (!newest || isNewerExecution(execution, newest.execution)) {
+        newest = { execution, step };
+      }
+    }
+    if (!newest) return false;
+    return newest.step.status === 'failed' && isPackageStallDiagnostic(newest.step.error);
+  } catch (err) {
+    logWarn(
+      deps.logger,
+      '[package-job] failed to read the package step history for asset %s: %o',
+      assetId,
+      err
+    );
+    return false;
+  }
+}
+
+function isNewerExecution(candidate: PipelineExecution, incumbent: PipelineExecution): boolean {
+  const byCreatedAt = (candidate.createdAt ?? '').localeCompare(incumbent.createdAt ?? '');
+  if (byCreatedAt !== 0) return byCreatedAt > 0;
+  return candidate.id.localeCompare(incumbent.id) > 0;
 }
 
 // Create (or re-attempt) the `package` Job for an asset at enqueue time, and

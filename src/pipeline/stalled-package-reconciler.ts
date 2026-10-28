@@ -34,7 +34,7 @@
 
 import type { JobRepository } from '../data/job-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
-import { failPackageJob } from './package-job.js';
+import { failPackageJob, PACKAGE_STALL_DIAGNOSTIC_MARKER } from './package-job.js';
 
 // Default bound: a `package` step still `running` after this long is declared
 // failed. Generous by default so a genuinely slow packaging job is never cut off
@@ -176,7 +176,13 @@ async function probePackagerPresent(
   }
 }
 
-// Build the timeout diagnostic. It always states the bound and the probed
+// Build the timeout diagnostic. The invariant opening is
+// PACKAGE_STALL_DIAGNOSTIC_MARKER (src/pipeline/package-job.ts), so a failure
+// this sweep declared stays recognisable as "we gave up waiting", not as "the
+// run failed" — which is what lets a genuine late success callback still be
+// applied (#1044 review, BLOCKING 5, packagingAbandonedByStallSweep).
+//
+// It always states the bound and the probed
 // presence, and distinguishes the two common causes (issue #336 acceptance):
 //   - present=false -> no packager instance to consume the job; a callback can
 //     never arrive.
@@ -185,7 +191,7 @@ async function probePackagerPresent(
 //   - present=unknown -> presence could not be determined; we still fail the
 //     step within the bound but name the ambiguity.
 function buildDiagnostic(minutes: number, present: boolean | undefined): string {
-  const base = `packager never signalled completion within ${minutes} minutes`;
+  const base = `${PACKAGE_STALL_DIAGNOSTIC_MARKER} ${minutes} minutes`;
   if (present === false) {
     return (
       `${base}; packager instance present=false — no packager instance to ` +

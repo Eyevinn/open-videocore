@@ -57,6 +57,11 @@ import {
 } from '../src/pipeline/packaging.js';
 import { InMemoryAssetRepository, type Rendition } from '../src/data/asset-repo.js';
 import { InMemoryJobRepository } from '../src/data/job-repo.js';
+import { InMemoryPipelineRepository } from '../src/data/pipeline-repo.js';
+import {
+  DEFAULT_PACKAGE_STALL_TIMEOUT_MS,
+  reconcileStalledPackages
+} from '../src/pipeline/stalled-package-reconciler.js';
 
 const noopPackageQueue: PackageQueue = { enqueue: vi.fn(async () => {}) };
 
@@ -374,6 +379,104 @@ describe('a packager callback for a superseded run is ignored (#1044 review)', (
         recorded: { prefix: 'a1/job-a/' },
         incoming: { bucket: 'pkg', prefix: 'a1/job-a/' },
         liveness: 'settled',
+        defaultBucket: 'pkg'
+      })
+    ).toBeUndefined();
+  });
+});
+
+describe('a late packager callback after the stall sweep is still applied (#1044 review, BLOCKING 5)', () => {
+  // The sweep's `failed` means "we stopped waiting for the callback", not "the
+  // run failed" — it fires after DEFAULT_PACKAGE_STALL_TIMEOUT_MS precisely for
+  // lost/slow callbacks (src/pipeline/stalled-package-reconciler.ts). Read as
+  // proof that a NEWER run had superseded this one, it discarded the genuine
+  // late success whole: the asset stayed on the previous generation and the
+  // fresh output was orphaned in the bucket.
+  //
+  // Contracts verified for this case (CLAUDE.md rule 7):
+  //   - `PipelineRepository.create/update/listByAsset` and
+  //     `StepExecution { name, status, jobId?, error?, startedAt? }` —
+  //     src/data/pipeline-repo.ts (`update` patches `steps`; the sweep ages a
+  //     step from `startedAt`).
+  //   - `DEFAULT_PACKAGE_STALL_TIMEOUT_MS` (15 min) and
+  //     `ReconcileStalledPackagesDeps { pipeline, jobs?, now?, stallTimeoutMs? }`
+  //     — src/pipeline/stalled-package-reconciler.ts.
+  //   - `JobRepository.findActiveByAssetId` returns the NON-TERMINAL set only
+  //     (ACTIVE_JOB_STATUSES) — src/data/job-repo.ts, which is why a swept job
+  //     disappears from the in-flight lookup.
+  it('repoints the asset at the new output instead of orphaning it', async () => {
+    const storage = recordingStorage();
+    const assets = new InMemoryAssetRepository();
+    const jobs = new InMemoryJobRepository();
+    const pipeline = new InMemoryPipelineRepository();
+    const asset = await assets.create({ name: 'clip' });
+    const svc = new PackagingService({
+      assets,
+      queue: noopPackageQueue,
+      jobs,
+      pipeline,
+      resolveStorage: storage.resolveStorage
+    });
+
+    // An earlier run packaged successfully: the asset points at job-a.
+    await runningPackageJob(jobs, asset.id);
+    await svc.handleSuccess({
+      url: 'https://encore/j1',
+      jobId: asset.id,
+      outputPath: `${asset.id}/job-a/`
+    });
+
+    // The re-package is enqueued: a running `package` step carrying its job id,
+    // started longer ago than the stall bound.
+    const execution = await pipeline.create({
+      assetId: asset.id,
+      pipelineName: 'package',
+      steps: ['package']
+    });
+    const stalledJobId = await runningPackageJob(jobs, asset.id);
+    await pipeline.update(execution.id, {
+      steps: [
+        {
+          name: 'package',
+          status: 'running',
+          jobId: stalledJobId,
+          startedAt: new Date(Date.now() - DEFAULT_PACKAGE_STALL_TIMEOUT_MS - 60_000).toISOString()
+        }
+      ]
+    });
+
+    // The sweep gives up on it: step and job both settle `failed`.
+    const swept = await reconcileStalledPackages({ pipeline, jobs });
+    expect(swept.failed).toBe(1);
+    expect((await jobs.get(stalledJobId))?.status).toBe('failed');
+
+    // The packager finishes anyway and its SUCCESS callback arrives late.
+    const handled = await svc.handleSuccess({
+      url: 'https://encore/j2',
+      jobId: asset.id,
+      outputPath: `${asset.id}/job-b/`
+    });
+
+    expect(handled).toBe(true);
+    // The asset now points at the output that was actually produced...
+    const stored = await assets.get(asset.id);
+    expect(stored?.packagedOutput?.prefix).toBe(`${asset.id}/job-b/`);
+    expect(stored?.manifestUrls?.hls).toContain(`${asset.id}/job-b/index.m3u8`);
+    // ...the fresh output was NOT deleted, and the generation it really did
+    // supersede was reclaimed.
+    expect(storage.removedPrefixes).toEqual([
+      { bucket: packagedBucket(), prefix: `${asset.id}/job-a/` }
+    ]);
+  });
+
+  it('treats an abandoned run as handleable, not as a superseded one', () => {
+    const recorded = { bucket: 'pkg', prefix: 'a1/job-a/' };
+    const incoming = { bucket: 'pkg', prefix: 'a1/job-b/' };
+    expect(
+      packagedCallbackSupersededRun({
+        recorded,
+        incoming,
+        liveness: 'abandoned',
         defaultBucket: 'pkg'
       })
     ).toBeUndefined();
