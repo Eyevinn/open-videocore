@@ -72,11 +72,24 @@ export type DroppedJob = {
 //                          spawn-failure.ts redactSpawnFailureMessage) — it is
 //                          served over HTTP, and OSC error text can echo the
 //                          credentials/URLs/token the spawn request carried.
+//   - httpCode:            the HTTP status the underlying OSC call failed with,
+//                          when it had one (@osaas/client-core reports a non-ok
+//                          response as a FetchError carrying `httpCode`; a
+//                          transport-level failure carries none, so this is
+//                          OPTIONAL — see oscHttpCode in
+//                          src/encore-scaler/osc-error.ts). #1286 asked for it
+//                          both on the wire (the redacted message strips HTML, so
+//                          "504" is no longer reliably readable from it) and as
+//                          pool state: the scale-up gate backs the NEXT spawn off
+//                          when the last one ended in a gateway timeout, and that
+//                          decision has to be made structurally rather than by
+//                          re-parsing the message.
 export type SpawnFailureRecord = {
   at: number;
   attempts: number;
   consecutiveFailures: number;
   message: string;
+  httpCode?: number;
 };
 
 export type EncoreScalerConfig = {
@@ -152,6 +165,24 @@ export type EncoreScalerConfig = {
   // would keep polling forever after we stopped waiting. Unset uses
   // DEFAULT_SPAWN_READY_POLL_INTERVAL_MS (1s, the SDK's own cadence).
   spawnReadyPollIntervalMs?: number;
+  // #1286: bound (ms) on the ADOPT PROBE that runs after every create attempt
+  // has ended in a gateway timeout. The create behind a 504 usually completes on
+  // the platform side, so the spawn keeps asking for the SAME name for a while
+  // before giving up — otherwise the next tick invents a new name and the
+  // instance that lands later is never adopted (it becomes the extra instance
+  // the orphan reaper has to remove). Unset uses
+  // DEFAULT_SPAWN_ADOPT_PROBE_TIMEOUT_MS.
+  spawnAdoptProbeTimeoutMs?: number;
+  // #1286: how often (ms) that probe re-asks. Unset uses
+  // DEFAULT_SPAWN_ADOPT_PROBE_INTERVAL_MS.
+  spawnAdoptProbeIntervalMs?: number;
+  // #1286: how long (ms) after a spawn that ended in a gateway timeout the
+  // scale-up gate refuses to start ANOTHER create for this workspace. A 504 is
+  // the platform telling us it is slow; starting a second create against it on
+  // the very next tick adds load to the thing that is already struggling and
+  // risks a second instance nobody asked for. Unset uses
+  // DEFAULT_SPAWN_GATEWAY_BACKOFF_MS; set to 0 to disable.
+  spawnGatewayBackoffMs?: number;
   // #778: how long (ms) an instance must have been continuously observed as
   // orphaned before the reaper destroys it. Guards a spawn in progress, which
   // holds a live OSC instance with no pool record for as long as
