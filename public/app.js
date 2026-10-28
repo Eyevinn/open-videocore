@@ -7458,6 +7458,16 @@ async function renderStorageTab(container) {
       testResultEl.className = 'storage-backend-test-result';
       const values = readValues();
       const secret = (values.secretAccessKey || '').trim();
+      // A backend registered with temporary credentials only authenticates with
+      // its session token, and the stored token is never recoverable
+      // (`credentials.sessionToken` comes back as the redacted marker,
+      // storage.ts:166) — so the probe has to carry whatever the operator typed
+      // into this form. testConnectionBodySchema (storage.ts:207-210) accepts
+      // `sessionToken` as an optional min(1) string and the route forwards it
+      // (storage.ts:501-508) into the probe target
+      // (storage-backend-registry.ts:830-837). Blank stays absent: the body
+      // builder drops a falsy value (app.js:2299-2301).
+      const sessionToken = (values.sessionToken || '').trim();
       if (!backendId) {
         testResultEl.textContent =
           'Save the backend first, then use Test connection to probe it.';
@@ -7474,7 +7484,11 @@ async function renderStorageTab(container) {
       testResultEl.textContent = 'Testing…';
       try {
         // Shared probe helper (issue #683) — same call the per-row action uses.
-        const result = await testStorageBackendConnection(backendId, secret);
+        const result = await testStorageBackendConnection(
+          backendId,
+          secret,
+          { sessionToken: sessionToken }
+        );
         // Response contract: { status: 'connected' | 'unreachable', message }.
         const ok = result && result.status === 'connected';
         testResultEl.textContent =
@@ -7645,12 +7659,14 @@ async function renderStorageTab(container) {
   // spinner while in flight, then Connected / Unreachable (+ message on failure
   // or timeout). Disables the row's Test button for the duration so a double
   // click can't launch two probes.
-  async function runRowTest(row, backendId, secret) {
+  // `extra` is the optional { sessionToken } passed straight to the probe
+  // helper, which drops it when blank (app.js:2299-2301).
+  async function runRowTest(row, backendId, secret, extra) {
     const btn = row.querySelector('.storage-backend-test-conn');
     if (btn) btn.disabled = true;
     setStorageBackendRowProbing(row);
     try {
-      const result = await testStorageBackendConnection(backendId, secret);
+      const result = await testStorageBackendConnection(backendId, secret, extra);
       applyStorageBackendRowTestResult(row, result);
     } catch (err) {
       // Network / HTTP failure or the client-side 10s timeout: render as an
@@ -7691,6 +7707,38 @@ async function renderStorageTab(container) {
       label.appendChild(input);
       body.appendChild(label);
 
+      // Temporary credentials: a backend registered with a session token only
+      // authenticates with that token, and the stored one is not recoverable
+      // server-side (the view returns the redacted marker, storage.ts:166;
+      // registry.testConnection builds the probe target from the CALLER's
+      // `secret.sessionToken` alone, storage-backend-registry.ts:830-837). So
+      // when the row's view reports `hasSessionToken === true` we offer an
+      // optional token field and forward it; without it such a backend could
+      // never pass its own Test connection. Rows without a stored token get no
+      // extra field, so their probe body is unchanged.
+      let tokenInput = null;
+      if (cached.hasSessionToken === true) {
+        const tokenLabel = document.createElement('label');
+        tokenLabel.className = 'form-field';
+        tokenLabel.textContent = 'Session token';
+        tokenInput = document.createElement('input');
+        tokenInput.type = 'password';
+        tokenInput.className = 'storage-test-session-token';
+        tokenInput.autocomplete = 'off';
+        tokenLabel.appendChild(tokenInput);
+        body.appendChild(tokenLabel);
+
+        const tokenHint = document.createElement('div');
+        tokenHint.id = 'storage-test-session-token-hint';
+        tokenInput.setAttribute('aria-describedby', tokenHint.id);
+        tokenHint.className = 'form-hint storage-test-session-token-hint';
+        tokenHint.textContent =
+          'This backend was registered with a session token. The stored token ' +
+          'cannot be read back, so re-enter it to probe with temporary ' +
+          'credentials. Leave blank to probe with the key pair alone.';
+        body.appendChild(tokenHint);
+      }
+
       const errEl = document.createElement('div');
       errEl.className = 'storage-test-error';
       errEl.setAttribute('role', 'alert');
@@ -7720,8 +7768,11 @@ async function renderStorageTab(container) {
           input.focus();
           return;
         }
+        // Optional: absent for rows with no stored token, and dropped by the
+        // body builder when the operator leaves it blank.
+        const sessionToken = tokenInput ? tokenInput.value.trim() : '';
         close();
-        runRowTest(row, backendId, secret);
+        runRowTest(row, backendId, secret, { sessionToken: sessionToken });
       });
       input.focus();
     });
