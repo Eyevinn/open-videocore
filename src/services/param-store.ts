@@ -236,18 +236,25 @@ function createdAtEpoch(createdAt?: string): number | undefined {
 // Total, deterministic order over a stack listing (issue #1165).
 //
 // The order, in precedence:
-//   1. Unstamped before stamped. A config with no usable `createdAt` was
-//      written by an earlier build, so it predates every stack a later build
-//      stamped. This is the rule that keeps a deployment's original default
-//      stack at index 0 when a new stack is provisioned — the reported bug,
-//      where adding a second stack to a deployment that had one moved the
-//      default to the new stack.
-//   2. `createdAt` ascending among stamped stacks, so a newly provisioned stack
-//      sorts last and is appended to the listing instead of landing in the
-//      middle. LEGACY_STACK_CREATED_AT is the lowest representable stamp, so a
-//      backfilled legacy stack sorts with the unstamped ones.
-//   3. Name ascending as the final tiebreak. Needed for two legacy stacks (no
-//      distinct instant to separate them) and for two stacks stamped inside the
+//   1. Creation time UNKNOWN before creation time KNOWN. A stack's creation
+//      time is unknown either because the config carries no usable `createdAt`
+//      (written by an earlier build) or because it carries the explicit
+//      LEGACY_STACK_CREATED_AT marker a backfill wrote (isLegacyCreatedAt).
+//      Those two are ONE equivalence class on purpose: a backfill records
+//      "creation time unknown", not "created at the epoch", so it must land in
+//      the same bucket as absence or backfilling one of several legacy stacks
+//      would move it past the still-unstamped ones and change element 0 (issue
+//      #1165 second review, blocking finding A). Either way the stack predates
+//      every stack a later build stamped. This is the rule that keeps a
+//      deployment's original default stack at index 0 when a new stack is
+//      provisioned — the reported bug, where adding a second stack to a
+//      deployment that had one moved the default to the new stack.
+//   2. `createdAt` ascending among stacks with a KNOWN creation time, so a
+//      newly provisioned stack sorts last and is appended to the listing
+//      instead of landing in the middle.
+//   3. Name ascending as the final tiebreak. Needed for two legacy stacks
+//      (unstamped, backfilled, or one of each — rule 1 puts them in one class
+//      with no instant to separate them) and for two stacks stamped inside the
 //      same millisecond. Without it the order would fall back to the store's
 //      unspecified iteration order and the default could still move.
 //
@@ -266,21 +273,45 @@ export function compareStackCreationOrder(
   a: StackListingEntry,
   b: StackListingEntry
 ): number {
-  const ae = createdAtEpoch(a.createdAt);
-  const be = createdAtEpoch(b.createdAt);
-  if (ae === undefined && be !== undefined) return -1;
-  if (ae !== undefined && be === undefined) return 1;
-  if (ae !== undefined && be !== undefined && ae !== be) return ae - be;
+  // Rule 1 operates on the equivalence class, not on the raw epoch: absence and
+  // the legacy backfill marker both mean "creation time unknown" and must sort
+  // identically, or a per-stack best-effort backfill (provision.ts) would move a
+  // stack out of the unstamped group mid-rollout and change the default.
+  const aUnknown = isCreationTimeUnknown(a.createdAt);
+  const bUnknown = isCreationTimeUnknown(b.createdAt);
+  if (aUnknown !== bUnknown) return aUnknown ? -1 : 1;
+  if (!aUnknown) {
+    const ae = createdAtEpoch(a.createdAt) as number;
+    const be = createdAtEpoch(b.createdAt) as number;
+    if (ae !== be) return ae - be;
+  }
   return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+}
+
+// True when a listing entry carries no usable creation time at all: either no
+// parseable `createdAt` (a stack written before creation times were recorded) or
+// the explicit LEGACY_STACK_CREATED_AT marker a backfill wrote for exactly that
+// kind of stack. Rule 1 of compareStackCreationOrder treats both as one class.
+//
+// Kept separate from isLegacyCreatedAt, which answers the narrower "is this
+// stamp the marker rather than a real instant" question for diagnostics and
+// returns false for absence.
+function isCreationTimeUnknown(createdAt?: string): boolean {
+  return createdAtEpoch(createdAt) === undefined || isLegacyCreatedAt(createdAt);
 }
 
 // Explicit "created before this deployment recorded creation times" marker
 // (issue #1165 review, blocking finding 1).
 //
 // Used to BACKFILL a legacy stack that carries no `createdAt`. It is the epoch
-// instant, so it compares lower than any real provision stamp and a backfilled
-// stack keeps exactly the position absence gave it (rule 1 above), with the name
-// tiebreak still separating legacy stacks from each other. Backfilling does not
+// instant, and compareStackCreationOrder recognises it (via isLegacyCreatedAt)
+// as "creation time unknown" rather than as a real instant at time zero, so a
+// backfilled stack keeps exactly the position absence gave it (rule 1 above):
+// still ahead of every stamped stack, still interleaved with the stacks that
+// have not been backfilled yet, with the name tiebreak separating legacy stacks
+// from each other. That equivalence is what makes a PARTIAL rollout safe — the
+// backfill is best-effort per stack, so a listing routinely mixes backfilled and
+// still-unstamped legacy stacks. Backfilling does not
 // claim to know when the stack was created — it records that the creation time
 // is unknown-and-early, which is the only true statement available: the config
 // service stores no creation metadata of its own (ConfigObject = { key, value,
@@ -572,11 +603,21 @@ const realSleep = (ms: number): Promise<void> =>
 //
 // Requesting more than 100 is rejected by schema validation, so a store holding
 // more than 100 keys CANNOT be enumerated by one call. The service does accept
-// an `offset`, so a paginating consumer is possible — this client does not
-// paginate today, which is why every caller of a list method must treat a full
-// page as "possibly truncated". See
-// docs/osc-feedback/incoming-issue804-config-svc-list-pagination.md.
+// `offset` and `match`, so a paginating consumer is possible: listStackNames
+// pages with both (issue #1165), because the stack listing's element [0] is the
+// default stack and a truncated page would silently move it. ConfigKvStore's
+// listByPrefix still reads a single page, which is why its callers must treat a
+// full page as "possibly truncated". See
+// docs/osc-feedback/incoming-issue804-config-svc-list-pagination.md and
+// docs/osc-feedback/incoming-stack-order-config-metadata.md.
 export const CONFIG_LIST_PAGE_LIMIT = 100 as const;
+
+// Hard bound on the page walk in listStackNames, so a store far larger than any
+// real deployment cannot turn one stack listing into an unbounded request fan.
+// 50 pages x 100 keys = 5000 stack configs per workspace; crossing it is logged
+// as a truncated listing rather than silently accepted, because truncation can
+// change which stack is element [0].
+export const CONFIG_LIST_MAX_PAGES = 50 as const;
 
 // HTTP-backed parameter store client for eyevinn-app-config-svc.
 //
@@ -816,36 +857,104 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
 
     async listStackNames(workspaceId) {
       const prefix = `openvideocore/${workspaceId}/`;
-      // The app-config-svc list endpoint returns { offset, limit, total, items }
-      // (ConfigObjectList). CONFIG_LIST_PAGE_LIMIT is the schema maximum for
-      // `limit`, so this single page is also the most one call can observe; a
-      // store holding more keys than that is silently truncated here.
+      // EXHAUSTIVE, not one page (issue #1165 second review, finding 3). The
+      // ordering guarantee openapi.json states unconditionally ("element 0 is
+      // the default stack", "provisioning another stack never changes which
+      // stack is first") cannot hold on a truncated listing: a cut-off page can
+      // drop the oldest stack and silently promote another to element 0. So
+      // this scopes the scan to this deployment's own keys with `match` and
+      // follows `offset` until the service reports no further page.
+      //
+      // Contract verified (CLAUDE.md rule 7) against the service's own source:
+      // Eyevinn/app-config-svc, `src/api_config.ts` on `main` (commit
+      // 85b3c15fda), route `GET /config` under the `/api/v1` prefix:
+      //   PageQuery = { match?: string; offset?: number (min 0);
+      //                 limit?: number (min 1, max 100) }
+      //   ConfigObjectList = { offset, limit, total, items, skippedKeys? }
+      //   ConfigObject     = { key: string; value: string; secret?: boolean }
+      //   - `match` is a glob: the handler scans redis with
+      //     `MATCH KEY_PREFIX + match` and, for pre-migration bare keys, with
+      //     `^` + match.replace(/\*/g, '.*') + `$`. `openvideocore/<ws>/*`
+      //     therefore selects exactly this deployment's stack keys.
+      //   - the RESPONSE `offset` is the NEXT offset, not the requested one:
+      //     `nextOffset = offset + limit < total ? offset + limit : 0`. So 0
+      //     means "that was the last page" and is the loop's stop condition.
+      //   - pagination is in-memory over a fresh scan per call, so a concurrent
+      //     write can shift items between pages; dedupe by key and bound the
+      //     loop rather than trusting the page walk to be a stable cursor.
       // This GET is the stack-resolver refresh round-trip (issue #421): wrap it
       // in bounded retry-with-backoff so a boot-time TLS blip or timeout does not
-      // turn into a full storage outage for the instance.
+      // turn into a full storage outage for the instance. The whole walk is one
+      // retry unit: a mid-walk failure restarts the walk rather than returning a
+      // partial listing that could reorder the default.
       return withRetry('listStackNames', async () => {
-        const h = await buildHeaders();
-        const res = await withTimeout((signal) =>
-          doFetch(`${base}/api/v1/config?limit=${CONFIG_LIST_PAGE_LIMIT}`, { method: 'GET', headers: h, signal })
-        );
-        if (!res.ok) {
-          const text = await res.text().catch(() => '');
-          const msg = `parameter store list failed: ${res.status} ${text}`.trim();
-          // 4xx (auth/config) will not self-correct — do not retry (issue #421).
-          if (res.status >= 400 && res.status < 500) {
-            throw new NonRetryableParamStoreError(msg, res.status);
+        // key -> raw stored value, deduped across pages.
+        const seen = new Map<string, string | undefined>();
+        let offset = 0;
+        let truncated = false;
+        for (let page = 0; ; page++) {
+          if (page >= CONFIG_LIST_MAX_PAGES) {
+            // Refuse to spin forever on a store larger than the walk budget.
+            truncated = true;
+            break;
           }
-          throw new Error(msg);
+          const query = new URLSearchParams({
+            match: `${prefix}*`,
+            limit: String(CONFIG_LIST_PAGE_LIMIT),
+            offset: String(offset)
+          });
+          const h = await buildHeaders();
+          const res = await withTimeout((signal) =>
+            doFetch(`${base}/api/v1/config?${query.toString()}`, {
+              method: 'GET',
+              headers: h,
+              signal
+            })
+          );
+          if (!res.ok) {
+            const text = await res.text().catch(() => '');
+            const msg = `parameter store list failed: ${res.status} ${text}`.trim();
+            // 4xx (auth/config) will not self-correct — do not retry (issue #421).
+            if (res.status >= 400 && res.status < 500) {
+              throw new NonRetryableParamStoreError(msg, res.status);
+            }
+            throw new Error(msg);
+          }
+          // `items` carries the VALUE alongside the key, so the `createdAt` that
+          // orders the listing (issue #1165) comes out of the SAME pages:
+          // ordering costs no extra round-trip and adds no per-stack GET.
+          const body = (await res.json()) as {
+            offset?: number;
+            items?: { key: string; value?: string }[];
+          };
+          const items = body.items ?? [];
+          for (const item of items) {
+            // `match` is applied server-side, but keep the client-side prefix
+            // check: it is the only thing that guarantees the slice below yields
+            // a stack name, whatever the glob matched.
+            if (item.key.startsWith(prefix)) seen.set(item.key, item.value);
+          }
+          const next = body.offset;
+          // 0 (or absent//malformed) = last page. Anything that does not move
+          // strictly forward would loop, so stop there too.
+          if (typeof next !== 'number' || !Number.isFinite(next) || next <= offset) {
+            break;
+          }
+          if (items.length === 0) break;
+          offset = next;
         }
-        // `items` carries the VALUE alongside the key — ConfigObject =
-        // { key: string; value: string; secret?: boolean } (contract cited on
-        // CONFIG_LIST_PAGE_LIMIT, verified against Eyevinn/app-config-svc
-        // src/api_config.ts @ c1538c0e88). So the `createdAt` that orders the
-        // listing (issue #1165) comes out of THIS SAME page: ordering costs no
-        // extra round-trip and adds no per-stack GET.
-        const body = (await res.json()) as {
-          items?: { key: string; value?: string }[];
-        };
+        if (truncated) {
+          diag.warn(
+            {
+              op: 'listStackNames',
+              workspaceId,
+              pages: CONFIG_LIST_MAX_PAGES,
+              observed: seen.size
+            },
+            'stack listing hit the page-walk budget; the listing may be ' +
+              'incomplete and the default stack may be wrong (issue #1165)'
+          );
+        }
         // The service specifies NO order on `items`, which is the whole of
         // #1165: taking its order through meant the first-listed stack — the
         // no-X-Stack-Name default — changed whenever a stack was added, and a
@@ -854,12 +963,10 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
         // operator has pinned the default (read per call, not captured at
         // construction, so the pin applies to an already-built store).
         return orderStackNamesByCreation(
-          (body.items ?? [])
-            .filter((item) => item.key.startsWith(prefix))
-            .map((item) => ({
-              name: item.key.slice(prefix.length),
-              createdAt: createdAtFromStoredValue(item.value)
-            })),
+          [...seen.entries()].map(([key, value]) => ({
+            name: key.slice(prefix.length),
+            createdAt: createdAtFromStoredValue(value)
+          })),
           resolvePinnedStackName()
         );
       });

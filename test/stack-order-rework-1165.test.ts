@@ -199,6 +199,60 @@ describe('LEGACY_STACK_CREATED_AT backfill is order-preserving', () => {
     expect(backfilled[0]).toBe('legacya');
   });
 
+  it('keeps element 0 when only ONE of three legacy stacks is backfilled', () => {
+    // THE MIXED STATE, and the regression this PR exists to fix (issue #1165
+    // second review, blocking finding A). The backfill in provision.ts is
+    // best-effort PER STACK — it only runs when that stack's provision is
+    // converged — so a deployment with three legacy stacks normally spends time
+    // with some stamped with the marker and the rest still unstamped. If the
+    // marker sorted as a real epoch-0 instant, rule 1 ("unknown before known")
+    // would put the backfilled stack AFTER both unstamped ones and the
+    // no-X-Stack-Name default would change mid-rollout.
+    const allUnstamped = orderStackNamesByCreation([
+      { name: 'legacyb' },
+      { name: 'legacyc' },
+      { name: 'legacya' }
+    ]);
+    expect(allUnstamped[0]).toBe('legacya');
+
+    // Backfilling the name-first stack (the current default) must not move it.
+    expect(
+      orderStackNamesByCreation([
+        { name: 'legacyb' },
+        { name: 'legacyc' },
+        { name: 'legacya', createdAt: LEGACY_STACK_CREATED_AT }
+      ])
+    ).toEqual(allUnstamped);
+
+    // Backfilling a NON-default stack must not promote it over the default
+    // either — the pre-fix order was ['legacya','legacyc','legacyb'].
+    expect(
+      orderStackNamesByCreation([
+        { name: 'legacyb', createdAt: LEGACY_STACK_CREATED_AT },
+        { name: 'legacyc' },
+        { name: 'legacya' }
+      ])
+    ).toEqual(allUnstamped);
+  });
+
+  it('keeps element 0 through a mixed-backfill listing round-trip', async () => {
+    // Same state, end to end over the config-service listing: one of three
+    // legacy stacks backfilled, plus a stack created after creation times
+    // started being recorded, which must stay last.
+    const store = httpStoreReturning([
+      { name: 'legacyc', config: stackConfig() },
+      { name: 'addedlater', config: stackConfig(PROVISION_STARTED_AT) },
+      { name: 'legacya', config: stackConfig(LEGACY_STACK_CREATED_AT) },
+      { name: 'legacyb', config: stackConfig() }
+    ]);
+    expect(await store.listStackNames(STACK_CONFIG_NAMESPACE)).toEqual([
+      'legacya',
+      'legacyb',
+      'legacyc',
+      'addedlater'
+    ]);
+  });
+
   it('keeps a backfilled legacy stack ahead of every stack created later', () => {
     expect(
       orderStackNamesByCreation([
@@ -216,6 +270,90 @@ describe('LEGACY_STACK_CREATED_AT backfill is order-preserving', () => {
     expect(await store.listStackNames(STACK_CONFIG_NAMESPACE)).toEqual([
       'legacystack',
       'addedlater'
+    ]);
+  });
+});
+
+describe('the stack listing is exhaustive, not one page', () => {
+  // Contract for this block, verified against the service's own source
+  // (CLAUDE.md rule 7): Eyevinn/app-config-svc `src/api_config.ts` on `main`
+  // (commit 85b3c15fda), route `GET /config` under `/api/v1`.
+  //   PageQuery = { match?: string; offset?: number (min 0);
+  //                 limit?: number (min 1, max 100) }
+  //   ConfigObjectList.offset is the NEXT offset:
+  //   `nextOffset = offset + limit < total ? offset + limit : 0`, so 0 ends the
+  //   walk. `match` is a glob applied to the key.
+  function pagedStore(pages: Array<{ names: string[]; nextOffset: number }>) {
+    const calls: string[] = [];
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const u = new URL(String(url));
+      calls.push(u.search);
+      const requested = Number(u.searchParams.get('offset') ?? '0');
+      const page =
+        pages.find((_, i) => i * 2 === requested) ?? pages[pages.length - 1]!;
+      return new Response(
+        JSON.stringify({
+          offset: page.nextOffset,
+          limit: 2,
+          total: pages.reduce((n, p) => n + p.names.length, 0),
+          items: page.names.map((name) => ({
+            key: stackConfigKey(STACK_CONFIG_NAMESPACE, name),
+            value: JSON.stringify(stackConfig())
+          }))
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    });
+    const store = makeHttpParamStore({
+      baseUrl: 'https://config.example.osaas.io/',
+      getOscToken: async () => 'test-sat',
+      apiKey: 'key123',
+      fetch: fetchMock as unknown as typeof globalThis.fetch
+    });
+    return { store, calls };
+  }
+
+  it('scopes the scan with match and follows offset to the last page', async () => {
+    // A single page would have returned only ['stackb','stacka'] -> element 0
+    // 'stacka', even though 'aaastack' exists and is the real default. That is
+    // the truncation the openapi contract's unconditional guarantee forbids.
+    const { store, calls } = pagedStore([
+      { names: ['stackb', 'stacka'], nextOffset: 2 },
+      { names: ['aaastack'], nextOffset: 0 }
+    ]);
+    const names = await store.listStackNames(STACK_CONFIG_NAMESPACE);
+    expect(names).toEqual(['aaastack', 'stacka', 'stackb']);
+    expect(calls.length).toBe(2);
+    for (const search of calls) {
+      const q = new URLSearchParams(search);
+      expect(q.get('match')).toBe(`openvideocore/${STACK_CONFIG_NAMESPACE}/*`);
+      expect(q.get('limit')).toBe('100');
+    }
+    expect(new URLSearchParams(calls[0]!).get('offset')).toBe('0');
+    expect(new URLSearchParams(calls[1]!).get('offset')).toBe('2');
+  });
+
+  it('stops instead of looping when the next offset does not move forward', async () => {
+    // The service paginates in memory over a fresh scan per call, so a page
+    // walk is not a stable cursor. A response that repeats or rewinds its
+    // offset must end the walk rather than spin.
+    const { store, calls } = pagedStore([
+      { names: ['onlystack'], nextOffset: 0 }
+    ]);
+    expect(await store.listStackNames(STACK_CONFIG_NAMESPACE)).toEqual([
+      'onlystack'
+    ]);
+    expect(calls.length).toBe(1);
+  });
+
+  it('does not return a stack twice when pages overlap', async () => {
+    const { store } = pagedStore([
+      { names: ['dupstack', 'other'], nextOffset: 2 },
+      { names: ['dupstack'], nextOffset: 0 }
+    ]);
+    expect(await store.listStackNames(STACK_CONFIG_NAMESPACE)).toEqual([
+      'dupstack',
+      'other'
     ]);
   });
 });

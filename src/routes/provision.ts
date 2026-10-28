@@ -1184,9 +1184,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 // config service stores no creation metadata — ConfigObject =
                 // { key, value, secret? }), so recording "now" would be a false
                 // instant that also moves the stack to the END of the listing
-                // and changes the default. The marker sorts exactly where
-                // absence sorted, so the backfill is order-preserving by
-                // construction.
+                // and changes the default. compareStackCreationOrder classes the
+                // marker with absence ("creation time unknown"), so the marker
+                // sorts exactly where absence sorted — including while only SOME
+                // of several legacy stacks have been backfilled, which is the
+                // normal state here because this write is best-effort per stack.
                 //
                 // Best-effort: a failed backfill must not turn a converging,
                 // idempotent provision of a healthy stack into an error. The
@@ -1200,8 +1202,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                     app.log.info(
                       { name, createdAt: LEGACY_STACK_CREATED_AT },
                       'backfilled the stack ordering key for a stack ' +
-                        'provisioned before creation times were recorded; ' +
-                        'its listing position is unchanged (issue #1165)'
+                        'provisioned before creation times were recorded; the ' +
+                        'marker records an unknown creation time and orders as ' +
+                        'absence did, so this stack and the default stack keep ' +
+                        'their listing positions whether or not the other ' +
+                        'legacy stacks have been backfilled yet (issue #1165)'
                     );
                   } catch (backfillErr) {
                     app.log.warn(
