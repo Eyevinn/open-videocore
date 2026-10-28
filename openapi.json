@@ -21693,6 +21693,10 @@
                                 "type": "number",
                                 "description": "How many scale-ups have failed in a row for this workspace. Reset to 0 by a successful spawn, so 1 is a fresh blip while a climbing number means the scaler has been unable to grow for a while."
                               },
+                              "httpCode": {
+                                "type": "number",
+                                "description": "HTTP status the failed instance-create returned, when it had one. 504 (or 408) means the request timed out at the gateway while the platform was probably still creating the instance: the spawn watches that name for a bounded time and adopts it if it appears, and the next scale-up for this workspace is held off rather than starting a second create. Absent for a transport-level failure, which carries no status."
+                              },
                               "message": {
                                 "type": "string",
                                 "description": "Error text from the failed spawn, redacted at write time: credentials, tokens, URLs and bare network locations (host, host:port, IP:port) are stripped, as is any HTML markup, because upstream error text can echo the request the spawn sent. This endpoint is unauthenticated, so the field carries the SHAPE of the failure, not its details."

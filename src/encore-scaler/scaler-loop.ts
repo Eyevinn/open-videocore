@@ -56,7 +56,12 @@ import {
   type AssignmentOutcome,
   type ProbeOutcome
 } from './assignment-log.js';
-import { spawnFailureSecrets } from './spawn-failure.js';
+import {
+  DEFAULT_SPAWN_GATEWAY_BACKOFF_MS,
+  readSpawnFailure,
+  spawnFailureSecrets,
+  spawnGatewayBackoffRemainingMs
+} from './spawn-failure.js';
 import { hasPendingPackaging } from './packaging-pin.js';
 import {
   ACTIVE_PAGE_SIZE,
@@ -453,28 +458,67 @@ export class EncoreScalerLoop {
       // workspace by GET /scaler/status, so swallowing it here loses no signal:
       // it is precisely what makes "at cap" distinguishable from "cannot spawn"
       // without pod logs.
-      try {
-        const spawned = await spawnInstance(this.config);
-        instances = [...instances, spawned];
-      } catch (err) {
-        console.error(
-          '[encore-scaler] scale-up: spawn failed (workspace=%s pending=%d instances=%d max=%d); ' +
-            'continuing the tick with the existing pool:',
+      //
+      // #1286: ...but a spawn that ended in a GATEWAY TIMEOUT is not simply
+      // retried on the next tick either. A 504 on createInstance is the platform
+      // telling us it is too slow to answer inside the ingress' 60s limit, while
+      // the create itself usually keeps going behind it. Starting another create
+      // 10s later therefore does two unhelpful things at once: it adds load to
+      // the thing that is already struggling, and it asks for a SECOND instance
+      // while the first one is still being built (under a new name, so the first
+      // one is nobody's — the extra instance #1223 reported). The spawn path's
+      // own adopt probe has just spent up to 90s watching for that instance
+      // (probeForGatewayTimedOutInstance, instance-pool.ts); this holds the next
+      // attempt off for a while longer so the platform, the orphan reaper and
+      // reconcile all get a chance to settle first.
+      //
+      // Read from pool state (keys.spawnFailure), not process memory, so it
+      // survives a restart and is the same for every replica. readSpawnFailure
+      // is total — it never throws — so this cannot be what breaks a tick.
+      const gatewayBackoffMs = spawnGatewayBackoffRemainingMs(
+        await readSpawnFailure(redis, workspaceId),
+        Date.now(),
+        this.config.spawnGatewayBackoffMs ?? DEFAULT_SPAWN_GATEWAY_BACKOFF_MS
+      );
+      if (gatewayBackoffMs > 0) {
+        console.warn(
+          '[encore-scaler] scale-up: holding off (workspace=%s pending=%d instances=%d ' +
+            'max=%d) — the last spawn timed out at the gateway and the platform may ' +
+            'still be creating that instance; next attempt in %dms (#1286)',
           workspaceId,
           pending,
           instances.length,
           maxInstances,
-          err
+          gatewayBackoffMs
         );
-        // #998: this is the signal that distinguishes "pool is at maxInstances"
-        // from "OSC will not create the instance" — the exact ambiguity #1071
-        // described — so it must reach the API/UI, not only pod logs.
-        this.logFailure(
-          'spawn',
-          `scale-up spawn failed (pending=${pending} instances=${instances.length} ` +
-            `max=${maxInstances}); continuing the tick with the existing pool`,
-          err
-        );
+        // Not logFailure: nothing has failed on this tick, and the failure that
+        // caused the back-off is already recorded (keys.spawnFailure) and served
+        // with its status code by GET /scaler/status. Everything after this gate
+        // — scale-down, the orphan sweep, dispatch — runs exactly as usual.
+      } else {
+        try {
+          const spawned = await spawnInstance(this.config);
+          instances = [...instances, spawned];
+        } catch (err) {
+          console.error(
+            '[encore-scaler] scale-up: spawn failed (workspace=%s pending=%d instances=%d max=%d); ' +
+              'continuing the tick with the existing pool:',
+            workspaceId,
+            pending,
+            instances.length,
+            maxInstances,
+            err
+          );
+          // #998: this is the signal that distinguishes "pool is at maxInstances"
+          // from "OSC will not create the instance" — the exact ambiguity #1071
+          // described — so it must reach the API/UI, not only pod logs.
+          this.logFailure(
+            'spawn',
+            `scale-up spawn failed (pending=${pending} instances=${instances.length} ` +
+              `max=${maxInstances}); continuing the tick with the existing pool`,
+            err
+          );
+        }
       }
     }
 

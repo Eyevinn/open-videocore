@@ -66,6 +66,15 @@ export type WorkspaceEncoreScalerConfig = {
   // worker node, not just a pod starting on an existing one. Undefined uses
   // DEFAULT_SPAWN_READY_TIMEOUT_MS (instance-pool, 15 min).
   spawnReadyTimeoutMs?: number;
+  // #1286: how a create that timed out AT THE GATEWAY is handled, forwarded to
+  // every per-workspace loop. The first bounds how long the spawn keeps asking
+  // for the same instance name after every attempt 504'd (the create behind a
+  // 504 usually completes, so the instance that lands is the one we want); the
+  // second holds the NEXT scale-up off so a second create is not started while
+  // the platform is slow. Undefined uses DEFAULT_SPAWN_ADOPT_PROBE_TIMEOUT_MS /
+  // DEFAULT_SPAWN_GATEWAY_BACKOFF_MS.
+  spawnAdoptProbeTimeoutMs?: number;
+  spawnGatewayBackoffMs?: number;
   // Redis connection string forwarded to each spawned callback listener.
   redisUrl: string;
   // Optional per-stack Valkey resolver (issue #615). When supplied, called once
@@ -435,6 +444,11 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       // wait for it rather than timing out and tearing the half-born instance
       // down.
       spawnReadyTimeoutMs: this.config.spawnReadyTimeoutMs,
+      // #1286: adopt the instance a gateway-timed-out create is still building
+      // instead of asking for a new name on the next tick, and hold that next
+      // create off while the platform is slow.
+      spawnAdoptProbeTimeoutMs: this.config.spawnAdoptProbeTimeoutMs,
+      spawnGatewayBackoffMs: this.config.spawnGatewayBackoffMs,
       oscContext: this.config.oscContext,
       redis,
       redisUrl,

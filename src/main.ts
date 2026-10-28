@@ -1090,6 +1090,35 @@ const encoreSpawnReadyTimeoutMs =
   Number.isFinite(encoreSpawnReadyTimeoutMsRaw) && encoreSpawnReadyTimeoutMsRaw > 0
     ? encoreSpawnReadyTimeoutMsRaw
     : undefined;
+// Issue #1286. Two bounds on how a create that timed out AT THE GATEWAY is
+// handled, both optional and both defaulted in the scaler itself
+// (DEFAULT_SPAWN_ADOPT_PROBE_TIMEOUT_MS / DEFAULT_SPAWN_GATEWAY_BACKOFF_MS):
+//   ENCORE_SPAWN_ADOPT_PROBE_TIMEOUT_MS — how long the spawn keeps asking for the
+//     SAME instance name after every attempt 504'd, because the create behind a
+//     504 usually completes and the instance that lands is the one we want (the
+//     alternative is a new name next tick and an extra instance for the reaper).
+//   ENCORE_SPAWN_GATEWAY_BACKOFF_MS — how long the next scale-up is held off
+//     after such a spawn, so the scaler does not start a second create against a
+//     platform that just told us it was slow. 0 disables the hold-off.
+// Invalid/absent => the built-in default. Negative is treated as absent; 0 is
+// honoured for the back-off only, where it has a meaning.
+const encoreSpawnAdoptProbeTimeoutMsRaw = parseInt(
+  process.env['ENCORE_SPAWN_ADOPT_PROBE_TIMEOUT_MS'] || '',
+  10
+);
+const encoreSpawnAdoptProbeTimeoutMs =
+  Number.isFinite(encoreSpawnAdoptProbeTimeoutMsRaw) &&
+  encoreSpawnAdoptProbeTimeoutMsRaw > 0
+    ? encoreSpawnAdoptProbeTimeoutMsRaw
+    : undefined;
+const encoreSpawnGatewayBackoffMsRaw = parseInt(
+  process.env['ENCORE_SPAWN_GATEWAY_BACKOFF_MS'] || '',
+  10
+);
+const encoreSpawnGatewayBackoffMs =
+  Number.isFinite(encoreSpawnGatewayBackoffMsRaw) && encoreSpawnGatewayBackoffMsRaw >= 0
+    ? encoreSpawnGatewayBackoffMsRaw
+    : undefined;
 // Bounded timeout (issue #273) for the failed-transcode reconciliation sweep: a
 // transcode still non-terminal after this long whose Encore record has been
 // garbage-collected (getJobStatus -> 404/undefined) is declared failed rather
@@ -1581,6 +1610,11 @@ function activateScaler(redisUrl: string): void {
     // Readiness budget for a freshly created instance (issue #1071): sized for
     // OSC provisioning a new worker node, not just a pod start.
     spawnReadyTimeoutMs: encoreSpawnReadyTimeoutMs,
+    // Gateway-timeout handling for a create that 504'd (issue #1286): adopt the
+    // instance the platform is still building instead of asking for a new name
+    // next tick, and hold the next create off while the platform is slow.
+    spawnAdoptProbeTimeoutMs: encoreSpawnAdoptProbeTimeoutMs,
+    spawnGatewayBackoffMs: encoreSpawnGatewayBackoffMs,
     // Point each spawned Encore instance at our own public profile index so it
     // loads the operator-managed profiles from CouchDB (issue #84).
     profilesUrl: encoreScalerProfilesUrl,

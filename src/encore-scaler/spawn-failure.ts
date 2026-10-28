@@ -55,6 +55,7 @@
 
 import type { Redis } from 'ioredis';
 import { keys, type EncoreScalerConfig, type SpawnFailureRecord } from './types.js';
+import { oscHttpCode } from './osc-error.js';
 
 // How long a spawn-failure record lives if nothing overwrites or clears it.
 // Every new failure rewrites the key with a fresh TTL, so this only expires a
@@ -499,11 +500,21 @@ export async function readSpawnFailure(
   // failure current or from last week?"), so it is treated as absent.
   if (typeof parsed.at !== 'number' || !Number.isFinite(parsed.at)) return undefined;
 
+  // #1286: httpCode stays ABSENT rather than defaulted. There is no neutral
+  // number for "the call failed without a status" (a transport failure carries
+  // none), and the scale-up back-off keys off this value, so inventing one would
+  // make it act on a status nothing reported. Records written before #1286 simply
+  // have no httpCode, which reads correctly as "unknown".
+  const httpCode =
+    typeof parsed.httpCode === 'number' && Number.isFinite(parsed.httpCode)
+      ? parsed.httpCode
+      : undefined;
   return {
     at: parsed.at,
     attempts: num(parsed.attempts, 0),
     consecutiveFailures: num(parsed.consecutiveFailures, 1),
-    message: typeof parsed.message === 'string' ? parsed.message : NO_MESSAGE
+    message: typeof parsed.message === 'string' ? parsed.message : NO_MESSAGE,
+    ...(httpCode === undefined ? {} : { httpCode })
   };
 }
 
@@ -523,11 +534,17 @@ export async function recordSpawnFailure(
 ): Promise<SpawnFailureRecord> {
   const previous = await readSpawnFailure(redis, workspaceId);
   const attempts = Math.max(0, Math.trunc(failure.attempts) || 0);
+  // #1286: the status is read STRUCTURALLY off the error (osc-error.ts
+  // oscHttpCode), never off the redacted message — the redaction strips the HTML
+  // a gateway timeout arrives as and truncates what is left, so the message is
+  // not a reliable place to find "504" again later.
+  const httpCode = oscHttpCode(failure.error);
   const record: SpawnFailureRecord = {
     at: Date.now(),
     attempts,
     consecutiveFailures: (previous?.consecutiveFailures ?? 0) + 1,
-    message: redactSpawnFailureMessage(failure.error, failure.secrets ?? [])
+    message: redactSpawnFailureMessage(failure.error, failure.secrets ?? []),
+    ...(httpCode === undefined ? {} : { httpCode })
   };
   await redis.set(
     keys.spawnFailure(workspaceId),
@@ -536,6 +553,62 @@ export async function recordSpawnFailure(
     SPAWN_FAILURE_TTL_MS
   );
   return record;
+}
+
+// #1286: the statuses that mean "nobody answered in time", i.e. the request may
+// STILL be running on the platform side.
+//
+// 504 Gateway Time-out is the one the incident is about: OSC's ingress gives up
+// at 60s while the create continues behind it, and a create that crosses that
+// limit usually completes (successful creates take roughly 18-33s, so the ones
+// that time out are the slow ones, not the failed ones). 408 Request Timeout is
+// the same shape one hop earlier. Everything else — including 502/503, where the
+// gateway has an upstream answer — is NOT in here: those do not imply a create
+// that is still in flight, so neither the adopt probe nor the back-off should
+// treat them as one.
+//
+// Deliberately narrower than isTransientOscError (osc-error.ts), which answers a
+// different question ("can a retry succeed?"). This one answers "might the thing
+// I asked for be happening right now anyway?".
+const GATEWAY_TIMEOUT_STATUSES = new Set([408, 504]);
+
+export function isGatewayTimeoutStatus(httpCode: number | undefined): boolean {
+  return httpCode !== undefined && GATEWAY_TIMEOUT_STATUSES.has(httpCode);
+}
+
+// How long (ms) the scale-up gate holds off after a spawn that ended in a
+// gateway timeout (#1286).
+//
+// Sized against the thing it is waiting for, not the tick: a create that 504s
+// has been running at least the ingress' 60s, and the spawn's own adopt probe
+// then watches the name for DEFAULT_SPAWN_ADOPT_PROBE_TIMEOUT_MS (90s,
+// instance-pool.ts) before giving up. Two minutes on top of that is one more
+// chance for the platform to finish and for the orphan reaper or the next
+// reconcile to notice the instance, without parking scale-up for so long that a
+// workspace with real queued work stops growing: at a 10s tick this skips about
+// 12 ticks, then tries again.
+export const DEFAULT_SPAWN_GATEWAY_BACKOFF_MS = 120_000;
+
+// Remaining back-off (ms) before this workspace may start another spawn, given
+// its last recorded spawn failure. 0 means "spawn now", which is the answer for
+// every failure that is not a gateway timeout — a 403 or a rejected body says
+// nothing about platform load and the record should not slow down the retry.
+//
+// Pure function of (record, now): the gate is computed from pool state rather
+// than held in process memory, so it survives an API restart and cannot differ
+// between replicas (CLAUDE.md 12-factor: stateless processes).
+export function spawnGatewayBackoffRemainingMs(
+  record: SpawnFailureRecord | undefined,
+  now: number,
+  backoffMs: number = DEFAULT_SPAWN_GATEWAY_BACKOFF_MS
+): number {
+  if (!record || backoffMs <= 0) return 0;
+  if (!isGatewayTimeoutStatus(record.httpCode)) return 0;
+  // A record with a future or nonsense timestamp (clock skew between the writer
+  // and the reader) must not park scale-up indefinitely: the elapsed time is
+  // clamped at 0, so the worst case is exactly one back-off window.
+  const elapsed = Math.max(0, now - record.at);
+  return Math.max(0, backoffMs - elapsed);
 }
 
 // Drop the workspace's spawn-failure record. Called on a successful spawn so a
