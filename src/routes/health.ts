@@ -68,10 +68,36 @@ const buildInfoSchema = z.object({
   packageVersion: z.string()
 });
 
+// Image-level feature signals (issue #1256 review). `authGateRegistered` is the
+// only member today: it reports whether the running image actually wired the
+// 401 presence gate (src/auth/middleware.ts registerAuth).
+//
+// Why this is on the unauthenticated endpoint, and why it exists at all: before
+// the application accepted `x-jwt` (#1256), the e2e suite could tell an image
+// WITH an auth gate from one without by sending `x-jwt` alone from behind the
+// platform ingress and expecting the application's own 401. Now that the
+// application accepts that header, every request that clears the ingress
+// carries a token the application admits, so a gated and an un-gated image
+// answer alike and the #711 regression became unobservable from outside. This
+// flag restores an observable image-level signal, so the suite can assert the
+// gate is present instead of inferring it from behaviour it can no longer
+// provoke.
+//
+// It discloses nothing an attacker can use: a `false` reading is already
+// trivially observable (send an anonymous request and get a 200), and the
+// source is public, so the flag only tells an operator what the code already
+// tells a reader. Same reasoning as `build` above.
+const featuresSchema = z.object({
+  // True when registerAuth wired `app.authenticate`, i.e. the 401 presence gate
+  // every protected router attaches is live in this image (issue #711 guard).
+  authGateRegistered: z.boolean()
+});
+
 export const healthResponseSchema = z.object({
   status: z.string(),
   service: z.string(),
   build: buildInfoSchema,
+  features: featuresSchema,
   resolver: z.object({
     degraded: z.boolean(),
     mode: z.enum(['none', 'no-storage', 'stale-last-known-good']),
@@ -96,6 +122,16 @@ export type HealthRouterOptions = {
   // Read the ingest-availability signals at request time. Evaluated per request
   // so the reported state always reflects current configuration.
   ingestSignals: () => IngestAvailabilitySignals;
+  // Read whether the 401 presence gate is wired, at request time (issue #1256
+  // review). Optional: when omitted it falls back to asking THIS plugin
+  // instance whether `authenticate` is decorated.
+  //
+  // main.ts must pass it explicitly, because fastify decorators are copied into
+  // a child context when the child is registered: main.ts registers this router
+  // before it calls registerAuth, so the fallback would read false there even
+  // though the gate is live. Passing `() => app.hasDecorator('authenticate')`
+  // closes over the ROOT instance and is evaluated per request, after boot.
+  authGateRegistered?: () => boolean;
 };
 
 export const healthRouter: FastifyPluginAsync<HealthRouterOptions> = async (
@@ -104,6 +140,9 @@ export const healthRouter: FastifyPluginAsync<HealthRouterOptions> = async (
 ) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
 
+  const authGateRegistered =
+    opts.authGateRegistered ?? (() => fastify.hasDecorator('authenticate'));
+
   app.get(
     '/health',
     { schema: { response: { 200: healthResponseSchema } } },
@@ -111,6 +150,7 @@ export const healthRouter: FastifyPluginAsync<HealthRouterOptions> = async (
       status: 'ok',
       service: 'open-videocore-api',
       build: opts.buildInfo,
+      features: { authGateRegistered: authGateRegistered() },
       resolver: opts.resolverSnapshot(),
       ingest: computeIngestAvailability(opts.ingestSignals())
     })

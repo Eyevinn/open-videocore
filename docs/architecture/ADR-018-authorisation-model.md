@@ -34,7 +34,11 @@ OSC platform primitive that supplies one**:
   boolean `request.authenticated` — nothing else. It never decodes the token for
   a user id, group, role, tenant, or claim
   (`src/auth/middleware.ts:12-17` decorates only `authenticated: boolean`;
-  `src/auth/middleware.ts:20-25` reads only the `Authorization: Bearer` header;
+  `src/auth/middleware.ts` `extractToken` reads the token from
+  `Authorization: Bearer <token>`, falling back to `x-jwt: Bearer <token>` when
+  Authorization is absent or carries no token (issue #1256) — two accepted
+  headers, but still only a `Bearer <token>` value and still no claims read from
+  it;
   `src/auth/middleware.ts:31,38` sets the boolean from `requireAuth`;
   `src/auth/workspace.ts:33-42` is presence-only, "the token is intentionally
   not inspected for identity, and nothing is scoped").

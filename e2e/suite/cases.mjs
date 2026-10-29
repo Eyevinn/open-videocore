@@ -149,6 +149,20 @@ export const cases = [
       if (ctx.config.expectCommit && build.commit && build.commit !== 'unknown' && build.commit !== ctx.config.expectCommit) {
         fail(`instance runs ${build.commit}, expected ${ctx.config.expectCommit}`);
       }
+      // Image-level auth-gate guard (issue #711, restored after #1256). The application now accepts
+      // `x-jwt`, so every request that clears the platform ingress carries a token it admits and the
+      // suite can no longer provoke the application's own 401 from behind the wall — an image that
+      // registered NO auth gate would answer like a gated one. The image therefore reports the gate
+      // itself: GET /health -> features.authGateRegistered (src/routes/health.ts featuresSchema,
+      // set from `app.hasDecorator('authenticate')`, i.e. whether registerAuth ran). Asserted here
+      // rather than in `auth-required` so this stays an image-identity check, next to `build`.
+      const features = r.body?.features;
+      if (!features || typeof features.authGateRegistered !== 'boolean') {
+        fail('GET /health has no features.authGateRegistered boolean');
+      }
+      if (features.authGateRegistered !== true) {
+        fail('instance reports no application auth gate (features.authGateRegistered=false)');
+      }
     },
   },
   {

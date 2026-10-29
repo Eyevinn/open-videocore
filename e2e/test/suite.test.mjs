@@ -54,6 +54,23 @@ test('an application without its own auth gate is indistinguishable from behind 
   assert.equal(result.status, 'green');
 });
 
+// Issue #1256 review. The behavioural probe above can no longer tell a gated image from an un-gated one from behind
+// the ingress, so the image reports the gate itself: GET /health -> features.authGateRegistered (src/routes/health.ts
+// featuresSchema). The `health` case asserts that flag, which makes the #711 regression visible to the suite again —
+// an image that registered no auth gate is red, not green.
+test('an image reporting no auth gate (features.authGateRegistered=false) fails health and turns the suite red', async () => {
+  const { result } = await run({ noAuthGate: true });
+  assert.equal(byId(result).health.status, 'fail');
+  assert.match(byId(result).health.detail, /no application auth gate/);
+  assert.equal(result.status, 'red');
+});
+
+test('the health case requires the image to report features.authGateRegistered at all', async () => {
+  const { result } = await run({ healthNoFeatures: true });
+  assert.equal(byId(result).health.status, 'fail');
+  assert.match(byId(result).health.detail, /features\.authGateRegistered/);
+});
+
 test('ingest job failure fails ingest and skips the rest of the chain', async () => {
   const { result } = await run({ ingestJobFails: true });
   const c = byId(result);
