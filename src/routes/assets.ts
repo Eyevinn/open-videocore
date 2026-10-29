@@ -94,6 +94,17 @@ import { authGate } from '../auth/middleware.js';
 import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
 import { emitAudit, originActor, type AuditEmitter } from '../data/audit-emit.js';
+// On-demand purge of a single archived asset (issue #837). The route REUSES the
+// retention sweep's per-asset purge path (`purgeArchivedAsset`) so the
+// cross-bucket object removal and the doc-replace-to-tombstone step are one
+// implementation shared with the timed sweep (#327), not a parallel one. The
+// cycle this creates with the sweep module (it imports `parseS3Uri` from here)
+// is only ever exercised at call time — both sides export hoisted function
+// declarations and neither touches the other at module-evaluation time.
+import {
+  purgeArchivedAsset,
+  type PurgeStorage
+} from '../pipeline/archived-asset-purge-sweep.js';
 import {
   SourceTooLargeError,
   WorkspaceStorage,
@@ -1476,6 +1487,28 @@ type AssetsRouterOptions = {
   // precedence `opts.subtitleGenerator ?? request.connections?.subtitleGenerator`
   // uses. When neither is available the route answers 501.
   deliveryClient?: DeliveryObjectClient;
+  // On-demand purge of a single archived asset (issue #837).
+  //
+  // `purgeToTombstone` replaces an archived asset's document with a tombstone
+  // (the doc-replace of issue #326). It is an INJECTED callback for the same
+  // reason the sweep's `purge` dep is: `purgeToTombstone` is NOT on the
+  // AssetRepository interface — it is a concrete method on
+  // CouchAssetRepository / InMemoryAssetRepository — so the per-stack repository
+  // proxy (PerWorkspaceAssetRepository) does not forward it. When absent, the
+  // route falls back to the concrete repo on the resolved stack connection
+  // (`request.connections.assets`) and finally to `opts.repository`, and
+  // answers 501 when neither exposes the method.
+  purgeToTombstone?: (
+    assetId: string
+  ) => Promise<string | boolean | undefined> | string | boolean | undefined;
+  // Resolve a storage handle for a bucket the purge must remove objects from.
+  // When absent, the route builds a WorkspaceStorage per target bucket from the
+  // request's own stack client (`request.connections.storageClient`), exactly as
+  // the stream route and GET /:id/files do; injectable so a test can assert the
+  // removed keys without a live object store. Returning undefined for a bucket
+  // skips object removal there — the tombstone is still recorded, matching the
+  // sweep's behaviour on an unconfigured store.
+  purgeStorageForBucket?: (bucket: string) => PurgeStorage | undefined;
   // The object-storage endpoint `deliveryClient` is authenticated against, used
   // to refuse a destination that declares a DIFFERENT endpoint (whose
   // credentials this API cannot hold — see destinationEndpointRefusal in
@@ -1809,6 +1842,64 @@ export function parseS3Uri(uri: string): { bucket: string; key: string } | null 
   const match = /^s3:\/\/([^/]+)\/(.+)$/.exec(uri);
   if (!match) return null;
   return { bucket: match[1], key: match[2] };
+}
+
+// Every stored object an asset's purge would REMOVE, as `bucket\u0000key` identities
+// (issue #837 review). `objectKey` is a client-settable field on POST /assets and
+// PATCH /assets/:id, so two documents can point at the SAME bytes; the purge
+// route uses these sets to refuse destroying bytes another document still
+// references. A plain key lives in `sourceBucket`; an `s3://bucket/key` rendition
+// lives in that bucket (parseS3Uri) — the same bucket resolution
+// `purgeArchivedAsset` itself applies (src/pipeline/archived-asset-purge-sweep.ts).
+// The packaged-output prefix is NOT included: it is derived from the asset id
+// (outputPrefix(asset.id), src/pipeline/packaging.ts) and so cannot be aimed at
+// another asset.
+function purgeableObjectIdentities(asset: Asset, sourceBucket: string): Set<string> {
+  const ids = new Set<string>();
+  const add = (rawKey: string | undefined): void => {
+    if (!rawKey) return;
+    const s3 = parseS3Uri(rawKey);
+    ids.add(s3 ? `${s3.bucket}\u0000${s3.key}` : `${sourceBucket}\u0000${rawKey}`);
+  };
+  add(asset.objectKey);
+  for (const rendition of asset.renditions ?? []) add(rendition.objectKey);
+  for (const track of asset.subtitleTracks ?? []) add(track.objectKey);
+  for (const thumb of asset.thumbnails ?? []) add(thumb);
+  return ids;
+}
+
+// Find a DIFFERENT live asset document that references any of the objects this
+// purge would destroy (issue #837 review). Pages `list()` over the workspace's
+// assets (tombstones are excluded from `list()` by construction — the in-memory
+// repo drops the document and the Couch repo filters on `resourceType`), so the
+// answer covers every still-restorable document, archived ones included.
+// Returns the first collision found, or undefined when the bytes are unshared.
+async function findSharedObjectOwner(
+  repo: AssetRepository,
+  asset: Asset,
+  sourceBucket: string
+): Promise<{ assetId: string; bucket: string; key: string } | undefined> {
+  const mine = purgeableObjectIdentities(asset, sourceBucket);
+  if (mine.size === 0) {
+    return undefined;
+  }
+  let offset = 0;
+  for (;;) {
+    const page = await repo.list({ limit: MAX_LIMIT, offset });
+    for (const other of page.items) {
+      if (other.id === asset.id) continue;
+      for (const identity of purgeableObjectIdentities(other, sourceBucket)) {
+        if (mine.has(identity)) {
+          const [bucket, key] = identity.split('\u0000');
+          return { assetId: other.id, bucket, key };
+        }
+      }
+    }
+    if (page.items.length < MAX_LIMIT) break;
+    offset += page.items.length;
+    if (offset >= page.total) break;
+  }
+  return undefined;
 }
 
 // The publicly reachable origin of THIS API up to (and including) the assets
@@ -7408,6 +7499,270 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         },
         request.log
       );
+      return reply.code(204).send(null);
+    }
+  );
+
+  // On-demand purge of ONE archived asset (issue #837).
+  //
+  // Before this route the only way to destroy an asset's bytes was the timed
+  // retention sweep (src/pipeline/archived-asset-purge-sweep.ts), driven by the
+  // instance-global window that defaults to 0 = never purge
+  // (RETENTION_DISABLED_MS, src/routes/retention.ts) — so `archived` was
+  // terminal unless an operator widened a GLOBAL policy to collect one asset.
+  // This is the deliberate, per-asset alternative: it changes no policy and
+  // sweeps nothing else.
+  //
+  // IT IS A SEPARATE, SECOND STEP, not a stronger DELETE. A `/purge`
+  // sub-resource (rather than `DELETE /:id?purge=true`) is what keeps that true:
+  // the asset must ALREADY be `archived`, so no single call can take a `ready`
+  // asset to destroyed, and the destructive verb is not reachable by adding a
+  // query parameter to the soft delete.
+  //
+  // IRREVERSIBLE. The source object, every rendition (including renditions in a
+  // foreign bucket), the whole packaged-output prefix, subtitle objects and
+  // thumbnails are removed, and the document is REPLACED by a tombstone — there
+  // is no restore afterwards (POST /:id/restore answers 410 on a tombstone,
+  // issue #326). The destruction itself is delegated to `purgeArchivedAsset`,
+  // the SAME per-asset path the retention sweep runs, so the two can never drift.
+  //
+  // GUARDS, in order:
+  //   410 — already purged (the id now resolves to a tombstone). Checked first so
+  //         a repeat call reports `gone` rather than `not_found`, consistent with
+  //         GET /:id and POST /:id/restore (issue #326).
+  //   404 — unknown asset.
+  //   409 — `delete_blocked` / `delete_protected`: an asset with
+  //         `deleteLock.locked` is a HARD block, exactly as DELETE /:id treats
+  //         it (ADR-020 decisions 1 & 2). There is no force override here —
+  //         unlock via DELETE /:id/lock first.
+  //   409 — `not_archived`: the asset is in any other lifecycle state. Archive it
+  //         with DELETE /:id first.
+  //   409 — `delete_blocked` / `referenced_by_job`: an active (pending/queued/
+  //         running) job still names this asset as its source, exactly as
+  //         DELETE /:id refuses (ADR-020 decision 1). Archiving does not cancel
+  //         jobs, so an archived asset can still be referenced.
+  //   409 — `has_children`: the asset still has a LIVE (non-archived) child.
+  //         The same block DELETE /:id enforces and the route equivalent of the
+  //         sweep's child-ordering deferral (anyLiveChild) — without it an
+  //         archived parent could be purged out from under a live child, leaving
+  //         the child pointing at a tombstone. Purge the children first.
+  //   409 — `shared_objects`: one of the objects this purge would remove is also
+  //         referenced by another live asset document. THE INVARIANT: a purge
+  //         only ever destroys bytes no other live asset references. Needed
+  //         because `objectKey` is client-settable (POST /assets, PATCH
+  //         /assets/:id — accepted even while archived), so a document can be
+  //         aimed at another asset's bytes; the delete-lock guard above protects
+  //         the locked document, this one protects its bytes.
+  //   501 — the resolved repository exposes no purge-to-tombstone write path, so
+  //         this deployment cannot record the purge (same `not_configured`
+  //         convention as the other capability-gated routes here).
+  //   204 — purged.
+  app.delete(
+    '/:id/purge',
+    {
+      schema: {
+        summary: 'Purge an archived asset on demand (IRREVERSIBLE)',
+        description:
+          'Permanently destroy ONE already-archived asset: its stored objects (source, renditions, ' +
+          'packaged output, subtitles, thumbnails) are removed and its document is replaced by a ' +
+          'tombstone. This is IRREVERSIBLE — the asset cannot be restored afterwards, and reads of ' +
+          'its id return 410 Gone from then on. The asset must already be `archived` (archive it ' +
+          'first with `DELETE /api/v1/assets/{id}`), and a delete-locked asset is refused with 409 ' +
+          '`delete_blocked` / `delete_protected` just as archiving is. The same integrity blocks ' +
+          '`DELETE /api/v1/assets/{id}` applies are enforced here: 409 `delete_blocked` / ' +
+          '`referenced_by_job` while an active job still names the asset as its source, and 409 ' +
+          '`has_children` while it still has a live (non-archived) child — purge the children ' +
+          'first so no child is left pointing at a tombstone. A purge destroys only bytes no other ' +
+          'asset references: if any object of this asset (source, rendition, subtitle, thumbnail) ' +
+          'is also referenced by another asset, the purge is refused with 409 `shared_objects` and ' +
+          'nothing is removed. Independent of the global ' +
+          'archived-asset retention window (`GET /api/v1/retention/config`): purging one asset here ' +
+          'changes no policy and affects no other asset. The purge is recorded in the audit log ' +
+          '(`GET /api/v1/audit`) as `asset.purged`.',
+        params: z.object({ id: z.string() }),
+        response: {
+          204: z.null(),
+          404: errorSchema,
+          409: z.union([deleteBlockedSchema, errorSchema]),
+          410: errorSchema,
+          501: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const id = request.params.id;
+
+      // Already purged -> 410 Gone, never 404 (tombstone semantics, issue #326).
+      // getState() surfaces the distinction on the ULID id path, as in GET /:id.
+      if (isUlid(id)) {
+        const state = await repo.getState(id);
+        if (state.kind === 'tombstone') {
+          return reply.code(410).send({ error: 'gone', message: 'asset has been purged' });
+        }
+      }
+
+      const existing = await repo.get(id);
+      if (!existing) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+
+      // HARD delete-lock block, identical in effect to DELETE /:id: surfaced as
+      // the shared `delete_blocked` envelope with reason `delete_protected` via
+      // DeleteProtectedError in this router's error handler. Checked BEFORE the
+      // archived-state check so a locked asset reports the lock (the actionable
+      // block) whatever state it is in.
+      if (existing.deleteLock?.locked) {
+        throw new DeleteProtectedError(id);
+      }
+
+      // Purge is only ever the second step: refuse anything not already archived.
+      if (existing.status !== 'archived') {
+        return reply.code(409).send({
+          error: 'not_archived',
+          message:
+            `asset is ${existing.status}, not archived; archive it with ` +
+            'DELETE /api/v1/assets/{id} before purging'
+        });
+      }
+
+      // In-flight job reference, the SAME hard block DELETE /:id applies (ADR-020
+      // decision 1, issue #569). An asset can be archived while a job that names
+      // it as source is still pending/queued/running — archiving does not cancel
+      // jobs — so destroying its bytes here would corrupt that in-flight
+      // pipeline. Same `delete_blocked` / `referenced_by_job` envelope, naming
+      // the blocking job ids; no force override exists on this route.
+      const activeJobs = await jobs.findActiveByAssetId(id);
+      if (activeJobs.length > 0) {
+        throw new ReferencedByJobError(
+          id,
+          activeJobs.map((j) => j.id)
+        );
+      }
+
+      // Live-child block, the SAME check DELETE /:id applies and the route
+      // equivalent of the sweep's child-ordering deferral (anyLiveChild,
+      // src/pipeline/archived-asset-purge-sweep.ts). An archived PARENT with a
+      // live child must not be purged: the child would be left pointing at a
+      // tombstone. `countChildren` counts only non-archived children (both the
+      // in-memory and Couch repos exclude `archived`), which is exactly the
+      // sweep's "live child" notion — an archived child is itself purgeable and
+      // never blocks. Where the sweep DEFERS (and retries on a later tick), the
+      // on-demand route REFUSES with the pre-existing `has_children` envelope:
+      // purge the children first.
+      const childCount = await repo.countChildren(id);
+      if (childCount > 0) {
+        throw new HasChildrenError(id);
+      }
+
+      // The source bucket this purge's plain keys resolve in — resolved ONCE and
+      // passed to both the ownership guard below and purgeArchivedAsset, so the
+      // bytes checked are the bytes removed.
+      const purgeSourceBucket =
+        request.connections?.sourceBucket ?? opts.sourceBucket ?? DEFAULT_SOURCE_BUCKET;
+
+      // OBJECT-OWNERSHIP INVARIANT (issue #837 review): a purge only ever
+      // destroys bytes that NO other live asset document references.
+      //
+      // Why this guard has to exist: `objectKey` is a client-settable field on
+      // POST /api/v1/assets and PATCH /api/v1/assets/{id}, and PATCH is accepted
+      // on an already-archived asset. Without this check a caller could aim
+      // their own archived asset (or a decoy) at another asset's source or
+      // rendition key — including a key belonging to a delete-locked asset — and
+      // destroy those bytes from here. The delete-lock guard above protects the
+      // locked DOCUMENT; only this guard protects its BYTES.
+      //
+      // `objectKey` stays client-settable (ingest, the objectkey backfill and the
+      // re-point flows all depend on writing it), so ownership is verified at
+      // purge time instead: every object this purge would remove — source,
+      // renditions (plain or `s3://bucket/key`), subtitles, thumbnails — is
+      // compared, per bucket, against every other live document's objects. Any
+      // overlap is refused with 409 `shared_objects` naming the other asset, and
+      // nothing is removed. The packaged-output prefix is exempt by construction:
+      // it is derived from the asset id (outputPrefix), not from a client field.
+      const sharedWith = await findSharedObjectOwner(repo, existing, purgeSourceBucket);
+      if (sharedWith) {
+        return reply.code(409).send({
+          error: 'shared_objects',
+          message:
+            `asset ${id} cannot be purged: its stored object ` +
+            `${sharedWith.key} (bucket ${sharedWith.bucket}) is also referenced by ` +
+            `asset ${sharedWith.assetId}, so destroying it would remove bytes that ` +
+            'asset still points at'
+        });
+      }
+
+      // Resolve the doc-replace write path. Preference order: the injected
+      // callback, then the resolved stack's CONCRETE repo
+      // (request.connections.assets), falling back to the router's own
+      // `repo` — because purgeToTombstone is not on the AssetRepository
+      // interface and the per-stack proxy does not forward it
+      // (src/data/per-workspace-repos.ts).
+      type PurgeCapable = {
+        purgeToTombstone?: (assetId: string) => Promise<string | undefined> | boolean;
+      };
+      const concreteRepo = (request.connections?.assets ?? repo) as unknown as PurgeCapable;
+      const purge =
+        opts.purgeToTombstone ??
+        (typeof concreteRepo.purgeToTombstone === 'function'
+          ? concreteRepo.purgeToTombstone.bind(concreteRepo)
+          : undefined);
+      if (!purge) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'this deployment cannot purge assets (no purge-to-tombstone write path)'
+        });
+      }
+
+      // Per-bucket storage handles, built from THIS request's stack client so the
+      // bytes removed are the bytes this request's asset owns (mirrors the
+      // per-bucket WorkspaceStorage construction in the stream route and
+      // GET /:id/files). Undefined when the stack has no object storage: the
+      // tombstone is still recorded, exactly as in the sweep.
+      const storageForBucket =
+        opts.purgeStorageForBucket ??
+        ((bucket: string): PurgeStorage | undefined => {
+          const client = request.connections?.storageClient;
+          return client ? new WorkspaceStorage(client, bucket) : undefined;
+        });
+
+      await purgeArchivedAsset(
+        {
+          purge,
+          storageForBucket,
+          sourceBucket: purgeSourceBucket,
+          // Adapter onto the request logger. The sweep logs printf-style
+          // ('… %s: %o', id, err); here the format string becomes the message and
+          // its arguments ride along as structured context, so a best-effort
+          // object-removal failure is still visible per request.
+          logger: {
+            info: (...args: unknown[]) => {
+              request.log.info({ purgeDetail: args.slice(1) }, String(args[0]));
+            },
+            warn: (...args: unknown[]) => {
+              request.log.warn({ purgeDetail: args.slice(1) }, String(args[0]));
+            }
+          }
+        },
+        existing
+      );
+
+      // Audit: the purge (issue #837). `asset.archived` is already audited on
+      // DELETE /:id and `asset.restored` on POST /:id/restore; a purge is the
+      // more consequential, irreversible event, so it gets an entry on the SAME
+      // fire-and-forget emitter (issue #564) — emitted only after a completed
+      // purge, so a 404/409/410/501 never records one.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.purged',
+          targetType: 'asset',
+          targetId: existing.id,
+          detail: { from: 'archived', irreversible: true, onDemand: true }
+        },
+        request.log
+      );
+
       return reply.code(204).send(null);
     }
   );

@@ -56,8 +56,17 @@ import {
   type AssignmentOutcome,
   type ProbeOutcome
 } from './assignment-log.js';
-import { spawnFailureSecrets } from './spawn-failure.js';
+import {
+  DEFAULT_SPAWN_GATEWAY_BACKOFF_MS,
+  readSpawnFailure,
+  spawnFailureSecrets,
+  spawnGatewayBackoffRemainingMs
+} from './spawn-failure.js';
 import { hasPendingPackaging } from './packaging-pin.js';
+import {
+  instancesHoldingStuckCancelledJobs,
+  stuckCancelledActiveIds
+} from './cancelled-job-reclaim.js';
 import {
   ACTIVE_PAGE_SIZE,
   fetchEncoreActiveState,
@@ -453,28 +462,67 @@ export class EncoreScalerLoop {
       // workspace by GET /scaler/status, so swallowing it here loses no signal:
       // it is precisely what makes "at cap" distinguishable from "cannot spawn"
       // without pod logs.
-      try {
-        const spawned = await spawnInstance(this.config);
-        instances = [...instances, spawned];
-      } catch (err) {
-        console.error(
-          '[encore-scaler] scale-up: spawn failed (workspace=%s pending=%d instances=%d max=%d); ' +
-            'continuing the tick with the existing pool:',
+      //
+      // #1286: ...but a spawn that ended in a GATEWAY TIMEOUT is not simply
+      // retried on the next tick either. A 504 on createInstance is the platform
+      // telling us it is too slow to answer inside the ingress' 60s limit, while
+      // the create itself usually keeps going behind it. Starting another create
+      // 10s later therefore does two unhelpful things at once: it adds load to
+      // the thing that is already struggling, and it asks for a SECOND instance
+      // while the first one is still being built (under a new name, so the first
+      // one is nobody's — the extra instance #1223 reported). The spawn path's
+      // own adopt probe has just spent up to 90s watching for that instance
+      // (probeForGatewayTimedOutInstance, instance-pool.ts); this holds the next
+      // attempt off for a while longer so the platform, the orphan reaper and
+      // reconcile all get a chance to settle first.
+      //
+      // Read from pool state (keys.spawnFailure), not process memory, so it
+      // survives a restart and is the same for every replica. readSpawnFailure
+      // is total — it never throws — so this cannot be what breaks a tick.
+      const gatewayBackoffMs = spawnGatewayBackoffRemainingMs(
+        await readSpawnFailure(redis, workspaceId),
+        Date.now(),
+        this.config.spawnGatewayBackoffMs ?? DEFAULT_SPAWN_GATEWAY_BACKOFF_MS
+      );
+      if (gatewayBackoffMs > 0) {
+        console.warn(
+          '[encore-scaler] scale-up: holding off (workspace=%s pending=%d instances=%d ' +
+            'max=%d) — the last spawn timed out at the gateway and the platform may ' +
+            'still be creating that instance; next attempt in %dms (#1286)',
           workspaceId,
           pending,
           instances.length,
           maxInstances,
-          err
+          gatewayBackoffMs
         );
-        // #998: this is the signal that distinguishes "pool is at maxInstances"
-        // from "OSC will not create the instance" — the exact ambiguity #1071
-        // described — so it must reach the API/UI, not only pod logs.
-        this.logFailure(
-          'spawn',
-          `scale-up spawn failed (pending=${pending} instances=${instances.length} ` +
-            `max=${maxInstances}); continuing the tick with the existing pool`,
-          err
-        );
+        // Not logFailure: nothing has failed on this tick, and the failure that
+        // caused the back-off is already recorded (keys.spawnFailure) and served
+        // with its status code by GET /scaler/status. Everything after this gate
+        // — scale-down, the orphan sweep, dispatch — runs exactly as usual.
+      } else {
+        try {
+          const spawned = await spawnInstance(this.config);
+          instances = [...instances, spawned];
+        } catch (err) {
+          console.error(
+            '[encore-scaler] scale-up: spawn failed (workspace=%s pending=%d instances=%d max=%d); ' +
+              'continuing the tick with the existing pool:',
+            workspaceId,
+            pending,
+            instances.length,
+            maxInstances,
+            err
+          );
+          // #998: this is the signal that distinguishes "pool is at maxInstances"
+          // from "OSC will not create the instance" — the exact ambiguity #1071
+          // described — so it must reach the API/UI, not only pod logs.
+          this.logFailure(
+            'spawn',
+            `scale-up spawn failed (pending=${pending} instances=${instances.length} ` +
+              `max=${maxInstances}); continuing the tick with the existing pool`,
+            err
+          );
+        }
       }
     }
 
@@ -495,6 +543,17 @@ export class EncoreScalerLoop {
     const now = Date.now();
     const survivors: EncoreInstanceRecord[] = [];
     let activeCount = instances.length;
+    // #1219: instances still mapped to a job an operator cancelled more than the
+    // grace window ago. Such an instance is a teardown CANDIDATE even though its
+    // tracked count says busy and its idle clock never advances — a job that has
+    // ignored its cancel (the frozen-encode case) would otherwise pin it for
+    // ever. Candidacy only: the authoritative real-state check below still
+    // decides whether it is destroyed. See cancelled-job-reclaim.ts.
+    const stuckCancelledHosts = await instancesHoldingStuckCancelledJobs(
+      redis,
+      workspaceId,
+      now
+    );
     for (const inst of instances) {
       // #778: idle age is measured from the last COMPLETION if there is one,
       // else from the moment the instance became ready (readyAt) — so an
@@ -517,10 +576,39 @@ export class EncoreScalerLoop {
       // A candidate for teardown is either an instance the tracked count already
       // considers idle-and-aged, or one already marked draining (which is being
       // held only until its real work clears — see below).
+      const idleAndAged = inst.activeJobs === 0 && idlePastTimeout;
       const isTeardownCandidate =
-        (inst.activeJobs === 0 && idlePastTimeout) || inst.draining === true;
+        idleAndAged || inst.draining === true || stuckCancelledHosts.has(inst.instanceId);
+      // #1219 review: candidacy alone does not justify a teardown when the ONLY
+      // reason for it is a drain an operator CANCEL wrote (cancelDrainingSince,
+      // cancelled-job-reclaim.ts recordOperatorCancel). Unlike a drain written
+      // below — which always means "already a teardown candidate, held only
+      // until its real work clears" — a cancel-set drain says nothing about the
+      // instance's own health or age: the host is typically warm, nowhere near
+      // idleTimeoutMs, and its cancel is honoured in seconds. Destroying it on
+      // that basis would bypass the idle timeout entirely and make every
+      // routine cancel churn an instance. So such an instance is destroyed only
+      // on positive evidence, checked after the authoritative real-state read
+      // below: a job that has demonstrably ignored its cancel, or the ordinary
+      // idle-and-aged condition that applies to every other instance.
+      const cancelDrainOnlyCandidate =
+        inst.cancelDrainingSince !== undefined &&
+        !idleAndAged &&
+        !stuckCancelledHosts.has(inst.instanceId);
 
-      if (!isTeardownCandidate || activeCount <= minInstances) {
+      // #1219 review 2: `activeCount <= minInstances` is a floor on DESTROYING,
+      // not on evaluating. It is therefore applied at the destroy site below
+      // rather than here, for one case only: an instance whose sole reason for
+      // candidacy is a cancel-set drain. The release that clears that drain
+      // (the only code in this repo that ever clears `draining`) sits below the
+      // authoritative real-state read, so short-circuiting here would make it
+      // unreachable for any pool sitting at its warm floor — and with dispatch
+      // skipping draining instances and no operator un-drain route, one routine
+      // cancel would pin a floor-sized pool out of service for ever. Every
+      // other candidate still short-circuits exactly as before, so a pool at its
+      // floor is never torn down below it.
+      const belowFloor = activeCount <= minInstances;
+      if (!isTeardownCandidate || (belowFloor && !cancelDrainOnlyCandidate)) {
         survivors.push(inst);
         continue;
       }
@@ -557,7 +645,20 @@ export class EncoreScalerLoop {
       // TTL expires. See src/encore-scaler/packaging-pin.ts.
       const pendingPackaging = await hasPendingPackaging(redis, inst.instanceId);
 
-      if (real.count > 0 || pendingPackaging) {
+      // #1219: an Encore job the operator cancelled, and that is STILL in the
+      // active set a grace window later, has ignored its cancel — the frozen
+      // encode the issue reports, which answers the cancel endpoint 200 "Ok"
+      // and keeps running ffmpeg. It is no longer work anybody wants, so it
+      // stops protecting its instance from teardown; destroying the instance is
+      // the only thing that stops it, and that is exactly what an operator had
+      // to do by hand. Per-externalId: every other active job keeps full
+      // drain-don't-kill protection, an instance whose real state could not be
+      // confirmed was already kept above, and a truncated page leaves its unseen
+      // jobs counted (count is exact, the id set is not) so it still drains.
+      const abandoned = await stuckCancelledActiveIds(redis, real.activeExternalIds, now);
+      const protectedCount = Math.max(0, real.count - abandoned.size);
+
+      if (protectedCount > 0 || pendingPackaging) {
         // The instance has real in-flight work, or packaging is still pending
         // against it, even though the tracked count (or the age clock) marked
         // it a teardown candidate. Do NOT destroy it. Mark it draining so
@@ -585,7 +686,73 @@ export class EncoreScalerLoop {
         continue;
       }
 
-      // Confirmed real.count === 0 and no pending packaging: safe to tear down.
+      // #1219 review: the honoured-cancel case. This instance is a candidate
+      // ONLY because an operator cancel marked it draining, and Encore has just
+      // confirmed it holds no work at all (protectedCount === 0 with
+      // abandoned.size === 0 means real.count === 0) — i.e. the cancel WAS
+      // honoured, in the normal way, within the grace window. Nothing here is
+      // evidence that the instance should go away: it is a healthy warm
+      // instance that has simply finished its job, and tearing it down would
+      // bypass idleTimeoutMs and make the cancel cost a fresh spawn.
+      //
+      // So keep it, and release the cancel-set drain: the reason for it (its
+      // job MIGHT be stuck) has been positively disproved, so the instance goes
+      // back into routing rather than lingering as warm-but-unroutable
+      // capacity. The tracked count is reconciled down to the confirmed real 0
+      // and the idle clock stamped from this confirmation, so from here on this
+      // instance ages out through exactly the same idle path as any other — it
+      // can neither be destroyed early nor pinned for ever.
+      if (cancelDrainOnlyCandidate && abandoned.size === 0) {
+        const releasedRecord: EncoreInstanceRecord = {
+          ...inst,
+          activeJobs: 0,
+          lastIdleAt: inst.activeJobs > 0 ? now : (resolveIdleSince(inst) ?? now),
+          draining: undefined,
+          cancelDrainingSince: undefined
+        };
+        console.warn(
+          `[encore-scaler] scale-down: instance ${inst.instanceId} was draining only because ` +
+            'an operator cancel may have left a stuck job on it; Encore reports no active ' +
+            'work, so the cancel was honoured — keeping the instance and returning it to ' +
+            'service, to age out on the normal idle timeout'
+        );
+        await updateInstance(redis, workspaceId, releasedRecord);
+        survivors.push(releasedRecord);
+        continue;
+      }
+
+      // #1219 review 2: the warm floor, enforced at the point it actually
+      // means something. Only a cancel-drain-only candidate can reach here with
+      // the pool at `minInstances` (every other candidate short-circuited
+      // above), and such an instance must never be destroyed below the floor —
+      // it got this far solely so its drain could be re-evaluated. Reaching
+      // here means that re-evaluation did not end in a release (an abandoned
+      // cancelled job turned up in the real active set), so keep the instance
+      // and let the next tick, or the stuck-cancel host path once the pool is
+      // above its floor, deal with it.
+      if (belowFloor) {
+        console.warn(
+          `[encore-scaler] scale-down: instance ${inst.instanceId} would be reclaimed but the ` +
+            `pool is at its floor (minInstances=${minInstances}); keeping it`
+        );
+        survivors.push(inst);
+        continue;
+      }
+
+      // Confirmed no PROTECTED work and no pending packaging: safe to tear down.
+      if (abandoned.size > 0) {
+        // #1219 reclaim: the only work left on this instance is job(s) the
+        // operator cancelled that Encore kept running. Name it explicitly —
+        // this is the one teardown that happens with Encore still reporting
+        // jobs active, and an operator reading the log must be able to tell it
+        // from a routine idle scale-down.
+        console.warn(
+          `[encore-scaler] scale-down: reclaiming instance ${inst.instanceId} — its only ` +
+            `remaining Encore work is cancelled job(s) [${[...abandoned].join(', ')}] still ` +
+            `reported active after the cancel grace window (encore reported ${real.count} ` +
+            'active); destroying the instance to stop them'
+        );
+      }
       await destroyInstance(inst.instanceId, this.config);
       activeCount -= 1;
     }

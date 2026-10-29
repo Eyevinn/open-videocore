@@ -193,6 +193,24 @@ const spawnFailureSchema = z
           'by a successful spawn, so 1 is a fresh blip while a climbing number ' +
           'means the scaler has been unable to grow for a while.'
       ),
+    // #1286: the status, structurally. The message is redacted and
+    // HTML-stripped at write time, so "504" is not reliably readable from it —
+    // and a gateway timeout is the one failure an operator has to be able to
+    // recognise at a glance, because it is the one where the platform probably
+    // DID create the instance. Absent when the call failed without a status at
+    // all (a transport-level failure), and absent on records written before this
+    // field existed.
+    httpCode: z
+      .number()
+      .describe(
+        'HTTP status the failed instance-create returned, when it had one. 504 ' +
+          '(or 408) means the request timed out at the gateway while the platform ' +
+          'was probably still creating the instance: the spawn watches that name ' +
+          'for a bounded time and adopts it if it appears, and the next scale-up ' +
+          'for this workspace is held off rather than starting a second create. ' +
+          'Absent for a transport-level failure, which carries no status.'
+      )
+      .optional(),
     message: z
       .string()
       .describe(

@@ -419,6 +419,38 @@ describe('shared table states', () => {
   });
 });
 
+describe('ops UI has no inline event-handler attributes (issue #824)', () => {
+  // Kept from #841 after #801 removed the inline `onerror` it set out to fix: helmet's default CSP sets
+  // `script-src-attr 'none'`, which `script-src 'unsafe-inline'` does not cover, so an inline handler is
+  // silently dead in production. This standing guard stops one from being reintroduced anywhere in public/.
+  it('keeps public/ free of inline event-handler attributes', async () => {
+    // Standing guard so the fix cannot regress anywhere in the ops UI.
+    const { readdirSync, readFileSync, statSync } = await import('node:fs');
+    // vitest resolves paths from the project root; import.meta.url is not a
+    // file: URL under the happy-dom environment.
+    const root = process.cwd() + '/public/';
+
+    const files: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of readdirSync(dir)) {
+        const full = dir + entry;
+        if (statSync(full).isDirectory()) walk(full + '/');
+        else if (/\.(js|html)$/.test(entry)) files.push(full);
+      }
+    };
+    walk(root);
+    expect(files.length).toBeGreaterThan(0);
+
+    // Matches an HTML attribute handler (`onerror="…"`, including one written
+    // inside a JS string), but not a property assignment (`el.onclick = fn`).
+    const inlineHandler = /["'\s](on[a-z]{3,})\s*=\s*\\?["']/i;
+    const offenders = files
+      .filter((f) => inlineHandler.test(readFileSync(f, 'utf8')))
+      .map((f) => f.slice(root.length));
+    expect(offenders).toEqual([]);
+  });
+});
+
 // ─── Thumbnails (issue #801) ──────────────────────────────────────────────────
 //
 // An <img> GET carries no Authorization header, so the list cell can never point

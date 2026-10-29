@@ -15,6 +15,13 @@
         <option value="">— loading —</option>
       </select>
       <a href="/api-docs/" target="_blank" rel="noopener" class="header-link">API docs ↗</a>
+      <!-- Issue #828: which build of the API this UI is talking to. Sits in the
+           header next to the stack selector so the two identifying facts —
+           WHICH stack and WHICH build — are in the same screenshot. Filled at
+           runtime from GET /health by public/build-info.js; nothing is baked
+           into this file, so the value always describes the running
+           deployment. -->
+      <div id="build-indicator" class="build-indicator"></div>
     </nav>
   </header>
 
