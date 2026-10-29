@@ -149,6 +149,20 @@ export const cases = [
       if (ctx.config.expectCommit && build.commit && build.commit !== 'unknown' && build.commit !== ctx.config.expectCommit) {
         fail(`instance runs ${build.commit}, expected ${ctx.config.expectCommit}`);
       }
+      // Image-level auth-gate guard (issue #711, restored after #1256). The application now accepts
+      // `x-jwt`, so every request that clears the platform ingress carries a token it admits and the
+      // suite can no longer provoke the application's own 401 from behind the wall — an image that
+      // registered NO auth gate would answer like a gated one. The image therefore reports the gate
+      // itself: GET /health -> features.authGateRegistered (src/routes/health.ts featuresSchema,
+      // set from `app.hasDecorator('authenticate')`, i.e. whether registerAuth ran). Asserted here
+      // rather than in `auth-required` so this stays an image-identity check, next to `build`.
+      const features = r.body?.features;
+      if (!features || typeof features.authGateRegistered !== 'boolean') {
+        fail('GET /health has no features.authGateRegistered boolean');
+      }
+      if (features.authGateRegistered !== true) {
+        fail('instance reports no application auth gate (features.authGateRegistered=false)');
+      }
     },
   },
   {
@@ -161,13 +175,18 @@ export const cases = [
     },
   },
   {
-    id: 'app-auth-required',
+    id: 'x-jwt-accepted',
     async run(ctx) {
-      // x-jwt gets past the wall; without Authorization the application itself must reject (regression guard for
-      // #711, the auth gate returning 401). The message proves the answer came from the application, not nginx.
-      const r = await ctx.ingress.request('GET', '/api/v1/assets/');
-      expectStatus(r, 401);
-      if (r.body?.error !== 'unauthorized') fail(`401 did not come from the application: ${r.text.slice(0, 200)}`);
+      // Issue #1256. OSC's own tooling tells callers to send the service token in `x-jwt`, and the platform ingress
+      // authenticates that header but does not turn it into Authorization. The application therefore has to accept
+      // `x-jwt: Bearer <token>` itself (src/auth/middleware.ts extractToken: Authorization first, x-jwt fallback). This
+      // sends x-jwt ALONE (the ingress client has no Authorization header) to a write route, the one the issue
+      // reported as 401 `missing access token`, and expects the asset to be created. The anonymous 401 stays pinned by
+      // `auth-required`. POST /api/v1/assets/ requires `name` and answers 201 (openapi.json).
+      const r = await ctx.ingress.request('POST', '/api/v1/assets/', { json: { name: `e2e-xjwt-${ctx.config.runId}` } });
+      expectStatus(r, 201);
+      // Best-effort cleanup through the fully-authenticated client; DELETE is a soft delete (archive).
+      if (r.body?.id) await ctx.client.request('DELETE', `/api/v1/assets/${r.body.id}`, { query: { force: 'true' } });
     },
   },
   {
