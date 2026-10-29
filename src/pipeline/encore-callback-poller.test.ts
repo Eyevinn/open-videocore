@@ -871,6 +871,76 @@ describe('encore-callback-poller — transcode->package handoff provisioning (#4
     expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
   });
 
+  // The transcode->package handoff is not one atomic write: completeTranscode
+  // persists the job and asset first, then the pipeline advance and the enqueue
+  // follow. If the pipeline write fails after the job is already `done` (on OSC:
+  // a packager create failed, then the catch's own pipeline write hit a gateway
+  // 500), the message is re-queued — and the retry must still advance the
+  // pipeline although completeTranscode now reports applied=false. Without
+  // that the execution stays transcode=running / package=pending forever.
+  it('resumes the package handoff on retry when the completion persisted but the pipeline advance did not', async () => {
+    const encoreUuid = 'uuid-handoff-partial';
+    const { externalId, pipelineId } = await seedAndEnqueue(encoreUuid);
+    const localJobId = findLocalJobId(externalId);
+    // First attempt: the pipeline write that moves `package` to running fails
+    // (the job is already `done` by then). Later writes succeed.
+    const originalUpdate = pipelines.update.bind(pipelines);
+    let failures = 0;
+    pipelines.update = async (id, patch) => {
+      const packageRunning = patch.steps?.some((s) => s.name === 'package' && s.status === 'running');
+      if (packageRunning && failures === 0) {
+        failures += 1;
+        expect((await jobs.get(localJobId))?.status).toBe('done');
+        throw new Error('500 Internal Server Error');
+      }
+      return originalUpdate(id, patch);
+    };
+    const ensurePackaging = vi.fn(async () => {});
+    const d = {
+      ...baseDeps(successFetch(externalId, encoreUuid), ensurePackaging),
+      messageRetryBackoffMs: () => 5
+    };
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(() => redis.zmembers(PACKAGING_QUEUE_KEY).length === 1);
+    } finally {
+      stop();
+    }
+
+    expect(failures).toBe(1);
+    const execution = await pipelines.get(pipelineId);
+    expect(execution?.status).toBe('running');
+    expect(execution?.steps.find((s) => s.name === 'transcode')?.status).toBe('done');
+    expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
+    expect((await jobs.get(localJobId))?.status).toBe('done');
+    expect(redis.zmembers(QUEUE_KEY)).toHaveLength(0);
+    expect(redis.zmembers(`${QUEUE_KEY}:dead`)).toHaveLength(0);
+  });
+
+  // A genuine duplicate completion for a job whose pipeline already advanced
+  // must stay a no-op: no second packaging enqueue.
+  it('does not enqueue packaging twice for a duplicate completion', async () => {
+    const encoreUuid = 'uuid-handoff-duplicate';
+    const { externalId } = await seedAndEnqueue(encoreUuid);
+    const d = { ...baseDeps(successFetch(externalId, encoreUuid), undefined) };
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(() => redis.zmembers(PACKAGING_QUEUE_KEY).length === 1);
+      // The listener delivers the same completion again.
+      await redis.zadd(
+        QUEUE_KEY,
+        Date.now(),
+        JSON.stringify({ jobId: encoreUuid, url: `${BASE_URL}/encoreJobs/${encoreUuid}` })
+      );
+      await waitFor(() => redis.zmembers(QUEUE_KEY).length === 0);
+      await new Promise((r) => setTimeout(r, 50));
+    } finally {
+      stop();
+    }
+    expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(1);
+  });
+
   // A completion for a job still `queued` (its onDispatched hook missed it —
   // the hook ran outside the job's stack, or the process restarted between
   // dispatch and the hook) must not be rejected as `queued -> done` forever:
