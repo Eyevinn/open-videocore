@@ -159,11 +159,16 @@ When `status` is `"done"`, the operation's `result` carries the stack
 coordinates (`name`, `minioEndpoint`, `couchdbUrl`, `redisUrl`).
 
 By default the stack provisions its own MinIO instance and buckets — no storage
-configuration is required. To point the source and/or packaged-output roles at
-an existing S3-compatible bucket instead, pass the optional `sourceStorage` /
-`packagedStorage` blocks; to opt into extra pipeline services, pass
-`options.autoSubtitles` / `options.sceneDetect` (both default `false`). See the
-[external-storage guide](../docs/guides/provisioning-external-storage.md) for
+configuration is required. The optional `sourceStorage` / `packagedStorage`
+blocks record an operator-owned bucket for a role (credentials as per-service OSC
+secrets, `bucket`/`region`/`endpointUrl`/`publicBaseUrl` as non-secret
+coordinates for delivery-URL emission); they do **not** move the bucket the
+pipeline reads and writes, and a block carrying `endpointUrl` is refused with a
+400 (issue #641). To ingest from a bucket on an external S3 API host, register it
+with `POST /api/v1/storage/backends` and pass `sourceBackend` on
+`POST /api/v1/assets/ingest-url` instead. To opt into extra pipeline services,
+pass `options.autoSubtitles` / `options.sceneDetect` (both default `false`). See
+the [external-storage guide](../docs/guides/provisioning-external-storage.md) for
 the full field list.
 
 List, inspect, and tear down stacks:
