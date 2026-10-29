@@ -383,114 +383,205 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
       // non-default stack is applied there instead of 404ing.
       const owningStack = await stackOwningAsset(request.body.jobId);
       return runWithRequestStack(owningStack, async () => {
-        const applied = await opts.packaging!.handleSuccess(request.body);
-        if (!applied) return reply.code(404).send({ error: 'not_found' });
+        // ORDER MATTERS (issue #1279). Delivery to a caller-requested
+        // destination is attempted FIRST, and only then is the `package` Job
+        // settled — `done` if the output got there, `failed` if it did not.
+        //
+        // The previous order settled the Job `done` inside handleSuccess before
+        // the copy was even attempted, and `done` is terminal
+        // (ALLOWED_JOB_TRANSITIONS, src/data/job-repo.ts; both settle helpers
+        // early-return on an inactive job, src/pipeline/package-job.ts), so the
+        // failure path below could never write `failed` and
+        // GET /api/v1/jobs/{id} kept answering `done` for an output that never
+        // arrived.
+        //
+        // Reading the execution before handleSuccess is safe: handleSuccess
+        // only writes the ASSET and settles the Job — it never touches the
+        // execution (src/pipeline/packaging.ts handleSuccess), so the
+        // running-`package`-step lookup resolves identically either side of it.
+        // Set when the packaged output could NOT be copied to the destination
+        // the caller requested (#1279). Declared out here because it decides
+        // how the Job and the execution settle and which webhook is dispatched.
+        let deliveryFailure: string | undefined;
         // Advance the matching PipelineExecution when packaging completes.
-        if (opts.pipelineRepository) {
-          const execution = await opts.pipelineRepository.findRunningByAssetAndStep(
-            request.body.jobId,
-            'package'
-          );
-          if (execution) {
-            // #525 pt.2: packaging for this execution is confirmed complete —
-            // release the pin (packaging-pin.ts) that kept the transcode
-            // instance alive against premature scale-down while this was
-            // pending. Best-effort: a release failure must never fail the
-            // packager's callback (it would just retry); the pin's own TTL is
-            // the safety net if this never runs.
-            if (opts.redis || opts.redisForJob) {
+        const execution = opts.pipelineRepository
+          ? await opts.pipelineRepository.findRunningByAssetAndStep(
+              request.body.jobId,
+              'package'
+            )
+          : undefined;
+        // The relocation result to persist on the execution, set only when the
+        // copy to the destination override actually succeeded. Hoisted to this
+        // scope with `deliveryFailure` because the execution is now settled
+        // AFTER handleSuccess (see above) rather than inside the block that
+        // performs the copy.
+        let relocationPatch:
+          | Partial<
+              Pick<
+                NonNullable<typeof execution>,
+                'resolvedOutputLocation' | 'relocatedPackagingIds'
+              >
+            >
+          | undefined;
+        if (opts.pipelineRepository && execution) {
+          // #525 pt.2: packaging for this execution is confirmed complete —
+          // release the pin (packaging-pin.ts) that kept the transcode
+          // instance alive against premature scale-down while this was
+          // pending. Best-effort: a release failure must never fail the
+          // packager's callback (it would just retry); the pin's own TTL is
+          // the safety net if this never runs.
+          if (opts.redis || opts.redisForJob) {
+            try {
+              // Correlate via the `transcode` step, falling back to the
+              // `package` step (issue #739). A package-only execution has NO
+              // transcode step — its single `package` step carries the earlier
+              // transcode's Encore job id, stamped at dispatch
+              // (src/routes/assets.ts, package-only branch), which is the id the
+              // pin was taken under. Without the fallback the lookup resolves
+              // `undefined`, the unpin is skipped, and the pin holds an
+              // otherwise-idle instance out of scale-down for its full TTL.
+              // CONTRACT: `StepExecution.encoreJobId?: string`
+              // (src/data/pipeline-repo.ts:43-56, field at :47).
+              const encoreJobId =
+                execution.steps.find((s) => s.name === 'transcode')?.encoreJobId ??
+                execution.steps.find((s) => s.name === 'package')?.encoreJobId;
+              const pinRedis = encoreJobId ? await redisForJob(opts, encoreJobId) : undefined;
+              if (encoreJobId && pinRedis) {
+                // Resolve the pinned instance through the shared resolver
+                // (CONTRACT: `resolvePackagingInstanceId(redis, encoreJobId)`,
+                // src/encore-scaler/packaging-target.ts) rather than reading
+                // keys.jobInstance directly. By the time a packager success
+                // callback arrives, the transcode it followed has succeeded —
+                // and the callback poller hdel's keys.jobInstance on exactly
+                // that event (encore-callback-poller.ts), so the direct read
+                // resolved null and the unpin was silently skipped, holding an
+                // idle instance out of scale-down for the pin's full TTL. The
+                // resolver reads keys.jobTerminalInstance, which is retained
+                // past terminal for precisely this.
+                const instanceId = await resolvePackagingInstanceId(pinRedis, encoreJobId);
+                if (instanceId) {
+                  await unpinInstanceForPackaging(pinRedis, instanceId, encoreJobId);
+                }
+              }
+            } catch (err) {
+              fastify.log.warn({ err, executionId: execution.id }, 'failed to release packaging pin after packager success');
+            }
+          }
+          // Post-package relocation (issue #208, ADR-011). If this execution
+          // carries a per-execution destination override, server-side-copy the
+          // packaged output from the default staging bucket to the override
+          // destination and record the resolved location for delivery (#210).
+          // Idempotent per packagingId: the packager callback is at-least-once,
+          // so a repeat success for an already-relocated packagingId must not
+          // re-copy or double-record. packagingId === assetId in our usage
+          // (see packaging.ts:44), and assetId === request.body.jobId.
+          const packagingId = request.body.jobId;
+          const alreadyRelocated =
+            execution.relocatedPackagingIds?.includes(packagingId) ?? false;
+          if (
+            execution.destinationBucket &&
+            !alreadyRelocated &&
+            opts.resolveRelocation
+          ) {
+            const destination = parseDestination(execution.destinationBucket);
+            const relocation = await opts.resolveRelocation();
+            if (destination && relocation) {
               try {
-                // Correlate via the `transcode` step, falling back to the
-                // `package` step (issue #739). A package-only execution has NO
-                // transcode step — its single `package` step carries the earlier
-                // transcode's Encore job id, stamped at dispatch
-                // (src/routes/assets.ts, package-only branch), which is the id the
-                // pin was taken under. Without the fallback the lookup resolves
-                // `undefined`, the unpin is skipped, and the pin holds an
-                // otherwise-idle instance out of scale-down for its full TTL.
-                // CONTRACT: `StepExecution.encoreJobId?: string`
-                // (src/data/pipeline-repo.ts:43-56, field at :47).
-                const encoreJobId =
-                  execution.steps.find((s) => s.name === 'transcode')?.encoreJobId ??
-                  execution.steps.find((s) => s.name === 'package')?.encoreJobId;
-                const pinRedis = encoreJobId ? await redisForJob(opts, encoreJobId) : undefined;
-                if (encoreJobId && pinRedis) {
-                  // Resolve the pinned instance through the shared resolver
-                  // (CONTRACT: `resolvePackagingInstanceId(redis, encoreJobId)`,
-                  // src/encore-scaler/packaging-target.ts) rather than reading
-                  // keys.jobInstance directly. By the time a packager success
-                  // callback arrives, the transcode it followed has succeeded —
-                  // and the callback poller hdel's keys.jobInstance on exactly
-                  // that event (encore-callback-poller.ts), so the direct read
-                  // resolved null and the unpin was silently skipped, holding an
-                  // idle instance out of scale-down for the pin's full TTL. The
-                  // resolver reads keys.jobTerminalInstance, which is retained
-                  // past terminal for precisely this.
-                  const instanceId = await resolvePackagingInstanceId(pinRedis, encoreJobId);
-                  if (instanceId) {
-                    await unpinInstanceForPackaging(pinRedis, instanceId, encoreJobId);
-                  }
-                }
+                const result = await relocatePackagedOutput(relocation.client, {
+                  sourceBucket: relocation.packagedBucket,
+                  sourcePrefix: outputPrefix(packagingId),
+                  destination
+                });
+                relocationPatch = {
+                  resolvedOutputLocation: {
+                    bucket: result.destination.bucket,
+                    prefix: result.destination.prefix
+                  },
+                  relocatedPackagingIds: [
+                    ...(execution.relocatedPackagingIds ?? []),
+                    packagingId
+                  ]
+                };
               } catch (err) {
-                fastify.log.warn({ err, executionId: execution.id }, 'failed to release packaging pin after packager success');
+                // The caller ASKED for the output at this destination (via
+                // `destination`, `externalBackend` or `destinationBucket` —
+                // all three normalize into execution.destinationBucket, see
+                // resolveOutputDestination in routes/assets.ts) and the copy
+                // did not get it there. Issue #1279: this used to be logged
+                // and the execution then settled `done` below, so the output
+                // sat only in the stack's internal staging storage while the
+                // caller saw success and nothing on the job said otherwise.
+                //
+                // Record the reason and settle the `package` step and the
+                // execution as FAILED instead (same shape as the packager
+                // failure path above: `StepExecution.status = 'failed'` +
+                // `StepExecution.error`, `PipelineExecution.status =
+                // 'failed'` — src/data/pipeline-repo.ts). The relocation is
+                // still left un-recorded, so re-driving the package step
+                // re-attempts the copy; what we no longer do is report
+                // success for an undelivered output.
+                deliveryFailure = `output delivery to destination failed: ${
+                  err instanceof Error ? err.message : String(err)
+                }`;
+                fastify.log.error(
+                  { err, packagingId, executionId: execution.id },
+                  'post-package relocation to destination override failed'
+                );
               }
             }
-            // Post-package relocation (issue #208, ADR-011). If this execution
-            // carries a per-execution destination override, server-side-copy the
-            // packaged output from the default staging bucket to the override
-            // destination and record the resolved location for delivery (#210).
-            // Idempotent per packagingId: the packager callback is at-least-once,
-            // so a repeat success for an already-relocated packagingId must not
-            // re-copy or double-record. packagingId === assetId in our usage
-            // (see packaging.ts:44), and assetId === request.body.jobId.
-            const packagingId = request.body.jobId;
-            const alreadyRelocated =
-              execution.relocatedPackagingIds?.includes(packagingId) ?? false;
-            let relocationPatch:
-              | Partial<
-                  Pick<
-                    typeof execution,
-                    'resolvedOutputLocation' | 'relocatedPackagingIds'
-                  >
-                >
-              | undefined;
-            if (
-              execution.destinationBucket &&
-              !alreadyRelocated &&
-              opts.resolveRelocation
-            ) {
-              const destination = parseDestination(execution.destinationBucket);
-              const relocation = await opts.resolveRelocation();
-              if (destination && relocation) {
-                try {
-                  const result = await relocatePackagedOutput(relocation.client, {
-                    sourceBucket: relocation.packagedBucket,
-                    sourcePrefix: outputPrefix(packagingId),
-                    destination
-                  });
-                  relocationPatch = {
-                    resolvedOutputLocation: {
-                      bucket: result.destination.bucket,
-                      prefix: result.destination.prefix
-                    },
-                    relocatedPackagingIds: [
-                      ...(execution.relocatedPackagingIds ?? []),
-                      packagingId
-                    ]
-                  };
-                } catch (err) {
-                  // Leave the relocation un-recorded so the copy is retried on a
-                  // subsequent (at-least-once) packager callback. The packaged
-                  // output already exists at the default staging location, so the
-                  // execution still advances below and downstream is not blocked.
-                  fastify.log.error(
-                    { err, packagingId, executionId: execution.id },
-                    'post-package relocation to destination override failed'
-                  );
-                }
-              }
-            }
-            const now = new Date().toISOString();
+          }
+        }
+        // Delivery is now known, so the asset writes + the terminal write on the
+        // `package` Job can happen (#1279). `settleJob: false` leaves the Job
+        // ACTIVE on a failed delivery so failPackageJob below can write `failed`
+        // with the reason; on a delivered output handleSuccess settles it `done`
+        // exactly as before (CONTRACT: `PackagingService.handleSuccess(payload,
+        // options?: PackagerSuccessOptions)`, src/pipeline/packaging.ts).
+        //
+        // An unknown asset still answers 404 here. The copy above is attempted
+        // before that check, but only for an asset that has a RUNNING `package`
+        // step on a pipeline execution, so a callback for an asset we do not
+        // hold does no relocation work.
+        const applied = await opts.packaging!.handleSuccess(request.body, {
+          settleJob: !deliveryFailure
+        });
+        if (!applied) return reply.code(404).send({ error: 'not_found' });
+        if (opts.pipelineRepository && execution) {
+          const now = new Date().toISOString();
+          if (deliveryFailure) {
+            // Delivery to the requested destination failed (#1279): settle
+            // the `package` step and the execution as failed, carrying the
+            // reason on the step's `error` so GET /api/v1/pipelines/{id} and
+            // the asset's executions show WHY, and settle the matching
+            // `package` Job with the same reason via failPackageJob — exactly
+            // how the packager failure callback below attributes a failure.
+            const runningPackageStep = execution.steps.find(
+              (s) => s.name === 'package' && s.status === 'running'
+            );
+            const failedSteps = execution.steps.map((s) =>
+              s.name === 'package' && s.status === 'running'
+                ? {
+                    ...s,
+                    status: 'failed' as const,
+                    error: deliveryFailure as string,
+                    completedAt: now
+                  }
+                : s
+            );
+            await opts.pipelineRepository.update(execution.id, {
+              steps: failedSteps,
+              status: 'failed'
+            });
+            await failPackageJob(
+              {
+                jobs: opts.jobRepository,
+                pipeline: opts.pipelineRepository,
+                logger: fastify.log
+              },
+              { jobId: runningPackageStep?.jobId, assetId: execution.assetId },
+              deliveryFailure
+            );
+          } else {
             const steps = execution.steps.map((s) =>
               s.name === 'package' && s.status === 'running'
                 ? { ...s, status: 'done' as const, completedAt: now }
@@ -504,10 +595,20 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
           }
         }
         if (opts.webhookDispatcher) {
-          void opts.webhookDispatcher.dispatch({
-            type: 'package.complete',
-            payload: { assetId: request.body.jobId }
-          });
+          // #1279: an output that never reached the requested destination is
+          // not a completed package — notify `package.failed` (the event the
+          // packager failure path uses) instead of `package.complete`.
+          void opts.webhookDispatcher.dispatch(
+            deliveryFailure
+              ? {
+                  type: 'package.failed',
+                  payload: { assetId: request.body.jobId, error: deliveryFailure }
+                }
+              : {
+                  type: 'package.complete',
+                  payload: { assetId: request.body.jobId }
+                }
+          );
         }
         return reply.code(200).send({ ok: true });
       });
