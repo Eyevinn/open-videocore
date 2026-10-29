@@ -117,13 +117,16 @@ curl https://<your-instance>/api/v1/provision/operations/<operationId>
 ```
 
 By default the stack provisions its own MinIO instance and buckets — no storage
-configuration is required. To redirect the source and/or packaged-output roles to
-a bucket you already run, pass the optional `sourceStorage` / `packagedStorage`
-blocks. These blocks redirect the bucket **name** only: they do not accept an
-external S3 API host, and a block carrying `endpointUrl` is refused with a 400
-(issue #641). To ingest from a bucket on an external S3 API host, register it with
-`POST /api/v1/storage/backends` — which does take `endpointUrl` — and pass
-`sourceBackend` on `POST /api/v1/assets/ingest-url`. See
+configuration is required. The optional `sourceStorage` / `packagedStorage`
+blocks let you record an operator-owned bucket for a role: the credentials become
+per-service OSC secrets and `bucket`/`region`/`endpointUrl`/`publicBaseUrl` are
+persisted as non-secret coordinates used when delivery URLs are emitted. They do
+**not** move the bucket the pipeline reads and writes — that stays the stack's
+own — and they do not accept an external S3 API host: a block carrying
+`endpointUrl` is refused with a 400 (issue #641). To ingest from a bucket on an
+external S3 API host, register it with `POST /api/v1/storage/backends` — which
+does take `endpointUrl` — and pass `sourceBackend` on
+`POST /api/v1/assets/ingest-url`. See
 [Provisioning with external S3-compatible storage](docs/guides/provisioning-external-storage.md)
 for every field, worked examples, and the CDN-origin pattern.
 

@@ -159,10 +159,12 @@ When `status` is `"done"`, the operation's `result` carries the stack
 coordinates (`name`, `minioEndpoint`, `couchdbUrl`, `redisUrl`).
 
 By default the stack provisions its own MinIO instance and buckets — no storage
-configuration is required. To redirect the source and/or packaged-output roles to
-a bucket you already run, pass the optional `sourceStorage` / `packagedStorage`
-blocks — bucket **name** only, a block carrying `endpointUrl` is refused with a
-400 (issue #641); to ingest from a bucket on an external S3 API host, register it
+configuration is required. The optional `sourceStorage` / `packagedStorage`
+blocks record an operator-owned bucket for a role (credentials as per-service OSC
+secrets, `bucket`/`region`/`endpointUrl`/`publicBaseUrl` as non-secret
+coordinates for delivery-URL emission); they do **not** move the bucket the
+pipeline reads and writes, and a block carrying `endpointUrl` is refused with a
+400 (issue #641). To ingest from a bucket on an external S3 API host, register it
 with `POST /api/v1/storage/backends` and pass `sourceBackend` on
 `POST /api/v1/assets/ingest-url` instead. To opt into extra pipeline services,
 pass `options.autoSubtitles` / `options.sceneDetect` (both default `false`). See
