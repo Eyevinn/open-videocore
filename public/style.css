@@ -1955,8 +1955,35 @@ pre.code-block {
   display: none;
 }
 
-.storage-backend-field.has-error input {
+.storage-backend-field.has-error input,
+.storage-backend-field.has-error select {
   border-color: var(--danger);
+}
+
+/* Optional registration fields: role / publicBaseUrl / sessionToken
+   (issue #870). Grouped in a <fieldset> so the set reads as one block of
+   extras; the legend carries the group name for AT as well as sighted users. */
+.storage-backend-optional-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0;
+  padding: 12px 14px 14px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+}
+
+.storage-backend-optional-group > legend {
+  padding: 0 6px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.storage-backend-optional-field .form-hint {
+  max-width: 62ch;
+  line-height: 1.45;
 }
 
 .storage-backend-form-actions {
@@ -2606,6 +2633,12 @@ tbody tr.coll-row.row-selected {
   margin-top: 4px;
 }
 
+/* Each pill is a <button> that filters the executions list (issue #831), so it
+   has to shed the global filled-accent button skin and keep the pill look. The
+   three states are deliberately different KINDS of change, not three shades of
+   one: rest = surface fill, hover = tinted fill + accent border, pressed =
+   stronger fill + solid accent ring + a visible ✓ (so the active filter is not
+   signalled by colour alone — WCAG 1.4.1). */
 .pipeline-catalog-pill {
   display: flex;
   align-items: baseline;
@@ -2614,17 +2647,58 @@ tbody tr.coll-row.row-selected {
   border: 1px solid var(--border);
   border-radius: 20px;
   padding: 5px 12px;
-  cursor: default;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text);
+  text-align: left;
+  white-space: nowrap;
 }
 
 .pipeline-catalog-pill:hover {
   border-color: var(--accent);
+  /* Explicit: the global `button:hover` rule would otherwise flood the pill
+     with the solid accent fill reserved for primary actions. */
+  background: rgba(99, 102, 241, 0.08);
+}
+
+/* Keyboard reachability (issue #831): the pills are in the tab order, so the
+   focus ring must be visible and must not be confused with the pressed fill. */
+.pipeline-catalog-pill:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The pressed (filtering) state. */
+.pipeline-catalog-pill.is-active,
+.pipeline-catalog-pill.is-active:hover {
+  background: rgba(99, 102, 241, 0.22);
+  border-color: var(--accent);
+  border-style: solid;
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+/* The ✓ exists in the markup for every pill (so turning the filter on does not
+   reflow the strip) but only shows on the active one. */
+.pipeline-catalog-pill-mark {
+  font-size: 11px;
+  color: var(--accent);
+  visibility: hidden;
+}
+
+.pipeline-catalog-pill.is-active .pipeline-catalog-pill-mark {
+  visibility: visible;
 }
 
 .pipeline-catalog-pill-name {
   font-size: 13px;
   font-weight: 500;
   color: var(--text);
+}
+
+.pipeline-catalog-pill.is-active .pipeline-catalog-pill-name {
+  font-weight: 600;
 }
 
 .pipeline-catalog-pill-id {
@@ -2635,7 +2709,10 @@ tbody tr.coll-row.row-selected {
 
 /* A pipeline whose every step is an optional service the active stack has not
    configured (issue #790). Dimmed, with a dashed border so it reads as
-   "unavailable" rather than merely low-contrast. */
+   "unavailable" rather than merely low-contrast. It stays FILTERABLE (issue
+   #831) — "has this stack ever run it?" is a fair question about an
+   unconfigured pipeline — so it is dimmed, never disabled, and it lifts to full
+   strength while it is the active filter. */
 .pipeline-catalog-pill.is-unavailable {
   border-style: dashed;
   opacity: 0.6;
@@ -2643,6 +2720,11 @@ tbody tr.coll-row.row-selected {
 
 .pipeline-catalog-pill.is-unavailable:hover {
   border-color: var(--border);
+  background: rgba(99, 102, 241, 0.08);
+}
+
+.pipeline-catalog-pill.is-unavailable.is-active {
+  opacity: 0.9;
 }
 
 .pipeline-catalog-pill-note {
@@ -2670,6 +2752,46 @@ tbody tr.coll-row.row-selected {
 .mb12 { margin-bottom: 12px; }
 .mt16 { margin-top: 16px; }
 .mt24 { margin-top: 24px; }
+
+/* Filter status line above the executions list (issue #831). Names the filter
+   in force and how much of the loaded page it shows, and holds the explicit
+   "Show all pipelines" escape hatch — so clearing the filter never depends on
+   knowing that the active pill toggles. */
+.pipeline-exec-filter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-height: 24px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.pipeline-exec-filter.is-filtered .pipeline-exec-filter-text {
+  color: var(--text);
+}
+
+button.pipeline-exec-filter-clear {
+  font-size: 12px;
+  padding: 4px 10px;
+}
+
+/* Filtered to a pipeline with no runs in the loaded page: an explanation, not a
+   blank panel (issue #831). */
+.pipeline-exec-empty {
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-top: 12px;
+  text-align: center;
+}
+
+.pipeline-exec-empty-title {
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
+}
 
 /* Pipeline execution list */
 .pipeline-exec-list {
@@ -2830,12 +2952,113 @@ body.detail-standalone main {
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
+  /* Issue #828: the strip now carries the stack label AND the build indicator
+     side by side, so it is a flex row rather than a single text node. */
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
-/* Collapse the strip entirely when there is no stack context to show, so a
-   detached window truly has no chrome above the pane. */
+/* Collapse the strip entirely when there is nothing to show, so a detached
+   window truly has no chrome above the pane. Issue #828 note: this now only
+   fires if BOTH the stack label and the build indicator are absent from the
+   markup — the build indicator always renders something (a version or
+   "build unknown"), so in practice the strip stays, which is the point: a
+   pop-out screenshot must identify the build. */
 .detail-standalone-context:empty {
   display: none;
+}
+
+/* ─── Running-build indicator (issue #828) ──────────────────────────────────
+   Used in the main header and in the detached-detail context strip. Deliberately
+   low-contrast-but-AA: --text-muted on --surface, at 12px, so it reads as
+   chrome without competing with the stack selector, while still clearing the
+   4.5:1 WCAG 2.1 AA ratio for normal text. */
+.build-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  min-width: 0;
+  /* Positioning context for the click-to-reveal details panel below. */
+  position: relative;
+}
+
+.build-indicator-toggle {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  max-width: 100%;
+}
+
+.build-indicator-toggle:hover {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+/* Keep a visible focus indicator (WCAG 2.4.7) — never outline: none. */
+.build-indicator-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.build-indicator-prefix {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+  /* Subdued, but still WCAG 2.1 AA for normal-size text. This is a 10px label,
+     so it needs the full 4.5:1 — not the 3:1 large-text allowance. Measured
+     against --surface (#1a1d27): --text-muted (#94a3b8) at this alpha composites
+     to ~#768294 → 5.6:1. The previous 0.75 landed at ~4.3:1, which fails 1.4.3.
+     Do not lower this without re-measuring. */
+  opacity: 0.9;
+}
+
+.build-indicator-value {
+  /* A git-describe string is an identifier — monospace so an operator can read
+     the SHA suffix off a screenshot without transcription errors. */
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The unknown state must not be mistaken for a real version. */
+.build-indicator-unknown {
+  font-style: italic;
+  font-family: inherit;
+  color: var(--warning);
+}
+
+.build-indicator-details {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 40;
+  margin-top: 4px;
+  padding: 8px 10px;
+  max-width: min(420px, calc(100vw - 24px));
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text);
+  /* formatBuildDetails() returns newline-separated lines; keep them. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 body.detail-standalone .assets-side {
@@ -3657,4 +3880,135 @@ td[data-empty='logs-never-written'] .ops-table-empty-detail {
   color: var(--text-muted);
   margin-top: 2px;
   word-break: break-word;
+}
+
+/* ─── Profile YAML inline detail row (issue #832) ────────────────────────────
+   View YAML expands a row directly beneath the clicked profile instead of
+   writing into one shared container below the whole table. The <pre> is a
+   bounded, focusable scroll region so a 240-line profile cannot push the
+   remaining rows out of reach, and keyboard users can still scroll it
+   (WCAG 2.1 SC 2.1.1). Focus rings are kept, never `outline: none`
+   (SC 2.4.7). */
+.pf-row-expanded > td {
+  border-bottom-color: transparent;
+}
+
+.pf-yaml-row > .pf-yaml-cell {
+  padding: 0 12px 12px;
+  background: var(--bg);
+}
+
+.pf-yaml-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 0;
+}
+
+.pf-yaml-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.pf-yaml-collapse-btn {
+  font-size: 12px;
+  padding: 3px 8px;
+}
+
+.pf-yaml-pre {
+  /* max-height is set inline from PROFILE_YAML_MAX_HEIGHT so the bound has one
+     source of truth shared with the script. */
+  overflow: auto;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+}
+
+.pf-yaml-pre:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.pf-yaml-error {
+  margin-top: 0;
+}
+
+/* ─── Search-tab metadata filter (issue #850) ───────────────────────────────
+   Repeatable `metadata.<key>=<value>` rows. A real fieldset/legend so the pairs
+   read as one group (same shape as .external-id-fieldset above), and the rows
+   reuse the tab's existing .form-row/.form-field furniture so the inputs line
+   up with Query/Tags/Container above them. */
+.search-md-fieldset {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin: 12px 0 0;
+}
+
+.search-md-legend {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  padding: 0 4px;
+}
+
+.search-md-rows {
+  margin-top: 8px;
+}
+
+/* The row's own gap; .form-row already lays the fields out side by side. */
+.search-md-row + .search-md-row {
+  margin-top: 8px;
+}
+
+/* The Remove button sits on the input baseline, not under the label line. */
+.search-md-remove-field {
+  justify-content: flex-end;
+  flex: 0 0 auto;
+}
+
+/* ─── Parametrised profile parameters (issue #869) ───────────────────────────
+   The asset-detail run control grows a field per SpEL parameter the chosen
+   profile declares. Same fieldset/legend furniture as .search-md-fieldset
+   above, and the fields reuse .form-row/.form-field so they line up with the
+   pipeline/profile selects they sit under. */
+.profile-params-fieldset {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin: 12px 0 0;
+}
+
+.profile-params-legend {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  padding: 0 4px;
+}
+
+.profile-params-row {
+  margin-top: 8px;
+}
+
+/* The API's rejected-key message, next to the fields it is about. Takes no
+   space while empty, so a clean form reserves no gap. */
+.profile-params-error:not(:empty) {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--danger);
 }

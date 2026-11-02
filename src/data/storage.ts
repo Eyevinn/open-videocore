@@ -335,6 +335,44 @@ export class WorkspaceStorage {
     });
   }
 
+  // Sum the sizes of every object under one key prefix, plus how many objects
+  // were counted (per-asset storage usage, issue #1242). Scoped sibling of
+  // `sumObjectSizes()` above: same recursive listObjectsV2 listing and the same
+  // `size` field on the object arm of the minio BucketItem union
+  // (node_modules/minio/dist/esm/internal/type.d.ts:83), but bounded to a
+  // prefix instead of the whole bucket — a packaged output set is one prefix
+  // (`<assetId>/<packagerJobId>/`), so the listing is O(objects-in-that-package)
+  // rather than O(bucket). Still a listing call, so it belongs on a read
+  // endpoint, never on a write hot path.
+  //
+  // The prefix is normalised exactly like every other key here (`scopedKey`:
+  // leading slashes stripped, `..` rejected). An empty result (nothing stored
+  // under the prefix) is reported as `{ objectCount: 0, totalBytes: 0 }`, not an
+  // error — the caller cannot distinguish a package that was deleted from one
+  // that never existed, and both genuinely occupy zero bytes.
+  async sumObjectSizesUnderPrefix(
+    prefix: string
+  ): Promise<{ objectCount: number; totalBytes: number }> {
+    const key = this.scopedKey(prefix);
+    const stream = this.client.listObjectsV2(this.bucket, key, true);
+    return await new Promise<{ objectCount: number; totalBytes: number }>((resolve, reject) => {
+      let objectCount = 0;
+      let totalBytes = 0;
+      stream.on('data', (obj) => {
+        // Recursive listings yield only object items (no prefix items), so
+        // every event is a real object; guard on `name` anyway so a prefix item
+        // from a non-recursive backend cannot inflate the count.
+        if (!obj.name) {
+          return;
+        }
+        objectCount++;
+        totalBytes += obj.size ?? 0;
+      });
+      stream.on('end', () => resolve({ objectCount, totalBytes }));
+      stream.on('error', reject);
+    });
+  }
+
   // List object keys in the bucket.
   async list(): Promise<string[]> {
     const keys: string[] = [];

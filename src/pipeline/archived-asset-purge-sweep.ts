@@ -172,7 +172,7 @@ export async function purgeExpiredArchivedAssets(
     }
 
     try {
-      await purgeOne(deps, asset);
+      await purgeArchivedAsset(deps, asset);
       purgedThisRun.add(asset.id);
       purged += 1;
       deps.logger?.info?.('[archived-asset-purge] purged expired asset %s', asset.id);
@@ -247,13 +247,29 @@ async function anyLiveChild(
   return false;
 }
 
+// The deps ONE asset's purge needs — the sweep's deps minus the enumeration and
+// window concerns (`assets`, `retentionMs`, `now`), which only the timed sweep
+// uses. A `PurgeExpiredArchivedAssetsDeps` satisfies this by construction, so
+// the sweep and the on-demand purge route (issue #837) drive the SAME removal +
+// tombstone path rather than two implementations that can drift apart.
+export type PurgeArchivedAssetDeps = Pick<
+  PurgeExpiredArchivedAssetsDeps,
+  'purge' | 'storageForBucket' | 'sourceBucket' | 'logger'
+>;
+
 // Purge one archived asset across its buckets, then replace its document with a
 // tombstone. Object removals are best-effort per object (a missing/blocked
 // object is logged and skipped) so a partial storage state never blocks the
 // document replacement — the sweep is idempotent and a later tick can re-reap
 // stragglers.
-async function purgeOne(
-  deps: PurgeExpiredArchivedAssetsDeps,
+//
+// ELIGIBILITY IS THE CALLER'S BUSINESS. This function performs the purge of an
+// asset the caller has already decided is purgeable: the sweep checks the
+// retention window + child ordering above, and the on-demand route
+// (DELETE /api/v1/assets/:id/purge, issue #837) checks `archived` + the
+// delete-lock. Nothing here re-derives those conditions.
+export async function purgeArchivedAsset(
+  deps: PurgeArchivedAssetDeps,
   asset: Asset
 ): Promise<void> {
   const sourceStorage = deps.storageForBucket(deps.sourceBucket);
@@ -316,7 +332,7 @@ async function purgeOne(
 // Remove one object, swallowing (logging) any failure so a single missing or
 // blocked object never aborts the asset's purge.
 async function removeObjectBestEffort(
-  deps: PurgeExpiredArchivedAssetsDeps,
+  deps: PurgeArchivedAssetDeps,
   storage: PurgeStorage,
   key: string,
   label: string

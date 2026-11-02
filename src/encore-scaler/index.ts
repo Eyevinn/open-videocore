@@ -14,6 +14,16 @@ import {
   withDependencyTimeout
 } from './dependency-timeout.js';
 import { assertUnderJobThroughputCap } from './job-throughput-cap.js';
+import { resolveEncoreCancelUrl, resolveJobInstanceId } from './cancel-target.js';
+import { recordOperatorCancel } from './cancelled-job-reclaim.js';
+
+// Per-request bound (ms) on the outbound Encore cancel POST. The cancel is
+// issued inside the operator's synchronous DELETE /jobs/:id request and the peer
+// may be a frozen Encore instance, so it needs its own ceiling rather than
+// Node's default (none). Sized like the callback probe's per-request bound
+// (DEFAULT_PROBE_REQUEST_TIMEOUT_MS, src/encore-scaler/callback-trust-probe.ts):
+// cancel is a control-plane POST, not a transfer.
+const CANCEL_REQUEST_TIMEOUT_MS = 5_000;
 
 export { EncoreScalerLoop } from './scaler-loop.js';
 export { encoreScalerRouter } from './encore-scaler-router.js';
@@ -111,46 +121,72 @@ export function makeScalingEncoreClient(config: EncoreScalerConfig): EncoreClien
         }
       }
 
-      // (2) If the job was dispatched, resolve the Encore-assigned UUID and the
-      // instance it ran on (both stored at dispatch time, scaler-loop.ts) and
-      // POST the real Encore cancel endpoint on that instance.
+      // (2) If the job was dispatched, POST the real Encore cancel endpoint for
+      // the job URL it was dispatched to.
       //   POST {instanceUrl}/encoreJobs/{uuid}/cancel — SVT Encore
       //   EncoreController.kt (github.com/svt/encore, verified 2026-07-09).
       //   404/409 are idempotent no-ops (job already gone/terminal).
-      const encoreUuid = await redis.get(keys.jobUuid(encoreJobId));
-      const instanceId = await redis.hget(keys.jobInstance(workspaceId), encoreJobId);
+      //
+      // #1219: resolution goes through resolveEncoreCancelUrl, which prefers the
+      // dispatch-time URL (keys.jobEncoreUrl, 24h TTL) and only then falls back
+      // to UUID + instance. Resolving from the LIVE keys.jobInstance mapping and
+      // keys.pool alone — as this path used to — silently POSTs nothing for any
+      // job whose live mapping has been cleared (success, scale-down/transport
+      // re-enqueue, dropped-job handling) or whose instance has left the pool,
+      // and step (3) below then records CANCELLED while the job keeps running on
+      // Encore. That is the defect #1219 reports: Videocore shows CANCELLED,
+      // Encore shows IN_PROGRESS. See src/encore-scaler/cancel-target.ts.
+      const encoreJobUrl = await resolveEncoreCancelUrl(redis, workspaceId, encoreJobId);
 
-      if (encoreUuid && instanceId) {
-        const poolRaw = await redis.hget(keys.pool(workspaceId), instanceId);
-        if (poolRaw) {
-          try {
-            const inst = JSON.parse(poolRaw) as { url?: string };
-            if (inst.url) {
-              const token = await config.getToken();
-              const res = await fetch(
-                `${inst.url.replace(/\/$/, '')}/encoreJobs/${encoreUuid}/cancel`,
-                { method: 'POST', headers: { authorization: `Bearer ${token}` } }
-              );
-              // 404/409 = already gone/terminal: idempotent no-op. Only surface
-              // other non-ok statuses.
-              if (!res.ok && res.status !== 404 && res.status !== 409) {
-                const text = await res.text().catch(() => '');
-                throw new Error(
-                  `Encore job cancellation failed: ${res.status} ${text}`.trim()
-                );
-              }
-            }
-          } catch (err) {
-            if (err instanceof Error && err.message.startsWith('Encore job cancellation failed')) {
-              throw err;
-            }
-            // Unparseable pool entry / network error: fall through to mark status.
+      // A cancel that could not be DELIVERED must not be reported as a cancel
+      // (#1219): the whole complaint is Videocore claiming CANCELLED for a job
+      // still running on Encore. So the failure is held, the local terminal
+      // status is still recorded in step (3) (nothing may re-dispatch a job the
+      // operator cancelled), and the error is then surfaced to the caller.
+      let deliveryError: unknown;
+      if (encoreJobUrl) {
+        try {
+          const token = await config.getToken();
+          const res = await fetch(`${encoreJobUrl.replace(/\/+$/, '')}/cancel`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${token}` },
+            // Bound the outbound call: a frozen Encore instance (the #1219 state)
+            // is exactly the peer that can accept a connection and never answer,
+            // and this call is awaited by the operator's DELETE /jobs/:id request.
+            signal: AbortSignal.timeout(CANCEL_REQUEST_TIMEOUT_MS)
+          });
+          // 404/409 = already gone/terminal: idempotent no-op. Only surface other
+          // non-ok statuses.
+          if (!res.ok && res.status !== 404 && res.status !== 409) {
+            const text = await res.text().catch(() => '');
+            throw new Error(`Encore job cancellation failed: ${res.status} ${text}`.trim());
           }
+        } catch (err) {
+          deliveryError = err;
         }
       }
 
       // (3) Record the terminal CANCELLED status so getJobStatus reports 'failed'.
       await redis.hset(keys.jobStatus(workspaceId), encoreJobId, 'CANCELLED');
+
+      // (4) #1219, the half that delivering the cancel does not fix: a FROZEN
+      // encode answers the cancel endpoint 200 "Ok" and keeps running, so the
+      // job never leaves Encore's active set and the scaler — which treats that
+      // set as real in-flight work — drains its instance forever instead of
+      // tearing it down. Record the cancel (with its timestamp, for the grace
+      // window) and stop routing new jobs to the instance, so scale-down can
+      // reclaim it once the job has demonstrably ignored the cancel. Destroying
+      // that instance is the only thing that stops a frozen ffmpeg, and doing it
+      // by hand is the workaround the issue reports. Best-effort by contract:
+      // never fails the cancel. See src/encore-scaler/cancelled-job-reclaim.ts.
+      if (encoreJobUrl) {
+        const instanceId = await resolveJobInstanceId(redis, workspaceId, encoreJobId).catch(
+          () => undefined
+        );
+        await recordOperatorCancel(redis, workspaceId, encoreJobId, instanceId);
+      }
+
+      if (deliveryError) throw deliveryError;
     }
   };
 }

@@ -15,7 +15,7 @@
       "readme.md": "a150ef08af156164a48acf98d27eae456ad25fa51efdc3e8de3af65e846e30cc",
       "docker-entrypoint.sh": "ec4c524f7bfa41ab03d0f4989446a061a4a4f7429f8362231a855dad274f5925"
     },
-    "liveFetchStatus": "NOT ATTEMPTED — no OSC credential or OSC tool surface was available in the environment that recorded this contract on 2026-10-14, so no job was created and no /logs/:name response was captured. Every `requiresLiveRun: true` field below is therefore unanswered, not answered-and-recorded. See docs/investigations/1191-ffmpeg-s3-scene-cut-timestamps.md and the agents-repo friction log incoming-ffmpeg-s3-job-log-discards-ffmpeg-stderr-on-success.md.",
+    "liveFetchStatus": "ATTEMPTED 2026-10-28 (issue #1192, run by birme's Claude session at the maintainer's request) against a MinIO instance on the OSC prod environment. Two jobs were created, polled to a terminal status, read back, and removed. The first-run 2026-10-14 'NOT ATTEMPTED' note is superseded for `sceneCutReadback.viaS3Object`; the other `requiresLiveRun: true` fields not exercised by that run remain unanswered (see `openQuestionsRequiringALiveRun`).",
     "symbols": [
       {
         "symbol": "doFFmpeg",
@@ -143,7 +143,8 @@
       "truncatedOrPagedByPlatform": null,
       "truncationThresholdBytes": null,
       "truncationNote": "UNANSWERED. Whether the OSC job-log route truncates, pages, or ring-buffers a long log — and at what size — is a platform property with no published contract and was not measured. Our own callers additionally cap what they RETAIN: src/pipeline/osc-job-log.ts MAX_LOG_CHARS = 4000, keeping the LAST 4000 characters; src/pipeline/osc-ffprobe.ts applies no cap of its own.",
-      "requiresLiveRun": true
+      "requiresLiveRun": true,
+      "observedOnExitZero": "2026-10-28 live run: the string returned by getLogsForInstance held only the wrapper's own lines (see `sceneCutReadback.viaS3Object.liveRun`), no ffmpeg stderr. Consistent with `carriesFfmpegStderr` above. A non-zero exit was not exercised, so the stderr-on-failure claim is still from source only."
     }
   },
   "sceneCutReadback": {
@@ -155,22 +156,108 @@
       "ifFfmpegExitedZero": "no showinfo lines in the log at all"
     },
     "viaS3Object": {
-      "verdict": "SUPPORTED BY THE UPLOADER, with one hard constraint",
+      "verdict": "CONFIRMED BY LIVE RUN (2026-10-28), with the one hard constraint above",
       "constraint": "The uploaded object must be ffmpeg's OWN muxer output: the single-file S3 branch uploads only the file whose basename equals the dest basename (src/ffmpeg.ts:337-345). A `-vf ...,metadata=print:file=scenes.txt` sidecar is written into the staging dir (cwd = stagingDir, src/ffmpeg.ts:224-226) but is NOT uploaded by that branch. The recursive branch (src/ffmpeg.ts:318-335, dest path ending in `/`) does upload it, at the cost of uploading the whole staging dir one prefix level above the dest.",
       "alsoRequires": "ffmpeg must exit 0, or uploadResult is never reached (src/ffmpeg.ts:28-29). So the command must be a well-formed real encode/mux, not `-f null -`.",
       "shapeThatFitsTheUploader": "-i s3://<bucket>/<key> -an -fps_mode passthrough -vf \"select='gt(scene,0.4)'\" -f framemd5 s3://<bucket>/<prefix>/<id>.framemd5 — the framemd5 muxer's own output lines carry the per-selected-frame pts plus a `#tb` timebase header, so the cut list IS the output file and the single-file upload branch applies unchanged.",
-      "requiresLiveRun": true,
-      "liveRunMustConfirm": [
-        "the Alpine ffmpeg build in the published image has the framemd5 muxer (Dockerfile:13 installs the distro package; the muxer set is not pinned)",
-        "`actualCmdString.replace(output, localOutputFile)` (src/ffmpeg.ts:190) rewrites the s3 output cleanly for this command (no earlier substring collision)",
-        "the job exits 0 and the object appears at the dest key"
-      ]
+      "requiresLiveRun": false,
+      "liveRunMustConfirmResolved": [
+        {
+          "item": "the Alpine ffmpeg build in the published image has the framemd5 muxer (Dockerfile:13 installs the distro package; the muxer set is not pinned)",
+          "result": "CONFIRMED. The published image's ffmpeg accepted `-f framemd5` and wrote the object; the object's own `#software` header reports `Lavf60.16.100`."
+        },
+        {
+          "item": "`actualCmdString.replace(output, localOutputFile)` (src/ffmpeg.ts:190) rewrites the s3 output cleanly for this command (no earlier substring collision)",
+          "result": "CONFIRMED. The job log's `Actual command string` shows the `s3://` output rewritten to `/usercontent/<staging>/<id>.framemd5` and the input rewritten to a presigned https URL; no substring collision."
+        },
+        {
+          "item": "the job exits 0 and the object appears at the dest key",
+          "result": "CONFIRMED. Both jobs reached `status: SuccessCriteriaMet`; the log ends with `Uploaded s3://<bucket>/<prefix>/<id>.framemd5` and the object is present at the dest key."
+        }
+      ],
+      "liveRun": {
+        "date": "2026-10-28",
+        "createJobBody": "name, cmdLineArgs, awsAccessKeyId (literal), awsSecretAccessKey (a `{{secrets.<name>}}` reference to a secret created under serviceId eyevinn-ffmpeg-s3), s3EndpointUrl",
+        "createJobResponseAndGetJobKeys": "createJob response keys: name, status, cmdLineArgs, awsAccessKeyId, awsSecretAccessKey, awsSessionToken, awsRegion, s3EndpointUrl. getJob adds `oscJob`. awsSessionToken and awsRegion appear as fields on the job object although this run did not send them.",
+        "finalStatusValue": "SuccessCriteriaMet (matches TERMINAL_STATUS in src/pipeline/osc-job-poll.ts)",
+        "runs": {
+          "with-cuts": {
+            "clip": "12s, 25fps, 640x360 H.264; four 3s segments (testsrc2, red, smptebars, blue) so hard cuts are at exactly 3s, 6s, 9s",
+            "cmdLineArgs": "-i s3://<bucket>/<prefix>/clip.mp4 -an -fps_mode passthrough -vf \"select='gt(scene,0.4)'\" -f framemd5 s3://<bucket>/<prefix>/clip.framemd5",
+            "finalJobStatus": "SuccessCriteriaMet",
+            "objectKey": "<prefix>/clip.framemd5",
+            "objectBytes": 455,
+            "objectVerbatim": [
+              "#format: frame checksums",
+              "#version: 2",
+              "#hash: MD5",
+              "#software: Lavf60.16.100",
+              "#tb 0: 1/25",
+              "#media_type 0: video",
+              "#codec_id 0: rawvideo",
+              "#dimensions 0: 640x360",
+              "#sar 0: 1/1",
+              "#stream#, dts,        pts, duration,     size, hash",
+              "0,         75,         75,        1,   345600, b6bdf78425c71ed0f9dc99bdd3d6467c",
+              "0,        150,        150,        1,   345600, 9e3b46ee66ea2374c8d7b200f5d3ca87",
+              "0,        225,        225,        1,   345600, 29a653044efdf73bae6681f875a750ac"
+            ],
+            "jobLogVerbatimRedacted": [
+              "Running ffmpeg with command: -i s3://<bucket>/<prefix>/clip.mp4 -an -fps_mode passthrough -vf \"select='gt(scene,0.4)'\" -f framemd5 s3://<bucket>/<prefix>/clip.framemd5",
+              "Generating signed URL for S3 input: s3://<bucket>/<prefix>/clip.mp4",
+              "Output file: s3://<bucket>/<prefix>/clip.framemd5",
+              "Staging directory: /usercontent/<staging>",
+              "Actual command string: -i https://<minio-endpoint>/<bucket>/<prefix>/clip.mp4?<PRESIGNED-QUERY-REDACTED: X-Amz-Algorithm, X-Amz-Credential, X-Amz-Date, X-Amz-Expires=21600, X-Amz-SignedHeaders=host, X-Amz-Signature> -an -fps_mode passthrough -vf \"select='gt(scene,0.4)'\" -f framemd5 /usercontent/<staging>/clip.framemd5",
+              "cmdString: -i https://<minio-endpoint>/<bucket>/<prefix>/clip.mp4?<PRESIGNED-QUERY-REDACTED: X-Amz-Algorithm, X-Amz-Credential, X-Amz-Date, X-Amz-Expires=21600, X-Amz-SignedHeaders=host, X-Amz-Signature> -an -fps_mode passthrough -vf \"select='gt(scene,0.4)'\" -f framemd5 /usercontent/<staging>/clip.framemd5",
+              "Uploaded s3://<bucket>/<prefix>/clip.framemd5"
+            ]
+          },
+          "zero-cut": {
+            "clip": "3s, 25fps, 640x360 H.264; a single solid-green segment, no cuts",
+            "cmdLineArgs": "-i s3://<bucket>/<prefix>/nocut.mp4 -an -fps_mode passthrough -vf \"select='gt(scene,0.4)'\" -f framemd5 s3://<bucket>/<prefix>/nocut.framemd5",
+            "finalJobStatus": "SuccessCriteriaMet",
+            "objectKey": "<prefix>/nocut.framemd5",
+            "objectBytes": 218,
+            "objectVerbatim": [
+              "#format: frame checksums",
+              "#version: 2",
+              "#hash: MD5",
+              "#software: Lavf60.16.100",
+              "#tb 0: 1/12800",
+              "#media_type 0: video",
+              "#codec_id 0: rawvideo",
+              "#dimensions 0: 640x360",
+              "#sar 0: 1/1",
+              "#stream#, dts,        pts, duration,     size, hash"
+            ],
+            "jobLogVerbatimRedacted": [
+              "Running ffmpeg with command: -i s3://<bucket>/<prefix>/nocut.mp4 -an -fps_mode passthrough -vf \"select='gt(scene,0.4)'\" -f framemd5 s3://<bucket>/<prefix>/nocut.framemd5",
+              "Generating signed URL for S3 input: s3://<bucket>/<prefix>/nocut.mp4",
+              "Output file: s3://<bucket>/<prefix>/nocut.framemd5",
+              "Staging directory: /usercontent/<staging>",
+              "Actual command string: -i https://<minio-endpoint>/<bucket>/<prefix>/nocut.mp4?<PRESIGNED-QUERY-REDACTED: X-Amz-Algorithm, X-Amz-Credential, X-Amz-Date, X-Amz-Expires=21600, X-Amz-SignedHeaders=host, X-Amz-Signature> -an -fps_mode passthrough -vf \"select='gt(scene,0.4)'\" -f framemd5 /usercontent/<staging>/nocut.framemd5",
+              "cmdString: -i https://<minio-endpoint>/<bucket>/<prefix>/nocut.mp4?<PRESIGNED-QUERY-REDACTED: X-Amz-Algorithm, X-Amz-Credential, X-Amz-Date, X-Amz-Expires=21600, X-Amz-SignedHeaders=host, X-Amz-Signature> -an -fps_mode passthrough -vf \"select='gt(scene,0.4)'\" -f framemd5 /usercontent/<staging>/nocut.framemd5",
+              "Uploaded s3://<bucket>/<prefix>/nocut.framemd5"
+            ]
+          }
+        },
+        "findings": [
+          "THE TIMEBASE IS NOT FIXED. The `#tb 0:` header is the stream timebase of the source: `1/25` for the multi-segment clip, `1/12800` for the single-segment mp4. A parser MUST read `#tb` and compute seconds = pts * num / den; it must not assume 1/25 or any constant.",
+          "Row columns are `stream#, dts, pts, duration, size, hash`; the pts column is the third. Only frames selected by `select='gt(scene,0.4)'` appear.",
+          "The first frame of the stream is NOT listed as a cut. For the 12s clip with cuts at 3s, 6s and 9s the object has exactly three rows, pts 75, 150, 225 at 1/25 = 3s, 6s, 9s.",
+          "A clip with no scene change produces a HEADER-ONLY object: the `#...` header lines and the `#stream#, dts, pts, ...` column line, and zero data rows. The job still exits 0 and uploads the object (218 bytes here). ADR-027 D3's zero-cut rule can rely on this.",
+          "Object location: exactly the dest key given in cmdLineArgs. The job applies no lifecycle or expiry; the object persists until something deletes it. The platform's job removal (`removeJob`) does not remove it.",
+          "The object is the only place the cuts appear. The log of an exit-0 job holds only the wrapper's own lines (`Running ffmpeg with command`, `Generating signed URL for S3 input`, `Output file`, `Staging directory`, `Actual command string`, `cmdString`, `Uploaded ...`); no `showinfo` or `pts_time` lines.",
+          "SECURITY NOTE: the job log contains the presigned input URL in full, including `X-Amz-Signature`, valid for `X-Amz-Expires=21600` (6 hours), twice (`Actual command string` and `cmdString`). Anyone who can read the log can fetch the source for 6 hours. The logs above are redacted. Callers that retain or forward job logs (src/pipeline/osc-job-log.ts) should redact `X-Amz-Signature` and `X-Amz-Credential` first.",
+          "Test inputs were generated locally and the test objects were deleted after the run; the job instances were removed with `removeJob`."
+        ]
+      }
     }
   },
   "openQuestionsRequiringALiveRun": [
-    "Are showinfo/pts_time lines present in the log of a job whose ffmpeg exited 0? Source says NO (src/ffmpeg.ts:224-235); a live run is only needed to confirm the platform adds nothing of its own.",
+    "Are showinfo/pts_time lines present in the log of a job whose ffmpeg exited 0? PARTLY ANSWERED 2026-10-28: the log of an exit-0 `framemd5` job held no showinfo/pts_time lines and no ffmpeg stderr at all. A `showinfo` command itself was not run.",
     "Does the job log truncate or page on a long video, and at what size?",
     "Does /logs/:name return the container's stderr stream as well as stdout? (The repo records the probe parse working in production, which implies yes for console.error, but no capture is recorded here.)",
-    "Does the framemd5-to-S3 shape above complete and upload?"
+    "ANSWERED 2026-10-28: yes. The framemd5-to-S3 shape completes, exits 0 and uploads; see `sceneCutReadback.viaS3Object.liveRun`."
   ]
 }

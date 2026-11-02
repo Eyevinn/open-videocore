@@ -170,6 +170,67 @@ test('notify: a failing notifier does not fail the cycle', async () => {
   assert.equal(store.get(C1).status, 'green');
 });
 
+// #1248: a suite run that ends infra-error says nothing about the image, so the cycle runs the suite once more
+// before it records a verdict.
+const infraSuite = (detail = 'transcode request answered HTTP 504') => ({
+  suiteVersion: 'v1', status: 'infra-error', build: {}, cases: [{ id: 'transcode', status: 'fail', failureClass: 'infra', detail }],
+});
+const greenSuite = () => ({ suiteVersion: 'v1', status: 'green', build: {}, cases: [{ id: 'transcode', status: 'pass' }] });
+
+test('a suite that ends infra-error is retried once; a green second run is what gets recorded', async () => {
+  let n = 0;
+  const { d, store } = deps({ runSuite: async () => (++n === 1 ? infraSuite() : greenSuite()) });
+  const r = await runCycle(d);
+  assert.equal(n, 2);
+  assert.equal(r.status, 'green');
+  assert.equal(r.suiteAttempts, 2);
+  assert.match(r.retriedAfter, /transcode: transcode request answered HTTP 504/);
+  assert.equal(store.get(C1).status, 'green');
+});
+
+test('a retry that ends red records red', async () => {
+  let n = 0;
+  const { d, store } = deps({ runSuite: async () => (++n === 1 ? infraSuite() : { suiteVersion: 'v1', status: 'red', build: {}, cases: [{ id: 'transcode', status: 'fail' }] }) });
+  const r = await runCycle(d);
+  assert.equal(r.status, 'red');
+  assert.equal(r.suiteAttempts, 2);
+  assert.equal(store.get(C1).status, 'red');
+});
+
+test('two infra-error runs are recorded infra-error, which is not final: the next cycle tries the same commit again', async () => {
+  let n = 0;
+  const { d, store } = deps({ runSuite: async () => { n++; return infraSuite(); } });
+  const r = await runCycle(d);
+  assert.equal(n, 2, 'one retry only');
+  assert.equal(r.status, 'infra-error');
+  assert.equal(r.suiteAttempts, 2);
+  assert.equal(store.get(C1).status, 'infra-error');
+  const again = await runCycle({ ...d, runSuite: async () => greenSuite() }); // the record did not block the commit
+  assert.equal(again.status, 'green');
+  assert.equal(again.suiteAttempts, 1);
+});
+
+test('a red suite is not retried', async () => {
+  let n = 0;
+  const { d } = deps({ runSuite: async () => { n++; return { suiteVersion: 'v1', status: 'red', build: {}, cases: [{ id: 'package', status: 'fail' }] }; } });
+  const r = await runCycle(d);
+  assert.equal(n, 1);
+  assert.equal(r.suiteAttempts, 1);
+  assert.equal(r.retriedAfter, undefined);
+});
+
+test('the retried-away platform failure is kept on the record, with its secrets masked', async () => {
+  let n = 0;
+  const { d, store } = deps({
+    secrets: ['hunter2-secret-value'],
+    runSuite: async () => (++n === 1 ? infraSuite('HTTP 504 for key hunter2-secret-value') : greenSuite()),
+  });
+  assert.equal((await runCycle(d)).status, 'green');
+  const stored = store.get(C1);
+  assert.match(stored.retriedAfter, /HTTP 504/);
+  assert.equal(JSON.stringify(stored).includes('hunter2-secret-value'), false);
+});
+
 test('notify: a skipped cycle does not notify', async () => {
   const sent = [];
   const { d, store } = deps({ notify: async (r) => { sent.push(r.status); } });

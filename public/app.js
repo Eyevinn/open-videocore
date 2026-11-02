@@ -36,6 +36,10 @@ import { applyThumbnail } from './thumbnail-url.js';
 // button; slugs are shown under their own "Slug" header. Contract grounding for
 // which value each endpoint accepts lives in public/copy-id.js.
 import { copyableIdCellHtml, slugCellHtml, wireCopyIdButtons } from './copy-id.js';
+// Running-build indicator (issue #828). Reads the build identity of the live
+// deployment from GET /health and renders it in the header. Contract grounding
+// for the /health `build` object lives in public/build-info.js.
+import { initBuildIndicator } from './build-info.js';
 // Shared detail-panel primitives (issue #963): the collapsed "Raw" disclosure
 // that holds the full server record, and the copyable field value built on the
 // copy-id.js control. Factored out because the pipeline-execution detail view
@@ -58,6 +62,11 @@ import { renderAttemptHistory } from './job-attempts.js';
 // public/lock-state.js (#894) and public/lock-detail.js; the contract grounding
 // for PUT/DELETE /assets/{id}/lock is in the latter's header.
 import { mountDeleteProtection } from './lock-detail.js';
+// Pipelines-tab catalog filter (issue #831). The active pipeline filter on the
+// executions list is written to / read from the URL through the SAME shared
+// URL-state contract every ops table already uses (public/table-url-state.js,
+// issues #368/#373) rather than a second, tab-local query-param parser.
+import { encodeTableState } from './table-url-state.js';
 
 // Blocked-archive explanation (issue #896), implementing
 // docs/ux/asset-lock-state-spec.md §5. Classifies the 409 from
@@ -121,6 +130,13 @@ import { mountAssetClip } from './asset-clip.js';
 // Full contract grounding, including why membership (`assetIds`) can neither be
 // sent nor affected, is in that module's header.
 import { mountCollectionRename } from './collection-rename.js';
+// The collection detail panel's "Edit metadata" action (issue #862): the
+// affordance for `description`, `tags` and `custom` — the three descriptive
+// fields PATCH /api/v1/collections/{id} has accepted since issue #560 but which
+// nothing in this UI could set. The body is built in ONE place inside that
+// module (`collectionEditPatchBody`), which only ever writes those three keys,
+// so the edit path can never send `assetIds`.
+import { mountCollectionEdit } from './collection-edit.js';
 
 // Read-only tracks panel (issue #902, broken out of #794): one section per track
 // kind — video, audio, subtitle — each listing only the attributes the API
@@ -789,6 +805,39 @@ function renderStorageBackendsList(backends) {
 // the UI (a stricter-than-API client constraint is safe — the API still accepts
 // it). Everything is framework-free so the field/validation logic is directly
 // unit-testable.
+//
+// ─── The three remaining registration fields (issue #870) ────────────────────
+//
+// Re-verified against the CURRENT contract (per CLAUDE.md rule 7) — the six
+// fields above are only two thirds of what the endpoint accepts:
+//   - POST /api/v1/storage/backends body = `registerBackendSchema`,
+//     src/routes/storage.ts:129-141 (nine properties, mirrored verbatim in
+//     openapi.json "/api/v1/storage/backends".post.requestBody; required there
+//     is exactly name/bucket/accessKeyId/secretAccessKey). The three this form
+//     never offered:
+//       role          storage.ts:133  z.enum(['source','packaged','both','archive']).default('both')
+//       sessionToken  storage.ts:139  z.string().min(1).optional()   — SECRET
+//       publicBaseUrl storage.ts:140  z.string().url().optional()
+//   - PATCH /api/v1/storage/backends/{id} = `updateBackendSchema`,
+//     src/routes/storage.ts:179-189 — carries the same three, all optional, so
+//     the edit form can offer them too; its `.refine` (:193-201) constrains only
+//     the accessKeyId/secretAccessKey pair, never the session token.
+//   - The redacted view `backendViewSchema` (src/routes/storage.ts:150-168)
+//     returns `role`, `publicBaseUrl` and `hasSessionToken`, and models a
+//     registered session token as the SAME `'***redacted***'` marker as the
+//     secret key (`credentials.sessionToken`, :166) — so the token gets exactly
+//     the secret-field treatment: password input, never seeded from a response,
+//     never cached.
+//   - `publicBaseUrl` is what makes packaged output publicly playable from a
+//     backend: GET /api/v1/assets/{id}/delivery resolves the packaged-role
+//     backend's public origin through `externalPublicBaseUrl(stackStorage
+//     ?.packaged)` (src/routes/assets.ts:4751) and emits URLs on that origin
+//     instead of falling through to the authorized stream proxy. The help text
+//     says so, because an operator cannot infer it from the field name.
+//
+// All three are optional in the schema, so an operator who ignores them
+// registers exactly what they register today (an omitted `role` is defaulted to
+// 'both' server-side, which is also what the select pre-selects).
 const STORAGE_SECRET_PLACEHOLDER = '••••••••  (unchanged)';
 
 // The six form fields in render order. `secret:true` marks the password input
@@ -803,6 +852,61 @@ const STORAGE_BACKEND_FORM_FIELDS = [
   { key: 'secretAccessKey', label: 'Secret access key', type: 'password', secret: true, placeholder: '' },
 ];
 
+// The four documented `role` values, in schema order, with operator-facing
+// copy. Mirrors `registerBackendSchema.role` (src/routes/storage.ts:133) and
+// `backendViewSchema.role` (:153) exactly — a value not in this list is a value
+// the API would 422.
+const STORAGE_BACKEND_ROLE_OPTIONS = [
+  { value: 'source', label: 'source — holds ingested source bytes' },
+  { value: 'packaged', label: 'packaged — holds packaged/delivery output' },
+  { value: 'both', label: 'both — source and packaged (default)' },
+  { value: 'archive', label: 'archive — cold destination for relocated sources' },
+];
+const STORAGE_BACKEND_ROLE_VALUES = STORAGE_BACKEND_ROLE_OPTIONS.map((o) => o.value);
+const STORAGE_BACKEND_DEFAULT_ROLE = 'both';
+
+// The three optional fields added by issue #870, rendered as their own group
+// after the required six. They deliberately do NOT carry the
+// `storage-backend-input` class: that class names the required core six (the
+// submit path reads every control by `[data-field]`, so the group is fully
+// wired either way), and keeping it stable means a form with these three
+// untouched is byte-for-byte the registration it is today.
+//   control: 'select' | 'input'; `secret:true` gets the secretAccessKey
+//   treatment; `help` renders as an aria-describedby hint.
+const STORAGE_BACKEND_OPTIONAL_FIELDS = [
+  {
+    key: 'role',
+    label: 'Role',
+    control: 'select',
+    options: STORAGE_BACKEND_ROLE_OPTIONS,
+    defaultValue: STORAGE_BACKEND_DEFAULT_ROLE,
+    help: 'Which side of the pipeline this backend serves. Defaults to "both"; '
+      + 'pick "archive" for a cold tier that only receives relocated sources.',
+  },
+  {
+    key: 'publicBaseUrl',
+    label: 'Public base URL (optional)',
+    control: 'input',
+    type: 'url',
+    placeholder: 'https://cdn.example.com/media',
+    help: 'The public origin this bucket is served from — a CDN or gateway in '
+      + 'front of it. Setting it is what makes packaged output playable '
+      + 'directly from this backend: /delivery then advertises URLs on this '
+      + 'origin instead of proxying the stream. Leave blank if the bucket is '
+      + 'not publicly readable.',
+  },
+  {
+    key: 'sessionToken',
+    label: 'Session token (optional)',
+    control: 'input',
+    type: 'password',
+    secret: true,
+    placeholder: '',
+    help: 'For temporary credentials (STS-style). Handled exactly like the '
+      + 'secret access key: never echoed back by the API and never cached here.',
+  },
+];
+
 // Pure, network-free validation of the raw field values (issue #681). `mode` is
 // 'add' | 'edit'. Returns { valid, errors, patch/body }. Error messages are
 // actionable per the acceptance criteria. On 'edit' an untouched secret (empty
@@ -811,7 +915,7 @@ const STORAGE_BACKEND_FORM_FIELDS = [
 // one without the other — updateBackendSchema.refine, storage.ts:190-201).
 function validateStorageBackendForm(mode, values) {
   const v = {};
-  for (const f of STORAGE_BACKEND_FORM_FIELDS) {
+  for (const f of STORAGE_BACKEND_FORM_FIELDS.concat(STORAGE_BACKEND_OPTIONAL_FIELDS)) {
     v[f.key] = typeof values[f.key] === 'string' ? values[f.key].trim() : '';
   }
   const errors = {};
@@ -848,21 +952,60 @@ function validateStorageBackendForm(mode, values) {
     errors.secretAccessKey = 'Secret access key is required.';
   }
 
+  // ── The three optional fields (issue #870) ──────────────────────────────────
+  // None of them is ever required, in either mode: all three are `.optional()`
+  // (or `.default()`) in registerBackendSchema (src/routes/storage.ts:133,139,
+  // 140), so an empty value must produce no error AND must not appear in the
+  // body — an omitted field is exactly today's registration.
+
+  // role: only the four enum members are sendable. An empty value is "let the
+  // server default it to 'both'" (storage.ts:133), which is what the select
+  // pre-selects anyway, so both paths register identically.
+  if (v.role && !STORAGE_BACKEND_ROLE_VALUES.includes(v.role)) {
+    errors.role = 'Role must be one of: ' + STORAGE_BACKEND_ROLE_VALUES.join(', ') + '.';
+  }
+
+  // publicBaseUrl: z.string().url() server-side (storage.ts:140). Same
+  // friendlier, protocol-specific message as endpointUrl.
+  if (v.publicBaseUrl && !/^https?:\/\/.+/i.test(v.publicBaseUrl)) {
+    errors.publicBaseUrl = 'Public base URL must start with http:// or https://';
+  } else if (v.publicBaseUrl && !errors.publicBaseUrl) {
+    try {
+      // eslint-disable-next-line no-new
+      new URL(v.publicBaseUrl);
+    } catch (_) {
+      errors.publicBaseUrl = 'Public base URL is not a valid URL.';
+    }
+  }
+
+  // sessionToken: z.string().min(1).optional() (storage.ts:139) — no format to
+  // check, and (like secretAccessKey) a blank value on edit means "leave the
+  // stored token alone", so there is nothing to reject.
+  const sessionTokenTyped = v.sessionToken.length > 0;
+
   const valid = Object.keys(errors).length === 0;
   if (!valid) return { valid: false, errors: errors };
+
+  // Append the optional trio to a body, each only when the operator supplied it.
+  function withOptional(target) {
+    if (v.role) target.role = v.role;
+    if (v.publicBaseUrl) target.publicBaseUrl = v.publicBaseUrl;
+    if (sessionTokenTyped) target.sessionToken = v.sessionToken;
+    return target;
+  }
 
   if (isAdd) {
     return {
       valid: true,
       errors: {},
-      body: {
+      body: withOptional({
         name: v.name,
         endpointUrl: v.endpointUrl,
         bucket: v.bucket,
         region: v.region,
         accessKeyId: v.accessKeyId,
         secretAccessKey: v.secretAccessKey,
-      },
+      }),
     };
   }
 
@@ -878,7 +1021,7 @@ function validateStorageBackendForm(mode, values) {
     body.accessKeyId = v.accessKeyId;
     body.secretAccessKey = v.secretAccessKey;
   }
-  return { valid: true, errors: {}, body: body };
+  return { valid: true, errors: {}, body: withOptional(body) };
 }
 
 // Pure render of the add/edit form (issue #681). Framework-free and network-free
@@ -954,6 +1097,93 @@ function renderStorageBackendForm(mode, backend) {
 
     form.appendChild(fieldWrap);
   });
+
+  // ── Optional registration fields (issue #870) ───────────────────────────────
+  // role / publicBaseUrl / sessionToken. Grouped in their own <fieldset> with a
+  // <legend> so AT announces them as one set of optional extras rather than
+  // three more required-looking inputs, and so an operator who does not need
+  // them can skip the group in one go. Every control is labelled, and every
+  // help text is wired through aria-describedby (WCAG 2.1 AA: 1.3.1, 3.3.2).
+  const optionalGroup = document.createElement('fieldset');
+  optionalGroup.className = 'storage-backend-optional-group';
+  const legend = document.createElement('legend');
+  legend.textContent = 'Optional';
+  optionalGroup.appendChild(legend);
+
+  STORAGE_BACKEND_OPTIONAL_FIELDS.forEach(function(f) {
+    const fieldWrap = document.createElement('div');
+    fieldWrap.className = 'form-field storage-backend-field storage-backend-optional-field';
+
+    const inputId = 'sbf-' + f.key;
+    const hintId = inputId + '-hint';
+    const label = document.createElement('label');
+    label.setAttribute('for', inputId);
+    label.textContent = f.label;
+    fieldWrap.appendChild(label);
+
+    let control;
+    if (f.control === 'select') {
+      control = document.createElement('select');
+      f.options.forEach(function(o) {
+        const opt = document.createElement('option');
+        opt.value = o.value;
+        opt.textContent = o.label;
+        control.appendChild(opt);
+      });
+      // Pre-select the backend's current role on edit (it is in the redacted
+      // view, backendViewSchema.role storage.ts:153); on add, the schema default
+      // 'both' — so a form the operator never touches registers what it does
+      // today.
+      const current = isEdit && typeof b.role === 'string'
+        && STORAGE_BACKEND_ROLE_VALUES.includes(b.role)
+        ? b.role
+        : (f.defaultValue || STORAGE_BACKEND_DEFAULT_ROLE);
+      control.value = current;
+    } else {
+      control = document.createElement('input');
+      control.type = f.type;
+      if (f.secret) {
+        // Same treatment as secretAccessKey: never seeded from a response (the
+        // API returns the token as the '***redacted***' marker, storage.ts:166),
+        // never offered to the password manager, blank on edit = leave stored
+        // token unchanged.
+        control.value = '';
+        control.autocomplete = 'new-password';
+        control.placeholder = isEdit && b.hasSessionToken === true
+          ? STORAGE_SECRET_PLACEHOLDER
+          : (f.placeholder || '');
+      } else {
+        control.value = isEdit && b[f.key] != null ? String(b[f.key]) : '';
+        control.placeholder = f.placeholder || '';
+      }
+    }
+    control.id = inputId;
+    control.name = f.key;
+    // NOT `storage-backend-input`: that class names the required core six.
+    control.className = 'storage-backend-optional-input';
+    control.dataset.field = f.key;
+    control.required = false;
+    control.setAttribute('aria-describedby', hintId);
+    fieldWrap.appendChild(control);
+
+    const hint = document.createElement('div');
+    hint.id = hintId;
+    hint.className = 'form-hint';
+    hint.textContent = f.secret && isEdit && b.hasSessionToken === true
+      ? 'Leave blank to keep the stored session token. Type a new value to replace it. ' + f.help
+      : f.help;
+    fieldWrap.appendChild(hint);
+
+    const errEl = document.createElement('div');
+    errEl.className = 'form-error';
+    errEl.dataset.errorFor = f.key;
+    errEl.setAttribute('role', 'alert');
+    fieldWrap.appendChild(errEl);
+
+    optionalGroup.appendChild(fieldWrap);
+  });
+
+  form.appendChild(optionalGroup);
 
   // Actions row: Save, Test connection, Cancel + inline result/status areas.
   const actions = document.createElement('div');
@@ -3333,12 +3563,18 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     // No auth header needed, so use a plain fetch rather than apiFetch.
     // Fall back to the known-good 'program' profile if the fetch fails or is empty.
     var encodeProfiles = ['program'];
+    // Declared SpEL parameters per profile, derived from the `items[].yaml` the
+    // SAME list response carries (issue #869). Empty object = nothing in the
+    // picker is parametrised, which is also what an older deployment or a stub
+    // without `items` yields.
+    var profileParams = {};
     try {
       const profilesResp = await fetch('/api/v1/profiles');
       if (profilesResp.ok) {
         const profilesData = await profilesResp.json();
         if (profilesData && Array.isArray(profilesData.profiles) && profilesData.profiles.length > 0) {
           encodeProfiles = profilesData.profiles;
+          profileParams = profileParamsIndex(profilesData.items);
         } else {
           console.warn('GET /profiles returned no profiles; falling back to default ["program"]');
         }
@@ -3396,7 +3632,14 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       pipelineOptions,
       '</select>',
       '<select id="profile-select" class="input" title="Encode profile (for pipelines with a transcode step)">',
-      encodeProfiles.map(function(p) { return '<option value="' + escHtml(p) + '">' + escHtml(p) + '</option>'; }).join(''),
+      // A parametrised profile is marked in the option itself (issue #869), so
+      // the operator can tell there is something to set BEFORE running. The
+      // value stays the bare profile name — that is what `profile` carries.
+      encodeProfiles.map(function(p) {
+        return '<option value="' + escHtml(p) + '"' +
+          ' title="' + escHtml(profileOptionTitle(p, profileParams[p])) + '">' +
+          escHtml(profileOptionLabel(p, profileParams[p])) + '</option>';
+      }).join(''),
       '</select>',
       '<button id="btn-run-pipeline" class="btn-ghost">Run Pipeline</button>',
     ].join('');
@@ -3435,11 +3678,39 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       }
     }
 
+    // Host for the selected profile's parameter form (issue #869). Sits under
+    // the run row so the fields read as belonging to the profile above them.
+    const profileParamsDiv = document.createElement('div');
+    profileParamsDiv.id = 'profile-params-area';
+    body.appendChild(profileParamsDiv);
+
+    // Draw (or clear) the parameter form for whatever is selected now. Nothing
+    // is drawn when the pipeline has no transcode step, or when the chosen
+    // profile declares no params — so the control is unchanged for every
+    // non-parametrised profile.
+    function updateProfileParams() {
+      var hasTranscode = ENCODE_PIPELINES.indexOf(pipelineSel.value) !== -1;
+      var params = hasTranscode ? profileParams[profileSel.value] : null;
+      var wanted = params && params.length > 0 ? profileSel.value : '';
+      // Idempotent for an unchanged selection: the run handler calls this from
+      // its `finally`, and a rejected run must not throw away the values that
+      // caused the rejection — nor the inline message explaining them.
+      if (profileParamsDiv.dataset.paramsProfile === wanted) return;
+      profileParamsDiv.dataset.paramsProfile = wanted;
+      var fieldset = renderProfileParamsForm(profileParamsDiv, profileSel.value, params);
+      // The hint only exists while the form does, so the picker points at it
+      // only then — a dangling aria-describedby would reference nothing.
+      if (fieldset) profileSel.setAttribute('aria-describedby', 'profile-params-hint');
+      else profileSel.removeAttribute('aria-describedby');
+    }
+
     function updateProfileVisibility() {
       var hasTranscode = ENCODE_PIPELINES.indexOf(pipelineSel.value) !== -1;
       profileSel.style.display = hasTranscode ? '' : 'none';
+      updateProfileParams();
     }
     pipelineSel.addEventListener('change', updateProfileVisibility);
+    profileSel.addEventListener('change', updateProfileParams);
     updateProfileVisibility();
 
     // Action buttons — static labels, no dynamic content
@@ -3512,6 +3783,19 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       var hasTranscode = ENCODE_PIPELINES.indexOf(pipeline) !== -1;
       var body2 = { pipeline: pipeline };
       if (hasTranscode) body2.profile = profileSel.value;
+      // Parametrised profile overrides (issue #869). Flat string map, top-level
+      // sibling of `profile` (openapi.json
+      // .paths["/api/v1/assets/{id}/execute"].post.requestBody; schema source
+      // src/routes/assets.ts:433/376). Only EDITED fields are collected, and the
+      // key is omitted entirely when nothing was edited — so a run with no edits
+      // posts the same body as before and the profile's own defaults apply.
+      var paramInputs = profileParamsDiv.querySelectorAll('.profile-param-input');
+      var paramsError = profileParamsDiv.querySelector('#profile-params-error');
+      if (paramsError) paramsError.textContent = '';
+      if (hasTranscode) {
+        var editedParams = collectProfileParams(profileParamsDiv);
+        if (Object.keys(editedParams).length > 0) body2.profileParams = editedParams;
+      }
 
       // Loading state: disable the button (and selects) and show progress so the
       // user gets immediate feedback that the dispatch is in flight.
@@ -3519,6 +3803,7 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       runBtn.disabled = true;
       pipelineSel.disabled = true;
       profileSel.disabled = true;
+      [].forEach.call(paramInputs, function(input) { input.disabled = true; });
       runBtn.textContent = 'Running…';
       showMsg(actionMsg, 'Queuing pipeline…', 'info');
 
@@ -3536,10 +3821,19 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
         actionMsg.innerHTML = '';
         // err.message carries the API error detail (apiFetch extracts body.error/message).
         showMsg(actionMsg, 'Error: ' + err.message, 'error');
+        // A rejected parameter key is a problem with the fields, so the server's
+        // own sentence — which names the accepted key set for this profile
+        // (src/pipeline/profile-params.ts:132-138, surfaced as the 400
+        // `unknown_profile_params` body `message`) — is repeated next to them.
+        // role="alert" on that element announces it without moving focus.
+        if (paramsError && err.body && err.body.error === 'unknown_profile_params') {
+          paramsError.textContent = err.message;
+        }
       } finally {
         runBtn.disabled = false;
         pipelineSel.disabled = false;
         profileSel.disabled = false;
+        [].forEach.call(paramInputs, function(input) { input.disabled = false; });
         runBtn.textContent = prevLabel;
         updateProfileVisibility();
       }
@@ -5785,9 +6079,32 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
 
     const kvDiv = document.createElement('div');
     kvDiv.className = 'kv-grid';
+    // Descriptive metadata is READ here as well as written by the edit dialog
+    // (issue #862): the three fields are part of `collectionSchema`
+    // (src/routes/collections.ts:126-137 — `description?`, `tags?`, `custom?`)
+    // and arrive on GET /api/v1/collections/{id}, but this panel never showed
+    // them, so a saved value had nowhere to appear. Each row is rendered from
+    // the server's response, escaped as text; an absent field shows '—'.
+    const customEntries = coll.custom && typeof coll.custom === 'object' && !Array.isArray(coll.custom)
+      ? Object.keys(coll.custom)
+      : [];
     kvDiv.innerHTML = [
       '<span class="kv-key">ID</span><span class="kv-val text-mono">' + escHtml(coll.id) + '</span>',
       '<span class="kv-key">Name</span><span class="kv-val">' + escHtml(coll.name || '—') + '</span>',
+      '<span class="kv-key">Description</span><span class="kv-val" id="coll-description">' + escHtml(coll.description || '—') + '</span>',
+      '<span class="kv-key">Tags</span><span class="kv-val" id="coll-tags">' +
+        escHtml(Array.isArray(coll.tags) && coll.tags.length > 0 ? coll.tags.join(', ') : '—') +
+        '</span>',
+      '<span class="kv-key">Custom</span><span class="kv-val" id="coll-custom">' +
+        escHtml(
+          customEntries.length > 0
+            ? customEntries.map(function(k) {
+                const v = coll.custom[k];
+                return k + ': ' + (typeof v === 'string' ? v : JSON.stringify(v));
+              }).join(', ')
+            : '—'
+        ) +
+        '</span>',
       '<span class="kv-key">Created</span><span class="kv-val">' + escHtml(fmtDate(coll.createdAt)) + '</span>',
     ].join('');
     body.appendChild(kvDiv);
@@ -5848,11 +6165,48 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
       },
     });
 
-    // Rename is the only action in this row today, so for a role that cannot
-    // write (no control mounted) the row and its outcome area would be two empty
-    // boxes with margins. Take them back out rather than leaving dead chrome
-    // above the member list.
-    if (!collRename.button) {
+    // ── Edit metadata: description, tags and custom (issue #862) ──
+    //
+    // Contract, fetched before this call was written (CLAUDE.md rule 7) and
+    // cited in full in public/collection-edit.js:
+    //   PATCH /api/v1/collections/{id} — `description: z.string().optional()`,
+    //        `tags: z.array(z.string()).optional()`,
+    //        `custom: z.record(z.unknown()).optional()` on `updateBodySchema`
+    //        (src/routes/collections.ts:250-263, inside `.strict()` at :263;
+    //        wired at :423-444); 200 = the updated collection, 400/404 = { error }.
+    //   Every present key is applied WHOLESALE and an absent key is left alone
+    //        (collections.ts:241-249) — which is why `tags` is edited as a whole
+    //        list here rather than appended to, and why removing a tag is just a
+    //        shorter array.
+    //   Membership is never sent: the edit body is built only in
+    //        `collectionEditPatchBody`, which writes at most
+    //        description/tags/custom. `assetIds` stays on the add/remove
+    //        controls below (PUT/DELETE /:id/assets/:assetId).
+    // Same action row and the same write gate as the rename, so there is one
+    // place on this panel where a collection's own fields are edited.
+    const collEdit = mountCollectionEdit({
+      collection: coll,
+      actionsRow: collActionsDiv,
+      canChange: canRenameCollection(),
+      apiFetch: apiFetch,
+      openModal: openModal,
+      showMsg: showMsg,
+      messageHost: function () {
+        return detailPanel.querySelector('#coll-action-msg') ||
+          detailPanel.querySelector('#coll-detail-body');
+      },
+      onSaved: async function (updated, message) {
+        // Collection search hits carry description/tags/custom, and the list
+        // behind the panel may show tags, so refresh it too.
+        if (typeof onRefresh === 'function') onRefresh();
+        await rerenderCollectionThenMsg(message, updated ? 'success' : 'error');
+      },
+    });
+
+    // For a role that cannot write neither control is mounted, so the row and
+    // its outcome area would be two empty boxes with margins. Take them back out
+    // rather than leaving dead chrome above the member list.
+    if (!collRename.button && !collEdit.button) {
       collActionsDiv.remove();
       collActionMsg.remove();
     }
@@ -6137,6 +6491,228 @@ const SEARCH_SCOPE_HINT =
   'Full-text search across the whole workspace: assets and collections both match on ' +
   'name, description and tags. Container format matches assets only.';
 
+// ─── Search-tab metadata filter (issue #850) ─────────────────────────────────
+//
+// Free-form operator metadata is filterable on the search endpoint, but the tab
+// offered no field for it. Contract grounding (verified, per CLAUDE.md rule 7):
+//   - GET /api/v1/search/ — src/routes/search.ts, router doc block (the
+//     "Free-form operator metadata (issue #12)" paragraph at the head of the
+//     file): the params are `metadata.<key>=<value>`, e.g.
+//     `?metadata.genre=documentary&metadata.language=sv`.
+//   - `extractMetadataFilter` (src/routes/search.ts:255-270) is what actually
+//     reads them: it walks EVERY query key, keeps the ones prefixed
+//     `metadata.`, drops the prefix, skips a bare `metadata.` with an empty
+//     field name, and — critically — collapses a repeated param to its FIRST
+//     value (`Array.isArray(value) ? value[0] : value`). So one key carries one
+//     value; the serialiser below uses URLSearchParams.set, never append, so a
+//     duplicated key cannot ship a value the server will silently ignore.
+//   - Any number of pairs combine, and combine with the other filters: the
+//     extracted object is passed straight through as `metadata` alongside `q`,
+//     `tags`, `mimeType`, `status` and the rest in the single `repo.search({…})`
+//     call (src/routes/search.ts:377-394).
+//   - Matching is EXACT on both key and value — src/data/search-repo.ts:393-397
+//     rejects the asset unless `md[key] === value` for every pair, with `md` the
+//     asset's own `metadata` object. No casefolding, no substring, no prefix. The
+//     copy below says so, because a field that reads like free text here would
+//     return "no results" for an asset the operator can see has the value.
+//   - These params are NOT in openapi.json's parameter list for
+//     "/api/v1/search/" (verified: its `get.parameters[]` holds only q, tags,
+//     mimeType, status, from, to, tamsFlowId, tamsTimerange, page, pageSize) —
+//     a free-form key cannot be enumerated in a static spec. The route source
+//     cited above is therefore the contract of record for the param NAME.
+//   - There is no endpoint that lists which metadata keys exist, so the field is
+//     a plain key input, not a picker.
+const SEARCH_METADATA_LEGEND = 'Metadata (exact match)';
+const SEARCH_METADATA_HINT =
+  'Key and value must match exactly, including case — "genre" does not match "Genre", ' +
+  'and "doc" does not match "documentary". Use the key as stored, without a ' +
+  '"metadata." prefix. Every pair must match, on top of the filters above.';
+const SEARCH_METADATA_KEY_LABEL = 'Key';
+const SEARCH_METADATA_VALUE_LABEL = 'Exact value';
+const SEARCH_METADATA_KEY_PLACEHOLDER = 'genre';
+const SEARCH_METADATA_VALUE_PLACEHOLDER = 'documentary';
+const SEARCH_METADATA_ADD_LABEL = 'Add metadata filter';
+const SEARCH_METADATA_REMOVE_LABEL = 'Remove';
+
+// Serialise operator metadata pairs onto a search query string as
+// `metadata.<key>=<value>`, per extractMetadataFilter above. Returns `params`.
+//
+// Skips a pair whose key is empty (the server drops a bare `metadata.` anyway)
+// and a pair whose value is empty, so an untouched or half-filled row widens
+// nothing: `metadata.<key>=` would be an exact-match filter for the empty
+// string, which is a different search, not an absent one. Both sides are
+// trimmed, matching how this tab already reads q/tags/mimeType — a value
+// surrounded by whitespace is a typo, not an exact match the operator meant.
+// `set` (not `append`) because a repeated key would reach the server as an
+// array and lose everything after the first value.
+function appendMetadataFilterParams(params, pairs) {
+  (pairs || []).forEach(function(pair) {
+    const key = pair && pair.key != null ? String(pair.key).trim() : '';
+    const value = pair && pair.value != null ? String(pair.value).trim() : '';
+    if (!key || !value) return;
+    params.set('metadata.' + key, value);
+  });
+  return params;
+}
+
+// Read the metadata rows currently in the Search tab, in DOM order. Serialising
+// is left to appendMetadataFilterParams so the skip rules live in one place.
+function readSearchMetadataPairs(section) {
+  const rows = section ? section.querySelectorAll('.search-md-row') : [];
+  return [].map.call(rows, function(row) {
+    const keyInput = row.querySelector('.search-md-key');
+    const valueInput = row.querySelector('.search-md-value');
+    return {
+      key: keyInput ? keyInput.value : '',
+      value: valueInput ? valueInput.value : '',
+    };
+  });
+}
+
+// Unique ids for the per-row label/input pairs, so each input keeps a real
+// <label for> rather than a placeholder standing in for one.
+let searchMetadataRowSeq = 0;
+
+// One key/value row. `onRemove` is called with the row element after it is
+// detached, so the caller can keep the group non-empty and move focus.
+function searchMetadataRow(onRemove) {
+  const n = ++searchMetadataRowSeq;
+  const keyId = 'search-md-key-' + n;
+  const valueId = 'search-md-value-' + n;
+
+  const row = document.createElement('div');
+  row.className = 'form-row search-md-row';
+
+  function field(id, labelText, placeholder, inputClass) {
+    const wrap = document.createElement('div');
+    wrap.className = 'form-field grow';
+    const label = document.createElement('label');
+    label.setAttribute('for', id);
+    label.textContent = labelText;
+    // The visible word is short and repeats down the column; the row number is
+    // announced but not drawn, so every input still has a UNIQUE name.
+    const ordinal = document.createElement('span');
+    ordinal.className = 'visually-hidden';
+    ordinal.textContent = ' (metadata filter ' + n + ')';
+    label.appendChild(ordinal);
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.id = id;
+    input.className = inputClass;
+    input.placeholder = placeholder;
+    wrap.appendChild(label);
+    wrap.appendChild(input);
+    return { wrap: wrap, input: input };
+  }
+
+  const keyField = field(
+    keyId,
+    SEARCH_METADATA_KEY_LABEL,
+    SEARCH_METADATA_KEY_PLACEHOLDER,
+    'search-md-key'
+  );
+  const valueField = field(
+    valueId,
+    SEARCH_METADATA_VALUE_LABEL,
+    SEARCH_METADATA_VALUE_PLACEHOLDER,
+    'search-md-value'
+  );
+  row.appendChild(keyField.wrap);
+  row.appendChild(valueField.wrap);
+
+  const removeWrap = document.createElement('div');
+  removeWrap.className = 'form-field search-md-remove-field';
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'btn-sm search-md-remove';
+  remove.textContent = SEARCH_METADATA_REMOVE_LABEL;
+  // "Remove" alone is ambiguous once there are three of them.
+  remove.setAttribute('aria-label', 'Remove metadata filter ' + n);
+  remove.addEventListener('click', function() {
+    row.remove();
+    if (onRemove) onRemove(row);
+  });
+  removeWrap.appendChild(remove);
+  row.appendChild(removeWrap);
+
+  return { row: row, keyInput: keyField.input, valueInput: valueField.input, removeBtn: remove };
+}
+
+// The whole metadata group: a real fieldset/legend so the pairs are announced as
+// one control rather than a loose run of text boxes, the exact-match hint wired
+// with aria-describedby, the rows, and the add control. Mirrors the
+// fieldset/legend shape public/external-ids.js already uses for its two-field
+// form. Inserted into `section` before `beforeEl` (or appended when it is
+// absent) and returned.
+function renderSearchMetadataFilter(section, beforeEl) {
+  const fieldset = document.createElement('fieldset');
+  fieldset.className = 'search-md-fieldset';
+  fieldset.id = 'search-md';
+
+  const legend = document.createElement('legend');
+  legend.className = 'search-md-legend';
+  legend.textContent = SEARCH_METADATA_LEGEND;
+  fieldset.appendChild(legend);
+
+  const hint = document.createElement('div');
+  hint.className = 'form-hint';
+  hint.id = 'search-md-hint';
+  hint.textContent = SEARCH_METADATA_HINT;
+  fieldset.appendChild(hint);
+  fieldset.setAttribute('aria-describedby', 'search-md-hint');
+
+  const rows = document.createElement('div');
+  rows.className = 'search-md-rows';
+  rows.id = 'search-md-rows';
+  fieldset.appendChild(rows);
+
+  // Add/remove are a visual change with no text of their own, so the count is
+  // also stated for a screen reader.
+  const status = document.createElement('div');
+  status.className = 'visually-hidden';
+  status.id = 'search-md-status';
+  status.setAttribute('aria-live', 'polite');
+
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.className = 'btn-sm search-md-add';
+  addBtn.id = 'search-md-add';
+  addBtn.textContent = SEARCH_METADATA_ADD_LABEL;
+
+  function announce(text) {
+    status.textContent = text + ' ' + rows.children.length + ' metadata filters.';
+  }
+
+  function addRow(options) {
+    const built = searchMetadataRow(function() {
+      // Never leave the group empty: a removed last row comes back blank, so the
+      // field stays discoverable and a blank row still serialises to nothing.
+      if (rows.children.length === 0) {
+        addRow({ focus: true, announce: false });
+        announce('Metadata filter cleared.');
+        return;
+      }
+      const next = rows.querySelector('.search-md-key');
+      if (next && next.focus) next.focus();
+      announce('Metadata filter removed.');
+    });
+    rows.appendChild(built.row);
+    if (options && options.focus && built.keyInput.focus) built.keyInput.focus();
+    if (!options || options.announce !== false) announce('Metadata filter added.');
+    return built;
+  }
+
+  addBtn.addEventListener('click', function() { addRow({ focus: true }); });
+
+  // One empty row up front, so the filter is visible without a click.
+  addRow({ announce: false });
+
+  fieldset.appendChild(addBtn);
+  fieldset.appendChild(status);
+  section.insertBefore(fieldset, beforeEl || null);
+  return fieldset;
+}
+
 // Why this tab exists alongside the Assets tab's filter box (issue #948). The
 // two surfaces look alike now that both take structured filters, so the copy
 // has to carry the distinction. #913 above named the scope; this intro says why
@@ -6199,6 +6775,12 @@ async function renderSearchTab(container) {
   ].join('');
   container.appendChild(section);
 
+  // Repeatable `metadata.<key>=<value>` pairs (issue #850), built with the DOM
+  // API rather than appended to the markup above because the rows are added and
+  // removed at runtime. Inserted between the filter row and the results so the
+  // results stay last.
+  renderSearchMetadataFilter(section, section.querySelector('#search-results'));
+
   section.querySelector('#search-btn').addEventListener('click', async function() {
     const q = section.querySelector('#search-q').value.trim();
     const tags = section.querySelector('#search-tags').value.trim();
@@ -6212,6 +6794,9 @@ async function renderSearchTab(container) {
     if (q) params.set('q', q);
     if (tags) params.set('tags', tags);
     if (mime) params.set('mimeType', mime);
+    // Each filled pair becomes one `metadata.<key>=<value>`; blank rows and
+    // half-filled rows emit nothing (issue #850).
+    appendMetadataFilterParams(params, readSearchMetadataPairs(section));
 
     try {
       const res = await apiFetch('/search?' + params.toString());
@@ -6241,6 +6826,165 @@ async function renderSearchTab(container) {
 const WEBHOOK_EVENTS = ['asset.ready', 'transcode.complete', 'package.complete', 'asset.failed'];
 
 // ─── PROFILES TAB ────────────────────────────────────────────────────────────
+
+// ─── Profile YAML inline detail row (issue #832) ─────────────────────────────
+//
+// View YAML used to render into one shared `#pf-yaml-view` container below the
+// whole table, so with a full profile list the output landed off-screen and the
+// button read as dead; a second click silently replaced the first profile and
+// nothing could close the panel. The YAML now renders as an expanding detail
+// row inserted directly beneath the clicked profile row.
+//
+// Contract grounding (verified, per CLAUDE.md rule 7):
+//   - GET /api/v1/profiles — openapi.json .paths["/api/v1/profiles/"].get, 200
+//     body `{ profiles: string[], items: { name, yaml, runnable, createdAt,
+//     updatedAt }[] }` (all five item fields required). The table reads
+//     `items[].name` / `items[].updatedAt`.
+//   - GET /api/v1/profiles/{name} — openapi.json
+//     .paths["/api/v1/profiles/{name}"].get, 200 body
+//     `{ name, yaml, runnable, createdAt, updatedAt }`, 404 `{ error, message? }`.
+//     The detail row reads `name` and `yaml` from that 200 body.
+//   The spec carries no operationId for either operation (both are
+//   `operationId: null` in openapi.json), so the path + method above is the
+//   identifying reference.
+
+/** Max height of the bounded YAML scroll region, so a 242-line profile cannot
+ *  push the remaining table rows out of reach. */
+const PROFILE_YAML_MAX_HEIGHT = '18rem';
+
+let profileYamlRowSeq = 0;
+
+// The shell every detail row shares: a full-width cell titled with the profile
+// name and carrying its own Collapse button, so the panel can be closed from
+// where it is read and not only from the button that opened it. Returns the
+// `<tr>` and the cell its body goes into.
+function profileYamlRowShell(name, colSpan, onCollapse) {
+  const tr = document.createElement('tr');
+  tr.className = 'pf-yaml-row';
+  tr.id = 'pf-yaml-row-' + (++profileYamlRowSeq);
+  const td = document.createElement('td');
+  td.colSpan = colSpan > 0 ? colSpan : 1;
+  td.className = 'pf-yaml-cell';
+
+  const head = document.createElement('div');
+  head.className = 'pf-yaml-head';
+  const heading = document.createElement('span');
+  heading.className = 'pf-yaml-title';
+  // textContent throughout — a profile name is operator-supplied too.
+  heading.textContent = 'YAML — ' + name;
+  head.appendChild(heading);
+  const collapseBtn = document.createElement('button');
+  collapseBtn.type = 'button';
+  collapseBtn.className = 'btn-ghost pf-yaml-collapse-btn';
+  collapseBtn.textContent = 'Collapse';
+  collapseBtn.setAttribute('aria-label', 'Collapse YAML for ' + name);
+  collapseBtn.addEventListener('click', function() {
+    if (typeof onCollapse === 'function') onCollapse();
+  });
+  head.appendChild(collapseBtn);
+  td.appendChild(head);
+
+  tr.appendChild(td);
+  return { row: tr, body: td };
+}
+
+// Builds the `<tr>` that carries one profile's YAML, spanning the full table
+// width.
+function createProfileYamlDetailRow(profile, colSpan, onCollapse) {
+  const name = (profile && profile.name) || '';
+  const shell = profileYamlRowShell(name, colSpan, onCollapse);
+
+  const pre = document.createElement('pre');
+  pre.className = 'pf-yaml-pre';
+  pre.style.maxHeight = PROFILE_YAML_MAX_HEIGHT;
+  // Focusable + named so the bounded scroll region is reachable and scrollable
+  // by keyboard alone (WCAG 2.1 SC 2.1.1).
+  pre.tabIndex = 0;
+  pre.setAttribute('role', 'region');
+  pre.setAttribute('aria-label', 'YAML for profile ' + name);
+  // textContent — never innerHTML — so YAML content cannot inject markup.
+  pre.textContent = (profile && profile.yaml) || '';
+  shell.body.appendChild(pre);
+
+  return shell.row;
+}
+
+// Builds the detail row shown when the per-profile fetch fails. Same inline
+// placement as a successful expand, so the failure is seen where it happened
+// instead of in a container the operator has to scroll to find.
+function createProfileYamlErrorRow(name, message, colSpan, onCollapse) {
+  const shell = profileYamlRowShell(name, colSpan, onCollapse);
+  shell.row.classList.add('pf-yaml-row-error');
+
+  const err = document.createElement('div');
+  err.className = 'msg msg-error pf-yaml-error';
+  err.setAttribute('role', 'alert');
+  err.textContent = 'Could not load YAML for "' + name + '": ' + message;
+  shell.body.appendChild(err);
+
+  return shell.row;
+}
+
+// Wires every `.pf-view-btn` in a rendered profiles table as a disclosure for
+// its own row. Each row toggles independently: expanding a second profile never
+// discards the first. `loadProfileYaml(name)` resolves the profile document
+// (GET /api/v1/profiles/{name}); it is a parameter so a DOM test can drive the
+// real toggle without a network call.
+function wireProfileYamlToggles(tableWrap, loadProfileYaml) {
+  const colSpan = tableWrap.querySelectorAll('thead th').length || 1;
+  tableWrap.querySelectorAll('.pf-view-btn').forEach(function(btn) {
+    const name = btn.dataset.name || '';
+    btn.setAttribute('aria-expanded', 'false');
+    let detailRow = null;
+
+    function collapse() {
+      if (detailRow && detailRow.parentNode) detailRow.remove();
+      detailRow = null;
+      const row = btn.closest('tr');
+      if (row) row.classList.remove('pf-row-expanded');
+      btn.setAttribute('aria-expanded', 'false');
+      btn.removeAttribute('aria-controls');
+      btn.textContent = 'View YAML';
+      btn.setAttribute('aria-label', 'View YAML for ' + name);
+    }
+
+    function expand(newRow) {
+      const row = btn.closest('tr');
+      detailRow = newRow;
+      if (row && row.parentNode) {
+        row.parentNode.insertBefore(newRow, row.nextSibling);
+        row.classList.add('pf-row-expanded');
+      }
+      btn.setAttribute('aria-expanded', 'true');
+      btn.setAttribute('aria-controls', newRow.id);
+      btn.textContent = 'Hide YAML';
+      btn.setAttribute('aria-label', 'Hide YAML for ' + name);
+    }
+
+    btn.setAttribute('aria-label', 'View YAML for ' + name);
+    btn.addEventListener('click', async function() {
+      if (btn.dataset.pfLoading === '1') return;
+      if (btn.getAttribute('aria-expanded') === 'true') {
+        collapse();
+        return;
+      }
+      btn.dataset.pfLoading = '1';
+      const restoreLabel = btn.textContent;
+      btn.textContent = 'Loading…';
+      btn.setAttribute('aria-busy', 'true');
+      try {
+        const p = await loadProfileYaml(name);
+        expand(createProfileYamlDetailRow(p || { name: name }, colSpan, collapse));
+      } catch (err) {
+        expand(createProfileYamlErrorRow(name, err && err.message ? err.message : String(err), colSpan, collapse));
+      } finally {
+        delete btn.dataset.pfLoading;
+        btn.removeAttribute('aria-busy');
+        if (btn.getAttribute('aria-expanded') !== 'true') btn.textContent = restoreLabel;
+      }
+    });
+  });
+}
 
 // Encore transcoding profiles (issue #84). Profiles are persisted in CouchDB
 // and served to Encore via the public GET /api/v1/profiles/index.yml. This tab
@@ -6285,7 +7029,6 @@ async function renderProfilesTab(container) {
     '</div>',
     '<div id="pf-bootstrap-msg"></div>',
     '<div id="pf-list-wrap"></div>',
-    '<div id="pf-yaml-view"></div>',
   ].join('');
   container.appendChild(listSection);
 
@@ -6312,7 +7055,7 @@ async function renderProfilesTab(container) {
       return;
     }
     const rows = items.map(function(p) {
-      return '<tr>' +
+      return '<tr class="pf-row" data-name="' + escHtml(p.name) + '">' +
         '<td class="cell-id">' + escHtml(p.name) + '</td>' +
         '<td>' + escHtml(fmtDate(p.updatedAt)) + '</td>' +
         '<td>' +
@@ -6329,29 +7072,11 @@ async function renderProfilesTab(container) {
       '</table>';
     wrap.appendChild(tableWrap);
 
-    tableWrap.querySelectorAll('.pf-view-btn').forEach(function(btn) {
-      btn.addEventListener('click', async function() {
-        const view = listSection.querySelector('#pf-yaml-view');
-        view.innerHTML = '';
-        try {
-          const p = await apiFetch('/profiles/' + encodeURIComponent(btn.dataset.name));
-          const box = document.createElement('div');
-          box.className = 'section';
-          const pre = document.createElement('pre');
-          pre.style.whiteSpace = 'pre-wrap';
-          pre.style.fontFamily = 'monospace';
-          // textContent — never innerHTML — so YAML content cannot inject markup.
-          pre.textContent = p.yaml || '';
-          const head = document.createElement('div');
-          head.className = 'section-title';
-          head.textContent = 'YAML — ' + p.name;
-          box.appendChild(head);
-          box.appendChild(pre);
-          view.appendChild(box);
-        } catch (err) {
-          showMsg(view, 'Error: ' + err.message, 'error');
-        }
-      });
+    // View YAML is a per-row disclosure (issue #832): the YAML lands in a row
+    // directly beneath the profile that was clicked, each row toggles on its
+    // own, and the content sits in a bounded scroll region.
+    wireProfileYamlToggles(tableWrap, function(name) {
+      return apiFetch('/profiles/' + encodeURIComponent(name));
     });
 
     tableWrap.querySelectorAll('.pf-delete-btn').forEach(function(btn) {
@@ -6395,7 +7120,8 @@ async function renderProfilesTab(container) {
         if (!ok) return;
         try {
           await apiFetch('/profiles/' + encodeURIComponent(btn.dataset.name), { method: 'DELETE' });
-          listSection.querySelector('#pf-yaml-view').innerHTML = '';
+          // Any open YAML detail rows live inside the table body, so the
+          // reload below replaces them; there is no separate panel to clear.
           loadProfiles();
         } catch (err) {
           reportActionFailure(err, {
@@ -6710,10 +7436,12 @@ async function renderStorageTab(container) {
       addBtn.focus();
     }
 
-    // Read the six field values off the rendered inputs.
+    // Read every field value off the rendered controls — the required core six
+    // AND the optional role/publicBaseUrl/sessionToken group (issue #870), which
+    // is why this selects on `[data-field]` rather than on one class.
     function readValues() {
       const out = {};
-      form.querySelectorAll('.storage-backend-input').forEach(function(inp) {
+      form.querySelectorAll('[data-field]').forEach(function(inp) {
         out[inp.dataset.field] = inp.value;
       });
       return out;
@@ -6730,6 +7458,16 @@ async function renderStorageTab(container) {
       testResultEl.className = 'storage-backend-test-result';
       const values = readValues();
       const secret = (values.secretAccessKey || '').trim();
+      // A backend registered with temporary credentials only authenticates with
+      // its session token, and the stored token is never recoverable
+      // (`credentials.sessionToken` comes back as the redacted marker,
+      // storage.ts:166) — so the probe has to carry whatever the operator typed
+      // into this form. testConnectionBodySchema (storage.ts:207-210) accepts
+      // `sessionToken` as an optional min(1) string and the route forwards it
+      // (storage.ts:501-508) into the probe target
+      // (storage-backend-registry.ts:830-837). Blank stays absent: the body
+      // builder drops a falsy value (app.js:2299-2301).
+      const sessionToken = (values.sessionToken || '').trim();
       if (!backendId) {
         testResultEl.textContent =
           'Save the backend first, then use Test connection to probe it.';
@@ -6746,7 +7484,11 @@ async function renderStorageTab(container) {
       testResultEl.textContent = 'Testing…';
       try {
         // Shared probe helper (issue #683) — same call the per-row action uses.
-        const result = await testStorageBackendConnection(backendId, secret);
+        const result = await testStorageBackendConnection(
+          backendId,
+          secret,
+          { sessionToken: sessionToken }
+        );
         // Response contract: { status: 'connected' | 'unreachable', message }.
         const ok = result && result.status === 'connected';
         testResultEl.textContent =
@@ -6769,7 +7511,9 @@ async function renderStorageTab(container) {
       const firstErr = applyStorageBackendFormErrors(form, result.errors);
       if (!result.valid) {
         if (firstErr) {
-          const el = form.querySelector('.storage-backend-input[data-field="' + firstErr + '"]');
+          // `[data-field]` so an error on one of the optional fields (#870) is
+          // focusable too.
+          const el = form.querySelector('[data-field="' + firstErr + '"]');
           if (el) el.focus();
         }
         return;
@@ -6915,12 +7659,14 @@ async function renderStorageTab(container) {
   // spinner while in flight, then Connected / Unreachable (+ message on failure
   // or timeout). Disables the row's Test button for the duration so a double
   // click can't launch two probes.
-  async function runRowTest(row, backendId, secret) {
+  // `extra` is the optional { sessionToken } passed straight to the probe
+  // helper, which drops it when blank (app.js:2299-2301).
+  async function runRowTest(row, backendId, secret, extra) {
     const btn = row.querySelector('.storage-backend-test-conn');
     if (btn) btn.disabled = true;
     setStorageBackendRowProbing(row);
     try {
-      const result = await testStorageBackendConnection(backendId, secret);
+      const result = await testStorageBackendConnection(backendId, secret, extra);
       applyStorageBackendRowTestResult(row, result);
     } catch (err) {
       // Network / HTTP failure or the client-side 10s timeout: render as an
@@ -6961,6 +7707,38 @@ async function renderStorageTab(container) {
       label.appendChild(input);
       body.appendChild(label);
 
+      // Temporary credentials: a backend registered with a session token only
+      // authenticates with that token, and the stored one is not recoverable
+      // server-side (the view returns the redacted marker, storage.ts:166;
+      // registry.testConnection builds the probe target from the CALLER's
+      // `secret.sessionToken` alone, storage-backend-registry.ts:830-837). So
+      // when the row's view reports `hasSessionToken === true` we offer an
+      // optional token field and forward it; without it such a backend could
+      // never pass its own Test connection. Rows without a stored token get no
+      // extra field, so their probe body is unchanged.
+      let tokenInput = null;
+      if (cached.hasSessionToken === true) {
+        const tokenLabel = document.createElement('label');
+        tokenLabel.className = 'form-field';
+        tokenLabel.textContent = 'Session token';
+        tokenInput = document.createElement('input');
+        tokenInput.type = 'password';
+        tokenInput.className = 'storage-test-session-token';
+        tokenInput.autocomplete = 'off';
+        tokenLabel.appendChild(tokenInput);
+        body.appendChild(tokenLabel);
+
+        const tokenHint = document.createElement('div');
+        tokenHint.id = 'storage-test-session-token-hint';
+        tokenInput.setAttribute('aria-describedby', tokenHint.id);
+        tokenHint.className = 'form-hint storage-test-session-token-hint';
+        tokenHint.textContent =
+          'This backend was registered with a session token. The stored token ' +
+          'cannot be read back, so re-enter it to probe with temporary ' +
+          'credentials. Leave blank to probe with the key pair alone.';
+        body.appendChild(tokenHint);
+      }
+
       const errEl = document.createElement('div');
       errEl.className = 'storage-test-error';
       errEl.setAttribute('role', 'alert');
@@ -6990,8 +7768,11 @@ async function renderStorageTab(container) {
           input.focus();
           return;
         }
+        // Optional: absent for rows with no stored token, and dropped by the
+        // body builder when the operator leaves it blank.
+        const sessionToken = tokenInput ? tokenInput.value.trim() : '';
         close();
-        runRowTest(row, backendId, secret);
+        runRowTest(row, backendId, secret, { sessionToken: sessionToken });
       });
       input.focus();
     });
@@ -8319,6 +9100,219 @@ var ENCODE_PIPELINES = PIPELINE_CATALOG
   .filter(function(p) { return p.steps.indexOf('transcode') !== -1; })
   .map(function(p) { return p.name; });
 
+// ─── Parametrised transcode profiles (issue #869) ────────────────────────────
+//
+// A profile can expose knobs: its YAML references `profileParams` through SpEL,
+// e.g. `crf: #{profileParams['crf']?:23}`. Until now the run control could only
+// name a profile, so a parametrised profile could only ever run with its
+// built-in defaults even though the API has accepted overrides since #287/#288.
+//
+// CONTRACT, read before this call was written (CLAUDE.md rule 7) — from this
+// repo's own route source and generated spec, never from the issue text:
+//   - POST /api/v1/assets/{id}/execute — openapi.json
+//     .paths["/api/v1/assets/{id}/execute"].post.requestBody: an object with
+//     `required: ["pipeline"]`, `additionalProperties: false`, and the optional
+//     siblings `profile` (string, minLength 1) and
+//     `profileParams: { type: 'object', additionalProperties: { type: 'string' } }`.
+//     So profileParams is a TOP-LEVEL FLAT STRING MAP alongside `profile` — not
+//     nested under it, and every value must be a string. Source of truth:
+//     `profileParams: profileParamsSchema.optional()` on the execute body
+//     (src/routes/assets.ts:433) over
+//     `const profileParamsSchema = z.record(z.string(), z.string())`
+//     (src/routes/assets.ts:376). The spec assigns this operation no
+//     operationId; it is keyed by path + method. The run control already posts
+//     to this exact route, so no new endpoint is introduced here.
+//   - 400 `unknown_profile_params` — a key the chosen profile does not declare
+//     is rejected at submit time with a message naming the accepted set
+//     (src/routes/assets.ts:5695-5760 -> validateProfileParams,
+//     src/pipeline/profile-params.ts:95-141). apiFetch prefers `body.message`
+//     (app.js:573), so that sentence is what the operator reads.
+//   - GET /api/v1/profiles — 200 `{ profiles: string[], items: [{ name, yaml,
+//     runnable, createdAt, updatedAt }] }` (listResponseSchema,
+//     src/routes/profiles.ts:121-124, items built at :173). `items[].yaml` is
+//     the same document the Profiles tab's View YAML button renders AND the one
+//     the server derives the accepted key set from, so the picker reads the
+//     declared params straight off the list response it already fetches: no
+//     extra request, and no second source of truth to drift.
+//
+// The key set is DERIVED from the YAML, never hardcoded. The regex below is the
+// client-side twin of SPEL_PROFILE_PARAM_REF (src/pipeline/profile-params.ts:43)
+// — Spring Expression Language map indexing, single OR double quotes — so the
+// form offers exactly the keys the server will accept, and nothing else.
+var PROFILE_PARAM_REF = /profileParams\[\s*(?:'([^']+)'|"([^"]+)")\s*\]/g;
+
+// The same reference WITH its SpEL Elvis default (`?:`), which is where the
+// declared default lives: `?:23`, `?:"medium"`, `?:'expr:not(mod(n,96))'`. The
+// quoted branches win over the bare one so a default containing `:` or `(` is
+// captured whole; the bare branch stops at the closing `}` of the `#{…}` block.
+var PROFILE_PARAM_DEFAULT_REF =
+  /profileParams\[\s*(?:'([^']+)'|"([^"]+)")\s*\]\s*\?:\s*(?:'([^']*)'|"([^"]*)"|([^}\s]*))/g;
+
+// Extract the parameters a profile YAML declares, in first-appearance order, as
+// `[{ key, defaultValue }]`. `defaultValue` is the declared SpEL default with
+// its quotes stripped, or '' when the reference carries none (the profile then
+// has no default to prefill — the field stays empty and is only sent if typed
+// into). Keys are de-duplicated: the same param is usually referenced several
+// times in one ladder (suffix + the encoder option it feeds). A profile that
+// references none returns [] — i.e. "not parametrised".
+function declaredProfileParams(profileYaml) {
+  if (!profileYaml) return [];
+  const yaml = String(profileYaml);
+  const defaults = {};
+  for (const match of yaml.matchAll(PROFILE_PARAM_DEFAULT_REF)) {
+    const key = match[1] || match[2];
+    if (!key || Object.prototype.hasOwnProperty.call(defaults, key)) continue;
+    // The first default the document states for a key is the one shown; a
+    // well-formed profile repeats the same default at every reference.
+    const value = match[3] !== undefined ? match[3]
+      : match[4] !== undefined ? match[4]
+      : (match[5] || '');
+    defaults[key] = value;
+  }
+  const params = [];
+  const seen = {};
+  for (const match of yaml.matchAll(PROFILE_PARAM_REF)) {
+    const key = match[1] || match[2];
+    if (!key || seen[key]) continue;
+    seen[key] = true;
+    params.push({
+      key: key,
+      defaultValue: Object.prototype.hasOwnProperty.call(defaults, key) ? defaults[key] : '',
+    });
+  }
+  return params;
+}
+
+// Build a `name -> [{ key, defaultValue }]` index from the `items` of the
+// profiles list response. Only parametrised profiles get an entry, so a lookup
+// miss means "this profile takes no params". Tolerates a response without
+// `items` (an older deployment, or a stubbed fetch): the picker then simply
+// marks nothing, which is the pre-#869 behaviour.
+function profileParamsIndex(items) {
+  const index = {};
+  (Array.isArray(items) ? items : []).forEach(function(item) {
+    if (!item || typeof item.name !== 'string') return;
+    const params = declaredProfileParams(item.yaml);
+    if (params.length > 0) index[item.name] = params;
+  });
+  return index;
+}
+
+// How a parametrised profile reads in the picker. The option VALUE stays the
+// bare profile name (that is what `profile` carries on the wire); only the
+// label is annotated, so the operator can see there is something to set before
+// running rather than discovering it in the output filename.
+function profileOptionLabel(name, params) {
+  if (!params || params.length === 0) return name;
+  return name + ' — ' + params.length + (params.length === 1 ? ' parameter' : ' parameters');
+}
+
+// The option's tooltip: which keys this profile declares, and what happens if
+// you leave them alone.
+function profileOptionTitle(name, params) {
+  if (!params || params.length === 0) {
+    return 'Encode profile (for pipelines with a transcode step)';
+  }
+  return 'Parametrised profile. Declares: ' +
+    params.map(function(p) { return p.key; }).join(', ') +
+    '. Each parameter keeps the profile’s own default unless you change it.';
+}
+
+var PROFILE_PARAMS_LEGEND = 'Profile parameters';
+var PROFILE_PARAMS_HINT =
+  'Prefilled with the defaults the profile declares. Only the values you change ' +
+  'are sent; anything you leave as-is stays on the profile’s own default. Clear a ' +
+  'field to fall back to its default.';
+
+// Render the parameter form for the selected profile into `hostEl`, replacing
+// whatever was there. `params` is the output of declaredProfileParams(); an
+// empty list renders nothing at all, so a non-parametrised profile looks exactly
+// as it did before #869. Returns the fieldset, or null when nothing was drawn.
+//
+// A real fieldset/legend (the shape renderSearchMetadataFilter and
+// public/external-ids.js already use) so the fields are announced as one group,
+// each input keeps a `<label for>`, and the hint is wired with aria-describedby.
+function renderProfileParamsForm(hostEl, profileName, params) {
+  if (!hostEl) return null;
+  hostEl.innerHTML = '';
+  if (!params || params.length === 0) return null;
+
+  const fieldset = document.createElement('fieldset');
+  fieldset.className = 'profile-params-fieldset';
+  fieldset.id = 'profile-params';
+
+  const legend = document.createElement('legend');
+  legend.className = 'profile-params-legend';
+  // Name the profile in the legend: the form's contents change with the picker,
+  // so the group has to say which profile it is describing.
+  legend.textContent = PROFILE_PARAMS_LEGEND + ' — ' + profileName;
+  fieldset.appendChild(legend);
+
+  const hint = document.createElement('div');
+  hint.className = 'form-hint';
+  hint.id = 'profile-params-hint';
+  hint.textContent = PROFILE_PARAMS_HINT;
+  fieldset.appendChild(hint);
+  fieldset.setAttribute('aria-describedby', 'profile-params-hint');
+
+  const row = document.createElement('div');
+  row.className = 'form-row profile-params-row';
+  params.forEach(function(param) {
+    const id = 'profile-param-' + param.key;
+    const wrap = document.createElement('div');
+    wrap.className = 'form-field grow';
+    const label = document.createElement('label');
+    label.setAttribute('for', id);
+    // Profile YAML is operator-supplied, so the key is set as text, never HTML.
+    label.textContent = param.key;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.id = id;
+    input.className = 'input profile-param-input';
+    input.dataset.paramKey = param.key;
+    // The declared default is both the starting value and the baseline the
+    // submit compares against, so an untouched field sends nothing.
+    input.dataset.paramDefault = param.defaultValue;
+    input.value = param.defaultValue;
+    if (param.defaultValue) input.placeholder = param.defaultValue;
+    wrap.appendChild(label);
+    wrap.appendChild(input);
+    row.appendChild(wrap);
+  });
+  fieldset.appendChild(row);
+
+  // Where the API's own 400 `unknown_profile_params` message lands — next to the
+  // fields it is about, not only in the page-level action message.
+  const error = document.createElement('div');
+  error.className = 'form-error profile-params-error';
+  error.id = 'profile-params-error';
+  error.setAttribute('role', 'alert');
+  fieldset.appendChild(error);
+
+  hostEl.appendChild(fieldset);
+  return fieldset;
+}
+
+// Read the form into the flat string map the execute body takes. ONLY edited
+// values travel: a field still holding its declared default (or cleared) is
+// omitted so the profile's own default applies server-side — which keeps a run
+// with no edits byte-identical to the pre-#869 request. Values are trimmed;
+// each lands as a single encoder token, so stray whitespace is never intended.
+function collectProfileParams(hostEl) {
+  const params = {};
+  if (!hostEl) return params;
+  const inputs = hostEl.querySelectorAll('.profile-param-input');
+  [].forEach.call(inputs, function(input) {
+    const key = input.dataset.paramKey;
+    if (!key) return;
+    const value = String(input.value == null ? '' : input.value).trim();
+    if (value === '') return;
+    if (value === String(input.dataset.paramDefault == null ? '' : input.dataset.paramDefault)) return;
+    params[key] = value;
+  });
+  return params;
+}
+
 var STEP_ICONS = {
   'extract-metadata': '🔬',
   'thumbnail': '🖼',
@@ -8428,6 +9422,145 @@ function optionalServiceNames(steps) {
       return (OPTIONAL_STEP_CONFIG[step] && OPTIONAL_STEP_CONFIG[step].serviceLabel) || step;
     })
     .join(', ');
+}
+
+// ─── Catalog pill filter on the executions list (issue #831) ─────────────────
+//
+// The catalog strip used to render each pipeline as an inert <span> that still
+// highlighted on hover and showed a tooltip — an affordance with nothing behind
+// it. Each pill is now a toggle button that narrows the executions list below to
+// that pipeline.
+//
+// CONTRACT (CLAUDE.md rule 7). The narrowing is CLIENT-SIDE on purpose:
+// GET /api/v1/pipelines/ accepts exactly three query params — `status`
+// (running|done|failed), `limit` (1..200) and `offset` (>=0) — per its
+// querystring schema at src/routes/pipelines.ts:105-109 and
+// openapi.json .paths["/api/v1/pipelines/"].get.parameters (this spec declares
+// no operationId for the op; it is keyed by path + method). There is no
+// pipeline-name parameter, so the pill filters the page this tab already
+// fetched rather than sending a key the route would reject. The field it
+// filters on, `pipelineName`, is a REQUIRED string on every item
+// (pipelineExecutionSchema, src/routes/pipelines.ts:54-63; the generated 200
+// lists it in `required` with `additionalProperties: false`), so the comparison
+// below can never silently miss a row for want of a field.
+//
+// Because the filter is applied to a bounded page, an "empty" result means
+// "none in the N most recent executions", and the empty state says exactly that
+// rather than claiming the pipeline has never run.
+var EXEC_LIST_LIMIT = 50;
+
+// URL-state namespace for the executions list. table-url-state.js emits
+// `pipelines.<key>` params for this namespace.
+var PIPELINES_NS = 'pipelines';
+// The shared URL-state contract has a FIXED key schema (sort/status/q/tags/meta/
+// from/to/page/cursor/size/cols — public/table-url-state.js:72-84) with no
+// "which pipeline" member, and encodeTableState() deletes only those fixed keys
+// within the namespace (table-url-state.js:452-453). So this one extra key is
+// written alongside them under the same namespace and survives the re-encode —
+// the same way the audit table carries its own filter keys
+// (public/audit-table.js:144-150, 574-579). The shared mechanism is reused, not
+// forked.
+var PIPELINE_FILTER_KEY = 'pipeline';
+var PIPELINE_FILTER_PARAM = PIPELINES_NS + '.' + PIPELINE_FILTER_KEY;
+// Shared-contract defaults for this list: no sort control, and a page size equal
+// to the limit the tab actually requests.
+var PIPELINES_URL_DEFAULTS = Object.freeze({ sort: null, size: EXEC_LIST_LIMIT });
+
+// Coerce a raw `pipelines.pipeline` value into a usable filter, or null for
+// "show all". Tolerant by design, like every other param in the shared contract:
+// the value must name a pipeline in PIPELINE_CATALOG, because a filter with no
+// pill to light up would leave the operator looking at an empty list with no
+// visible control to clear. Anything else degrades to "all".
+function normalizePipelineFilter(raw) {
+  if (typeof raw !== 'string') return null;
+  var name = raw.trim();
+  if (!name) return null;
+  var known = PIPELINE_CATALOG.some(function(p) { return p.name === name; });
+  return known ? name : null;
+}
+
+// Read the active pipeline filter from the live URL. SSR/test-safe: an absent
+// window yields "all".
+function readPipelineFilterFromUrl(win) {
+  var w = win || (typeof window !== 'undefined' ? window : undefined);
+  var search = w && w.location ? w.location.search : '';
+  var params = new URLSearchParams(search || '');
+  return normalizePipelineFilter(params.get(PIPELINE_FILTER_PARAM));
+}
+
+// Reflect the active filter in the URL without reloading, preserving the path,
+// the hash, and every param that belongs to another namespace. Mirrors
+// audit-table.js's extra-key sync: encodeTableState() rebuilds this namespace's
+// shared keys (and clears stale ones) on top of the current search, then the
+// catalog key is set or deleted. Returns the applied relative URL, or '' when
+// there is no history to write (SSR / sandboxed).
+function applyPipelineFilterToUrl(name, win) {
+  var w = win || (typeof window !== 'undefined' ? window : undefined);
+  if (!w || !w.location || !w.history) return '';
+  var loc = w.location;
+  var params = encodeTableState(
+    { size: EXEC_LIST_LIMIT },
+    PIPELINES_NS,
+    PIPELINES_URL_DEFAULTS,
+    new URLSearchParams(loc.search || '')
+  );
+  if (name) params.set(PIPELINE_FILTER_PARAM, name);
+  else params.delete(PIPELINE_FILTER_PARAM);
+  var qs = params.toString();
+  var relative = (loc.pathname || '') + (qs ? '?' + qs : '') + (loc.hash || '');
+  try {
+    w.history.replaceState(w.history.state == null ? null : w.history.state, '', relative);
+  } catch (e) {
+    return '';
+  }
+  return relative;
+}
+
+// Narrow a fetched page of executions to one pipeline. `null`/'' means "all".
+function filterExecutionsByPipeline(items, name) {
+  var list = Array.isArray(items) ? items : [];
+  if (!name) return list;
+  return list.filter(function(exec) {
+    return !!exec && exec.pipelineName === name;
+  });
+}
+
+// The human label for a pipeline name, falling back to the name itself for a
+// pipeline the catalog does not describe.
+function pipelineLabel(name) {
+  var entry = PIPELINE_CATALOG.filter(function(p) { return p.name === name; })[0];
+  return entry ? entry.label : String(name || '');
+}
+
+// Text for the filter status line above the list. Announced via role="status",
+// so it names the filter AND the count rather than relying on the pill's colour.
+function pipelineFilterSummary(name, shown, total) {
+  if (!name) return 'Showing all ' + total + ' loaded execution' + (total === 1 ? '' : 's') + '.';
+  return 'Showing ' + shown + ' of ' + total + ' loaded execution' +
+    (total === 1 ? '' : 's') + ' for ' + pipelineLabel(name) + '.';
+}
+
+// The explanatory empty state for a filter that matches nothing (acceptance
+// criterion: must not look broken). An unconfigured pipeline stays filterable,
+// so this also explains WHY a stack that never provisioned the optional service
+// has no runs for it — reusing the same notConfiguredText() wording the pill
+// tooltip and the run-pipeline picker already use.
+function pipelineFilterEmptyText(name, availability) {
+  var entry = PIPELINE_CATALOG.filter(function(p) { return p.name === name; })[0];
+  var lines = ['No executions for this pipeline.'];
+  var detail = 'Nothing in the ' + EXEC_LIST_LIMIT +
+    ' most recent executions ran ' + pipelineLabel(name) + '.';
+  if (entry) {
+    var blocked = unconfiguredOptionalSteps(entry, availability || {});
+    if (blocked.length > 0) {
+      detail += ' ' + notConfiguredText(blocked) +
+        (isPipelineUnavailable(entry, availability || {})
+          ? ', so it cannot run here yet.'
+          : ', so that step is skipped when it does run.');
+    }
+  }
+  lines.push(detail);
+  return lines;
 }
 
 var EXEC_STATUS_CLASS = {
@@ -8548,24 +9681,51 @@ async function renderPipelinesTab(container) {
   // ── Compact catalog strip ──
   // Optional steps the ACTIVE stack has not configured are marked here too
   // (issue #790), so the catalog and the asset detail picker tell the same story.
+  //
+  // Each pill is a real <button type="button"> (issue #831): it filters the
+  // executions list below, so it must be in the tab order and activatable with
+  // Enter/Space, which a <span> with a click handler is not. It is a TOGGLE —
+  // `aria-pressed` carries the on/off state to assistive tech, and pressing the
+  // active pill again clears the filter.
+  //
+  // An unconfigured (`is-unavailable`) pipeline stays filterable and is NOT
+  // disabled: "this stack never ran it" is exactly the question an operator asks
+  // about such a pipeline, and the empty state answers it.
   var stepAvailability = await loadOptionalStepAvailability();
+  // The filter in force. Restored from the URL so a deep link / reload lands on
+  // the same view (see readPipelineFilterFromUrl).
+  var activeFilter = readPipelineFilterFromUrl();
   var catalogBar = document.createElement('div');
   catalogBar.className = 'pipeline-catalog-bar';
+  // Labelled as a group so a screen reader announces what these seven buttons
+  // are for before reading them.
+  catalogBar.setAttribute('role', 'group');
+  catalogBar.setAttribute('aria-label', 'Filter executions by pipeline');
   PIPELINE_CATALOG.forEach(function(pipeline) {
-    var pill = document.createElement('span');
+    var pill = document.createElement('button');
+    pill.type = 'button';
     var blocked = unconfiguredOptionalSteps(pipeline, stepAvailability);
     var unavailable = isPipelineUnavailable(pipeline, stepAvailability);
     pill.className = 'pipeline-catalog-pill' + (unavailable ? ' is-unavailable' : '');
+    pill.dataset.pipeline = pipeline.name;
     pill.title = pipeline.description + '\nSteps: ' + pipeline.steps.join(' → ') +
       (blocked.length > 0
         ? '\n' + notConfiguredText(blocked) + (unavailable ? '.' : ', so that step is skipped.')
         : '');
     pill.innerHTML =
+      // The active marker is a glyph, not just a colour change, so the pressed
+      // state is not carried by colour alone (WCAG 1.4.1). It is aria-hidden
+      // because `aria-pressed` already says this to assistive tech.
+      '<span class="pipeline-catalog-pill-mark" aria-hidden="true">✓</span>' +
       '<span class="pipeline-catalog-pill-name">' + escHtml(pipeline.label) + '</span>' +
       '<span class="pipeline-catalog-pill-id">' + escHtml(pipeline.name) + '</span>' +
       (unavailable
         ? '<span class="pipeline-catalog-pill-note">not configured</span>'
         : '');
+    pill.addEventListener('click', function() {
+      // Toggle: the active pill clears the filter, any other pill replaces it.
+      setPipelineFilter(activeFilter === pipeline.name ? null : pipeline.name);
+    });
     catalogBar.appendChild(pill);
   });
   wrap.appendChild(catalogBar);
@@ -8576,6 +9736,24 @@ async function renderPipelinesTab(container) {
   execHeader.textContent = 'Pipeline Executions';
   wrap.appendChild(execHeader);
 
+  // Filter status line: says which filter is in force and how much of the
+  // loaded page it shows, and carries the explicit "Show all" escape hatch so
+  // clearing the filter does not depend on remembering that the active pill
+  // toggles. role="status" so the change is announced without stealing focus.
+  var filterBar = document.createElement('div');
+  filterBar.className = 'pipeline-exec-filter';
+  var filterText = document.createElement('span');
+  filterText.className = 'pipeline-exec-filter-text';
+  filterText.setAttribute('role', 'status');
+  filterBar.appendChild(filterText);
+  var clearBtn = document.createElement('button');
+  clearBtn.type = 'button';
+  clearBtn.className = 'btn-ghost pipeline-exec-filter-clear';
+  clearBtn.textContent = 'Show all pipelines';
+  clearBtn.addEventListener('click', function() { clearFilterAndRestoreFocus(); });
+  filterBar.appendChild(clearBtn);
+  wrap.appendChild(filterBar);
+
   var execList = document.createElement('div');
   execList.className = 'pipeline-exec-list';
   execList.textContent = 'Loading…';
@@ -8584,20 +9762,82 @@ async function renderPipelinesTab(container) {
   container.appendChild(wrap);
 
   var pollTimer = null;
+  // The last page fetched from GET /api/v1/pipelines/, kept so switching the
+  // filter re-renders from memory — no refetch, no reload.
+  var loadedItems = [];
+
+  // Paint the pills' pressed state to match `activeFilter`.
+  function paintPills() {
+    catalogBar.querySelectorAll('.pipeline-catalog-pill').forEach(function(pill) {
+      var on = pill.dataset.pipeline === activeFilter;
+      pill.classList.toggle('is-active', on);
+      pill.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+  }
+
+  // Render the executions list for the filter in force, from `loadedItems`.
+  function renderExecList() {
+    var shown = filterExecutionsByPipeline(loadedItems, activeFilter);
+    execList.innerHTML = '';
+    if (loadedItems.length === 0) {
+      execList.textContent = 'No pipeline executions yet.';
+    } else if (shown.length === 0) {
+      // Filtered to nothing: explain it rather than leaving a blank panel.
+      var empty = document.createElement('div');
+      empty.className = 'pipeline-exec-empty';
+      pipelineFilterEmptyText(activeFilter, stepAvailability).forEach(function(line, i) {
+        var p = document.createElement('div');
+        p.className = i === 0 ? 'pipeline-exec-empty-title' : 'text-muted';
+        p.textContent = line;
+        empty.appendChild(p);
+      });
+      var showAll = document.createElement('button');
+      showAll.type = 'button';
+      showAll.className = 'btn-ghost mt12';
+      showAll.textContent = 'Show all pipelines';
+      showAll.addEventListener('click', function() { clearFilterAndRestoreFocus(); });
+      empty.appendChild(showAll);
+      execList.appendChild(empty);
+    } else {
+      shown.forEach(function(exec) {
+        execList.appendChild(renderExecutionRow(exec));
+      });
+    }
+    filterText.textContent = pipelineFilterSummary(activeFilter, shown.length, loadedItems.length);
+    // The clear control only exists while there is something to clear.
+    clearBtn.hidden = !activeFilter;
+    filterBar.classList.toggle('is-filtered', !!activeFilter);
+  }
+
+  // The one place the filter changes: update state, URL, pills and list.
+  function setPipelineFilter(name) {
+    activeFilter = normalizePipelineFilter(name);
+    applyPipelineFilterToUrl(activeFilter);
+    paintPills();
+    renderExecList();
+  }
+
+  // Clearing the filter destroys the control that did it — the status line's
+  // button hides, and the empty state's button is re-rendered away — so a
+  // keyboard user would be dropped on <body> mid-task. Hand focus back to the
+  // pill that was just unpressed, which is still there and is the control that
+  // would re-apply the filter.
+  function clearFilterAndRestoreFocus() {
+    var cleared = activeFilter;
+    setPipelineFilter(null);
+    if (!cleared) return;
+    var target = catalogBar.querySelector('[data-pipeline="' + cssEscape(cleared) + '"]');
+    if (target && typeof target.focus === 'function') target.focus();
+  }
 
   async function loadExecutions() {
     try {
-      var data = await apiFetch('/pipelines?limit=50');
+      var data = await apiFetch('/pipelines?limit=' + EXEC_LIST_LIMIT);
       var items = (data && data.items) ? data.items : [];
-      execList.innerHTML = '';
-      if (items.length === 0) {
-        execList.textContent = 'No pipeline executions yet.';
-      } else {
-        items.forEach(function(exec) {
-          execList.appendChild(renderExecutionRow(exec));
-        });
-      }
-      // Poll while any execution is running.
+      loadedItems = items;
+      renderExecList();
+      // Poll while any execution is running — judged on the whole fetched page,
+      // not the filtered view, so a filter can never silence the poll.
       var anyRunning = items.some(function(e) { return e.status === 'running'; });
       if (anyRunning) {
         pollTimer = setTimeout(loadExecutions, 5000);
@@ -8607,6 +9847,14 @@ async function renderPipelinesTab(container) {
     }
   }
 
+  // Paint the restored filter BEFORE the first fetch resolves, so a deep-linked
+  // view never flashes an unfiltered strip or an orphaned clear button.
+  paintPills();
+  clearBtn.hidden = !activeFilter;
+  filterBar.classList.toggle('is-filtered', !!activeFilter);
+  filterText.textContent = activeFilter
+    ? 'Loading executions for ' + pipelineLabel(activeFilter) + '…'
+    : '';
   await loadExecutions();
 
   // Stop polling when the tab is replaced.
@@ -9197,6 +10445,13 @@ export {
   // apiFetch() against a gated router, catching future drift between the gate
   // and the UI's credential handling alongside test/workspace-acl.test.ts.
   apiFetch,
+  // Per-row profile YAML disclosure (issue #832). Exported so a DOM/unit test
+  // can drive the REAL toggle wiring and row builders — the same code path the
+  // Profiles tab uses — against a stubbed GET /profiles/{name} loader.
+  wireProfileYamlToggles,
+  createProfileYamlDetailRow,
+  createProfileYamlErrorRow,
+  PROFILE_YAML_MAX_HEIGHT,
   isAssetWedged,
   filterWedgedAssets,
   renderAssetDetailBody,
@@ -9247,6 +10502,12 @@ export {
   validateStorageBackendForm,
   applyStorageBackendFormErrors,
   STORAGE_SECRET_PLACEHOLDER,
+  // The role / publicBaseUrl / sessionToken group (issue #870). Exported so a
+  // test can assert the select offers exactly the four documented role values
+  // and that each optional field is omitted from the body when left untouched.
+  STORAGE_BACKEND_OPTIONAL_FIELDS,
+  STORAGE_BACKEND_ROLE_OPTIONS,
+  STORAGE_BACKEND_DEFAULT_ROLE,
   // Remove-with-confirmation flow (issue #682). Exported so a DOM/unit test can
   // exercise the confirmation dialog + the 409 in-use message formatter.
   openStorageBackendRemoveDialog,
@@ -9342,6 +10603,21 @@ export {
   // agrees with the backend's BUILT_IN_PIPELINES / PIPELINE_DESCRIPTIONS
   // (issue #739) — the pipeline picker and the execute enum must not drift.
   PIPELINE_CATALOG,
+  // Catalog pill filter on the pipelines tab (issue #831). Exported so a
+  // DOM/unit test can drive the REAL renderer — the pills are buttons, the
+  // click narrows the list, the URL carries the choice under the shared
+  // table-url-state namespace, and a filter that matches nothing explains
+  // itself — plus the pure helpers, without standing up a server.
+  renderPipelinesTab,
+  normalizePipelineFilter,
+  readPipelineFilterFromUrl,
+  applyPipelineFilterToUrl,
+  filterExecutionsByPipeline,
+  pipelineFilterSummary,
+  pipelineFilterEmptyText,
+  PIPELINES_NS,
+  PIPELINE_FILTER_PARAM,
+  EXEC_LIST_LIMIT,
   // Search-tab format filter (issue #822). Exported so a DOM/unit test can
   // drive the real Search tab against a stubbed fetch and assert the field's
   // own placeholder is a value the API can match.
@@ -9353,6 +10629,14 @@ export {
   SEARCH_TAB_TITLE,
   SEARCH_SECTION_TITLE,
   SEARCH_SCOPE_HINT,
+  // Search-tab metadata filter (issue #850). The serialiser is exported on its
+  // own so the skip rules (empty key, empty value, repeated key) can be pinned
+  // without driving the DOM, and the copy constants so a test can assert the
+  // wording does not promise partial matching the backend will not do.
+  appendMetadataFilterParams,
+  readSearchMetadataPairs,
+  SEARCH_METADATA_LEGEND,
+  SEARCH_METADATA_HINT,
   // NOTE (issue #948): SEARCH_TAB_INTRO is deliberately NOT exported. The
   // "states it returns collections" acceptance criterion is already pinned by
   // the #913 assertions on SEARCH_SECTION_TITLE / SEARCH_SCOPE_HINT above; the
@@ -9391,6 +10675,19 @@ export {
   setupTabs,
   auditTabWiring,
   reportTabWiring,
+  // Parametrised transcode profiles in the run control (issue #869). Exported so
+  // a DOM/unit test can drive the REAL extraction, picker marking, form builder
+  // and submit-time collection — the same code path renderAssetDetailBody uses —
+  // against the profile YAML shape the server derives its accepted key set from,
+  // without standing up a server.
+  declaredProfileParams,
+  profileParamsIndex,
+  profileOptionLabel,
+  profileOptionTitle,
+  renderProfileParamsForm,
+  collectProfileParams,
+  PROFILE_PARAMS_LEGEND,
+  PROFILE_PARAMS_HINT,
   // Remaining-retention-window text for the restore action (issue #891).
   // Exported so a DOM/unit test can exercise the pure formatter directly on a
   // hand-built `retention` object, without standing up a server. The formatter
@@ -9410,5 +10707,19 @@ export {
 if (typeof window !== 'undefined' && window.__OPS_MAIN__ === true && document.querySelector('.tab-bar')) {
   setupTabs();
   switchTab(localStorage.getItem(TAB_KEY) || 'assets');
-  initStackSelector();
+  // Surface the running build (issue #828) only AFTER the stack selector has
+  // settled: initStackSelector may be the thing that picks the active stack
+  // (it defaults to the first provisioned one when nothing is stored), and the
+  // single console line must name the stack the UI actually ended up pointed
+  // at, not the empty value it started with. The indicator render itself does
+  // not depend on the stack, so a selector failure must not suppress it —
+  // hence the catch, not a bare chain.
+  initStackSelector()
+    .catch(function () { /* selector failure is reported by initStackSelector itself */ })
+    .then(function () {
+      return initBuildIndicator({
+        mount: document.getElementById('build-indicator'),
+        stack: getActiveStack(),
+      });
+    });
 }

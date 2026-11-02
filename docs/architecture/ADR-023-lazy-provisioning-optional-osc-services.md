@@ -344,6 +344,24 @@ and `services[]` without risking a double teardown.
 
 ## 4. Design for scene detection (ready for an implementation issue)
 
+> **SUPERSEDED IN PRINCIPLE 2026-10-15 — see ADR-027 (#1190, decision taken in #883).**
+> Scene detection moves off `eyevinn-function-scenes` onto the `eyevinn-ffmpeg-s3`
+> **ephemeral per-job** runner. An ffmpeg-s3 job is created per run and deleted on
+> completion, so there is no optional long-lived service to provision lazily for this
+> slot: §4.1 (`ensureSceneDetectProvisioned`), §4.2 (single-flight), §4.3 (trigger
+> point), §4.5 (readiness deadline), §4.6 (persisted `sceneDetectInstanceName`) and
+> §4.7 (acceptance criteria) all fall away with the old path.
+>
+> **§4.4 survives unchanged** — scene detection is still an optional, fire-and-forget
+> step whose failures settle as `skipped` + `skipReason` and never fail the pipeline
+> run. ADR-027 D3 builds on it.
+>
+> This section is **left in place as the accurate description of the code on `main`**,
+> which still uses `eyevinn-function-scenes` until the rewrite (#1192) lands. **The
+> full amendment — striking §4.1–§4.3 and §4.5–§4.7 — happens as part of #1193**
+> (*retire the `eyevinn-function-scenes` path and its lazy provisioning*), whose scope
+> already includes "amend ADR-023 §4 accordingly". §5 (subtitles) is unaffected.
+
 This section is the hand-off. It is deliberately written against real symbols and
 line numbers so an implementer does not have to re-derive the wiring.
 

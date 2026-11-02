@@ -1,5 +1,6 @@
 // One runner cycle (ADR-007 §2). Pure orchestration over injected adapters so every branch is testable
-// offline. Result statuses: green | red | stale | infra-error. The runner never promotes anything.
+// offline. Result statuses: green | red | stale | infra-error (the suite can return infra-error itself, see
+// suite/run.mjs). The runner never promotes anything.
 //
 // Results are keyed by the COMMIT the tested image was built from, read from the `:latest` image's label
 // io.osaas.repo.commit in the registry. GET /health cannot supply it: the platform builds the image without git
@@ -21,7 +22,7 @@ const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * @property {(inst: { baseUrl: string, token: string }) => Promise<any>} [prepare]   make the instance ready for the suite (provision its stack); a failure is infra-error
  * @property {(record: any, prior: any) => Promise<void>} [notify]   alert on a failing verdict; its failure never fails the cycle
  * @property {string[]} [secrets]    exact values to mask in anything stored or printed
- * @property {{ waitMs?: number, pollMs?: number, retries?: number, backoffMs?: number }} [opts]
+ * @property {{ waitMs?: number, pollMs?: number, retries?: number, backoffMs?: number, suiteRetries?: number }} [opts]   `suiteRetries`: extra suite runs when a run ends infra-error (default 1)
  * @property {(ms: number) => Promise<void>} [sleep]
  * @property {() => number} [now]
  * @property {() => string} [clock]  ISO timestamp
@@ -30,7 +31,7 @@ const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /** @param {Deps} d */
 export async function runCycle(d) {
   const { registry, instance, store } = d;
-  const o = { waitMs: 15 * 60_000, pollMs: 10_000, retries: 2, backoffMs: 30_000, ...d.opts };
+  const o = { waitMs: 15 * 60_000, pollMs: 10_000, retries: 2, backoffMs: 30_000, suiteRetries: 1, ...d.opts };
   const sleep = d.sleep ?? realSleep;
   const now = d.now ?? Date.now;
   const clock = d.clock ?? (() => new Date().toISOString());
@@ -87,17 +88,43 @@ export async function runCycle(d) {
     }
   }
 
-  let suite;
-  try { suite = await d.runSuite(inst, expected); } catch (e) {
-    return finish({ status: 'infra-error', suiteVersion: null, cases: [], detail: clean(`suite crashed: ${e?.message ?? e}`) });
+  // The suite itself can end infra-error (a platform failure in a case, suite/run.mjs) and a crash is one too.
+  // Such a run says nothing about the image, so it is worth `suiteRetries` more runs before a verdict is recorded:
+  // the transcode case failed this way three times on 2026-10-19 while the same image digest went green 12/12 by hand
+  // (#1248). Only the last run is the verdict; `suiteAttempts` says how many it took and `retriedAfter` keeps what
+  // the first platform failure looked like.
+  const attempt = async () => {
+    try { return await d.runSuite(inst, expected); } catch (e) {
+      return { status: 'infra-error', suiteVersion: null, cases: [], detail: clean(`suite crashed: ${e?.message ?? e}`) };
+    }
+  };
+  let suite = await attempt();
+  let suiteAttempts = 1;
+  let retriedAfter;
+  while (suite.status === 'infra-error' && suiteAttempts <= o.suiteRetries) {
+    retriedAfter ??= infraSummary(suite, clean);
+    await sleep(o.backoffMs);
+    suite = await attempt();
+    suiteAttempts++;
   }
 
   return finish({
-    status: suite.status, // green | red
+    status: suite.status, // green | red | infra-error
     suiteVersion: suite.suiteVersion,
     imageDigest: before.digest,
     version: build?.version ?? suite.build?.version,
     cases: suite.cases,
     swept: suite.swept,
+    suiteAttempts,
+    ...(suite.detail && { detail: clean(suite.detail) }),
+    ...(retriedAfter && { retriedAfter }),
   });
+}
+
+/** One line per platform failure in a suite run that was retried, so the retried-away failure is still on record. */
+function infraSummary(suite, clean) {
+  const failed = (suite.cases ?? []).filter((c) => c.status === 'fail');
+  const parts = failed.map((c) => `${c.id}: ${c.detail ?? 'no detail'}`);
+  if (suite.detail) parts.push(String(suite.detail));
+  return clean(parts.join(' | ') || 'infra-error with no detail');
 }
