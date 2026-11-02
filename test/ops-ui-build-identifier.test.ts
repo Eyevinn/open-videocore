@@ -41,6 +41,11 @@ const HEALTH_BODY = healthResponseSchema.parse({
     builtAt: '2026-10-20T11:22:33.000Z',
     packageVersion: '1.6.0',
   },
+  // Image-level feature signals (issue #1256 review): the gate is wired here,
+  // as it is in any real image (src/main.ts calls registerAuth).
+  features: {
+    authGateRegistered: true,
+  },
   resolver: {
     degraded: false,
     mode: 'none',

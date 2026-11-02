@@ -1607,6 +1607,10 @@ const authBody = `
 <p>Every request — other than health checks and the internal service callbacks — is authenticated with a bearer token, presented as an <code>Authorization</code> header:</p>
 <div class="code-block"><pre><code>Authorization: Bearer &lt;your-osc-access-token&gt;</code></pre></div>
 <p>In production on OSC, this is enforced by the platform's login wall in front of the instance. The token is your OSC Personal Access Token — the same one used in <a href="installation.html">Installation</a> to deploy the instance.</p>
+<h3 id="x-jwt">The <code>x-jwt</code> header</h3>
+<p>The same token is also accepted in an <code>x-jwt</code> header, with the same <code>Bearer</code> prefix:</p>
+<div class="code-block"><pre><code>x-jwt: Bearer &lt;your-osc-access-token&gt;</code></pre></div>
+<p>This is the header the platform's own ingress authenticates, and the one OSC's client tooling sends when it calls a deployed service endpoint. The ingress does not copy it into <code>Authorization</code>, so a caller that follows that tooling would otherwise clear the wall and then be rejected by the application with <code>401 missing access token</code>. Send either header; <code>Authorization</code> wins when both are present and carry a token. Neither header present (or neither carrying a <code>Bearer &lt;token&gt;</code> value) is still a <code>401</code>.</p>
 
 <h2 id="errors">Errors &amp; conventions</h2>
 <ul>

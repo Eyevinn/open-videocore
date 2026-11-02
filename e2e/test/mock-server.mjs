@@ -23,13 +23,33 @@ export function startMock({ token = 'tok', commit = 'abc1234', sourceDigest = 's
     const p = url.pathname;
     // Like the platform ingress: every path, /health included, needs x-jwt: Bearer <token>.
     if (!faults.openAuth && req.headers['x-jwt'] !== `Bearer ${token}`) return json(res, 401, { error: 'unauthorized' });
-    if (p.startsWith('/api/') && !faults.appOpen && !/^Bearer\s+\S+/.test(req.headers.authorization ?? '')) return json(res, 401, { error: 'unauthorized', message: 'missing access token' });
-    if (p === '/health') return json(res, 200, { status: 'ok', service: 'open-videocore-api', build: { version: '1.5.0', commit, sourceDigest, builtAt: null, packageVersion: '1.5.0' } });
+    // The application gate (src/auth/middleware.ts extractToken, issue #1256): `Authorization: Bearer <non-empty>` first,
+    // falling back to `x-jwt: Bearer <non-empty>`. A presence check, not a verification.
+    const bearer = (h) => /^Bearer\s+\S+/.test(h ?? '');
+    if (p.startsWith('/api/') && !faults.appOpen && !(bearer(req.headers.authorization) || bearer(req.headers['x-jwt']))) return json(res, 401, { error: 'unauthorized', message: 'missing access token' });
+    // `features.authGateRegistered` mirrors src/routes/health.ts featuresSchema: the image's own
+    // report of whether the 401 presence gate is wired. `noAuthGate` models an image that reports
+    // no gate — the #711 regression the suite has to stay able to see now that the application
+    // accepts x-jwt and the behavioural probe can no longer provoke a 401 from behind the ingress.
+    // Kept separate from `appOpen` (which models non-enforcement) so each facet can be driven on
+    // its own; a real un-gated image would report both at once.
+    // `healthNoFeatures` models an older image that predates the block entirely.
+    if (p === '/health') return json(res, 200, { status: 'ok', service: 'open-videocore-api', build: { version: '1.5.0', commit, sourceDigest, builtAt: null, packageVersion: '1.5.0' }, ...(faults.healthNoFeatures ? {} : { features: { authGateRegistered: !faults.noAuthGate } }) });
     const m = (re) => p.match(re);
     let x;
     if (req.method === 'GET' && p === '/api/v1/assets/') {
       const all = [...assets.values()]; const limit = Number(url.searchParams.get('limit') ?? 50); const offset = Number(url.searchParams.get('offset') ?? 0);
       return json(res, 200, { items: all.slice(offset, offset + limit), limit, offset, total: all.length });
+    }
+    if (req.method === 'POST' && p === '/api/v1/assets/') {
+      if (typeof body?.name !== 'string' || body.name.length === 0) return json(res, 400, { error: 'bad_request', message: 'name is required' });
+      const id = randomUUID();
+      // The real API creates in `uploading` with neither `tags` nor `renditions`
+      // (src/data/asset-repo.ts create(): `status: 'uploading'`, `tags` only when the
+      // caller supplied some, no `renditions` key; openapi.json status enum includes
+      // "uploading"). The mock used to invent `ready` + empty tags/renditions.
+      assets.set(id, { id, name: body.name, status: 'uploading', createdAt: new Date().toISOString() });
+      return json(res, 201, assets.get(id));
     }
     if (req.method === 'POST' && p === '/api/v1/assets/ingest-url') {
       const id = randomUUID(); const jobId = randomUUID();

@@ -291,12 +291,25 @@ await app.register(fastifySwagger, {
       { name: 'admin', description: 'Operational status and background service control' },
       { name: 'logs', description: 'Cursor-paged operational log stream' },
     ],
+    // Both headers the auth middleware accepts are declared, so the published
+    // contract matches src/auth/middleware.ts extractToken (issue #1256):
+    // `Authorization: Bearer <token>` first, `x-jwt: Bearer <token>` as the
+    // fallback. Declaring only bearerAuth told generated clients and the
+    // api-docs "Authorize" dialog that the x-jwt route did not exist.
+    //
+    // `x-jwt` is modelled as an apiKey-in-header scheme because that is the
+    // only OpenAPI 3 scheme type for a named custom header; the VALUE is still
+    // `Bearer <token>`, which the description states since the scheme type
+    // cannot express it.
     components: {
       securitySchemes: {
-        bearerAuth: { type: 'http', scheme: 'bearer', description: 'OSC access token (injected by the OSC login wall in production)' }
+        bearerAuth: { type: 'http', scheme: 'bearer', description: 'OSC access token (injected by the OSC login wall in production)' },
+        xJwtAuth: { type: 'apiKey', in: 'header', name: 'x-jwt', description: 'OSC access token as `Bearer <token>` in the platform ingress header. Accepted as a fallback when Authorization is absent or carries no token, so a caller following OSC tooling (which sends the service access token in `x-jwt`) is not rejected 401 (issue #1256). Include the `Bearer ` prefix in the value.' }
       }
     },
-    security: [{ bearerAuth: [] }]
+    // Either scheme alone is sufficient — separate array members are OR, a
+    // single member with both keys would mean AND.
+    security: [{ bearerAuth: [] }, { xJwtAuth: [] }]
   },
   transform: jsonSchemaTransform
 });
@@ -354,7 +367,11 @@ await app.register(healthRouter, {
   ingestSignals: () => ({
     storageAvailable,
     hasEnvMinio: Boolean(process.env['MINIO_URL'])
-  })
+  }),
+  // Read per request against the ROOT instance, so it reflects the
+  // registerAuth(app) call further down this file rather than this router's
+  // registration-time view of the decorators (see HealthRouterOptions).
+  authGateRegistered: () => app.hasDecorator('authenticate')
 });
 app.get('/healthz', async () => ({ status: 'ok' }));
 

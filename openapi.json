@@ -11,6 +11,12 @@
         "type": "http",
         "scheme": "bearer",
         "description": "OSC access token (injected by the OSC login wall in production)"
+      },
+      "xJwtAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-jwt",
+        "description": "OSC access token as `Bearer <token>` in the platform ingress header. Accepted as a fallback when Authorization is absent or carries no token, so a caller following OSC tooling (which sends the service access token in `x-jwt`) is not rejected 401 (issue #1256). Include the `Bearer ` prefix in the value."
       }
     },
     "schemas": {}
@@ -58,6 +64,18 @@
                         "sourceDigest",
                         "builtAt",
                         "packageVersion"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "features": {
+                      "type": "object",
+                      "properties": {
+                        "authGateRegistered": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "authGateRegistered"
                       ],
                       "additionalProperties": false
                     },
@@ -171,6 +189,7 @@
                     "status",
                     "service",
                     "build",
+                    "features",
                     "resolver",
                     "ingest"
                   ],
@@ -26678,6 +26697,9 @@
   "security": [
     {
       "bearerAuth": []
+    },
+    {
+      "xJwtAuth": []
     }
   ],
   "tags": [
