@@ -1539,6 +1539,55 @@ describe('encore-callback-poller — webhook dispatch on the poller completion p
     expect(parsed.profile).toBe('program');
   });
 
+  // issue #1293: the poller's own normaliseRenditions (kept in sync with the
+  // route's copy) must also carry the first video stream's codec through to the
+  // stored Rendition (Rendition.codec, src/data/asset-repo.ts:459, written by
+  // transcode.ts:446) and onto the encode-completion event's optional `codec`
+  // (encodeCompletionEventSchema, src/pipeline/encode-completion-event.ts:171).
+  it('#1293: carries the video stream codec onto renditions settled via the poller', async () => {
+    const encoreUuid = 'uuid-webhook-codec';
+    const { externalId, assetId } = await seedScenario(redis, jobs, assets, pipelines, { encoreUuid });
+    const localId = findLocalJobId(externalId);
+    await jobs.update(localId, { status: 'running', profile: 'program' });
+    await jobs.appendEncodeAttempt(localId, { index: 1 });
+
+    const { dispatcher, delivered } = await makeDispatcher();
+    const fetchFn = makeFetch({
+      jobDocs: {
+        [encoreUuid]: {
+          externalId,
+          status: 'SUCCESSFUL',
+          output: [
+            {
+              type: 'VideoFile',
+              file: 'out/1080p.mp4',
+              // A media-analyzer VideoStream carries codec next to the
+              // dimensions, plus siblings we do not model.
+              videoStreams: [{ width: 1920, height: 1080, codec: 'h264', bitDepth: 8 }],
+              overallBitrate: 5_000_000
+            },
+            {
+              type: 'VideoFile',
+              file: 'out/720p.mp4',
+              videoStreams: [{ width: 1280, height: 720, codec: 'hevc' }],
+              overallBitrate: 3_000_000
+            }
+          ]
+        }
+      }
+    });
+
+    await runCompletion(deps(fetchFn, dispatcher), encoreUuid, localId, 'done');
+    await waitFor(() => delivered.some((d) => d.event === ENCODE_COMPLETION_EVENT_TYPE));
+
+    const stored = (await assets.get(assetId))?.renditions ?? [];
+    expect(stored.map((r) => r.codec)).toEqual(['h264', 'hevc']);
+
+    const encode = delivered.find((d) => d.event === ENCODE_COMPLETION_EVENT_TYPE)!;
+    const codecParsed = encodeCompletionEventSchema.parse(encode.payload);
+    expect(codecParsed.codec).toBe('h264');
+  });
+
   // Idempotency: the sweep re-observing an already-settled job runs the same
   // handleMessage path, but completeTranscode no-ops (applied === false), so no
   // event may be re-delivered.

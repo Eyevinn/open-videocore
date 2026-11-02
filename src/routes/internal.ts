@@ -108,13 +108,28 @@ const errorSchema = z.object({ error: z.string(), message: z.string().optional()
 //   status      — "NEW"|"QUEUED"|"IN_PROGRESS"|"SUCCESSFUL"|"FAILED"|"CANCELLED"
 //   message     — error message when status=FAILED
 //   output      — array of MediaFile (VideoFile|AudioFile|ImageFile|SubtitleFile)
-//                 VideoFile has: file (path), type ("VideoFile"), videoStreams[{width,height}]
+//                 VideoFile has: file (path), type ("VideoFile"),
+//                 videoStreams[{width,height,codec,...}]
 //
 // We filter output to VideoFile entries only (type === "VideoFile") to extract
 // rendition dimensions. The schema is lenient on unknown fields.
+//
+// `codec` (issue #1293): each videoStreams[i] is a media-analyzer VideoStream
+// (`codec: String`, non-null upstream, alongside profile/pixelFormat/bitDepth
+// which we do not model — svt/media-analyzer tag release-2.0.7,
+// src/main/kotlin/se/svt/oss/mediaanalyzer/file/VideoStream.kt:7-9, the version
+// Encore pins; VideoFile.videoStreams is a List<VideoStream>, VideoFile.kt:11-17).
+// It was previously dropped here, so no stored Rendition ever had a codec even
+// though Rendition.codec (src/data/asset-repo.ts:459) and
+// CallbackRendition.codec (src/pipeline/transcode.ts:267) both exist and
+// transcode.ts:446 copies it onto the stored rendition. Modelled OPTIONAL on our
+// side even though upstream is non-null: an output may carry no videoStreams at
+// all, and this schema must never reject a completion over a field we only read
+// for metadata.
 const videoStreamSchema = z.object({
   width: z.number().optional(),
-  height: z.number().optional()
+  height: z.number().optional(),
+  codec: z.string().optional()
 }).passthrough();
 
 const callbackOutputSchema = z.object({
@@ -301,6 +316,9 @@ function normaliseRenditions(
       width: stream?.width ?? 0,
       height: stream?.height ?? 0,
       objectKey: o.file ?? `rendition-${i + 1}`,
+      // First video stream's codec (issue #1293). Undefined when the callback
+      // reported none — CallbackRendition.codec is optional.
+      codec: stream?.codec,
       bitrateBps: o.overallBitrate
     };
   });

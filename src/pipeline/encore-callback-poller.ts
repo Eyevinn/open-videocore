@@ -355,10 +355,16 @@ async function enqueuePackagingJob(
 }
 
 // A produced Encore output entry (subset — matches the internal route schema).
+// `codec` (issue #1293): each videoStreams[i] is a media-analyzer VideoStream
+// with `codec: String` (svt/media-analyzer release-2.0.7,
+// src/main/kotlin/se/svt/oss/mediaanalyzer/file/VideoStream.kt:7-9); it was
+// dropped here, so no rendition settled by the poller ever had one. Optional on
+// our side for the same reason as the route's schema (an output may report no
+// videoStreams).
 type EncoreOutput = {
   file?: string;
   type?: string;
-  videoStreams?: Array<{ width?: number; height?: number }>;
+  videoStreams?: Array<{ width?: number; height?: number; codec?: string }>;
   overallBitrate?: number;
 };
 
@@ -382,6 +388,8 @@ function normaliseRenditions(output: EncoreOutput[] | undefined): CallbackRendit
       width: stream?.width ?? 0,
       height: stream?.height ?? 0,
       objectKey: o.file ?? `rendition-${i + 1}`,
+      // First video stream's codec (issue #1293), mirroring the route's copy.
+      codec: stream?.codec,
       bitrateBps: o.overallBitrate
     };
   });

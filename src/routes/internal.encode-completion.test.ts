@@ -233,4 +233,64 @@ describe('encode-completion event emission on transcode completion (issue #693)'
     // Duration still derives from the attempt log.
     expect(parsed.encodeDurationMs).toBe(12_000);
   });
+
+  // issue #1293: a callback whose output DOES carry a per-stream codec. The
+  // video-stream schema (videoStreamSchema, src/routes/internal.ts) now models
+  // `codec` and normaliseRenditions reads it off the first video stream, so the
+  // value reaches both the stored Rendition (Rendition.codec,
+  // src/data/asset-repo.ts:459, written by transcode.ts:446) and the
+  // encode-completion event's optional `codec`
+  // (encodeCompletionEventSchema, src/pipeline/encode-completion-event.ts:171).
+  // Upstream the field is non-null on a VideoStream (svt/media-analyzer
+  // release-2.0.7, .../file/VideoStream.kt:7-9), but our schema keeps it optional
+  // so a callback reporting no videoStreams (the older fixture above, which still
+  // yields undefined) is still accepted rather than rejected.
+  it('#1293: carries the first video stream codec onto the stored rendition and the event', async () => {
+    const { app, jobs, assets, delivered } = await buildApp([ENCODE_COMPLETION_EVENT_TYPE]);
+    const { assetId, externalId } = await seedRunningTranscode(jobs, assets, {
+      startedAt: '2026-09-14T10:00:00.000Z',
+      endedAt: '2026-09-14T10:00:20.000Z'
+    });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/internal/encore-callback',
+      payload: {
+        externalId,
+        status: 'SUCCESSFUL',
+        output: [
+          {
+            file: 'transcode/asset/job/1080.mp4',
+            type: 'VideoFile',
+            // A media-analyzer VideoStream: codec alongside the dimensions, plus
+            // sibling fields we deliberately do not model (passthrough).
+            videoStreams: [
+              { width: 1920, height: 1080, codec: 'h264', profile: 'high', bitDepth: 8 }
+            ],
+            overallBitrate: 5_000_000
+          },
+          {
+            file: 'transcode/asset/job/720.mp4',
+            type: 'VideoFile',
+            videoStreams: [{ width: 1280, height: 720, codec: 'hevc' }],
+            overallBitrate: 3_000_000
+          }
+        ]
+      }
+    });
+    expect(res.statusCode).toBe(200);
+    await new Promise((r) => setImmediate(r));
+
+    // Persisted on the asset: one rendition per output, each with ITS OWN codec.
+    const stored = (await assets.get(assetId))?.renditions ?? [];
+    expect(stored.map((r) => r.codec)).toEqual(['h264', 'hevc']);
+    expect(stored[0].width).toBe(1920);
+
+    // And surfaced on the encode-completion event (first rendition).
+    const encodeEvents = delivered.filter((d) => d.event === ENCODE_COMPLETION_EVENT_TYPE);
+    expect(encodeEvents).toHaveLength(1);
+    const parsed = encodeCompletionEventSchema.parse(encodeEvents[0].payload);
+    expect(parsed.codec).toBe('h264');
+    expect(parsed.renditionCount).toBe(2);
+  });
 });
