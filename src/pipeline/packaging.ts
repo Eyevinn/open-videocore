@@ -629,7 +629,17 @@ export class PackagingService implements PackagingTrigger {
     const packagedOutput = packagedOutputFromCallback(payload.outputPath, packagedBucket());
     await this.deps.assets.update(assetId, {
       manifestUrls,
-      ...(packagedOutput ? { packagedOutput } : {})
+      ...(packagedOutput ? { packagedOutput } : {}),
+      // Clear the packaged-output-stale marker (issue #1290) in the SAME write
+      // that repoints the manifests: a re-encode without a package had recorded
+      // that these manifests described an older generation of `renditions`
+      // (pipeline/transcode.ts completeTranscode), and this callback is the
+      // package that resolves it. Stated explicitly here so the clear is
+      // readable at the call site; both repositories ALSO clear it on any
+      // `manifestUrls` write (applyPatch, data/asset-repo.ts +
+      // data/couch-asset-repo.ts), so the invariant does not depend on this
+      // line alone.
+      packagedOutputStale: false
     });
     // Issue #1279: the packager finishing is NOT the same thing as the output
     // being delivered. When the execution carries a destination override, the

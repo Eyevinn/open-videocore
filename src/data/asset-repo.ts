@@ -604,6 +604,35 @@ export type Asset = {
   // resolve the REAL, job-nested manifest objects instead of a derived flat path.
   // Optional/additive: absent on assets packaged before #502 (lazy-resolved).
   packagedOutput?: PackagedOutput;
+  // The asset's packaged output no longer describes its current renditions
+  // (issue #1290). Set by the transcode completion handler when an encode
+  // succeeds on an asset that ALREADY carries `manifestUrls`: the new output
+  // lands under `transcode/<assetId>/<jobId>` and only `renditions` is
+  // rewritten, so the packaged manifests keep pointing at the PREVIOUS encode.
+  // Nothing in the record used to say the two disagreed.
+  //
+  // Deliberately a MARKER, not a clear (issue #1290 decision): `manifestUrls`
+  // stays put so playback keeps working over the previous package, and
+  // GET /:id/delivery resolution is unchanged. A caller that needs the two to
+  // agree reads this flag and re-packages.
+  //
+  // Cleared the moment a package completes and repoints `manifestUrls` (see
+  // `UpdateAssetInput.manifestUrls` below and applyPatch in both repositories),
+  // so "stale" can never outlive the package that resolved it.
+  //
+  // Optional/additive, and absent means NOT stale: documents written before
+  // #1290 lack it and stay valid v1 documents (the reviewState / packagedOutput
+  // precedent), so no schemaVersion bump is required. Only ever `true` — the
+  // not-stale state is the field's absence, matching how `deleteLock` records
+  // "unlocked" by removing itself (applyDeleteLock).
+  //
+  // #1244 (superseded-output deletion) only deletes the previous packaged
+  // prefix AFTER a new package has confirmed `packagedOutput.prefix` +
+  // `manifestUrls.hls` point at the new generation — which is exactly when this
+  // marker clears. So the two agree: while the marker is set the old package is
+  // still there and still playable; when the old package is gone the marker is
+  // already cleared.
+  packagedOutputStale?: boolean;
   // ABR renditions produced by transcoding (issue #8). Populated on the SOURCE
   // asset when a transcode job completes; undefined until then.
   renditions?: Rendition[];
@@ -752,8 +781,12 @@ export type UpdateAssetInput = {
   technicalMetadata?: TechnicalMetadata | null;
   technicalMetadataError?: string;
   // Set by the packaging pipeline (issue #9). Writing `manifestUrls` clears any
-  // prior `packagingError`; writing `packagingError` records a failure and
-  // leaves `manifestUrls` untouched. Neither field changes `status`.
+  // prior `packagingError` — and, since #1290, any prior `packagedOutputStale`
+  // marker: the write IS the repoint onto the new package, so the recorded
+  // disagreement between manifests and renditions is resolved by definition.
+  // Writing `packagingError` records a failure and leaves `manifestUrls`
+  // untouched (a failed package leaves a stale marker standing, correctly).
+  // Neither field changes `status`.
   manifestUrls?: ManifestUrls;
   packagingError?: string;
   // Set by the packaging pipeline (issue #502) alongside `manifestUrls`: the
@@ -761,6 +794,14 @@ export type UpdateAssetInput = {
   // manifest keys) captured from the packager callback's `outputPath`. Does not
   // change `status`. Additive — omitted on legacy packaging callbacks.
   packagedOutput?: PackagedOutput;
+  // Set by the transcode completion handler (issue #1290) when an encode
+  // succeeds on an asset that already has packaged output: `true` records that
+  // the packaged manifests describe an OLDER encode than `renditions`. `false`
+  // clears the marker (stored as absence, so documents stay clean). Does not
+  // change `status` and never touches `manifestUrls` — see the field comment on
+  // `Asset.packagedOutputStale`. Writing `manifestUrls` clears it implicitly, so
+  // the package-complete path does not have to remember to.
+  packagedOutputStale?: boolean;
   // Set by the transcode pipeline (issue #8) on the source asset when a
   // transcode job completes. Does not change `status`.
   renditions?: Rendition[];
@@ -1769,12 +1810,24 @@ export class InMemoryAssetRepository implements AssetRepository {
       next.manifestUrls = patch.manifestUrls;
       // A successful packaging result clears any stale error.
       next.packagingError = undefined;
+      // ...and the packaged-output-stale marker (issue #1290): this write IS the
+      // repoint of the manifests onto freshly packaged output, so the recorded
+      // disagreement with `renditions` is resolved. Enforced here (not only at
+      // the call site in pipeline/packaging.ts) so the invariant "manifestUrls
+      // written => not stale" holds for EVERY writer of the field.
+      next.packagedOutputStale = undefined;
     }
     if (patch.packagingError !== undefined) {
       next.packagingError = patch.packagingError;
     }
     if (patch.packagedOutput !== undefined) {
       next.packagedOutput = patch.packagedOutput;
+    }
+    // Packaged-output staleness (issue #1290). `true` marks, `false` clears —
+    // stored as absence so an asset that was never stale and one whose marker
+    // was cleared are byte-identical, and pre-#1290 documents round-trip clean.
+    if (patch.packagedOutputStale !== undefined) {
+      next.packagedOutputStale = patch.packagedOutputStale ? true : undefined;
     }
     if (patch.renditions !== undefined) {
       next.renditions = patch.renditions;

@@ -2439,6 +2439,10 @@
                     "packagingError": {
                       "type": "string"
                     },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
+                    },
                     "renditions": {
                       "type": "array",
                       "items": {
@@ -3025,6 +3029,10 @@
                           },
                           "packagingError": {
                             "type": "string"
+                          },
+                          "packagedOutputStale": {
+                            "type": "boolean",
+                            "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                           },
                           "renditions": {
                             "type": "array",
@@ -3756,6 +3764,10 @@
                           "packagingError": {
                             "type": "string"
                           },
+                          "packagedOutputStale": {
+                            "type": "boolean",
+                            "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
+                          },
                           "renditions": {
                             "type": "array",
                             "items": {
@@ -4308,6 +4320,10 @@
                           },
                           "packagingError": {
                             "type": "string"
+                          },
+                          "packagedOutputStale": {
+                            "type": "boolean",
+                            "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                           },
                           "renditions": {
                             "type": "array",
@@ -4937,6 +4953,10 @@
                     "packagingError": {
                       "type": "string"
                     },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
+                    },
                     "renditions": {
                       "type": "array",
                       "items": {
@@ -5540,6 +5560,10 @@
                     },
                     "packagingError": {
                       "type": "string"
+                    },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                     },
                     "renditions": {
                       "type": "array",
@@ -6321,6 +6345,10 @@
                     "packagingError": {
                       "type": "string"
                     },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
+                    },
                     "renditions": {
                       "type": "array",
                       "items": {
@@ -6941,6 +6969,10 @@
                     },
                     "packagingError": {
                       "type": "string"
+                    },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                     },
                     "renditions": {
                       "type": "array",
@@ -7661,6 +7693,10 @@
                           },
                           "packagingError": {
                             "type": "string"
+                          },
+                          "packagedOutputStale": {
+                            "type": "boolean",
+                            "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                           },
                           "renditions": {
                             "type": "array",
@@ -10810,6 +10846,10 @@
                     "packagingError": {
                       "type": "string"
                     },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
+                    },
                     "renditions": {
                       "type": "array",
                       "items": {
@@ -11745,6 +11785,10 @@
                     "packagingError": {
                       "type": "string"
                     },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
+                    },
                     "renditions": {
                       "type": "array",
                       "items": {
@@ -12550,6 +12594,10 @@
                     },
                     "packagingError": {
                       "type": "string"
+                    },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                     },
                     "renditions": {
                       "type": "array",
@@ -13660,6 +13708,10 @@
                     "packagingError": {
                       "type": "string"
                     },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
+                    },
                     "renditions": {
                       "type": "array",
                       "items": {
@@ -14219,6 +14271,10 @@
                     },
                     "packagingError": {
                       "type": "string"
+                    },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                     },
                     "renditions": {
                       "type": "array",
@@ -14871,6 +14927,10 @@
                     },
                     "packagingError": {
                       "type": "string"
+                    },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                     },
                     "renditions": {
                       "type": "array",
@@ -15640,6 +15700,10 @@
                     "packagingError": {
                       "type": "string"
                     },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
+                    },
                     "renditions": {
                       "type": "array",
                       "items": {
@@ -16188,6 +16252,10 @@
                     },
                     "packagingError": {
                       "type": "string"
+                    },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                     },
                     "renditions": {
                       "type": "array",
@@ -16739,6 +16807,10 @@
                     },
                     "packagingError": {
                       "type": "string"
+                    },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                     },
                     "renditions": {
                       "type": "array",

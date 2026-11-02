@@ -1268,6 +1268,26 @@ const assetSchema = z.object({
   // packaging completes; `packagingError` carries the last packaging failure.
   manifestUrls: manifestUrlsSchema.optional(),
   packagingError: z.string().optional(),
+  // The packaged output no longer matches the asset's current renditions
+  // (issue #1290). Present and `true` ONLY after an encode succeeded on an asset
+  // that already had `manifestUrls`, until a package repoints them; absent means
+  // not stale. `manifestUrls` and GET /:id/delivery are deliberately unchanged
+  // while it is set — playback over the previous package keeps working — so this
+  // flag is the only way a caller can tell that `manifestUrls` and `renditions`
+  // describe different encodes. Contract: `Asset.packagedOutputStale`
+  // (src/data/asset-repo.ts), persisted at `structural.packagedOutputStale`
+  // (src/data/asset-document.ts).
+  packagedOutputStale: z
+    .boolean()
+    .optional()
+    .describe(
+      'True when the packaged output (`manifestUrls`, `packagedOutput`) was ' +
+        'produced from an EARLIER encode than the current `renditions` — set ' +
+        'when a re-encode completes and no new package follows it. Omitted ' +
+        '(never false) when the two agree. The manifests are left in place and ' +
+        'keep playing the previous package; re-run packaging to resolve it, ' +
+        'which clears this flag and repoints `manifestUrls`.'
+    ),
   // ABR renditions produced by transcoding (issue #8, redesigned #79). Absent
   // until a transcode job completes; each entry is an embedded variant of this
   // single asset (no child assets).
