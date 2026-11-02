@@ -110,7 +110,11 @@ import { makeOscProbeRunner } from './pipeline/osc-ffprobe.js';
 import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-extractor.js';
 import { makeOscSubtitleGenerator } from './pipeline/osc-auto-subtitles.js';
 import type { SubtitleGenerator } from './pipeline/subtitle-generator.js';
-import { makeFfmpegS3SceneDetector } from './pipeline/osc-scene-detect-ffmpeg-s3.js';
+import {
+  makeFfmpegS3SceneDetector,
+  configuredScenePollBudgetMs
+} from './pipeline/osc-scene-detect-ffmpeg-s3.js';
+import { sceneUrlTtlSeconds } from './pipeline/scene-detector.js';
 import type { SceneDetector } from './pipeline/scene-detector.js';
 import type { SceneDetectObjectStore } from './services/workspace-stack.js';
 import { makeOscThumbnailExtractor } from './pipeline/osc-thumbnail.js';
@@ -463,7 +467,8 @@ const storageBackendRegistry = new StorageBackendRegistry(
 // builders — so a freshly provisioned optional service is picked up on the next
 // pipeline run with NO API restart. When object storage is unavailable the
 // builders are omitted and the steps stay disabled (graceful skip). The
-// runner-tuning knobs (AUTO_SUBTITLES_WRITES_S3, SCENE_DETECT_PATH) are NOT
+// runner-tuning knobs (AUTO_SUBTITLES_WRITES_S3, and for scene detection
+// SCENE_POLL_BUDGET_SECONDS paired with SCENE_URL_TTL_SECONDS) are NOT
 // activation switches and remain here.
 const storageBackedForOptionalSteps = Boolean(process.env['MINIO_URL']) || Boolean(paramStore);
 const optionalStepBuilders = storageBackedForOptionalSteps
@@ -495,7 +500,14 @@ const optionalStepBuilders = storageBackedForOptionalSteps
           s3SecretKey: s3.secretKey,
           s3Bucket: s3.bucket,
           readCutObject: s3.readObject,
-          removeCutObject: s3.removeObject
+          removeCutObject: s3.removeObject,
+          // Poll budget comes from configuration, not from the runner's own
+          // default (ADR-027 D8.2): SCENE_POLL_BUDGET_SECONDS if set, else the
+          // 25-minute default — and in either case clamped by the runner to the
+          // presigned-GET lifetime that SCENE_URL_TTL_SECONDS configures, so the
+          // two env vars cannot drift into a guaranteed mid-decode 403.
+          pollBudgetMs: configuredScenePollBudgetMs(),
+          urlTtlSeconds: sceneUrlTtlSeconds()
         })
     }
   : {};

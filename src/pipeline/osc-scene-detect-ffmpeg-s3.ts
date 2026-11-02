@@ -67,8 +67,9 @@ import {
   type Context
 } from '@osaas/client-core';
 import { FFPROBE_SERVICE_ID } from '../services/stack.js';
-import { pollOscJobUntilDone } from './osc-job-poll.js';
+import { pollOscJobUntilDone, DEFAULT_JOB_POLL_TIMEOUT_MS } from './osc-job-poll.js';
 import { captureJobLogs, OscJobError } from './osc-job-log.js';
+import { sceneUrlTtlSeconds } from './scene-detector.js';
 import type { SceneDetector, SceneDetectorResult } from './scene-detector.js';
 
 // Scene-change threshold for ffmpeg's `select` filter. Held at the value the
@@ -86,12 +87,116 @@ export const SCENE_CUT_KEY_PREFIX = 'scene-detect/';
 
 // Poll budget for ONE detection job (ADR-027 D8). Scene detection is the first
 // caller that decodes the whole file rather than seeking, so the shared
-// 5-minute default of osc-job-poll.ts is not a sensible ceiling for it. Sized
-// to stay inside the presigned source URL's own lifetime
+// DEFAULT_JOB_POLL_TIMEOUT_MS (5 min, osc-job-poll.ts) is not a sensible
+// ceiling for it. Sized to stay inside the presigned source URL's own lifetime
 // (DEFAULT_SCENE_URL_TTL_SECONDS = 30 min in scene-detector.ts): the URL is
 // ffmpeg's `-i`, so it must remain valid for the whole decode, and a budget
 // that outlived the URL would just trade a timeout for a mid-decode read error.
+//
+// This constant is only the DEFAULT. The number that actually applies is
+// resolved per call by resolveScenePollBudgetMs() below, which re-derives the
+// ceiling from the TTL that is configured in this deployment — because the
+// 30-minute TTL this 25 minutes was chosen against is itself overridable
+// (SCENE_URL_TTL_SECONDS), and a comment cannot keep the pair honest.
 export const DEFAULT_SCENE_POLL_BUDGET_MS = 25 * 60_000; // 25 minutes
+
+// Env override for the per-detection poll budget, in SECONDS — the same unit as
+// SCENE_URL_TTL_SECONDS, which it must be configured against (ADR-027 D8.2:
+// "if an operator needs a longer budget they must raise SCENE_URL_TTL_SECONDS
+// with it"). Non-numeric or non-positive values fall back to the default, the
+// same degradation rule sceneUrlTtlSeconds() uses for its own env var.
+export const SCENE_POLL_BUDGET_ENV = 'SCENE_POLL_BUDGET_SECONDS';
+
+// Fraction of the presigned-GET lifetime the poll budget may occupy. 5/6 is not
+// an arbitrary safety factor: it is exactly the ratio the pair of defaults
+// already expresses (25 min of a 30 min TTL), so deriving the ceiling from the
+// configured TTL reproduces the chosen defaults bit for bit while leaving the
+// same ~17% of the URL's life as headroom for queueing and image pull. ADR-027
+// D8.2 requires "budget <= TTL, with headroom".
+export const SCENE_POLL_BUDGET_TTL_FRACTION = 5 / 6;
+
+// The largest poll budget that still fits inside a presigned GET of
+// `ttlSeconds`. Defaults to the TTL this deployment is actually configured with
+// (sceneUrlTtlSeconds(), src/pipeline/scene-detector.ts).
+export function scenePollBudgetCeilingMs(ttlSeconds: number = sceneUrlTtlSeconds()): number {
+  return Math.floor(ttlSeconds * 1000 * SCENE_POLL_BUDGET_TTL_FRACTION);
+}
+
+// The configured budget before it is checked against the TTL.
+export function configuredScenePollBudgetMs(): number {
+  const raw = process.env[SCENE_POLL_BUDGET_ENV];
+  if (!raw) return DEFAULT_SCENE_POLL_BUDGET_MS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed * 1000 : DEFAULT_SCENE_POLL_BUDGET_MS;
+}
+
+export type ScenePollBudget = {
+  // The budget to actually pass to pollOscJobUntilDone.
+  budgetMs: number;
+  // What was configured before clamping (env/caller/default).
+  requestedMs: number;
+  // The TTL the ceiling was derived from, and the ceiling itself.
+  ttlSeconds: number;
+  ceilingMs: number;
+  // True when the configured budget outlived the URL and was cut back.
+  clamped: boolean;
+};
+
+// ADR-027 D8.2, made executable: resolve the poll budget AGAINST THE CONFIGURED
+// TTL rather than against a comment.
+//
+// WHY THIS EXISTS. The presigned GET is ffmpeg's `-i`, so a budget longer than
+// the URL's lifetime is not a longer wait — it is a *guaranteed* mid-decode 403
+// that D3 then persists nothing for, making the misconfiguration invisible.
+// Before this function the 25-minute default was paired with the 30-minute TTL
+// in prose only, and `SCENE_URL_TTL_SECONDS=600` silently produced exactly that
+// failure for every detection longer than ten minutes.
+//
+// CLAMP AND LOG, NOT FAIL. D8.2 permits either. Clamping is chosen because
+// detection is dispatched detached (`void detectScenes(...)`) on every ingest:
+// throwing at resolve time would turn one env-var mistake into a failed
+// scene-detect step for every asset in the deployment, while clamping keeps
+// detection working for everything that fits inside the TTL and still names the
+// misconfiguration in the log. The warning is emitted once per detection, by
+// the caller of this function, so the operator sees it on a real run rather
+// than only at boot.
+export function resolveScenePollBudgetMs(
+  requestedMs?: number,
+  ttlSeconds: number = sceneUrlTtlSeconds()
+): ScenePollBudget {
+  const requested =
+    typeof requestedMs === 'number' && Number.isFinite(requestedMs) && requestedMs > 0
+      ? requestedMs
+      : configuredScenePollBudgetMs();
+  const ceilingMs = scenePollBudgetCeilingMs(ttlSeconds);
+  const clamped = requested > ceilingMs;
+  return {
+    budgetMs: clamped ? ceilingMs : requested,
+    requestedMs: requested,
+    ttlSeconds,
+    ceilingMs,
+    clamped
+  };
+}
+
+// The operator-facing warning for a clamped budget. Separated from the runner so
+// the message is assertable without running a job.
+export function scenePollBudgetWarning(budget: ScenePollBudget): string {
+  const below =
+    budget.budgetMs < DEFAULT_JOB_POLL_TIMEOUT_MS
+      ? ` The clamped budget is BELOW the shared ${DEFAULT_JOB_POLL_TIMEOUT_MS / 1000}s` +
+        ` job-poll default, so scene detection now has less time than every other` +
+        ` ephemeral job in this deployment.`
+      : '';
+  return (
+    `[scene-detect] configured poll budget ${budget.requestedMs / 1000}s exceeds the ` +
+    `presigned source URL's usable lifetime (SCENE_URL_TTL_SECONDS=${budget.ttlSeconds}s, ` +
+    `usable ceiling ${budget.ceilingMs / 1000}s); clamping to ${budget.budgetMs / 1000}s. ` +
+    `A budget above the TTL cannot work: the URL is ffmpeg's input, so the job would ` +
+    `fail mid-decode with a 403 instead of waiting longer. Raise SCENE_URL_TTL_SECONDS ` +
+    `together with ${SCENE_POLL_BUDGET_ENV} if longer detections are needed.${below}`
+  );
+}
 
 // The ONLY statuses that mean the job finished successfully. Mirrors
 // osc-clip.ts SUCCESS_STATUSES verbatim (issue #786): an ALLOW-list, so a
@@ -128,11 +233,25 @@ export type OscSceneJobApi = {
   // Best-effort delete of the cut-list object once parsed. Optional so a
   // deployment without delete rights still gets detection.
   removeCutObject?: (objectKey: string) => Promise<void>;
-  // Per-call poll budget; defaults to DEFAULT_SCENE_POLL_BUDGET_MS.
+  // Per-call poll budget. Defaults to the configured budget
+  // (SCENE_POLL_BUDGET_SECONDS, else DEFAULT_SCENE_POLL_BUDGET_MS) and is, in
+  // either case, clamped to the configured presigned-URL TTL by
+  // resolveScenePollBudgetMs (ADR-027 D8.2) — a caller cannot opt out of the
+  // TTL pairing.
   pollBudgetMs?: number;
+  // Override for the presigned-GET TTL the budget is checked against, in
+  // seconds. Defaults to sceneUrlTtlSeconds(); only detectScenes callers that
+  // pass their own `ttlSeconds` (and tests) need to set it, and when they do it
+  // MUST be the same number they presign with.
+  urlTtlSeconds?: number;
   // Override for the cut-object key prefix (tests, and deployments that sweep a
   // different prefix).
   keyPrefix?: string;
+  // Optional sink for the clamped-budget warning (ADR-027 D8.2). Defaults to
+  // console.
+  logger?: {
+    warn?(...a: unknown[]): void;
+  };
 };
 
 // A unique, OSC-valid ephemeral job name: lowercase alphanumeric, bounded
@@ -273,6 +392,16 @@ export function makeFfmpegS3SceneDetector(api: OscSceneJobApi): SceneDetector {
     const objectKey = sceneCutObjectKey(name, api.keyPrefix ?? SCENE_CUT_KEY_PREFIX);
     const destination = sceneCutDestinationUri(api.s3Bucket, objectKey);
 
+    // Resolve the wait budget against the TTL that is CONFIGURED here, not
+    // against the default the constant was sized for (ADR-027 D8.2). Done
+    // before the job is created so the warning reaches the log even if the job
+    // itself fails immediately.
+    const budget = resolveScenePollBudgetMs(api.pollBudgetMs, api.urlTtlSeconds);
+    if (budget.clamped) {
+      const warn = api.logger?.warn ?? console.warn;
+      warn(scenePollBudgetWarning(budget));
+    }
+
     await api.createJob(api.context, FFPROBE_SERVICE_ID, sat, {
       name,
       cmdLineArgs: sceneDetectCmdLine(presignedUrl, destination),
@@ -290,7 +419,7 @@ export function makeFfmpegS3SceneDetector(api: OscSceneJobApi): SceneDetector {
       // detached runners (osc-ffprobe / osc-thumbnail) applies — an unseen but
       // healthy queueing status must not break detection for every asset.
       const status = await pollOscJobUntilDone(api, FFPROBE_SERVICE_ID, name, sat, {
-        timeoutMs: api.pollBudgetMs ?? DEFAULT_SCENE_POLL_BUDGET_MS
+        timeoutMs: budget.budgetMs
       });
       if (!SUCCESS_STATUSES.has(status)) {
         failure = `OSC scene-detect job "${name}" ended with non-success status "${status}"`;

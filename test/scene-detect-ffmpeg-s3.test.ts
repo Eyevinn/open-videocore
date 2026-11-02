@@ -8,7 +8,7 @@
 // service, including the two different `#tb` timebases the live run recorded
 // (1/25 and 1/12800 — `liveRun.findings`: "THE TIMEBASE IS NOT FIXED").
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   makeFfmpegS3SceneDetector,
   parseFramemd5Cuts,
@@ -18,9 +18,15 @@ import {
   sceneDetectJobName,
   Framemd5ParseError,
   SCENE_SELECT_THRESHOLD,
+  DEFAULT_SCENE_POLL_BUDGET_MS,
+  SCENE_POLL_BUDGET_ENV,
+  configuredScenePollBudgetMs,
+  resolveScenePollBudgetMs,
+  scenePollBudgetCeilingMs,
+  scenePollBudgetWarning,
   type OscSceneJobApi
 } from '../src/pipeline/osc-scene-detect-ffmpeg-s3.js';
-import { parseSceneResult } from '../src/pipeline/scene-detector.js';
+import { parseSceneResult, DEFAULT_SCENE_URL_TTL_SECONDS } from '../src/pipeline/scene-detector.js';
 import { detectScenes } from '../src/pipeline/scene-detector.js';
 
 // liveRun.runs['with-cuts']: 12s / 25fps clip with hard cuts at 3s, 6s, 9s.
@@ -307,5 +313,120 @@ describe('a failed scene-detect job persists NOTHING (ADR-027 D3 / issue #881)',
     const metadata = updates[0]!['sceneMetadata'] as { boundaries: unknown[]; sceneCount: number };
     expect(metadata.sceneCount).toBe(3);
     expect(metadata.boundaries[0]).toEqual({ startSeconds: 3, keyframeSeconds: 3, endSeconds: 6 });
+  });
+});
+
+// ADR-027 D8.2: the poll budget and the presigned-GET TTL are one pair of
+// numbers, and the TTL side is overridable per deployment
+// (SCENE_URL_TTL_SECONDS). A budget above the configured TTL is a GUARANTEED
+// mid-decode 403 rather than a longer wait, and D3 then persists nothing — so
+// the misconfiguration must be clamped and named, never left to drift.
+describe('poll budget is resolved against the CONFIGURED URL TTL (ADR-027 D8.2)', () => {
+  const savedTtl = process.env['SCENE_URL_TTL_SECONDS'];
+  const savedBudget = process.env[SCENE_POLL_BUDGET_ENV];
+
+  afterEach(() => {
+    vi.useRealTimers();
+    if (savedTtl === undefined) delete process.env['SCENE_URL_TTL_SECONDS'];
+    else process.env['SCENE_URL_TTL_SECONDS'] = savedTtl;
+    if (savedBudget === undefined) delete process.env[SCENE_POLL_BUDGET_ENV];
+    else process.env[SCENE_POLL_BUDGET_ENV] = savedBudget;
+  });
+
+  it('leaves the default 25-minute budget untouched under the default 30-minute TTL', () => {
+    delete process.env['SCENE_URL_TTL_SECONDS'];
+    delete process.env[SCENE_POLL_BUDGET_ENV];
+    const resolved = resolveScenePollBudgetMs();
+    expect(resolved.budgetMs).toBe(DEFAULT_SCENE_POLL_BUDGET_MS);
+    expect(resolved.ttlSeconds).toBe(DEFAULT_SCENE_URL_TTL_SECONDS);
+    expect(resolved.clamped).toBe(false);
+  });
+
+  it('clamps the default budget when SCENE_URL_TTL_SECONDS is lowered to 600', () => {
+    process.env['SCENE_URL_TTL_SECONDS'] = '600';
+    const resolved = resolveScenePollBudgetMs();
+    expect(resolved.clamped).toBe(true);
+    expect(resolved.requestedMs).toBe(DEFAULT_SCENE_POLL_BUDGET_MS);
+    // 5/6 of 600s, i.e. inside the URL's life with headroom for queueing.
+    expect(resolved.budgetMs).toBe(500_000);
+    expect(resolved.budgetMs).toBeLessThan(resolved.ttlSeconds * 1000);
+  });
+
+  it('clamps an env-configured budget that outlives the configured TTL', () => {
+    process.env['SCENE_URL_TTL_SECONDS'] = '1200';
+    process.env[SCENE_POLL_BUDGET_ENV] = '3600';
+    expect(configuredScenePollBudgetMs()).toBe(3_600_000);
+    const resolved = resolveScenePollBudgetMs();
+    expect(resolved.clamped).toBe(true);
+    expect(resolved.budgetMs).toBe(scenePollBudgetCeilingMs(1200));
+    expect(resolved.budgetMs).toBe(1_000_000);
+  });
+
+  it('honours a raised budget when the operator raised the TTL with it', () => {
+    process.env['SCENE_URL_TTL_SECONDS'] = '7200';
+    process.env[SCENE_POLL_BUDGET_ENV] = '3600';
+    const resolved = resolveScenePollBudgetMs();
+    expect(resolved.clamped).toBe(false);
+    expect(resolved.budgetMs).toBe(3_600_000);
+  });
+
+  it.each(['', 'abc', '0', '-30'])(
+    'degrades a non-positive/non-numeric budget override (%s) to the default',
+    (raw) => {
+      process.env[SCENE_POLL_BUDGET_ENV] = raw;
+      expect(configuredScenePollBudgetMs()).toBe(DEFAULT_SCENE_POLL_BUDGET_MS);
+    }
+  );
+
+  it('warns loudly, naming both env vars, when the pair is misconfigured', () => {
+    const warning = scenePollBudgetWarning(resolveScenePollBudgetMs(25 * 60_000, 600));
+    expect(warning).toContain('SCENE_URL_TTL_SECONDS=600s');
+    expect(warning).toContain(SCENE_POLL_BUDGET_ENV);
+    expect(warning).toContain('clamping to 500s');
+  });
+
+  it('logs the clamp warning on a real detection run', async () => {
+    const warnings: unknown[][] = [];
+    const { api } = makeApi({ object: WITH_CUTS_OBJECT });
+    const detector = makeFfmpegS3SceneDetector({
+      ...api,
+      pollBudgetMs: 25 * 60_000,
+      urlTtlSeconds: 600,
+      logger: { warn: (...a: unknown[]) => warnings.push(a) }
+    });
+    await expect(detector('https://src.test/a.mp4')).resolves.toEqual({ cuts: [3, 6, 9] });
+    expect(warnings).toHaveLength(1);
+    expect(String(warnings[0]![0])).toMatch(/exceeds the presigned source URL's usable lifetime/);
+  });
+
+  it('does not warn when the configured budget fits inside the configured TTL', async () => {
+    const warnings: unknown[][] = [];
+    const { api } = makeApi({ object: WITH_CUTS_OBJECT });
+    const detector = makeFfmpegS3SceneDetector({
+      ...api,
+      pollBudgetMs: 60_000,
+      urlTtlSeconds: 1800,
+      logger: { warn: (...a: unknown[]) => warnings.push(a) }
+    });
+    await expect(detector('https://src.test/a.mp4')).resolves.toEqual({ cuts: [3, 6, 9] });
+    expect(warnings).toHaveLength(0);
+  });
+
+  it('actually polls against the clamped budget, not the configured one', async () => {
+    vi.useFakeTimers();
+    const { api } = makeApi({ object: WITH_CUTS_OBJECT, statuses: ['Running'] });
+    const detector = makeFfmpegS3SceneDetector({
+      ...api,
+      // 25 minutes asked for, but the URL only lives 6s here: the ceiling is 5s,
+      // so the timeout must report 5s rather than 1500s.
+      pollBudgetMs: 25 * 60_000,
+      urlTtlSeconds: 6,
+      logger: { warn: () => undefined }
+    });
+    const settled = detector('https://src.test/a.mp4').catch((err: unknown) => err);
+    await vi.advanceTimersByTimeAsync(30_000);
+    const err = await settled;
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/timed out after 5s/);
   });
 });

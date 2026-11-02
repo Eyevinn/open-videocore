@@ -61,7 +61,15 @@ function isActiveStatus(status: string): boolean {
 }
 
 const POLL_INTERVAL_MS = 3_000;
-const TIMEOUT_MS = 5 * 60_000; // 5 minutes
+
+// The shared default wait budget, applied to every caller that passes no
+// `timeoutMs`. EXPORTED (ADR-027 D8.1, "Export the default so the detector can
+// express its own budget relative to it") so a caller with a different budget —
+// today only the scene detector — can state its own number against this one
+// instead of silently diverging from it. TIMEOUT_MS is kept as the in-module
+// name the comments below refer to.
+export const DEFAULT_JOB_POLL_TIMEOUT_MS = 5 * 60_000; // 5 minutes
+const TIMEOUT_MS = DEFAULT_JOB_POLL_TIMEOUT_MS;
 
 // How long a status that is neither known-terminal nor known-active is tolerated
 // before an opted-in caller gives up (issue #786 review): without this, a status
