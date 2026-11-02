@@ -1875,16 +1875,30 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // behaviour (no object-store secret is minted for it) until #1096
         // migrates it.
         //
-        // BEST-EFFORT, by review (issue #1094). These two writes are NOT
-        // load-bearing for the stack that is being provisioned: the scaler's
-        // spawn path writes `{{secrets.<stack>.objectstore.s3secretaccesskey}}`
-        // for serviceId 'encore' ITSELF before referencing it (#1287,
-        // encore-scaler/instance-pool.ts encoreS3CreateBodyFields), so this
-        // write only converges on the same name/value it already uses, and the
-        // per-job ffmpeg bodies still take theirs from `s3Config`
-        // (pipeline/osc-rewrap.ts, pipeline/osc-thumbnail.ts) — for those this
-        // pre-establishes the secret NAMES under each consuming serviceId for
-        // the follow-up that switches them to references too. Unlike the #212 block above, which only runs when the
+        // BEST-EFFORT, by review (issue #1094). The per-job ffmpeg bodies still
+        // take their credential from `s3Config` (pipeline/osc-rewrap.ts,
+        // pipeline/osc-thumbnail.ts), so for serviceId 'eyevinn-ffmpeg-s3' this
+        // only pre-establishes the secret NAME for the follow-up that switches
+        // those bodies to references too.
+        //
+        // For serviceId 'encore' it is the scaler's spawn path that consumes
+        // this name: since the #1287 review that path REFERENCES
+        // `{{secrets.<stack>.objectstore.s3secretaccesskey}}` and no longer
+        // writes it (encore-scaler/instance-pool.ts encoreS3CreateBodyFields;
+        // the name is handed to it as EncoreS3Config.secretAccessKeyRef by
+        // services/encore-s3-config.ts). OSC service secrets are write-once
+        // with no update path (ADR-002-credential-storage.md), so exactly one
+        // writer can own the name and it is this one. Convergence on an
+        // identical name/value therefore holds only for the DIRECT-HIT case —
+        // the scaler resolving the same stack key this provision run wrote, and
+        // the derivation reproducing the same secret. It does NOT hold when
+        // encore-s3-config.ts takes its documented single-stack fallback for a
+        // `stackKey` equal to DEPLOYMENT_CONTEXT (the literal 'default',
+        // auth/workspace.ts), where the resolved stack — and so the referenced
+        // secret name — is the first provisioned stack's, not necessarily this
+        // one's.
+        //
+        // Unlike the #212 block above, which only runs when the
         // operator supplied an external bucket, this runs on EVERY per-stack
         // provision, so leaving it as a bare `await` in the main try block made
         // a single `saveSecret` hiccup roll back an otherwise fully provisioned
@@ -1921,9 +1935,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               app.log.warn(
                 { err: secretErr, name, serviceId },
                 'could not persist the per-stack object-store credential as ' +
-                  'an OSC secret; the stack is unaffected because no runtime ' +
-                  'path resolves this secret reference yet, and a retried ' +
-                  'provision re-attempts the write'
+                  'an OSC secret; the stack is otherwise provisioned, and a ' +
+                  'retried provision re-attempts the write under the same ' +
+                  "name. For serviceId 'encore' this name is the one the " +
+                  'scaler references when spawning a transcoder (#1287), so ' +
+                  'retry the provision before expecting transcodes to run'
               );
             }
           }

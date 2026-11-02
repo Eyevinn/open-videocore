@@ -34,6 +34,21 @@ export type EncoreS3Config = {
   // encoreS3CreateBodyFields, #1287) — never a log line, never an API response.
   secretAccessKey: string;
   region?: string;      // S3 region string — MinIO ignores it but Encore requires a value
+  // Name of an OSC secret, scoped to serviceId 'encore', that ALREADY HOLDS
+  // `secretAccessKey` because the provisioning path minted it for this stack
+  // (src/routes/provision.ts applies encoreCredentialMapping(objectStoreCreds,
+  // OBJECT_STORE) under `${stackName}.${purpose}`). Set by
+  // resolveEncoreS3Config (src/services/encore-s3-config.ts) only for the
+  // per-stack credential, which is exactly the case provisioning mints for.
+  //
+  // When set, the spawn path REFERENCES this name and does not call saveSecret:
+  // OSC service secrets are write-once with no update path and no read-back
+  // (ADR-002-credential-storage.md, "Service secrets are write-once, never
+  // read-back" / "Rotation = new secret name + reprovision. There is no
+  // in-place secret update."), and the pinned SDK exposes only a bare POST
+  // (@osaas/client-core lib/core.d.ts:154 `saveSecret`, lib/core.js:355-369),
+  // so re-POSTing an existing name is not a supported upsert.
+  secretAccessKeyRef?: string;
 };
 
 // A job reconcile() observed as silently dropped from an Encore instance's live

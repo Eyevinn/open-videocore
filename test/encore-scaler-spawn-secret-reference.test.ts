@@ -268,4 +268,72 @@ describe('scaler spawn sends the object-store secret as an OSC secret reference 
     );
     expect(JSON.stringify(transcoderCreateBody())).not.toContain(rotated);
   });
+
+  // #1287 REVIEW FINDING (head 05cd97fb). The provisioning path already mints
+  // `${stackName}.objectstore.s3secretaccesskey` for serviceId 'encore'
+  // (src/routes/provision.ts, applyCredentialMapping over
+  // encoreCredentialMapping(objectStoreCreds, OBJECT_STORE)), and OSC service
+  // secrets are write-once with no update path and no read-back
+  // (docs/architecture/ADR-002-credential-storage.md:46,48,155,174; the pinned
+  // @osaas/client-core 0.24.0 `saveSecret` is a bare POST to
+  // /mysecrets/<serviceId> that rejects on any non-2xx — lib/core.d.ts:154,
+  // lib/core.js:355-369, no PUT/update/delete counterpart). So when the stack's
+  // resolved config carries that pre-minted name as
+  // `EncoreS3Config.secretAccessKeyRef` (set by
+  // src/services/encore-s3-config.ts resolveEncoreS3Config), the spawn path
+  // must REFERENCE it and write nothing.
+  it('references the pre-minted secret name without writing it when the resolved config carries one', async () => {
+    const preMinted = `${WORKSPACE}.objectstore.s3secretaccesskey`;
+    await expect(
+      spawnInstance(
+        makeConfig({
+          s3Config: {
+            endpoint: 'https://objectstore.example',
+            accessKeyId: STORE_KEY_ID,
+            secretAccessKey: STORE_SECRET,
+            secretAccessKeyRef: preMinted
+          }
+        }),
+        1
+      )
+    ).rejects.toThrow();
+
+    const body = transcoderCreateBody();
+    expect(body?.['s3SecretAccessKey']).toBe(`{{secrets.${preMinted}}}`);
+    // No POST on a name that already exists: nothing was written at all.
+    expect(saveSecretMock).not.toHaveBeenCalled();
+    // And the literal is still absent from the create body.
+    expect(JSON.stringify(body)).not.toContain(STORE_SECRET);
+    expect(body?.['s3AccessKeyId']).toBe(STORE_KEY_ID);
+  });
+
+  // FAIL CLOSED. For a credential with no pre-minted secret the scaler still
+  // owns the write, and a rejected write must fail the spawn rather than fall
+  // back to sending the literal.
+  it('fails the spawn closed when the secret write rejects, never falling back to the literal', async () => {
+    const writeFailure = new Error('osc refused the secret write');
+    saveSecretMock.mockRejectedValue(writeFailure);
+    // Let createInstance succeed if it were ever reached, so the only thing
+    // that can fail this spawn is the secret write itself.
+    createInstanceMock.mockResolvedValue({ name: 'should-never-be-created' });
+
+    await expect(spawnInstance(makeConfig(), 1)).rejects.toThrow(
+      'osc refused the secret write'
+    );
+
+    // The transcoder was never created — not with the literal, not with a
+    // reference to a secret that does not exist.
+    expect(transcoderCreateBody()).toBeUndefined();
+    const everySentArg = JSON.stringify(createInstanceMock.mock.calls);
+    expect(everySentArg).not.toContain(STORE_SECRET);
+
+    // A later spawn retries the write rather than serving a cached field set
+    // built from a failed one.
+    saveSecretMock.mockResolvedValue(undefined);
+    createInstanceMock.mockRejectedValue(new Error('refused by test'));
+    await expect(spawnInstance(makeConfig(), 1)).rejects.toThrow();
+    expect(transcoderCreateBody()?.['s3SecretAccessKey']).toBe(
+      `{{secrets.${WORKSPACE}.objectstore.s3secretaccesskey}}`
+    );
+  });
 });

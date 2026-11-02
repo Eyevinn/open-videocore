@@ -686,9 +686,12 @@ async function createOrAdoptCallbackListener(
 // (provision.ts:1900-1912 applies encoreCredentialMapping(objectStoreCreds,
 // OBJECT_STORE) under `${stackName}.${purpose}`, provision.ts:1371-1373). The
 // scaler's `workspaceId` IS that stack identity (workspace-registry.ts:408-419
-// resolves the loop key to the stack whose S3 config it loads), so both writers
-// address one deterministic name per workspace with the same value instead of
-// two parallel naming schemes.
+// resolves the loop key to the stack whose S3 config it loads), so one
+// deterministic name per workspace serves both paths instead of two parallel
+// naming schemes. Since the #1287 review the scaler does not WRITE that shared
+// name when provisioning minted it — it references it (see
+// encoreS3CreateBodyFields) — and uses this purpose only to name a secret of
+// its own for a credential provisioning never minted one for.
 const OBJECT_STORE_SECRET_PURPOSE = 'objectstore';
 
 // Cached per-workspace create-body S3 fields, so the OSC secret is written ONCE
@@ -732,7 +735,26 @@ export function forgetEncoreS3CreateFields(workspaceId?: string): void {
 // leaked, without touching this function.
 //
 // Contract: saveSecret(serviceId, name, value, ctx): Promise<void>
-// (@osaas/client-core lib/core.d.ts:154).
+// (@osaas/client-core lib/core.d.ts:154); the implementation is a bare POST to
+// /mysecrets/<serviceId> that rejects on any non-2xx (lib/core.js:355-369).
+// There is no PUT/update/delete counterpart in the pinned 0.24.0 SDK, and
+// ADR-002-credential-storage.md:46,48 records OSC service secrets as
+// "write-once, never-read-back", :155,174 "Rotation = new secret name +
+// reprovision. There is no in-place secret update."
+//
+// WHICH NAME IS WRITTEN AND WHICH IS ONLY REFERENCED (#1287 review finding).
+// For a per-stack object-store credential the provisioning path has ALREADY
+// minted `${stackName}.objectstore.s3secretaccesskey` for serviceId 'encore'
+// with the same value (src/routes/provision.ts, applyCredentialMapping over
+// encoreCredentialMapping(objectStoreCreds, OBJECT_STORE)). Re-POSTing an
+// existing name is not a supported upsert under the contract above, so this
+// function does NOT write it: `EncoreS3Config.secretAccessKeyRef` carries the
+// pre-minted name (set by services/encore-s3-config.ts resolveEncoreS3Config
+// for exactly the credential provisioning mints for) and the body is built as
+// `{{secrets.<that name>}}` with no secret write at all. Only a credential with
+// no pre-minted secret — a pre-#1094 stack on the legacy deployment-wide
+// password, or a static operator-configured store — is written here, under the
+// scaler's own deterministic name.
 //
 // Throws whatever saveSecret threw. That is deliberate: there is no fallback to
 // sending the literal, so a spawn whose secret could not be written fails and is
@@ -758,7 +780,16 @@ export async function encoreS3CreateBodyFields(
 
   const fingerprint = createHash('sha256')
     .update(
-      JSON.stringify([s3.endpoint, s3.accessKeyId, s3.secretAccessKey, s3.region ?? ''])
+      JSON.stringify([
+        s3.endpoint,
+        s3.accessKeyId,
+        s3.secretAccessKey,
+        s3.region ?? '',
+        // A stack that GAINS a pre-minted secret name (first resolve after a
+        // reprovision) must rebuild its fields rather than serve the cached
+        // self-written reference.
+        s3.secretAccessKeyRef ?? ''
+      ])
     )
     .digest('hex');
   const cached = encoreS3CreateFields.get(config.workspaceId);
@@ -773,7 +804,23 @@ export async function encoreS3CreateBodyFields(
   // scaler's long-standing default rather than sending an absent region.
   if (fields['s3Region'] === undefined) fields['s3Region'] = 'us-east-1';
 
+  // The purpose whose secret the provisioning path pre-mints, so a future
+  // session-token secret (purpose `objectstore.s3sessiontoken`) is not silently
+  // treated as pre-minted — provisioning mints only the one below.
+  const PRE_MINTED_PURPOSE = `${OBJECT_STORE_SECRET_PURPOSE}.s3secretaccesskey`;
+
   for (const secret of mapping.secrets) {
+    const preMinted =
+      secret.purpose === PRE_MINTED_PURPOSE && s3.secretAccessKeyRef
+        ? s3.secretAccessKeyRef
+        : undefined;
+    if (preMinted) {
+      // Reference only. No saveSecret call: the name already exists in the
+      // environment and the SDK has no update path to write it with (see the
+      // header). The literal still never reaches the create body.
+      fields[secret.field] = `{{secrets.${preMinted}}}`;
+      continue;
+    }
     const secretName = `${config.workspaceId}.${secret.purpose}`;
     await saveSecret(ENCORE_SERVICE_ID, secretName, secret.value, config.oscContext);
     fields[secret.field] = `{{secrets.${secretName}}}`;
