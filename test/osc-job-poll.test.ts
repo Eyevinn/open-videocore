@@ -16,7 +16,11 @@
 // opted-in and default behaviours are asserted below.
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { pollOscJobUntilDone, type JobWaiter } from '../src/pipeline/osc-job-poll.js';
+import {
+  pollOscJobUntilDone,
+  DEFAULT_JOB_POLL_TIMEOUT_MS,
+  type JobWaiter
+} from '../src/pipeline/osc-job-poll.js';
 
 function waiter(getJob: JobWaiter['getJob']): JobWaiter {
   return { context: {} as JobWaiter['context'], getJob };
@@ -140,4 +144,70 @@ describe('pollOscJobUntilDone', () => {
 
     await expect(pending).resolves.toBe('Failed');
   });
+});
+
+// The per-call budget (ADR-027 D8.1, issue #1192). Scene detection decodes the
+// whole file, so it needs a budget above the shared default — and the awaited
+// routes must keep the shared default exactly, which is what the last case here
+// pins. The timeout message must name the caller's service and the budget that
+// actually applied (ADR-027 C6: it used to hardcode "probe").
+describe('pollOscJobUntilDone per-call timeoutMs budget (ADR-027 D8.1)', () => {
+  it('waits for the caller-supplied budget rather than the 5-minute default', async () => {
+    vi.useFakeTimers();
+    const getJob = vi.fn().mockResolvedValue({ status: 'Running' }) as unknown as JobWaiter['getJob'];
+
+    const pending = pollOscJobUntilDone(waiter(getJob), 'eyevinn-ffmpeg-s3', 'scenes1', 'sat', {
+      timeoutMs: 10 * 60_000
+    });
+    const settled = pending.catch((err: unknown) => err);
+
+    // Past the shared 5-minute default: a job on a 10-minute budget is still
+    // being polled here, which is the whole point of the option.
+    await vi.advanceTimersByTimeAsync(DEFAULT_JOB_POLL_TIMEOUT_MS + 30_000);
+    expect(getJob).toHaveBeenCalled();
+    const callsAtDefaultDeadline = (getJob as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    const err = await settled;
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain('eyevinn-ffmpeg-s3 job "scenes1" timed out after 600s');
+    expect(
+      (getJob as unknown as ReturnType<typeof vi.fn>).mock.calls.length
+    ).toBeGreaterThan(callsAtDefaultDeadline);
+  });
+
+  it('returns the terminal status inside a short explicit budget', async () => {
+    vi.useFakeTimers();
+    const getJob = vi
+      .fn()
+      .mockResolvedValueOnce({ status: 'Running' })
+      .mockResolvedValue({ status: 'SuccessCriteriaMet' }) as unknown as JobWaiter['getJob'];
+
+    const pending = pollOscJobUntilDone(waiter(getJob), 'svc', 'job7', 'sat', {
+      timeoutMs: 30_000
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    await expect(pending).resolves.toBe('SuccessCriteriaMet');
+  });
+
+  it.each([undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY])(
+    'falls back to the exported shared default for timeoutMs=%s',
+    async (bad) => {
+      vi.useFakeTimers();
+      const getJob = vi.fn().mockResolvedValue({ status: 'Running' }) as unknown as JobWaiter['getJob'];
+
+      const pending = pollOscJobUntilDone(waiter(getJob), 'svc', 'job8', 'sat', {
+        timeoutMs: bad as number | undefined
+      });
+      const settled = pending.catch((err: unknown) => err);
+      await vi.advanceTimersByTimeAsync(DEFAULT_JOB_POLL_TIMEOUT_MS + 10_000);
+
+      const err = await settled;
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toContain(
+        `timed out after ${DEFAULT_JOB_POLL_TIMEOUT_MS / 1000}s`
+      );
+    }
+  );
 });
