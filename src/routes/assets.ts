@@ -198,6 +198,7 @@ import { parseDestination } from '../pipeline/output-relocation.js';
 import {
   deliverAssetObject,
   destinationEndpointRefusal,
+  jobDestinationEndpointRefusal,
   type DeliveryFailureReason,
   type DeliveryObjectClient
 } from '../pipeline/asset-delivery.js';
@@ -1515,6 +1516,10 @@ type AssetsRouterOptions = {
   // src/pipeline/asset-delivery.ts). Production reads it from the resolved
   // stack (`request.connections.s3Config.endpoint`,
   // src/services/workspace-stack.ts:152); injectable here for tests.
+  //
+  // Issue #1280: the SAME endpoint is the one a package/execute job's output
+  // would be relocated on, so it is also what a job-submit destination claim is
+  // compared against (`stackStorageEndpointFor` / resolveJobDestination).
   deliveryEndpoint?: string;
 };
 
@@ -2799,6 +2804,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     return true;
   }
 
+  // The object-storage endpoint THIS request's bytes live on: the resolved
+  // stack's `s3Config.endpoint` (src/services/workspace-stack.ts:152), with the
+  // injectable `deliveryEndpoint` option taking precedence exactly as the
+  // delivery route reads it. Used to refuse a job whose named output destination
+  // is registered at a different endpoint (issue #1280). Undefined when no stack
+  // storage is resolved for the request.
+  function stackStorageEndpointFor(request: {
+    connections?: { s3Config?: { endpoint: string } | undefined } | null;
+  }): string | undefined {
+    return opts.deliveryEndpoint ?? request.connections?.s3Config?.endpoint;
+  }
+
   // Resolve a package/publish job's requested output destination into the single
   // per-execution `destinationBucket` string the ADR-011 relocation path already
   // consumes. Accepts AT MOST ONE of three mutually-exclusive output-destination
@@ -2824,6 +2841,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // or backend_role). When none is supplied the job uses the provisioned default
   // (fully backwards compatible).
   //
+  // EXTERNAL ENDPOINT (issue #1280): either NAMED path may resolve to a backend
+  // registered at its own `endpointUrl`. The relocation this resolver feeds has
+  // no way to reach that endpoint — it copies with the stack's own storage client
+  // to a bucket NAME (see `jobDestinationEndpointRefusal`,
+  // src/pipeline/asset-delivery.ts) — so such a job is refused here with the SAME
+  // 422 `destination_unreachable` shape POST /:id/deliver returns, instead of
+  // being accepted and writing its output to the wrong store.
+  //
   // Returns:
   //   { ok: true, destinationBucket } — the resolved override string (or
   //     undefined when none was supplied: the job uses the provisioned default).
@@ -2839,10 +2864,35 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // `destination` carries a template. Ignored on the inline-override and
       // externalBackend paths (which are not templated).
       assetId?: string;
+      // The object-storage endpoint THIS request's stack is authenticated
+      // against (`WorkspaceConnections.s3Config.endpoint`,
+      // src/services/workspace-stack.ts:152), used to refuse a named
+      // destination/backend registered at a DIFFERENT endpoint (issue #1280).
+      // Undefined (no resolved stack storage) leaves the pre-#1280 behaviour
+      // unchanged — see `jobDestinationEndpointRefusal`.
+      stackStorageEndpoint?: string;
     },
     reply: import('fastify').FastifyReply
   ): Promise<{ ok: true; destinationBucket?: string } | { ok: false }> {
-    const { destination, externalBackend, destinationBucket, assetId } = args;
+    const { destination, externalBackend, destinationBucket, assetId, stackStorageEndpoint } =
+      args;
+    // Refuse a job whose named destination/backend declares an endpoint this
+    // API cannot write output to (issue #1280). Same 422 `destination_unreachable`
+    // envelope the delivery route sends (DELIVERY_FAILURE_RESPONSE,
+    // src/routes/assets.ts:933) so one error code covers "this destination is
+    // not writable from here" on both surfaces.
+    function refuseExternalEndpoint(
+      ref: string,
+      endpointUrl: string | undefined
+    ): boolean {
+      const refusal = jobDestinationEndpointRefusal(endpointUrl, stackStorageEndpoint);
+      if (!refusal) return false;
+      reply.code(422).send({
+        error: 'destination_unreachable',
+        message: `destination "${ref}" cannot receive this job's output: ${refusal}`
+      });
+      return true;
+    }
     // Mutual exclusion across all three output-destination expressions: at most
     // ONE may be supplied. More than one is ambiguous -> 400 (issue #573 / #549).
     // Each feature keeps its own pre-existing 400 error shape rather than a new
@@ -2913,6 +2963,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         });
         return { ok: false };
       }
+      // Issue #1280: the backend is write-capable in role terms, but if it lives
+      // at its own endpoint the relocation cannot reach it — refuse rather than
+      // resolve a destination whose output would land on our own store.
+      if (refuseExternalEndpoint(externalBackend, record.endpointUrl)) {
+        return { ok: false };
+      }
       return { ok: true, destinationBucket: backendOutputDestination(record) };
     }
 
@@ -2931,6 +2987,23 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         message: 'storage-backend registry is not configured'
       });
       return { ok: false };
+    }
+    // Issue #1280: read the destination RECORD first so its `endpointUrl` can be
+    // checked before resolution — `resolveDestinationBucket` returns only the
+    // `<bucket>/<prefix>/` string (storage-backend-registry.ts:983-998), which
+    // carries no endpoint. Resolved through the SAME `resolveForOutput` the
+    // delivery route uses for this purpose (assets.ts, POST /:id/deliver), under
+    // the SAME workspace namespace this path resolves the bucket in. An unknown
+    // reference (or the implicit default) answers undefined and falls through to
+    // resolveDestinationBucket's own, unchanged error semantics.
+    if (stackStorageEndpoint !== undefined && stackStorageEndpoint.length > 0) {
+      const record = await opts.storageBackendRegistry.resolveForOutput(
+        STACK_CONFIG_NAMESPACE,
+        destination
+      );
+      if (record && refuseExternalEndpoint(destination, record.endpointUrl)) {
+        return { ok: false };
+      }
     }
     try {
       const resolved = await opts.storageBackendRegistry.resolveDestinationBucket(
@@ -6010,6 +6083,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //         is missing from the bucket the transcode step would read. The #1058
   //         stack-routing gate runs FIRST (is this the right stack at all?), then
   //         the #1059 readiness gate (are the bytes actually there?).
+  //   422 — (pipeline mode, issue #1280) `destination_unreachable` — the named
+  //         `destination` is registered at an object-storage endpoint this stack
+  //         cannot write job output to, so the job is refused rather than
+  //         relocated to a same-named bucket on this stack's own store
   //   501 — required service not configured on this deployment
   //   502 — Encore submission failed, or (pipeline mode, issue #1059)
   //         `source_verification_failed` — the object store could not be asked
@@ -6035,6 +6112,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           400: z.object({ error: z.string(), message: z.string() }),
           404: z.object({ error: z.string() }),
           409: z.object({ error: z.string(), message: z.string() }),
+          // Issue #1280: the named destination is registered at an endpoint this
+          // stack cannot write job output to. Same envelope every other 422 on
+          // this router uses.
+          422: z.object({ error: z.string(), message: z.string() }),
           501: z.object({ error: z.string(), message: z.string() }),
           502: z.object({ error: z.string(), message: z.string() })
         }
@@ -6068,7 +6149,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           {
             destination: request.body.destination,
             destinationBucket: request.body.destinationBucket,
-            assetId: asset.id
+            assetId: asset.id,
+            // Issue #1280: refuse a destination registered at an endpoint this
+            // stack cannot write job output to, before the pipeline starts.
+            stackStorageEndpoint: stackStorageEndpointFor(request)
           },
           reply
         );
@@ -6209,7 +6293,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           destination: request.body.destination,
           externalBackend: request.body.externalBackend,
           destinationBucket: request.body.destinationBucket,
-          assetId: asset.id
+          assetId: asset.id,
+          // Issue #1280: refuse a destination/backend registered at an endpoint
+          // this stack cannot write job output to, before the execution starts.
+          stackStorageEndpoint: stackStorageEndpointFor(request)
         },
         reply
       );
