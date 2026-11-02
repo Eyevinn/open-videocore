@@ -372,6 +372,15 @@ export const AssetDocumentSchema = z.object({
           masterDashKey: z.string().optional()
         })
         .optional(),
+      // The packaged output no longer describes the asset's current renditions
+      // (issue #1290): a re-encode succeeded, `renditions` was rewritten, and no
+      // new package followed — so `manifests` / `packagedOutput` above still
+      // describe the PREVIOUS encode. Pipeline-derived, so it belongs here under
+      // `structural` beside the two fields it qualifies, NOT under editorial
+      // `descriptive` (ADR-005 writer provenance). Optional, only ever persisted
+      // as `true`, so documents written before #1290 (field absent) still
+      // deserialize as not-stale — no schemaVersion bump required.
+      packagedOutputStale: z.boolean().optional(),
       thumbnails: z.array(ThumbnailSchema).optional(),
       collections: z.array(z.string()).default([]),
       derivedFrom: z.string().nullable().optional(),
@@ -597,6 +606,12 @@ export function toAssetDocument(
       masterDashKey: asset.packagedOutput.masterDashKey
     };
   }
+  // Packaged-output staleness (issue #1290). Only persisted when the asset is
+  // actually stale, so a not-stale asset round-trips with the field absent —
+  // absence is the not-stale state, exactly as for pre-#1290 documents.
+  if (asset.packagedOutputStale) {
+    doc.structural.packagedOutputStale = true;
+  }
   if (asset.subtitlesError) {
     doc.structural.subtitlesError = asset.subtitlesError;
   }
@@ -747,6 +762,11 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
           masterDashKey: doc.structural.packagedOutput.masterDashKey
         }
       : undefined,
+    // Packaged-output staleness (issue #1290). Read back only when the stored
+    // document says `true`; anything else (absent, or an explicit `false`
+    // written by an older/foreign writer) maps to undefined so the flat type
+    // carries one representation of not-stale.
+    packagedOutputStale: doc.structural?.packagedOutputStale === true ? true : undefined,
     subtitlesError: doc.structural?.subtitlesError,
     // Scene-detection metadata (issue #115). Absent structural.sceneDetection
     // maps to `undefined` (never detected) rather than `null`; the flat type

@@ -451,6 +451,36 @@ export async function completeTranscode(
   await deps.assets.update(params.sourceAssetId, { renditions });
   // The source asset itself returns to `ready` now that renditions exist.
   const refreshed = await deps.assets.get(params.sourceAssetId);
+  // #1290: this encode has just replaced `renditions`, and the asset's packaged
+  // manifests were produced from the PREVIOUS one. A re-encode writes its output
+  // under `transcode/<assetId>/<jobId>` (transcodeOutputPrefix) and nothing here
+  // repackages, so `manifestUrls` / `packagedOutput` keep pointing at the older
+  // generation. Record that disagreement on the asset.
+  //
+  // We do NOT clear `manifestUrls` (issue #1290 decision): playback over the
+  // previous package keeps working and `/delivery` resolution is unchanged. The
+  // marker is the only new state, and it is read from `refreshed` — the state
+  // AFTER the renditions write and BEFORE anything repackages, which is exactly
+  // the asset whose two halves disagree.
+  //
+  // Gated on the asset actually having packaged output: a first-ever encode has
+  // no manifests to be stale, so nothing is written for it.
+  //
+  // When this completion IS the transcode step of a pipeline that goes on to
+  // package (`abr-vod` / `full`, see routes/internal.ts and
+  // encore-callback-poller.ts, which trigger packaging after this call), the
+  // marker is correct for the window in between and the packager's success
+  // callback clears it with the manifests repoint (pipeline/packaging.ts
+  // handleSuccess). Marking here rather than at each handoff site keeps the one
+  // rule on the one path every completion goes through — the internal callback
+  // route, the completion poller, and the #709 drop correction alike.
+  if (
+    refreshed &&
+    (refreshed.manifestUrls?.hls || refreshed.manifestUrls?.dash) &&
+    refreshed.packagedOutputStale !== true
+  ) {
+    await deps.assets.update(params.sourceAssetId, { packagedOutputStale: true });
+  }
   if (refreshed?.status === 'processing') {
     await deps.assets.update(params.sourceAssetId, { status: 'ready' });
   } else if (refreshed?.status === 'failed') {

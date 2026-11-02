@@ -408,12 +408,21 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.manifestUrls !== undefined) {
       next.manifestUrls = patch.manifestUrls;
       next.packagingError = undefined;
+      // ...and the packaged-output-stale marker (issue #1290) — same invariant
+      // as the in-memory repo (data/asset-repo.ts): a manifests repoint resolves
+      // the recorded disagreement with `renditions`, whoever writes it.
+      next.packagedOutputStale = undefined;
     }
     if (patch.packagingError !== undefined) {
       next.packagingError = patch.packagingError;
     }
     if (patch.packagedOutput !== undefined) {
       next.packagedOutput = patch.packagedOutput;
+    }
+    // Packaged-output staleness (issue #1290). `true` marks, `false` clears —
+    // stored as absence, same sentinel handling as the in-memory repo.
+    if (patch.packagedOutputStale !== undefined) {
+      next.packagedOutputStale = patch.packagedOutputStale ? true : undefined;
     }
     if (patch.renditions !== undefined) {
       next.renditions = patch.renditions;
