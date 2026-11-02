@@ -42,6 +42,16 @@
 // REACHABILITY (ADR-018 D3): registration-time reachability validation is
 // OPTIONAL and NOT required here; it is inherited from the injected registry's
 // own `validate` config (issue #550) unchanged — this router adds no probe.
+//
+// AUTH (issue #1282): because this surface is a VIEW over the SAME storage
+// records as /storage/backends, it must apply the SAME authentication rule. It
+// previously had NO gate, so an anonymous caller could list and register
+// destinations (and read back the non-secret coordinates of every output-role
+// backend) while the identical records behind GET /api/v1/storage/backends
+// correctly answered 401. The router now attaches the shared 401 presence gate
+// `authGate` (src/auth/middleware.ts) as its FIRST preHandler, exactly as
+// storageRouter (routes/storage.ts) and assetsRouter (routes/assets.ts) do.
+// Authorisation (the 403 role matrix) is deliberately unchanged here.
 
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
@@ -57,6 +67,7 @@ import {
 } from '../services/storage-backend-registry.js';
 import { InvalidPathTemplateError } from '../services/destination-path-template.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
+import { authGate } from '../auth/middleware.js';
 
 export type ExportDestinationsRouterOptions = {
   // The SAME registry the /storage/backends surface uses (ADR-018 D1: reuse the
@@ -185,6 +196,16 @@ export const exportDestinationsRouter: FastifyPluginAsync<
   // Matches the /storage/backends surface (storage.ts:187) so both surfaces
   // address the SAME records for the SAME tenant (ADR-017 D2).
   const workspaceId = STACK_CONFIG_NAMESPACE;
+
+  // 401 presence gate (issue #1282), registered FIRST so an anonymous request is
+  // rejected before any handler reads or writes a storage record. This is the
+  // SAME hook, resolved from the SAME module, that the /storage/backends view of
+  // these records attaches (routes/storage.ts: `app.addHook('preHandler',
+  // authGate(app))`). Plugin-scoped and lazy: authGate resolves
+  // `app.authenticate` at request time and no-ops when registerAuth was never
+  // called, so unit tests that build this router in isolation are unaffected
+  // while the real app (src/main.ts registerAuth) enforces the gate.
+  app.addHook('preHandler', authGate(app));
 
   app.setErrorHandler((err, _request, reply) => {
     // The OSC-managed default is not deletable (ADR-017 D3) -> 409. This surface
