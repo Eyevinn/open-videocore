@@ -110,8 +110,9 @@ import { makeOscProbeRunner } from './pipeline/osc-ffprobe.js';
 import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-extractor.js';
 import { makeOscSubtitleGenerator } from './pipeline/osc-auto-subtitles.js';
 import type { SubtitleGenerator } from './pipeline/subtitle-generator.js';
-import { makeOscSceneDetector } from './pipeline/osc-scene-detect.js';
+import { makeFfmpegS3SceneDetector } from './pipeline/osc-scene-detect-ffmpeg-s3.js';
 import type { SceneDetector } from './pipeline/scene-detector.js';
+import type { SceneDetectObjectStore } from './services/workspace-stack.js';
 import { makeOscThumbnailExtractor } from './pipeline/osc-thumbnail.js';
 import type { FrameExtractor } from './pipeline/thumbnail.js';
 import { makeOscRewrapRunner } from './pipeline/osc-rewrap.js';
@@ -474,12 +475,27 @@ const optionalStepBuilders = storageBackedForOptionalSteps
           instanceName,
           writesToS3: process.env['AUTO_SUBTITLES_WRITES_S3'] === 'true'
         }),
-      sceneDetector: (instanceName: string): SceneDetector =>
-        makeOscSceneDetector({
+      // Scene detection runs as an ephemeral eyevinn-ffmpeg-s3 job (issue
+      // #1192, ADR-027 D1) — NOT against an eyevinn-function-scenes instance,
+      // which cannot return cut timecodes through any documented endpoint
+      // (#797). `instanceName` therefore no longer selects the service: it stays
+      // the stack record's ACTIVATION flag for this optional step (issue #217),
+      // and retiring the field itself is #1193's job. The legacy runner
+      // (makeOscSceneDetector) and its pinned request contract are left in place
+      // for that issue to remove.
+      sceneDetector: (instanceName: string, s3: SceneDetectObjectStore): SceneDetector =>
+        makeFfmpegS3SceneDetector({
           context: oscContext,
-          getInstance,
-          instanceName,
-          path: process.env['SCENE_DETECT_PATH']
+          createJob,
+          getJob,
+          getLogsForInstance,
+          removeJob,
+          s3Endpoint: s3.endpoint,
+          s3AccessKey: s3.accessKey,
+          s3SecretKey: s3.secretKey,
+          s3Bucket: s3.bucket,
+          readCutObject: s3.readObject,
+          removeCutObject: s3.removeObject
         })
     }
   : {};

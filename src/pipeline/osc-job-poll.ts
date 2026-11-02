@@ -92,6 +92,16 @@ export type PollOptions = {
   // unseen-but-healthy queueing status to break metadata extraction and
   // thumbnails for every uploaded asset.
   failFastOnUnknownStatus?: boolean;
+
+  // Per-call wait budget in milliseconds, overriding TIMEOUT_MS (ADR-027 D8,
+  // issue #1192). Added because scene detection is the first caller whose job
+  // decodes the WHOLE file rather than seeking or running a short pass, so the
+  // shared 5-minute default would be the expected outcome for ordinary
+  // long-form assets rather than an edge case — and since every runner removes
+  // the job in a `finally`, a timeout tears the job down mid-decode and leaves
+  // nothing to retry against. Ignored when not a positive finite number, so a
+  // misconfigured override degrades to the default instead of to "no wait".
+  timeoutMs?: number;
 };
 
 // Wait for an OSC ephemeral job to reach a terminal state. Returns the terminal
@@ -117,7 +127,13 @@ export async function pollOscJobUntilDone(
   sat: string,
   options: PollOptions = {}
 ): Promise<string> {
-  const deadline = Date.now() + TIMEOUT_MS;
+  const budgetMs =
+    typeof options.timeoutMs === 'number' &&
+    Number.isFinite(options.timeoutMs) &&
+    options.timeoutMs > 0
+      ? options.timeoutMs
+      : TIMEOUT_MS;
+  const deadline = Date.now() + budgetMs;
   let unrecognised: { status: string; since: number } | undefined;
   while (Date.now() < deadline) {
     const job = await api.getJob(api.context, serviceId, name, sat) as Record<string, unknown> | undefined;
@@ -145,5 +161,7 @@ export async function pollOscJobUntilDone(
     }
     await new Promise((res) => setTimeout(res, POLL_INTERVAL_MS));
   }
-  throw new Error(`probe job "${name}" timed out after ${TIMEOUT_MS / 1000}s`);
+  // The message used to hardcode "probe" for every caller (ADR-027 C6 flagged
+  // it); it now names the service id and the budget that actually applied.
+  throw new Error(`${serviceId} job "${name}" timed out after ${budgetMs / 1000}s`);
 }
