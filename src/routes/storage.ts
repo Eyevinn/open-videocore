@@ -35,6 +35,10 @@ import { authorize, methodToAction, AUTHZ_FORBIDDEN_ERROR } from '../auth/author
 import { authGate } from '../auth/middleware.js';
 import type { PrincipalRole } from '../auth/principal.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
+// Issue #1280: the single comparison that decides whether this stack can write
+// job output to a backend's own endpoint. Shared with the submit-time refusal in
+// routes/assets.ts so the warning and the refusal cannot disagree.
+import { jobOutputEndpointWarning } from '../pipeline/asset-delivery.js';
 
 // Hard cap on objects returned by a single listing call. Bounds the response
 // size regardless of how many objects a prefix holds.
@@ -60,6 +64,14 @@ export type StorageRouterOptions = {
   // registry wired) the /backends routes respond 501, mirroring the /buckets
   // routes' degradation when object storage is unconfigured.
   storageBackendRegistry?: StorageBackendRegistry;
+  // The object-storage endpoint this deployment's jobs relocate output on, used
+  // to warn at registration time that a backend's OWN endpoint will not be used
+  // for job output (issue #1280). Production reads it from the resolved stack
+  // per request (`request.connections.s3Config.endpoint`,
+  // src/services/workspace-stack.ts:152), which this option overrides;
+  // injectable for tests. Undefined with no resolved stack storage — then there
+  // is no endpoint to compare against and no warning is emitted.
+  objectStoreEndpoint?: string;
 };
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
@@ -169,6 +181,16 @@ const backendViewSchema = z.object({
 
 const backendListSchema = z.object({
   backends: z.array(backendViewSchema)
+});
+
+// The register (201) response: the redacted view PLUS any non-fatal warnings
+// about the registration just accepted (issue #1280) — a backend registered at
+// its OWN endpoint is not used for job output. Additive and optional, so a
+// registration with nothing to warn about serialises exactly as before and the
+// list/get views are unchanged. Warnings carry endpoint/bucket coordinates only,
+// never credential material.
+const registeredBackendSchema = backendViewSchema.extend({
+  warnings: z.array(z.string()).optional()
 });
 
 // PATCH request (issue #679). Every field optional; an omitted field is left
@@ -348,14 +370,18 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
   // parameter store; the secret access key (and optional session token) go to
   // OSC per-serviceId secrets via saveSecret (ADR-017 D1). The response is
   // ALWAYS redacted — the secret is never echoed back.
-  //   201 — { ...backend, credentials: { secretAccessKey: '***redacted***' } }
+  //   201 — { ...backend, credentials: { secretAccessKey: '***redacted***' } },
+  //         plus `warnings` when the registration is accepted but will not
+  //         behave as an operator might expect: a backend registered at its OWN
+  //         `endpointUrl` is NOT used for job output (issue #1280), and a job
+  //         referencing it is refused at submit.
   //   501 — registry / OSC secret storage not configured
   app.post(
     '/backends',
     {
       schema: {
         body: registerBackendSchema,
-        response: { 201: backendViewSchema, 422: validationErrorSchema, 501: errorSchema }
+        response: { 201: registeredBackendSchema, 422: validationErrorSchema, 501: errorSchema }
       }
     },
     async (request, reply) => {
@@ -374,7 +400,16 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
         });
       }
       const view = await storageBackendRegistry.register(workspaceId, request.body);
-      return reply.code(201).send(view);
+      // Issue #1280: the backend is registered, but if it declares its own
+      // endpoint, job output will not go there — say so on the response rather
+      // than leaving the operator to discover it from a job that never arrives.
+      const warning = jobOutputEndpointWarning(
+        view.endpointUrl,
+        opts.objectStoreEndpoint ?? request.connections?.s3Config?.endpoint
+      );
+      return reply
+        .code(201)
+        .send({ ...view, ...(warning ? { warnings: [warning] } : {}) });
     }
   );
 
