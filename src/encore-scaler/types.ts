@@ -28,8 +28,10 @@ export type EncoreS3Config = {
   // stack, no longer a deployment-wide root user. A stack provisioned before
   // #1094 still resolves to the legacy root user until #1096 migrates it.
   accessKeyId: string;
-  // SECRET. Goes into the spawned instance's create body (instance-pool.ts) and
-  // nowhere else — never a log line, never an API response.
+  // SECRET. Handed to the OSC secret store (saveSecret) by the spawn path and
+  // nowhere else: the spawned instance's create body carries only the resulting
+  // `{{secrets.<name>}}` reference (instance-pool.ts
+  // encoreS3CreateBodyFields, #1287) — never a log line, never an API response.
   secretAccessKey: string;
   region?: string;      // S3 region string — MinIO ignores it but Encore requires a value
 };

@@ -1876,14 +1876,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // migrates it.
         //
         // BEST-EFFORT, by review (issue #1094). These two writes are NOT
-        // load-bearing for the stack that is being provisioned: nothing resolves
-        // `{{secrets.<stack>.objectstore.*}}` yet — the scaler passes the
-        // literal secret in the encore create body
-        // (encore-scaler/instance-pool.ts) and the per-job ffmpeg bodies take
-        // theirs from `s3Config` (pipeline/osc-rewrap.ts,
-        // pipeline/osc-thumbnail.ts) — they pre-establish the secret NAMES under
-        // each consuming serviceId for the follow-up that switches those paths
-        // to references. Unlike the #212 block above, which only runs when the
+        // load-bearing for the stack that is being provisioned: the scaler's
+        // spawn path writes `{{secrets.<stack>.objectstore.s3secretaccesskey}}`
+        // for serviceId 'encore' ITSELF before referencing it (#1287,
+        // encore-scaler/instance-pool.ts encoreS3CreateBodyFields), so this
+        // write only converges on the same name/value it already uses, and the
+        // per-job ffmpeg bodies still take theirs from `s3Config`
+        // (pipeline/osc-rewrap.ts, pipeline/osc-thumbnail.ts) — for those this
+        // pre-establishes the secret NAMES under each consuming serviceId for
+        // the follow-up that switches them to references too. Unlike the #212 block above, which only runs when the
         // operator supplied an external bucket, this runs on EVERY per-stack
         // provision, so leaving it as a bare `await` in the main try block made
         // a single `saveSecret` hiccup roll back an otherwise fully provisioned

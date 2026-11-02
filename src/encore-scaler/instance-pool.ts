@@ -37,8 +37,13 @@ import {
   getInstance,
   getInstanceHealth,
   listInstances as oscListInstances,
-  removeInstance
+  removeInstance,
+  saveSecret
 } from '@osaas/client-core';
+import {
+  encoreCredentialMapping,
+  type ExternalStorageCredentials
+} from '../services/external-storage-credentials.js';
 import {
   DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS,
   waitForInstanceReadyBounded
@@ -674,6 +679,110 @@ async function createOrAdoptCallbackListener(
   }
 }
 
+// #1287: the secret-purpose qualifier the per-stack object-store credential is
+// saved under. Identical to provision.ts's OBJECT_STORE constant
+// (src/routes/provision.ts:892), so the scaler's secret name is the SAME name
+// the provisioning path already pre-mints for serviceId 'encore'
+// (provision.ts:1900-1912 applies encoreCredentialMapping(objectStoreCreds,
+// OBJECT_STORE) under `${stackName}.${purpose}`, provision.ts:1371-1373). The
+// scaler's `workspaceId` IS that stack identity (workspace-registry.ts:408-419
+// resolves the loop key to the stack whose S3 config it loads), so both writers
+// address one deterministic name per workspace with the same value instead of
+// two parallel naming schemes.
+const OBJECT_STORE_SECRET_PURPOSE = 'objectstore';
+
+// Cached per-workspace create-body S3 fields, so the OSC secret is written ONCE
+// per workspace and reused by every later spawn (#1287) rather than on every
+// scale-up. `fingerprint` is a hash of the credential the fields were built
+// from, so a rotated key (a re-resolved stack config, workspace-registry.ts:417)
+// re-saves under the same deterministic name instead of serving a stale
+// reference. Keyed by workspaceId; the value holds only the NON-secret fields
+// plus `{{secrets.*}}` references — never the literal credential.
+const encoreS3CreateFields = new Map<
+  string,
+  { fingerprint: string; fields: Record<string, string> }
+>();
+
+// Test-only / teardown seam: forget the cached fields for one workspace (or all
+// of them), so a workspace whose loop was torn down does not keep a reference
+// minted for a credential nobody resolved again.
+export function forgetEncoreS3CreateFields(workspaceId?: string): void {
+  if (workspaceId === undefined) {
+    encoreS3CreateFields.clear();
+    return;
+  }
+  encoreS3CreateFields.delete(workspaceId);
+}
+
+// Build the S3 portion of a spawned Encore instance's create body (#1287).
+//
+// The secret access key is NEVER a literal create-instance parameter: it is
+// written as an OSC per-service secret scoped to serviceId 'encore' and the body
+// carries `{{secrets.<name>}}`, exactly as the provisioning path does
+// (src/routes/provision.ts:1366-1373 secretRef / 1375-1395 applyCredentialMapping,
+// and the same pattern at src/routes/optional-services.ts:256-268).
+//
+// WHICH field is a secret and WHAT each field is called is not restated here —
+// it comes from encoreCredentialMapping (src/services/external-storage-
+// credentials.ts:89-116), the single source of Encore's field-name convention:
+// `s3AccessKeyId` / `s3Region` / `s3Endpoint` are plain config fields,
+// `s3SecretAccessKey` (and `s3SessionToken` when the resolved config ever gains
+// one — EncoreS3Config has no session token today, types.ts:24-35) are secrets.
+// Iterating `mapping.secrets` means a future secret field is referenced, not
+// leaked, without touching this function.
+//
+// Contract: saveSecret(serviceId, name, value, ctx): Promise<void>
+// (@osaas/client-core lib/core.d.ts:154).
+//
+// Throws whatever saveSecret threw. That is deliberate: there is no fallback to
+// sending the literal, so a spawn whose secret could not be written fails and is
+// retried by the caller's retry/back-off path.
+export async function encoreS3CreateBodyFields(
+  config: EncoreScalerConfig
+): Promise<Record<string, string>> {
+  const s3 = config.s3Config;
+  if (!s3) return {};
+
+  const creds: ExternalStorageCredentials = {
+    // encoreCredentialMapping reads accessKeyId/secretAccessKey/region/
+    // endpointUrl only — `bucket` is required by the shared
+    // ExternalStorageCredentials type but used solely by the packager mapping's
+    // OutputFolder (external-storage-credentials.ts:118-135). The scaler's
+    // EncoreS3Config carries no bucket, and Encore takes its input URI per job.
+    bucket: '',
+    accessKeyId: s3.accessKeyId,
+    secretAccessKey: s3.secretAccessKey,
+    region: s3.region,
+    endpointUrl: s3.endpoint
+  };
+
+  const fingerprint = createHash('sha256')
+    .update(
+      JSON.stringify([s3.endpoint, s3.accessKeyId, s3.secretAccessKey, s3.region ?? ''])
+    )
+    .digest('hex');
+  const cached = encoreS3CreateFields.get(config.workspaceId);
+  if (cached && cached.fingerprint === fingerprint) {
+    return { ...cached.fields };
+  }
+
+  const mapping = encoreCredentialMapping(creds, OBJECT_STORE_SECRET_PURPOSE);
+  const fields: Record<string, string> = { ...mapping.configFields };
+  // Encore requires SOME region value even where the store ignores it; the
+  // mapping omits the field when the resolved config has none, so keep the
+  // scaler's long-standing default rather than sending an absent region.
+  if (fields['s3Region'] === undefined) fields['s3Region'] = 'us-east-1';
+
+  for (const secret of mapping.secrets) {
+    const secretName = `${config.workspaceId}.${secret.purpose}`;
+    await saveSecret(ENCORE_SERVICE_ID, secretName, secret.value, config.oscContext);
+    fields[secret.field] = `{{secrets.${secretName}}}`;
+  }
+
+  encoreS3CreateFields.set(config.workspaceId, { fingerprint, fields });
+  return { ...fields };
+}
+
 async function spawnPooledInstance(
   config: EncoreScalerConfig,
   maxAttempts: number,
@@ -684,6 +793,12 @@ async function spawnPooledInstance(
   // Lowercase-alphanumeric, matching OSC's instance-name rules
   // (isValidInstanceName) and the provision route's own naming constraints.
   const name = `${scalerInstancePrefix(config.workspaceId)}${Date.now().toString(36)}`;
+  // #1287: the S3 fields, with the secret access key already written to OSC as a
+  // per-service secret and reduced to a `{{secrets.<name>}}` reference. Resolved
+  // ONCE here, outside the retry loop, so retries send the identical body and
+  // the secret write is not repeated per attempt; cached per workspace so later
+  // spawns reuse the same secret.
+  const s3Fields = await encoreS3CreateBodyFields(config);
 
   let lastErr: unknown;
   let instance: OscInstance | undefined;
@@ -708,13 +823,12 @@ async function spawnPooledInstance(
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     progress.attempts += 1;
     try {
-      const instanceBody: Record<string, string> = { name };
-      if (config.s3Config) {
-        instanceBody['s3Endpoint'] = config.s3Config.endpoint;
-        instanceBody['s3AccessKeyId'] = config.s3Config.accessKeyId;
-        instanceBody['s3SecretAccessKey'] = config.s3Config.secretAccessKey;
-        instanceBody['s3Region'] = config.s3Config.region ?? 'us-east-1';
-      }
+      // #1287: s3AccessKeyId/s3Endpoint/s3Region are plain config fields and
+      // s3SecretAccessKey is a `{{secrets.<name>}}` reference to an OSC secret
+      // — the literal is never part of the instance configuration. Resolved
+      // once before the retry loop (see above the loop) so a retry re-uses the
+      // same reference instead of re-writing the secret per attempt.
+      const instanceBody: Record<string, string> = { name, ...s3Fields };
       // Point the instance at our own public profile index so it loads the
       // operator-managed profiles from CouchDB (issue #84). `profilesUrl` is the
       // Encore service's own config key for the YAML profile index URL.
