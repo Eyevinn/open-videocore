@@ -53,14 +53,19 @@ vi.mock('../src/auth/workspace.js', async () => {
 import { registerAuth } from '../src/auth/middleware.js';
 import { assetsRouter } from '../src/routes/assets.js';
 import { exportDestinationsRouter } from '../src/routes/export-destinations.js';
+import { storageRouter } from '../src/routes/storage.js';
 import { DEPLOYMENT_CONTEXT } from '../src/auth/workspace.js';
-import { STACK_CONFIG_NAMESPACE } from '../src/services/workspace-stack.js';
+import {
+  STACK_CONFIG_NAMESPACE,
+  type WorkspaceStackResolver
+} from '../src/services/workspace-stack.js';
 import { InMemoryAssetRepository } from '../src/data/asset-repo.js';
 import { InMemoryJobRepository } from '../src/data/job-repo.js';
 import { InMemoryPipelineRepository } from '../src/data/pipeline-repo.js';
 import {
   StorageBackendRegistry,
   InMemoryBackendRecordStore,
+  REDACTED,
   type StorageBackendRole,
   type SecretStore
 } from '../src/services/storage-backend-registry.js';
@@ -332,5 +337,128 @@ describe('registration warns that an external endpoint is not used for job outpu
 
     expect(res.statusCode).toBe(201);
     expect((res.json() as { warnings?: string[] }).warnings).toBeUndefined();
+  });
+});
+
+// The SECOND registration surface over the same StorageBackendRegistry records
+// (export-destinations and storage/backends are two views of one registry —
+// test/export-destinations-auth-parity.test.ts:52-70). `POST
+// /api/v1/storage/backends` answers with its own extended 201 schema
+// (`registeredBackendSchema = backendViewSchema.extend({ warnings:
+// z.array(z.string()).optional() })`, src/routes/storage.ts:192) and emits the
+// warning through the same shared `jobOutputEndpointWarning`
+// (src/pipeline/asset-delivery.ts:446). The serialiser is the contract that
+// matters here: a zod response schema that had NOT been extended would strip
+// `warnings` silently and still compile, so these cases exercise the wire
+// payload, not just the handler.
+//
+// Mirrors the export-destinations block above case for case, injecting the
+// stack's object-storage endpoint through the router's `objectStoreEndpoint`
+// option (StorageRouterOptions.objectStoreEndpoint, src/routes/storage.ts:74) —
+// the same seam `buildDestinationsApp` uses.
+describe('backend registration warns that an external endpoint is not used for job output (issue #1280)', () => {
+  // /backends keys records under STACK_CONFIG_NAMESPACE and never resolves a
+  // stack, so a resolver that throws if touched keeps the harness honest (same
+  // stub as test/export-destinations-auth-parity.test.ts:30-34).
+  const stackResolverStub = {
+    resolve: () => {
+      throw new Error('stackResolver.resolve must not be called by these routes');
+    }
+  } as unknown as WorkspaceStackResolver;
+
+  async function buildBackendsApp(stackEndpoint?: string) {
+    const app = Fastify();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    // storageRouter gates /backends behind authGate, so the presence gate has to
+    // be wired and a bearer token sent (unlike the anonymous export-destinations
+    // harness above).
+    registerAuth(app);
+    const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore(), {
+      saveSecret: vi.fn(async () => {})
+    } as unknown as SecretStore);
+    await app.register(storageRouter, {
+      prefix: '/api/v1/storage',
+      stackResolver: stackResolverStub,
+      storageBackendRegistry: registry,
+      ...(stackEndpoint !== undefined ? { objectStoreEndpoint: stackEndpoint } : {})
+    });
+    await app.ready();
+    return app;
+  }
+
+  // registerBackendSchema (src/routes/storage.ts:141-154): name, role, bucket,
+  // accessKeyId, secretAccessKey required-shaped; endpointUrl optional.
+  const backendBody = (endpointUrl?: string) => ({
+    name: 'partner-backend',
+    role: 'packaged',
+    bucket: 'partner-bucket',
+    accessKeyId: 'AKIAEXAMPLE',
+    secretAccessKey: RAW_SECRET,
+    ...(endpointUrl !== undefined ? { endpointUrl } : {})
+  });
+
+  function registerBackend(app: FastifyInstance, endpointUrl?: string) {
+    return app.inject({
+      method: 'POST',
+      url: '/api/v1/storage/backends',
+      headers: A,
+      payload: backendBody(endpointUrl)
+    });
+  }
+
+  it('registers the backend and warns the endpoint will not be used for job output', async () => {
+    const app = await buildBackendsApp(STACK_ENDPOINT);
+
+    const res = await registerBackend(app, FOREIGN_ENDPOINT);
+
+    // Registration still succeeds — the warning is informational, not a refusal.
+    expect(res.statusCode).toBe(201);
+    const payload = res.json() as { warnings?: string[]; endpointUrl?: string };
+    expect(payload.endpointUrl).toBe(FOREIGN_ENDPOINT);
+    // Present on the WIRE: proves registeredBackendSchema really carries the key
+    // through the zod serialiser rather than dropping it.
+    expect(payload.warnings).toHaveLength(1);
+    expect(payload.warnings?.[0]).toContain('will NOT be used for job output');
+    // The warning points at the submit-time behaviour an operator will hit.
+    expect(payload.warnings?.[0]).toContain('destination_unreachable');
+    await app.close();
+  });
+
+  it('emits no warning for a backend on this stack own endpoint', async () => {
+    const app = await buildBackendsApp(STACK_ENDPOINT);
+
+    const res = await registerBackend(app, STACK_ENDPOINT);
+
+    expect(res.statusCode).toBe(201);
+    expect((res.json() as { warnings?: string[] }).warnings).toBeUndefined();
+    await app.close();
+  });
+
+  it('emits no warning when the backend makes no endpoint claim', async () => {
+    const app = await buildBackendsApp(STACK_ENDPOINT);
+
+    const res = await registerBackend(app);
+
+    expect(res.statusCode).toBe(201);
+    expect((res.json() as { warnings?: string[] }).warnings).toBeUndefined();
+    await app.close();
+  });
+
+  it('never echoes the registered secret, warning or not', async () => {
+    // ADR-017 D1 redaction holds on the extended 201 body too: the view's
+    // `credentials.secretAccessKey` is the fixed marker and the raw secret
+    // appears nowhere in the serialised payload.
+    for (const endpointUrl of [FOREIGN_ENDPOINT, STACK_ENDPOINT, undefined]) {
+      const app = await buildBackendsApp(STACK_ENDPOINT);
+
+      const res = await registerBackend(app, endpointUrl);
+
+      expect(res.statusCode).toBe(201);
+      const payload = res.json() as { credentials: { secretAccessKey: string } };
+      expect(payload.credentials.secretAccessKey).toBe(REDACTED);
+      expect(res.payload).not.toContain(RAW_SECRET);
+      await app.close();
+    }
   });
 });
