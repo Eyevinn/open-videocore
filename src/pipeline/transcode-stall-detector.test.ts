@@ -37,6 +37,7 @@ import { describe, it, expect, vi } from 'vitest';
 
 import {
   DEFAULT_TRANSCODE_STALL_TIMEOUT_MS,
+  MIN_ARMED_PROGRESS,
   buildStallFailureMessage,
   recordProgressAndDetectStalls,
   type StallTrackerEntry,
@@ -178,6 +179,128 @@ describe('transcode stall detector (#1218)', () => {
   });
 });
 
+// Review follow-up on #1318: a stall report is not advisory — it cancels the
+// attempt and re-dispatches, and it reproduces itself on every attempt, so a
+// healthy job misread as stalled becomes a GUARANTEED terminal `failed` once
+// MAX_ENCODE_ATTEMPTS is exhausted. These pin the two guards that keep a
+// slow-but-healthy encode out of that path.
+describe('progress floor: the analyze window is not a freeze (#1218 review)', () => {
+  it('never reports a job that has not reported any progress, however long it sits', () => {
+    const state = tracker();
+    const t0 = 6_000_000;
+    const seen: StalledTranscode[] = [];
+    // Encore's `progress` is declared `default: 0`, so an IN_PROGRESS job that
+    // has not emitted a number yet — exactly what the pre-encode analyze step
+    // looks like from here — reads as 0 for its whole duration. Ten full bounds
+    // of that must not produce a single report.
+    for (let tick = 0; tick < 10; tick++) {
+      seen.push(
+        ...recordProgressAndDetectStalls(state, [{ externalId: EXTERNAL_ID, progress: 0 }], {
+          now: t0 + tick * (TIMEOUT_MS + 1_000),
+          stallTimeoutMs: TIMEOUT_MS
+        })
+      );
+    }
+    expect(seen).toEqual([]);
+  });
+
+  it('does not arm a clock at all for a sub-floor sample', () => {
+    const state = tracker();
+    recordProgressAndDetectStalls(state, [{ externalId: EXTERNAL_ID, progress: 0 }], {
+      now: 7_000_000,
+      stallTimeoutMs: TIMEOUT_MS
+    });
+    // No entry means the long analyze window cannot later be counted as elapsed
+    // stall time against the first real sample.
+    expect(state.size).toBe(0);
+  });
+
+  it('arms the clock on the first sample at or above the floor, measured from THAT sample', () => {
+    const state = tracker();
+    const t0 = 8_000_000;
+    // A long analyze window at 0 …
+    for (let tick = 0; tick < 5; tick++) {
+      recordProgressAndDetectStalls(state, [{ externalId: EXTERNAL_ID, progress: 0 }], {
+        now: t0 + tick * TIMEOUT_MS,
+        stallTimeoutMs: TIMEOUT_MS
+      });
+    }
+    // … then the encode starts. The clock starts HERE, not at t0.
+    const armedAt = t0 + 5 * TIMEOUT_MS;
+    expect(
+      recordProgressAndDetectStalls(state, [{ externalId: EXTERNAL_ID, progress: MIN_ARMED_PROGRESS }], {
+        now: armedAt,
+        stallTimeoutMs: TIMEOUT_MS
+      })
+    ).toEqual([]);
+    expect(state.get(EXTERNAL_ID)).toMatchObject({
+      progress: MIN_ARMED_PROGRESS,
+      advancedAt: armedAt
+    });
+    // Still within one bound OF THE ARM: not stalled, even though far more than
+    // one bound has passed since the job first appeared.
+    expect(
+      recordProgressAndDetectStalls(state, [{ externalId: EXTERNAL_ID, progress: MIN_ARMED_PROGRESS }], {
+        now: armedAt + TIMEOUT_MS,
+        stallTimeoutMs: TIMEOUT_MS
+      })
+    ).toEqual([]);
+  });
+
+  it('still reports a genuine freeze once the encode has started', () => {
+    const state = tracker();
+    const t0 = 9_000_000;
+    // The floor must not disable detection: a job that reached 1% and then froze
+    // is the real #1218 defect and has to be reported.
+    recordProgressAndDetectStalls(state, [{ externalId: EXTERNAL_ID, progress: 1 }], {
+      now: t0,
+      stallTimeoutMs: TIMEOUT_MS
+    });
+    const stalls = recordProgressAndDetectStalls(
+      state,
+      [{ externalId: EXTERNAL_ID, progress: 1 }],
+      { now: t0 + TIMEOUT_MS + 1, stallTimeoutMs: TIMEOUT_MS }
+    );
+    expect(stalls.map((s) => s.encoreJobId)).toEqual([EXTERNAL_ID]);
+  });
+
+  it('ignores a sub-floor sample without disturbing an already-armed clock', () => {
+    const state = tracker();
+    const t0 = 9_500_000;
+    recordProgressAndDetectStalls(state, [{ externalId: EXTERNAL_ID, progress: 40 }], {
+      now: t0,
+      stallTimeoutMs: TIMEOUT_MS
+    });
+    // A spurious 0 (an unreported value re-read as the schema default) must not
+    // count as "progress changed" and reset the stall clock — that would be a
+    // false NEGATIVE, hiding a real freeze.
+    recordProgressAndDetectStalls(state, [{ externalId: EXTERNAL_ID, progress: 0 }], {
+      now: t0 + 1_000,
+      stallTimeoutMs: TIMEOUT_MS
+    });
+    expect(state.get(EXTERNAL_ID)).toMatchObject({ progress: 40, advancedAt: t0 });
+    expect(
+      recordProgressAndDetectStalls(state, [{ externalId: EXTERNAL_ID, progress: 40 }], {
+        now: t0 + TIMEOUT_MS + 1,
+        stallTimeoutMs: TIMEOUT_MS
+      }).map((s) => s.encoreJobId)
+    ).toEqual([EXTERNAL_ID]);
+  });
+
+  it('defaults the bound high enough that a one-percent step cannot trip it', () => {
+    // The bound is derived from the reporting granularity: Encore reports INTEGER
+    // percent, so a healthy job holds one value for at most total/100. A bound of
+    // B therefore only misfires on an encode longer than 100 x B. Pin that the
+    // default tolerates an encode far longer than anything this API dispatches.
+    const longestToleratedEncodeMs = DEFAULT_TRANSCODE_STALL_TIMEOUT_MS * 100;
+    const ninetySixHoursMs = 96 * 60 * 60_000;
+    expect(longestToleratedEncodeMs).toBeGreaterThan(ninetySixHoursMs);
+    // And still bounded: a hang cannot cost more than one bound per attempt.
+    expect(DEFAULT_TRANSCODE_STALL_TIMEOUT_MS).toBeLessThanOrEqual(2 * 60 * 60_000);
+    expect(MIN_ARMED_PROGRESS).toBeGreaterThan(0);
+  });
+});
+
 describe('stall failure text feeds the EXISTING retry policy (#1218 / #727)', () => {
   it('classifies as a retryable failure class, like the fast-error path', () => {
     const message = buildStallFailureMessage({
@@ -293,6 +416,31 @@ describe('IN_PROGRESS sweep raises a stalled transcode (#1218)', () => {
         });
         now += TIMEOUT_MS + 30_000;
         progress += 1;
+      }
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(raised).toEqual([]);
+  });
+
+  // Review follow-up on #1318: the same false positive, seen end-to-end through
+  // the sweep rather than against the detector directly.
+  it('stays silent across many bounds while Encore reports progress 0', async () => {
+    const raised: StalledTranscode[] = [];
+    const deps = makeDeps(async (stalls) => {
+      raised.push(...stalls);
+    });
+    // A job in its pre-encode analyze window: IN_PROGRESS on the page, progress
+    // still at the schema default of 0.
+    vi.stubGlobal('fetch', makeFetch(() => [{ externalId: EXTERNAL_ID, progress: 0 }]));
+    try {
+      let now = 10_000_000;
+      for (let tick = 0; tick < 6; tick++) {
+        await syncInProgressJobProgress(deps, INSTANCE_RECORD, 'test-sat', {
+          pageSize: 100,
+          now: () => now
+        });
+        now += TIMEOUT_MS + 60_000;
       }
     } finally {
       vi.unstubAllGlobals();

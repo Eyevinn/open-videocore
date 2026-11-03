@@ -2446,7 +2446,7 @@ function activateScaler(redisUrl: string): void {
     // #1218: how long an Encore job may sit on the SAME progress value before the
     // sweep declares it stalled. A source connection dropped mid-encode can freeze
     // ffmpeg silently — no error, Encore stays IN_PROGRESS, the job stays `running`
-    // forever and no retry fires. Unset => the detector's own 20-minute default
+    // forever and no retry fires. Unset => the detector's own 60-minute default
     // (DEFAULT_TRANSCODE_STALL_TIMEOUT_MS), which is also what an unparseable value
     // falls back to so a typo cannot start failing healthy encodes immediately.
     transcodeStallTimeoutMs: encoreTranscodeStallTimeoutMs,
