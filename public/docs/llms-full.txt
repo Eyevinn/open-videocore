@@ -2209,9 +2209,10 @@ Response 200 (application/json)
   Get a single extracted thumbnail.
 
   Parameters
-Name | In | Type | Required
-id | path | string | required
-index | path | string | required
+Name | In | Type | Required | Description
+size | query | string (small, medium, full) | optional | Which rendition of the thumbnail at this index to serve: small (360px wide), medium (1280px wide), or full — the unscaled extracted frame, and the default. Scaled renditions exist only for assets whose extraction ran with THUMBNAIL_MULTI_SIZE=true (issue #1303). When the requested size was never recorded for this frame (older assets, or a partial extraction) the FULL-size object is served instead and the response is still 200 — a missing size is never a 404. An unrecognised value is rejected with 400.
+id | path | string | required |
+index | path | string | required |
   Response
 Response 200
 (no body)
@@ -2219,9 +2220,10 @@ Response 200
   GET /api/v1/assets/{id}/thumbnails/{index}/url
 
   Parameters
-Name | In | Type | Required
-id | path | string | required
-index | path | string | required
+Name | In | Type | Required | Description
+size | query | string (small, medium, full) | optional | Which rendition of the thumbnail at this index to serve: small (360px wide), medium (1280px wide), or full — the unscaled extracted frame, and the default. Scaled renditions exist only for assets whose extraction ran with THUMBNAIL_MULTI_SIZE=true (issue #1303). When the requested size was never recorded for this frame (older assets, or a partial extraction) the FULL-size object is served instead and the response is still 200 — a missing size is never a 404. An unrecognised value is rejected with 400.
+id | path | string | required |
+index | path | string | required |
   Response
 Response 200 (application/json)
 {
@@ -2230,7 +2232,8 @@ Response 200 (application/json)
   "objectKey": "string",
   "url": "string",
   "expiresAt": "string",
-  "expiresInSeconds": 0
+  "expiresInSeconds": 0,
+  "size": "small"
 }
 
   GET /api/v1/assets/{id}/tracks

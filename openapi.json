@@ -12074,6 +12074,21 @@
         "parameters": [
           {
             "schema": {
+              "type": "string",
+              "enum": [
+                "small",
+                "medium",
+                "full"
+              ],
+              "default": "full"
+            },
+            "in": "query",
+            "name": "size",
+            "required": false,
+            "description": "Which rendition of the thumbnail at this index to serve: `small` (360px wide), `medium` (1280px wide), or `full` \u2014 the unscaled extracted frame, and the default. Scaled renditions exist only for assets whose extraction ran with THUMBNAIL_MULTI_SIZE=true (issue #1303). When the requested size was never recorded for this frame (older assets, or a partial extraction) the FULL-size object is served instead and the response is still 200 \u2014 a missing size is never a 404. An unrecognised value is rejected with 400."
+          },
+          {
+            "schema": {
               "type": "string"
             },
             "in": "path",
@@ -12099,6 +12114,21 @@
     "/api/v1/assets/{id}/thumbnails/{index}/url": {
       "get": {
         "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "small",
+                "medium",
+                "full"
+              ],
+              "default": "full"
+            },
+            "in": "query",
+            "name": "size",
+            "required": false,
+            "description": "Which rendition of the thumbnail at this index to serve: `small` (360px wide), `medium` (1280px wide), or `full` \u2014 the unscaled extracted frame, and the default. Scaled renditions exist only for assets whose extraction ran with THUMBNAIL_MULTI_SIZE=true (issue #1303). When the requested size was never recorded for this frame (older assets, or a partial extraction) the FULL-size object is served instead and the response is still 200 \u2014 a missing size is never a 404. An unrecognised value is rejected with 400."
+          },
           {
             "schema": {
               "type": "string"
@@ -12141,6 +12171,14 @@
                     },
                     "expiresInSeconds": {
                       "type": "number"
+                    },
+                    "size": {
+                      "type": "string",
+                      "enum": [
+                        "small",
+                        "medium",
+                        "full"
+                      ]
                     }
                   },
                   "required": [
@@ -12149,7 +12187,8 @@
                     "objectKey",
                     "url",
                     "expiresAt",
-                    "expiresInSeconds"
+                    "expiresInSeconds",
+                    "size"
                   ],
                   "additionalProperties": false
                 }
