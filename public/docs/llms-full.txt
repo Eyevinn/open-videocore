@@ -3778,7 +3778,8 @@ Request body (application/json)
       "videoStreams": [
         {
           "width": null,
-          "height": null
+          "height": null,
+          "codec": null
         }
       ],
       "overallBitrate": 0

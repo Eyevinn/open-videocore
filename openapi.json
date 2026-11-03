@@ -18669,6 +18669,10 @@
                               },
                               "height": {
                                 "type": "number"
+                              },
+                              "codec": {
+                                "type": "string",
+                                "nullable": true
                               }
                             },
                             "additionalProperties": true
