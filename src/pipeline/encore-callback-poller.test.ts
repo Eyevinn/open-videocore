@@ -26,6 +26,7 @@
 //     (src/pipeline/transcode.ts:155-161).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
 import { sweepTerminalJobs, startEncoreCallbackPoller, purgeStalePackagingJobs } from './encore-callback-poller.js';
 import { DEFAULT_PACKAGE_STALL_TIMEOUT_MS } from './stalled-package-reconciler.js';
@@ -1544,6 +1545,10 @@ describe('encore-callback-poller — webhook dispatch on the poller completion p
   // stored Rendition (Rendition.codec, src/data/asset-repo.ts:459, written by
   // transcode.ts:446) and onto the encode-completion event's optional `codec`
   // (encodeCompletionEventSchema, src/pipeline/encode-completion-event.ts:171).
+  // Upstream the field is nullable — `val codec: String?`,
+  // svt/media-analyzer@release-2.0.11 .../file/VideoStream.kt:8, the version
+  // pinned by svt/encore encore-common/build.gradle.kts:8 — see the null case
+  // below; this test covers a codec that IS present.
   it('#1293: carries the video stream codec onto renditions settled via the poller', async () => {
     const encoreUuid = 'uuid-webhook-codec';
     const { externalId, assetId } = await seedScenario(redis, jobs, assets, pipelines, { encoreUuid });
@@ -1586,6 +1591,70 @@ describe('encore-callback-poller — webhook dispatch on the poller completion p
     const encode = delivered.find((d) => d.event === ENCODE_COMPLETION_EVENT_TYPE)!;
     const codecParsed = encodeCompletionEventSchema.parse(encode.payload);
     expect(codecParsed.codec).toBe('h264');
+  });
+
+  // issue #1293 (review follow-up): this path reads the Encore job document with
+  // an unchecked cast (no zod validation on the fetched body), and upstream
+  // declares `val codec: String?` (svt/media-analyzer@release-2.0.11,
+  // .../file/VideoStream.kt:8; pinned at svt/encore
+  // encore-common/build.gradle.kts:8), so a stream with no detected codec arrives
+  // as a literal `null`. That null must NOT be copied onto the stored rendition:
+  // the read schema is `codec: z.string().optional()` (renditionSchema,
+  // src/routes/assets.ts:1031, serialiser wired at src/main.ts:256) and would
+  // fail to serialise the asset afterwards.
+  it('#1293: collapses a null codec to absent on renditions settled via the poller', async () => {
+    const encoreUuid = 'uuid-webhook-codec-null';
+    const { externalId, assetId } = await seedScenario(redis, jobs, assets, pipelines, { encoreUuid });
+    const localId = findLocalJobId(externalId);
+    await jobs.update(localId, { status: 'running', profile: 'program' });
+    await jobs.appendEncodeAttempt(localId, { index: 1 });
+
+    const { dispatcher, delivered } = await makeDispatcher();
+    const fetchFn = makeFetch({
+      jobDocs: {
+        [encoreUuid]: {
+          externalId,
+          status: 'SUCCESSFUL',
+          output: [
+            {
+              type: 'VideoFile',
+              file: 'out/1080p.mp4',
+              // No codec detected upstream -> serialised as null, not omitted.
+              videoStreams: [{ width: 1920, height: 1080, codec: null }],
+              overallBitrate: 5_000_000
+            },
+            {
+              type: 'VideoFile',
+              file: 'out/720p.mp4',
+              videoStreams: [{ width: 1280, height: 720, codec: 'hevc' }],
+              overallBitrate: 3_000_000
+            }
+          ]
+        }
+      }
+    });
+
+    await runCompletion(deps(fetchFn, dispatcher), encoreUuid, localId, 'done');
+    await waitFor(() => delivered.some((d) => d.event === ENCODE_COMPLETION_EVENT_TYPE));
+
+    const stored = (await assets.get(assetId))?.renditions ?? [];
+    expect(stored).toHaveLength(2);
+    // Absent, NOT null.
+    expect(stored[0].codec).toBeUndefined();
+    expect(stored[0].codec).not.toBeNull();
+    expect(stored[0].height).toBe(1080);
+    // A real codec on a sibling output still carries through.
+    expect(stored[1].codec).toBe('hevc');
+    // Every stored codec satisfies the read-side field contract
+    // `codec: z.string().optional()` (src/routes/assets.ts:1031); a literal null
+    // throws here, which is exactly the asset-read break this guards.
+    for (const r of stored) {
+      expect(() => z.string().optional().parse(r.codec)).not.toThrow();
+    }
+
+    const encode = delivered.find((d) => d.event === ENCODE_COMPLETION_EVENT_TYPE)!;
+    const nullParsed = encodeCompletionEventSchema.parse(encode.payload);
+    expect(nullParsed.codec).toBeUndefined();
   });
 
   // Idempotency: the sweep re-observing an already-settled job runs the same
