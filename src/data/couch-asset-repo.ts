@@ -430,6 +430,12 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.thumbnails !== undefined) {
       next.thumbnails = patch.thumbnails;
     }
+    // Multi-size variants (issue #1303). Empty list -> absence, so the document
+    // of an asset that never ran multi-size is byte-identical to one whose
+    // scaled jobs all failed. Mirrors InMemoryAssetRepository.update.
+    if (patch.thumbnailSizes !== undefined) {
+      next.thumbnailSizes = patch.thumbnailSizes.length > 0 ? patch.thumbnailSizes : undefined;
+    }
     if (patch.metadata !== undefined) {
       next.metadata = applyMetadata(existing.metadata, patch.metadata, patch.replaceMetadata ?? false);
     }

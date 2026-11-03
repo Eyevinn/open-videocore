@@ -93,6 +93,20 @@ export const ThumbnailSchema = z.object({
 });
 export type DocThumbnail = z.infer<typeof ThumbnailSchema>;
 
+// Scaled variant of a thumbnail (issue #1303), persisted beside — never inside
+// — `thumbnails` so the full-size list and its index meaning are untouched.
+// Only written when the extraction ran with `THUMBNAIL_MULTI_SIZE=true`; the
+// whole array is optional, so documents written before #1303 (field absent)
+// still deserialize unchanged and no schemaVersion bump is required.
+export const ThumbnailSizeSchema = z.object({
+  // The `thumbnails[].objectKey` this variant was derived from.
+  fullObjectKey: z.string(),
+  variant: z.enum(['small', 'medium']),
+  width: z.number(),
+  objectKey: z.string()
+});
+export type DocThumbnailSize = z.infer<typeof ThumbnailSizeSchema>;
+
 export const ProvenanceEntrySchema = z.object({
   at: z.string(),
   by: z.enum(PROVENANCE_ACTORS),
@@ -382,6 +396,10 @@ export const AssetDocumentSchema = z.object({
       // deserialize as not-stale — no schemaVersion bump required.
       packagedOutputStale: z.boolean().optional(),
       thumbnails: z.array(ThumbnailSchema).optional(),
+      // Scaled thumbnail variants (issue #1303). Optional and only ever written
+      // non-empty, so pre-#1303 documents and every flag-off extraction leave
+      // the field absent.
+      thumbnailSizes: z.array(ThumbnailSizeSchema).optional(),
       collections: z.array(z.string()).default([]),
       derivedFrom: z.string().nullable().optional(),
       // Version-chain linkage (issue #118), DISTINCT from `derivedFrom` (which
@@ -628,6 +646,11 @@ export function toAssetDocument(
   if (asset.thumbnails && asset.thumbnails.length > 0) {
     doc.structural.thumbnails = asset.thumbnails.map((objectKey) => ({ objectKey }));
   }
+  // Scaled variants (issue #1303). Only persisted when non-empty, so an asset
+  // extracted with the flag off is byte-identical to a pre-#1303 document.
+  if (asset.thumbnailSizes && asset.thumbnailSizes.length > 0) {
+    doc.structural.thumbnailSizes = asset.thumbnailSizes;
+  }
   if (asset.audioTracks && asset.audioTracks.length > 0) {
     doc.structural.editorialAudio = asset.audioTracks;
   }
@@ -701,6 +724,9 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
       ? { hls: doc.structural.manifests.hls, dash: doc.structural.manifests.dash }
       : undefined;
   const thumbnails = doc.structural?.thumbnails?.map((t) => t.objectKey);
+  // issue #1303: absent / empty maps back to undefined so the flat type stays
+  // clean for every asset that never ran multi-size extraction.
+  const thumbnailSizes = doc.structural?.thumbnailSizes;
   const renditions = doc.structural?.renditions;
   const collections = doc.structural?.collections;
   const derivedFrom = doc.structural?.derivedFrom ?? undefined;
@@ -781,6 +807,7 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
     sceneDetectionError: doc.structural?.sceneDetectionError,
     renditions: renditions && renditions.length > 0 ? renditions : undefined,
     thumbnails: thumbnails && thumbnails.length > 0 ? thumbnails : undefined,
+    thumbnailSizes: thumbnailSizes && thumbnailSizes.length > 0 ? thumbnailSizes : undefined,
     metadata:
       doc.descriptive.custom && Object.keys(doc.descriptive.custom).length > 0
         ? doc.descriptive.custom

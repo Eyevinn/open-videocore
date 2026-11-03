@@ -318,6 +318,18 @@ export async function purgeArchivedAsset(
     for (const thumb of asset.thumbnails ?? []) {
       await removeObjectBestEffort(deps, sourceStorage, thumb, `thumbnail of ${asset.id}`);
     }
+    // Scaled thumbnail variants (issue #1303) live beside the full frames in the
+    // same bucket and must go the same way — otherwise a multi-size asset leaves
+    // orphaned `_360`/`_1280` objects behind. Empty for every asset extracted
+    // with THUMBNAIL_MULTI_SIZE off, so this loop is a no-op by default.
+    for (const size of asset.thumbnailSizes ?? []) {
+      await removeObjectBestEffort(
+        deps,
+        sourceStorage,
+        size.objectKey,
+        `thumbnail (${size.variant}) of ${asset.id}`
+      );
+    }
   }
 
   // 5. Replace the document with a tombstone (doc-replace). This is the LAST
