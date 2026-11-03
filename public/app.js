@@ -2569,6 +2569,31 @@ async function renderAssetsTab(container) {
   // selection, which is the state its controls render as disabled.
   let bulkBar = null;
 
+  // Host for a row action's PERSISTENT outcome notice (issue #933's
+  // `.msg-unrecoverable`, reached from the row-level Restore below). It is a
+  // sibling of the table, not a cell inside it, for two reasons: the table
+  // rebuilds its own `tbody` on every reload, which would wipe a notice mounted
+  // there; and a terminal outcome has to outlive the row it is about — a purged
+  // asset leaves the list entirely on the next read. Placed directly after the
+  // header so it reads BEFORE the table it refers to (DOM order == reading
+  // order); the notice itself carries role="alert" (WCAG 2.1 AA 4.1.3).
+  const rowActionMsg = document.createElement('div');
+  rowActionMsg.id = 'assets-row-action-msg';
+  rowActionMsg.className = 'assets-row-action-msg';
+  main.appendChild(rowActionMsg);
+
+  // The live row control for `assetId`, or null when that row is not on screen.
+  // Matched by walking `dataset.id` rather than building a selector, so an id
+  // this client did not author never has to be CSS-escaped.
+  const rowRestoreControl = function (assetId) {
+    if (!assetsTable || !assetsTable.el) return null;
+    const btns = assetsTable.el.querySelectorAll('.asset-restore-btn');
+    for (let i = 0; i < btns.length; i++) {
+      if (btns[i].dataset.id === assetId) return btns[i];
+    }
+    return null;
+  };
+
   assetsTable = createAssetsTable({
     apiFetch,
     renderBadge,
@@ -2758,6 +2783,102 @@ async function renderAssetsTab(container) {
         reportActionFailure(err, {
           action: 'Re-drive metadata extraction',
           detail: 'Asset ' + id + ' is unchanged.',
+        });
+        return false;
+      }
+    },
+    onRestore: async function (id, name) {
+      // Restore an archived asset straight from its row (issue #836). The row
+      // only renders this control when `status === 'archived'`, and this is the
+      // single route out of that terminal state.
+      //
+      // Contract, verified in this tree (CLAUDE.md rule 7) — identical to the
+      // detail panel's #btn-restore-asset control:
+      //   openapi.json .paths["/api/v1/assets/{id}/restore"] — the only key is
+      //   `post`; `responses` keys are exactly 200 / 404 / 410; the single
+      //   parameter is path `id` (string, required); there is NO requestBody.
+      //   Source: src/routes/assets.ts:8058-8103 (`app.post('/:id/restore')`,
+      //   schema `{ 200: assetSchema, 404: errorSchema, 410: errorSchema }`
+      //   :8063), mounted under `/api/v1/assets`.
+      //   200 — the FULL updated asset: `status` has flipped out of `archived`
+      //         to `ready` (its pre-archive status when that was `ready`) or
+      //         otherwise `failed` (`restoreTargetStatus`). A `true` return
+      //         reloads the table so the row shows the new status.
+      //   404 — unknown id OR not currently archived (indistinguishable, gap
+      //         G1). The row's `id` is the ULID the handler needs: restore does
+      //         NOT resolve a slug (it passes the raw param to `repo.restore`).
+      //         `reply.code(404).send({ error: 'not_found' })`, assets.ts:8080.
+      //   410 — already purged (tombstone): permanent, not a retry.
+      //         `reply.code(410).send({ error: 'gone', message: 'asset has been
+      //         purged' })`, assets.ts:8075, reached when
+      //         `repo.getState(id).kind === 'tombstone'` (assets.ts:8072-8077).
+      //
+      // RETURN VALUE == "reload the table". The table reloads unless this
+      // resolves `false` (public/assets-table.js:1732-1746), so `false` means
+      // strictly "the row on screen is still accurate". Every outcome below that
+      // proves the row is STALE therefore resolves `true` — the reload is how the
+      // row stops lying, and (for the 410) how the control disappears for good.
+      const label = nameOrFallback(name, 'this asset');
+      // Clear the previous row-action outcome before starting a new one, exactly
+      // as the detail panel clears #action-msg on each click: a terminal notice
+      // about an earlier asset must not sit next to this asset's result.
+      rowActionMsg.innerHTML = '';
+      try {
+        await apiFetch('/assets/' + encodeURIComponent(id) + '/restore', {
+          method: 'POST',
+        });
+        return true;
+      } catch (err) {
+        if (isPurgedGone(err)) {
+          // 410: the retention sweep tombstoned the asset, so restore can never
+          // succeed — the same terminal outcome the detail panel renders at
+          // #btn-restore-asset (issue #933). Mirrored here deliberately, down to
+          // the two parts styling alone cannot carry:
+          //   * NOT reportActionFailure. That is this app's one signal for "the
+          //     action failed", and every refusal it humanizes ends in "try
+          //     again" (ACTION_FAILURE_REASON_COPY) — the single instruction a
+          //     tombstone can never satisfy. The shared `.msg-unrecoverable`
+          //     notice states the outcome as final instead, and persists (no 6s
+          //     auto-dismiss) because this outcome never changes.
+          //   * The Restore control is REMOVED, not disabled. A greyed-out button
+          //     reads as "not right now"; there is no "right now" for a purged
+          //     asset, so the affordance goes away entirely.
+          renderPurgedUnrecoverable(rowActionMsg, {
+            id: 'row-restore-gone-notice',
+            subject: quotedOrEmpty(name, id),
+            serverMessage: err.message,
+            retire: [rowRestoreControl(id)],
+          });
+          // Reload (NOT `false`): a tombstone is no longer a listed asset, so
+          // this row is stale and the reload is what retires it for good — the
+          // same assetsTable.reload() the detail panel's 410 path issues. The
+          // `true` return IS that reload (assets-table.js:1741-1746), which also
+          // means the table never re-enables the button this path just removed.
+          return true;
+        }
+        if (err && err.status === 404) {
+          // 404: the API has nothing to restore — either this id is unknown or
+          // the asset is no longer archived (gap G1, the same body for both). The
+          // outcome is retryable in class, so it is reported the ordinary way,
+          // but the ROW IS KNOWN-STALE: it is still offering Restore for a
+          // lifecycle state the API says it is not in. So this reloads, for the
+          // same reason onRename reloads on 404 (above) and the detail panel
+          // re-reads on 404.
+          reportActionFailure(err, {
+            action: 'Restore asset',
+            detail:
+              '"' + label + '" was not restored — the API reports nothing to ' +
+              'restore, so either it is no longer archived or the id is ' +
+              'unknown. The list has been re-read from the API.',
+          });
+          return true;
+        }
+        // 401/403 from the auth gate, a 5xx, or a transport failure: nothing
+        // changed server-side as far as this client can tell, so the row stays
+        // as it is (no reload) and the control comes back for a retry.
+        reportActionFailure(err, {
+          action: 'Restore asset',
+          detail: '"' + label + '" was not restored. Nothing has changed.',
         });
         return false;
       }

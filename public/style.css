@@ -2242,6 +2242,18 @@ pre.code-block {
   margin-bottom: 0;
 }
 
+/* Host for a row action's persistent outcome notice (issue #836/#933): the
+   terminal `.msg-unrecoverable` a purged (410) Restore leaves behind. Collapsed
+   while empty so it takes no vertical space in the ordinary case, and padded to
+   line up with the header/bulk-bar strips above the table when it is not. */
+.assets-row-action-msg:empty {
+  display: none;
+}
+
+.assets-row-action-msg {
+  padding: 10px 16px 0;
+}
+
 /* Bulk-action bar above the assets table (issue #916). Visually a continuation
    of the header strip rather than a floating overlay, so it never covers rows
    and needs no dismissal affordance. */
