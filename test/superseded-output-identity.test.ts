@@ -62,6 +62,10 @@ import {
   DEFAULT_PACKAGE_STALL_TIMEOUT_MS,
   reconcileStalledPackages
 } from '../src/pipeline/stalled-package-reconciler.js';
+import {
+  PACKAGE_STALL_DIAGNOSTIC_MARKER,
+  packagingAbandonedByStallSweep
+} from '../src/pipeline/package-job.js';
 
 const noopPackageQueue: PackageQueue = { enqueue: vi.fn(async () => {}) };
 
@@ -580,5 +584,225 @@ describe('a transcode completion for a superseded run is ignored (#1044 review)'
     expect(storage.removedObjects).toEqual([
       { bucket: storage.defaultBucket, key: `transcode/${asset.id}/${job1}/1080.mp4` }
     ]);
+  });
+});
+
+describe('the stall sweep verdict is one-shot and sweep-written only (#1044 review, findings 6 and 7)', () => {
+  // Finding 6: the `abandoned` liveness that lets a genuine late callback
+  // through was a STANDING property of the asset's newest execution ("its
+  // `package` step is failed with the sweep's diagnostic"), and nothing cleared
+  // it. Every later callback therefore also reported `abandoned`, which is
+  // handled with NO supersession guard, so an at-least-once redelivery of an
+  // OLDER run's callback was applied, repointed the asset backwards, and had the
+  // newest subfolder deleted as "superseded" — the data loss MAJOR 3 is about.
+  //
+  // Finding 7: that same verdict was decided by substring-matching
+  // `steps[].error`, a field the UNAUTHENTICATED packager failure callback fills
+  // verbatim from caller-supplied text, so the signal was forgeable on demand.
+  //
+  // Contracts verified before writing (CLAUDE.md rule 7):
+  //   - `StepExecution.failureReason?: StepFailureReason` with
+  //     `STEP_FAILURE_REASONS = ['package-stall']` — src/data/pipeline-repo.ts;
+  //     written ONLY by the sweep's step patch
+  //     (src/pipeline/stalled-package-reconciler.ts) and read only by
+  //     `packagingAbandonedByStallSweep` / `isPackageStallFailure`
+  //     (src/pipeline/package-job.ts).
+  //   - The failure route's step write is
+  //     `{ ...s, status: 'failed', error: `packager failure: ${message}` }` from
+  //     body `packagerFailureSchema = z.object({ message: z.string() })`, on an
+  //     unauthenticated route — src/routes/internal.ts POST
+  //     /packagerCallback/failure. Replicated verbatim below, since the forged
+  //     value is the whole point of the case.
+  //   - `PipelineRepository.create/update/listByAsset`, `PackageJobDeps
+  //     { jobs?, pipeline?, logger? }` — src/data/pipeline-repo.ts,
+  //     src/pipeline/package-job.ts.
+  //   - `DEFAULT_PACKAGE_STALL_TIMEOUT_MS` + `reconcileStalledPackages` —
+  //     src/pipeline/stalled-package-reconciler.ts (ages a `package` step from
+  //     `startedAt`).
+
+  // Enqueue a packaging run and age it past the stall bound, so the next sweep
+  // gives up on it: a running `package` step carrying its own job id.
+  async function stalledPackageRun(
+    pipeline: InMemoryPipelineRepository,
+    jobs: InMemoryJobRepository,
+    assetId: string
+  ) {
+    const execution = await pipeline.create({
+      assetId,
+      pipelineName: 'package',
+      steps: ['package']
+    });
+    const jobId = await runningPackageJob(jobs, assetId);
+    await pipeline.update(execution.id, {
+      steps: [
+        {
+          name: 'package',
+          status: 'running',
+          jobId,
+          startedAt: new Date(Date.now() - DEFAULT_PACKAGE_STALL_TIMEOUT_MS - 60_000).toISOString()
+        }
+      ]
+    });
+    return { executionId: execution.id, jobId };
+  }
+
+  it('keeps the newest generation when two swept runs report out of order', async () => {
+    const storage = recordingStorage();
+    const assets = new InMemoryAssetRepository();
+    const jobs = new InMemoryJobRepository();
+    const pipeline = new InMemoryPipelineRepository();
+    const asset = await assets.create({ name: 'clip' });
+    const svc = new PackagingService({
+      assets,
+      queue: noopPackageQueue,
+      jobs,
+      pipeline,
+      resolveStorage: storage.resolveStorage
+    });
+
+    // An earlier run packaged successfully: the asset points at job-0.
+    await runningPackageJob(jobs, asset.id);
+    await svc.handleSuccess({
+      url: 'https://packager/j0',
+      jobId: asset.id,
+      outputPath: `${asset.id}/job-0/`
+    });
+
+    // Two re-packages are enqueued and BOTH outlive the stall bound.
+    const runA = await stalledPackageRun(pipeline, jobs, asset.id);
+    const runB = await stalledPackageRun(pipeline, jobs, asset.id);
+    const swept = await reconcileStalledPackages({ pipeline, jobs });
+    expect(swept.failed).toBe(2);
+    expect((await jobs.get(runA.jobId))?.status).toBe('failed');
+    expect((await jobs.get(runB.jobId))?.status).toBe('failed');
+
+    // Run B — the newest — reports first and is applied: the asset points at
+    // job-b and the generation it replaced (job-0) is reclaimed.
+    expect(
+      await svc.handleSuccess({
+        url: 'https://packager/jb',
+        jobId: asset.id,
+        outputPath: `${asset.id}/job-b/`
+      })
+    ).toBe(true);
+    expect((await assets.get(asset.id))?.packagedOutput?.prefix).toBe(`${asset.id}/job-b/`);
+
+    // Run A's callback lands AFTER it (late, or redelivered at least once). It
+    // must be ignored: applied, it would repoint the asset back at job-a and
+    // delete job-b, which is the live output.
+    expect(
+      await svc.handleSuccess({
+        url: 'https://packager/ja',
+        jobId: asset.id,
+        outputPath: `${asset.id}/job-a/`
+      })
+    ).toBe(true);
+
+    const stored = await assets.get(asset.id);
+    expect(stored?.packagedOutput?.prefix).toBe(`${asset.id}/job-b/`);
+    expect(stored?.manifestUrls?.hls).toContain(`${asset.id}/job-b/index.m3u8`);
+    expect(storage.removedPrefixes).toEqual([
+      { bucket: packagedBucket(), prefix: `${asset.id}/job-0/` }
+    ]);
+  });
+
+  it('consumes the sweep verdict once the late callback has been applied', async () => {
+    const storage = recordingStorage();
+    const assets = new InMemoryAssetRepository();
+    const jobs = new InMemoryJobRepository();
+    const pipeline = new InMemoryPipelineRepository();
+    const asset = await assets.create({ name: 'clip' });
+    const svc = new PackagingService({
+      assets,
+      queue: noopPackageQueue,
+      jobs,
+      pipeline,
+      resolveStorage: storage.resolveStorage
+    });
+
+    const run = await stalledPackageRun(pipeline, jobs, asset.id);
+    await reconcileStalledPackages({ pipeline, jobs });
+
+    // Swept: the run is abandoned, so its late callback is still genuine.
+    expect(await packagingAbandonedByStallSweep({ pipeline }, asset.id)).toBe(true);
+    const sweptStep = (await pipeline.get(run.executionId))?.steps[0];
+    expect(sweptStep?.status).toBe('failed');
+    expect(sweptStep?.failureReason).toBe('package-stall');
+
+    await svc.handleSuccess({
+      url: 'https://packager/jb',
+      jobId: asset.id,
+      outputPath: `${asset.id}/job-b/`
+    });
+
+    // The verdict has been acted on, so it no longer applies to the NEXT
+    // callback — which is what re-arms the supersession guard. The operator's
+    // record of the sweep is untouched: the step stays failed, with its reason.
+    expect(await packagingAbandonedByStallSweep({ pipeline }, asset.id)).toBe(false);
+    const consumedStep = (await pipeline.get(run.executionId))?.steps[0];
+    expect(consumedStep?.status).toBe('failed');
+    expect(consumedStep?.error).toContain(PACKAGE_STALL_DIAGNOSTIC_MARKER);
+    expect(consumedStep?.failureReason).toBeUndefined();
+  });
+
+  it('cannot be forged through the packager failure callback message', async () => {
+    const storage = recordingStorage();
+    const assets = new InMemoryAssetRepository();
+    const jobs = new InMemoryJobRepository();
+    const pipeline = new InMemoryPipelineRepository();
+    const asset = await assets.create({ name: 'clip' });
+    const svc = new PackagingService({
+      assets,
+      queue: noopPackageQueue,
+      jobs,
+      pipeline,
+      resolveStorage: storage.resolveStorage
+    });
+
+    // The live generation.
+    await runningPackageJob(jobs, asset.id);
+    await svc.handleSuccess({
+      url: 'https://packager/jb',
+      jobId: asset.id,
+      outputPath: `${asset.id}/job-b/`
+    });
+
+    // An unauthenticated POST /packagerCallback/failure whose `message` carries
+    // the sweep's diagnostic text verbatim. The route writes it into the step's
+    // `error` exactly like this, for every execution with a running `package`
+    // step on every provisioned stack.
+    const execution = await pipeline.create({
+      assetId: asset.id,
+      pipelineName: 'package',
+      steps: ['package']
+    });
+    const forged = `${PACKAGE_STALL_DIAGNOSTIC_MARKER} 15 minutes; packager instance present=true`;
+    await pipeline.update(execution.id, {
+      status: 'failed',
+      steps: [
+        {
+          name: 'package',
+          status: 'failed',
+          error: `packager failure: ${forged}`,
+          completedAt: new Date().toISOString()
+        }
+      ]
+    });
+
+    // The forged text buys nothing: the liveness verdict reads structured state
+    // the failure route never writes.
+    expect(await packagingAbandonedByStallSweep({ pipeline }, asset.id)).toBe(false);
+
+    // So the supersession guard still holds, and a callback reporting any other
+    // generation cannot delete the one the asset is serving.
+    expect(
+      await svc.handleSuccess({
+        url: 'https://packager/ja',
+        jobId: asset.id,
+        outputPath: `${asset.id}/job-a/`
+      })
+    ).toBe(true);
+    expect((await assets.get(asset.id))?.packagedOutput?.prefix).toBe(`${asset.id}/job-b/`);
+    expect(storage.removedPrefixes).toEqual([]);
   });
 });

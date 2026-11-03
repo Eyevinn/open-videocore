@@ -43,7 +43,8 @@ import {
 import type {
   PipelineExecution,
   PipelineRepository,
-  StepExecution
+  StepExecution,
+  StepFailureReason
 } from '../data/pipeline-repo.js';
 // The correlation id + deterministic prefix are derived from the ONE definition
 // of each (packaging.ts), never re-implemented here. packaging.ts imports this
@@ -117,8 +118,9 @@ export async function inFlightPackageJob(
 // The invariant part of the stalled-package sweep's diagnostic (issue #336,
 // src/pipeline/stalled-package-reconciler.ts buildDiagnostic, which composes its
 // message from THIS constant so the two can never drift). It lives here, beside
-// the settle helper the sweep writes it through (`failPackageJob`), because the
-// string is what makes a sweep-declared failure recognisable afterwards.
+// the settle helper the sweep writes it through (`failPackageJob`). It is the
+// HUMAN-READABLE half of the verdict only: nothing branches on it (#1044 review,
+// finding 7 — see PACKAGE_STALL_FAILURE_REASON below).
 //
 // WHY IT HAS TO BE RECOGNISABLE (#1044 review, BLOCKING 5): the sweep's `failed`
 // is NOT a verdict that the run failed. It is us giving up on a callback that has
@@ -130,31 +132,83 @@ export async function inFlightPackageJob(
 // callback is arriving now (it is genuine and must be applied).
 export const PACKAGE_STALL_DIAGNOSTIC_MARKER = 'packager never signalled completion within';
 
-// Was this failure written by the stalled-package sweep? Text-matched rather
-// than flagged on the record because the sweep's own write is the only trace it
-// leaves (it patches `steps[].error` and the job's `error`, both with the same
-// message — stalled-package-reconciler.ts), and the marker above is the single
-// definition both the writer and this reader share.
-export function isPackageStallDiagnostic(error: string | undefined): boolean {
-  return typeof error === 'string' && error.includes(PACKAGE_STALL_DIAGNOSTIC_MARKER);
+// The sweep's verdict as STRUCTURED state, and the only thing the run-identity
+// guard below reads (#1044 review, finding 7).
+//
+// It used to be read out of `steps[].error` by substring-matching the diagnostic
+// marker above. That field is not the sweep's alone: the packager FAILURE
+// callback (POST /api/v1/internal/packagerCallback/failure, unauthenticated by
+// design — src/routes/internal.ts) writes `packager failure: ${message}` into it
+// verbatim from `request.body.message` (CONTRACT: `packagerFailureSchema` =
+// `z.object({ message: z.string() })`, src/routes/internal.ts), for EVERY
+// execution with a running `package` step on every provisioned stack. So one
+// unauthenticated POST could forge the marker on every in-flight packaging step,
+// flip those assets to liveness 'abandoned', and disable the supersession guard
+// that keeps a redelivered older callback from deleting the newest generation.
+//
+// A control decision must therefore not be derived from that text. This value is
+// written in exactly ONE place — the stalled-package sweep's step patch
+// (src/pipeline/stalled-package-reconciler.ts) — and `failureReason` is never
+// populated from request input anywhere in the codebase, so no caller-supplied
+// string can produce it. The marker string stays what it always was: the
+// human-readable half of the diagnostic.
+export const PACKAGE_STALL_FAILURE_REASON: StepFailureReason = 'package-stall';
+
+// Was this step failed by the stalled-package sweep? Structured match only (see
+// above): the status the sweep writes plus the reason only the sweep sets.
+export function isPackageStallFailure(step: StepExecution | undefined): boolean {
+  return step?.status === 'failed' && step.failureReason === PACKAGE_STALL_FAILURE_REASON;
 }
 
-// Did the stalled-package sweep ABANDON this asset's most recent packaging
-// episode (#1044 review, BLOCKING 5)? Positive evidence only: true exactly when
-// the newest PipelineExecution that has a `package` step carries that step
-// `failed` with the sweep's own diagnostic.
+// The asset's most recent packaging episode as recorded on its executions: the
+// newest PipelineExecution that has a `package` step, with that step and its
+// index (the index so a writer can patch it in place).
 //
 // Read off the EXECUTION's step rather than the package Job because the step is
-// the write the sweep always makes (`steps[idx] = { status: 'failed', error }`,
-// stalled-package-reconciler.ts) while the job settle after it is conditional on
-// a job repository being wired and on the step carrying a `jobId` — and because
-// the terminal job is not reachable by asset: `findActiveByAssetId` returns the
-// NON-TERMINAL set only (CONTRACT: JobRepository, src/data/job-repo.ts).
+// the write the sweep always makes (`steps[idx] = { status: 'failed', error,
+// failureReason }`, stalled-package-reconciler.ts) while the job settle after it
+// is conditional on a job repository being wired and on the step carrying a
+// `jobId` — and because the terminal job is not reachable by asset:
+// `findActiveByAssetId` returns the NON-TERMINAL set only (CONTRACT:
+// JobRepository, src/data/job-repo.ts).
 //
 // Ordering is computed here (createdAt desc, id as tiebreak) rather than taken
 // from the repository: `listByAsset` is specified only as "the asset's
 // executions" (CONTRACT: PipelineRepository.listByAsset, src/data/pipeline-repo.ts)
 // and the in-memory backend returns them ASCENDING.
+//
+// Shared by the reader (`packagingAbandonedByStallSweep`) and the writer
+// (`clearPackageStallMarker`) so the step whose marker is consumed is always the
+// same step the guard answers from. Throws only what the repository throws; both
+// callers catch.
+async function newestPackageStep(
+  pipeline: PipelineRepository,
+  assetId: string
+): Promise<{ execution: PipelineExecution; step: StepExecution; index: number } | undefined> {
+  const executions = await pipeline.listByAsset(assetId);
+  let newest: { execution: PipelineExecution; step: StepExecution; index: number } | undefined;
+  for (const execution of executions) {
+    const index = execution.steps.findIndex((s) => s.name === 'package');
+    if (index < 0) continue;
+    if (!newest || isNewerExecution(execution, newest.execution)) {
+      newest = { execution, step: execution.steps[index], index };
+    }
+  }
+  return newest;
+}
+
+// Did the stalled-package sweep ABANDON this asset's most recent packaging
+// episode, with its late callback NOT yet honoured (#1044 review, BLOCKING 5)?
+// Positive evidence only: true exactly when the newest PipelineExecution that
+// has a `package` step carries that step `failed` with the sweep's own
+// structured reason.
+//
+// NOT STICKY (#1044 review, finding 6): the marker is consumed — cleared by
+// `clearPackageStallMarker` — as soon as a late callback for that episode has
+// been applied, so this answers `true` for the ONE callback the sweep gave up
+// waiting for and `false` for everything after it. Left standing it permanently
+// disabled the supersession guard for the asset, and a redelivered older
+// callback then repointed the asset backwards and deleted the newest generation.
 //
 // Best-effort like everything else here: any repository error, or no pipeline
 // repository wired, answers `false`, which leaves the caller's behaviour exactly
@@ -165,17 +219,8 @@ export async function packagingAbandonedByStallSweep(
 ): Promise<boolean> {
   if (!deps.pipeline) return false;
   try {
-    const executions = await deps.pipeline.listByAsset(assetId);
-    let newest: { execution: PipelineExecution; step: StepExecution } | undefined;
-    for (const execution of executions) {
-      const step = execution.steps.find((s) => s.name === 'package');
-      if (!step) continue;
-      if (!newest || isNewerExecution(execution, newest.execution)) {
-        newest = { execution, step };
-      }
-    }
-    if (!newest) return false;
-    return newest.step.status === 'failed' && isPackageStallDiagnostic(newest.step.error);
+    const newest = await newestPackageStep(deps.pipeline, assetId);
+    return isPackageStallFailure(newest?.step);
   } catch (err) {
     logWarn(
       deps.logger,
@@ -184,6 +229,52 @@ export async function packagingAbandonedByStallSweep(
       err
     );
     return false;
+  }
+}
+
+// Consume the sweep's abandonment marker once its late callback has been applied
+// (#1044 review, finding 6).
+//
+// The marker answers one question — "is the callback arriving now the one the
+// sweep stopped waiting for?" — and that is true for exactly one callback. Until
+// this ran, nothing cleared it: `completePackageJob` writes only the Job record,
+// and the packager-success route promotes the execution's `package` step only
+// when it is `running` (src/routes/internal.ts), which a swept `failed` step
+// never is again. The marker therefore stood for the life of the asset, every
+// later callback reported liveness 'abandoned', and `packagedCallbackSupersededRun`
+// (src/pipeline/packaging.ts) — which only guards 'settled' — stopped protecting
+// the newest generation: an at-least-once redelivery of an OLDER run's callback
+// was applied, repointed the asset backwards, and had the newest subfolder
+// deleted as "superseded".
+//
+// Clears `failureReason` on the SAME step the guard reads, and only when that
+// step still carries the sweep's reason. Everything else on the step is left
+// exactly as it is: the step stays `failed` with the sweep's diagnostic text and
+// the execution keeps its status, so what an operator sees in
+// GET /api/v1/pipelines/{id} does not change — the sweep really did fail that
+// run, and this is bookkeeping about whether its late callback has been honoured.
+//
+// Best-effort and never throws, like every function here: a repository error
+// leaves the marker in place (the pre-finding-6 behaviour) and is logged.
+export async function clearPackageStallMarker(
+  deps: PackageJobDeps,
+  assetId: string
+): Promise<void> {
+  if (!deps.pipeline) return;
+  try {
+    const newest = await newestPackageStep(deps.pipeline, assetId);
+    if (!newest || !isPackageStallFailure(newest.step)) return;
+    const steps: StepExecution[] = newest.execution.steps.map((s) => ({ ...s }));
+    const { failureReason: _consumed, ...cleared } = steps[newest.index];
+    steps[newest.index] = cleared;
+    await deps.pipeline.update(newest.execution.id, { steps });
+  } catch (err) {
+    logWarn(
+      deps.logger,
+      '[package-job] failed to clear the package-stall marker for asset %s: %o',
+      assetId,
+      err
+    );
   }
 }
 

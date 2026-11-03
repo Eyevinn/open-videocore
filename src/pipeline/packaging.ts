@@ -42,6 +42,7 @@ import type { StorageBackendConfig } from '../services/param-store.js';
 import { emitAudit, originActor, type AuditEmitter, type AuditErrorLog } from '../data/audit-emit.js';
 import { logPipelineEvent, type PipelineLogSink } from '../services/pipeline-log.js';
 import {
+  clearPackageStallMarker,
   completePackageJob,
   failPackageJob,
   inFlightPackageJob,
@@ -88,6 +89,14 @@ export function packagingId(assetId: string): string {
 //                   (`packagingAbandonedByStallSweep`, src/pipeline/package-job.ts).
 //                   A run WAS awaiting a callback and we stopped waiting, so an
 //                   arriving callback is that run's and is still genuine.
+//                   ONE-SHOT (#1044 review, finding 6): the sweep's marker is
+//                   consumed once that callback has been applied, so the next
+//                   callback for the asset resolves 'settled' and is guarded
+//                   again. The evidence is structured state only the sweep
+//                   writes (`StepExecution.failureReason`), never the step's
+//                   free-text `error` — which the unauthenticated packager
+//                   failure callback fills from caller-supplied input
+//                   (#1044 review, finding 7).
 //   - 'settled'   — no non-terminal `package` job exists and no run was
 //                   abandoned: a completion already settled this asset's
 //                   packaging, so an arriving callback belongs to a run that was
@@ -772,10 +781,11 @@ export class PackagingService implements PackagingTrigger {
     // already deleted) and then delete the newest generation, so it is ignored
     // outright — nothing persisted, nothing deleted, nothing settled. Checked
     // BEFORE the update, with the generation the asset currently points at.
+    const liveness = await this.packagingRunLiveness(assetId);
     const supersededRun = packagedCallbackSupersededRun({
       recorded: asset.packagedOutput,
       incoming: packagedOutput,
-      liveness: await this.packagingRunLiveness(assetId),
+      liveness,
       defaultBucket: packagedBucket()
     });
     if (supersededRun) {
@@ -810,6 +820,23 @@ export class PackagingService implements PackagingTrigger {
       manifestUrls,
       ...(packagedOutput ? { packagedOutput } : {})
     });
+    // #1044 review (finding 6): the abandonment marker is CONSUMED here, now
+    // that the late callback the stall sweep gave up waiting for has actually
+    // been applied to the asset. It answers "is the callback arriving now that
+    // run's?", which is true for exactly one callback; left standing it reported
+    // 'abandoned' for every later callback too, and 'abandoned' is handled with
+    // no supersession guard — so an at-least-once redelivery of an OLDER run's
+    // callback was applied, repointed the asset backwards, and then had the
+    // newest subfolder deleted as "superseded". With the marker consumed, the
+    // next callback resolves 'settled' and the MAJOR-3 guard protects the
+    // newest generation again.
+    //
+    // AFTER the asset write, never before: if the write throws, the marker must
+    // survive so the redelivered callback is still honoured. Best-effort and
+    // never throws (clearPackageStallMarker, src/pipeline/package-job.ts).
+    if (liveness === 'abandoned') {
+      await clearPackageStallMarker(this.packageJobDeps(), assetId);
+    }
     // #1044: ORDER MATTERS — the superseded subfolder is removed only after the
     // asset has been re-read back pointing at the NEW one. A failed/partial write
     // here leaves the previous output exactly where it is, so the asset is still
