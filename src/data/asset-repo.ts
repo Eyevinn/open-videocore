@@ -15,6 +15,16 @@
 import { ulid } from 'ulid';
 import { withinCreatedRange } from './created-range.js';
 import { currentDocumentStackName } from '../services/request-stack-context.js';
+// Shared DRM vocabulary (ADR-008 §5.1/§8), in its own module so the asset model
+// and the per-execution request (pipeline-repo.ts) import the same enums
+// without importing each other.
+import type {
+  DrmErrorCode,
+  DrmStatus,
+  DrmSystem,
+  ProtectionScheme,
+  TrackTypeGroup
+} from '../types/drm.js';
 
 // ---------------------------------------------------------------------------
 // Asset model + lifecycle
@@ -442,6 +452,56 @@ export type PackagedOutput = {
   masterDashKey?: string;
 };
 
+// DRM protection state of the asset's packaged output (ADR-008 §8, issue
+// #1259). Pipeline-derived like `packagedOutput` / `packagingError`, so it is
+// persisted under the ADR-005 `structural` namespace (`structural.drm`, see
+// asset-document.ts) and surfaced FLAT here — the packagedOutput precedent,
+// stated as ADR-008 decision D7.
+//
+// Field-for-field the ADR-008 §8 shape:
+//   - status:         protection lifecycle (`pending` while keys/packaging are
+//                     in flight, `protected` once the encrypted package landed,
+//                     `failed` on a recoverable failure, `unsupported` when the
+//                     packaging runner cannot encrypt at all — D8).
+//   - providerId:     the operator-chosen key-provider config id (e.g.
+//                     `primary`). v1 allows ONE provider per stack; the field
+//                     exists so per-asset provider selection stays additive
+//                     (ADR-008 §5.2).
+//   - scheme:         the common-encryption scheme the package was built with.
+//   - systems:        the DRM systems the package is signalled for.
+//   - keyIds:         IDENTIFIERS ONLY, one entry per track type group. ADR-008
+//                     D4: content keys are never persisted, never logged and
+//                     never returned by any API, so this type carries no `key`
+//                     member and no raw bytes anywhere.
+//   - licenceUrls:    per-system licence service URL, when the provider
+//                     supplied one. Licence requests never pass through this
+//                     API — the player talks to the provider directly (§9 N4).
+//   - certificateUrl: application certificate URL, where the system needs one.
+//   - requestedAt:    when protection was first requested for this asset.
+//   - protectedAt:    when the encrypted package landed; absent until then.
+//   - error:          human-readable, already redacted/truncated — provider
+//                     error bodies are never echoed verbatim (§10).
+//   - errorCode:      machine-readable companion to `error`, absent for a
+//                     failure we cannot classify (the `StepExecution.errorDetail`
+//                     convention, pipeline-repo.ts).
+//
+// DRM never changes `Asset.status` (ADR-008 §8): an asset whose DRM step failed
+// is still `ready` with `drm.status = 'failed'`, exactly as for `packagingError`.
+export type AssetDrm = {
+  status: DrmStatus;
+  providerId: string;
+  scheme: ProtectionScheme;
+  systems: DrmSystem[];
+  // Key identifiers per track type group — no key material (ADR-008 D4).
+  keyIds: { trackGroup: TrackTypeGroup; keyId: string }[];
+  licenceUrls?: Partial<Record<DrmSystem, string>>;
+  certificateUrl?: string;
+  requestedAt: string;
+  protectedAt?: string;
+  error?: string;
+  errorCode?: DrmErrorCode;
+};
+
 // One ABR rendition produced by a transcode job (issue #8, redesigned #79).
 // Renditions are EMBEDDED variants of a single asset, not separate child
 // assets. An asset represents a piece of content; all of its transcoded
@@ -649,6 +709,17 @@ export type Asset = {
   // still there and still playable; when the old package is gone the marker is
   // already cleared.
   packagedOutputStale?: boolean;
+  // DRM protection state of the packaged output (ADR-008 §8/D7, issue #1259).
+  // Persisted at `structural.drm` and read back by `fromAssetDocument`, right
+  // beside `packagedOutput` — the same pipeline-derived treatment, so it is
+  // surfaced flat here rather than under a second lifecycle field.
+  //
+  // Optional and additive in exactly the way `packagedOutput` is: absent on
+  // every asset written before #1259, and absent on EVERY asset while
+  // `DRM_ENABLED` is off (ADR-008 D9) — the mappers refuse to write or read the
+  // slot with the flag off, so no schemaVersion bump is required and the clear
+  // path is unchanged. Never carries key material (D4).
+  drm?: AssetDrm;
   // ABR renditions produced by transcoding (issue #8). Populated on the SOURCE
   // asset when a transcode job completes; undefined until then.
   renditions?: Rendition[];

@@ -17,8 +17,10 @@ import type {
   PipelineRepository,
   StepExecution
 } from './pipeline-repo.js';
+import { cloneDrmRequest } from './pipeline-repo.js';
 import type { PipelineStepName } from '../pipeline/pipelines.js';
 import { stepErrorDetailSchema } from '../pipeline/step-error-detail.js';
+import { DRM_SYSTEMS, PROTECTION_SCHEMES, drmEnabled } from '../types/drm.js';
 import type { StoredDoc, StackCouch } from './couchdb.js';
 import { monotonicFactory } from 'ulid';
 
@@ -36,6 +38,8 @@ export class CouchPipelineRepository implements PipelineRepository {
     pipelineName: string;
     steps: PipelineStepName[];
     destinationBucket?: string;
+    // Per-execution DRM request (ADR-008, issue #1259) — see PipelineRepository.
+    drm?: PipelineExecution['drm'];
   }): Promise<PipelineExecution> {
     const couch = this.couchFor();
     const now = new Date().toISOString();
@@ -49,6 +53,9 @@ export class CouchPipelineRepository implements PipelineRepository {
       ...(input.destinationBucket !== undefined
         ? { destinationBucket: input.destinationBucket }
         : {}),
+      // DRM request (#1259). Persisted only with `DRM_ENABLED` on (ADR-008 D9),
+      // so a flag-off execution document is identical to a pre-#1259 one.
+      ...(drmEnabled() && input.drm !== undefined ? { drm: cloneDrmRequest(input.drm) } : {}),
       createdAt: now,
       updatedAt: now
     };
@@ -161,6 +168,9 @@ function toDoc(execution: PipelineExecution): Record<string, unknown> {
     ...(execution.relocatedPackagingIds !== undefined
       ? { relocatedPackagingIds: execution.relocatedPackagingIds }
       : {}),
+    // Per-execution DRM request (#1259). Request intent only — no key material
+    // and no key identifiers ever reach this document (ADR-008 D4).
+    ...(execution.drm !== undefined ? { drm: cloneDrmRequest(execution.drm) } : {}),
     createdAt: execution.createdAt,
     updatedAt: execution.updatedAt
   };
@@ -207,9 +217,48 @@ function fromDoc(doc: StoredDoc): PipelineExecution {
           )
         }
       : {}),
+    // Per-execution DRM request (#1259). Hydrated only with `DRM_ENABLED` on
+    // (ADR-008 D9), so a block left by an earlier flag-on run is not read back
+    // while the feature is off, and only when the stored value actually matches
+    // the contract — the `isResolvedLocation` guard precedent, so a malformed
+    // document degrades to "no request" instead of a partially-typed execution.
+    ...(drmEnabled() && isDrmRequest(doc['drm']) ? { drm: cloneDrmRequest(doc['drm']) } : {}),
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };
+}
+
+// Narrow a stored value to the per-execution DRM request shape (#1259):
+// `requested: true` plus optional, ENUM-CHECKED coordinates. Mirrors
+// `isResolvedLocation` below. An out-of-enum `scheme`/`systems` entry fails the
+// guard rather than being cast through, so no invented vocabulary can reach a
+// typed PipelineExecution.
+function isDrmRequest(value: unknown): value is NonNullable<PipelineExecution['drm']> {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const v = value as Record<string, unknown>;
+  if (v['requested'] !== true) {
+    return false;
+  }
+  if (v['providerId'] !== undefined && typeof v['providerId'] !== 'string') {
+    return false;
+  }
+  if (
+    v['scheme'] !== undefined &&
+    !PROTECTION_SCHEMES.includes(v['scheme'] as (typeof PROTECTION_SCHEMES)[number])
+  ) {
+    return false;
+  }
+  if (v['systems'] !== undefined) {
+    if (!Array.isArray(v['systems'])) {
+      return false;
+    }
+    if (!v['systems'].every((s) => DRM_SYSTEMS.includes(s as (typeof DRM_SYSTEMS)[number]))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function stripPartition(id: string): string {
