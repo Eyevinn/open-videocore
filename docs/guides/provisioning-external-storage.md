@@ -41,6 +41,73 @@ and wired into the provision request body at lines 64-67.
 Anything the schema does not list is rejected — the request body is validated,
 so a typo'd field name fails fast rather than being silently ignored.
 
+## What a storage block actually redirects
+
+Two different things get called "redirection" here, and only one of them is
+achievable today.
+
+**The bucket name is achievable.** The stack can create and use a bucket you
+name, on the stack's own object-storage endpoint, with the stack's own
+credentials. That is what `HONOUR_CUSTOM_BUCKETS` below turns on.
+
+**A different endpoint is not.** Supplying `endpointUrl` is rejected with a 400
+naming the field. The transcode and packaging path builds bucket-only
+`s3://<bucket>/…` URIs against one fixed endpoint and has no per-job endpoint or
+credential override, so a second object store cannot be addressed at all.
+Returning success while jobs quietly wrote somewhere else was the old behaviour
+and the worst failure mode available, so the request now fails loudly instead.
+
+### `HONOUR_CUSTOM_BUCKETS`
+
+Honouring `bucket` changes where every job reads and writes, so it is an
+**opt-in flag on the API process**, off by default:
+
+| `HONOUR_CUSTOM_BUCKETS` | Effect |
+|---|---|
+| unset (default), `0`, `false`, `off` | Jobs use the stack's own `openvideocore-source` / `openvideocore-packaged`. A different `bucket` in the request is not used; the API logs the exact field at `error` level. |
+| `1`, `true`, `yes`, `on` | The stack creates (or adopts) the bucket you name on its own object-storage endpoint and binds every job to it. |
+
+With the flag on:
+
+- The bucket is created if absent and adopted untouched if it already exists, so
+  a bucket you pre-created with objects in it is safe to name.
+- If the bucket cannot be created or reached, provisioning **fails** with the
+  bucket name and role in the error. There is no fallback to the default — a
+  stack that quietly used a different bucket than the one you asked for is the
+  problem this flag exists to avoid.
+- Packaged output keeps its anonymous read-only object policy, applied to the
+  bucket you named rather than the default, so players can still fetch
+  manifests and segments.
+- Delivery URLs are emitted against the same bucket the job wrote, because the
+  stored binding and the stored storage coordinates are written from one value.
+
+### The two roles must use different buckets
+
+A request where the source and packaged roles resolve to the **same** bucket is
+rejected with `400` before anything is created, naming the field(s) you sent.
+Packaged output is made anonymously readable so players can fetch manifests and
+segments without a token; source masters must stay private. One shared bucket
+would put that public-read policy on the bucket holding your masters, so there
+is no configuration in which it is allowed. Note that this also catches naming
+`openvideocore-packaged` as your source bucket while the packaged role takes its
+default.
+
+### Changing the bucket of an existing stack
+
+Provisioning is idempotent: calling it again for a name that already exists
+converges on that stack. Omitting the storage blocks entirely, or re-supplying
+the bucket the stack is **already** bound to, keeps that binding — this is the
+call to repeat to converge, or to resume a provision that failed partway
+through. Calling it again with a **different** bucket is **rejected**, and the
+operation fails before anything is created or rewritten.
+
+Nothing is migrated by a rebind: existing objects stay in the bucket they were
+written to, stored object keys keep resolving against it, and delivery URLs you
+have already handed out keep pointing at it. A stack whose media is split across
+two buckets has no coherent read path, so the only two supported moves are to
+re-provision with the bucket the stack is already bound to, or to provision a
+new stack for the new bucket.
+
 ## Credentials are OSC secrets, never plaintext parameters
 
 This is the load-bearing rule (ADR-002): `secretAccessKey` and `sessionToken`
@@ -87,6 +154,13 @@ Here only the source role is redirected to `acme-media-ingest`; packaged output
 still lands on the per-stack MinIO bucket because `packagedStorage` was omitted.
 
 ## Example 2 — a generic S3-compatible provider
+
+> **This request is currently rejected.** `endpointUrl` returns a 400 naming the
+> field — see [What a storage block actually
+> redirects](#what-a-storage-block-actually-redirects). The example is kept
+> because it is the shape the field will take once the pipeline can address a
+> second object store; until then, drop `endpointUrl` and enable
+> `HONOUR_CUSTOM_BUCKETS` to use your own bucket on the stack's own endpoint.
 
 For a cloud object store that presents an S3-compatible API on its own host,
 set `endpointUrl` to that provider's S3 endpoint. `region` is usually still
@@ -150,8 +224,16 @@ part of the packager's `OutputFolder` contract, not the bucket name itself.
   opt-in per role.
 - Supply `sourceStorage` and/or `packagedStorage` to redirect a role to an
   operator-owned bucket.
-- Omit `endpointUrl` for an AWS-region bucket; set it for a generic
-  S3-compatible provider.
+- Only the **bucket name** can be redirected, and only with
+  `HONOUR_CUSTOM_BUCKETS` enabled on the API. The bucket lives on the stack's
+  own object-storage endpoint.
+- `endpointUrl` is rejected with a 400: a second object store cannot be
+  addressed by the pipeline yet.
+- The source and packaged roles must name different buckets; one shared bucket
+  is rejected with a 400 because the packaged bucket is anonymously readable.
+- Re-provisioning an existing stack with a different bucket is rejected.
+  Existing objects are not migrated. Omitting the blocks, or re-supplying the
+  bound bucket, converges (and resumes a partially failed provision).
 - Credentials (`secretAccessKey`, `sessionToken`) are stored as OSC secrets and
   never as plaintext parameters (ADR-002). Only `bucket`, `endpointUrl`, and
   `region` are persisted.

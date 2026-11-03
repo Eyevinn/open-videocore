@@ -1564,7 +1564,7 @@ Access Token as the OSC access token. Generate strong passwords for
   -d '{"name": "mystack"}'</code></pre></div>
     <p>Provisioning is asynchronous. Poll the returned <code>operationId</code> until <code>status</code> reaches <code>"done"</code>:</p>
     <div class="code-block"><pre><code>curl https://&lt;your-instance&gt;/api/v1/provision/operations/&lt;operationId&gt;</code></pre></div>
-    <div class="callout">By default the stack provisions its own object storage and buckets — no storage configuration required. To point at an existing S3-compatible bucket instead, pass the optional <code>sourceStorage</code> / <code>packagedStorage</code> blocks — see <a href="ref-provisioning.html#post-api-v1-provision">provision</a> in the reference.</div>
+    <div class="callout">By default the stack provisions its own object storage and buckets — no storage configuration required. To have the stack use buckets you name instead, pass the optional <code>sourceStorage</code> / <code>packagedStorage</code> blocks <strong>and start the API with <code>HONOUR_CUSTOM_BUCKETS</code> enabled</strong>; the buckets are then created on the stack's own object-storage endpoint. Only the bucket name can be redirected — a supplied <code>endpointUrl</code> is rejected with a <code>400</code>. See <a href="ref-provisioning.html#post-api-v1-provision">provision</a> in the reference.</div>
   </li>
   <li>
     <h3>Bootstrap transcoding profiles</h3>

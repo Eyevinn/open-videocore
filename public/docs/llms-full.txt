@@ -4616,7 +4616,7 @@ curl -X POST https://<your-instance>/api/v1/provision \
 
     curl https://<your-instance>/api/v1/provision/operations/<operationId>
 
-    By default the stack provisions its own object storage and buckets — no storage configuration required. To point at an existing S3-compatible bucket instead, pass the optional sourceStorage / packagedStorage blocks — see provision in the reference.
+    By default the stack provisions its own object storage and buckets — no storage configuration required. To have the stack use buckets you name instead, pass the optional sourceStorage / packagedStorage blocks and start the API with HONOUR_CUSTOM_BUCKETS enabled; the buckets are then created on the stack's own object-storage endpoint. Only the bucket name can be redirected — a supplied endpointUrl is rejected with a 400. See provision in the reference.
 
   -
     Bootstrap transcoding profiles
