@@ -1158,31 +1158,40 @@ function buildColumns(renderCtx) {
             '" title="Re-run metadata extraction to recover this asset" style="font-size:12px;padding:3px 8px;">Re-drive</button> '
           : '';
 
-        // Archive is a NO-OP on an asset that is already `archived`, and the app
-        // can tell locally, so the control is withheld rather than offered as a
-        // confirmation for an action that would change nothing (issue #955,
-        // broken out from #853).
-        //   - The second archive SUCCEEDS — it does NOT fail with a 422.
-        //     `isValidTransition` short-circuits on `from === to` ("idempotent
-        //     no-op transitions are allowed", src/data/asset-repo.ts →
-        //     `isValidTransition`), so `applyStatus('archived', 'archived')`
-        //     returns the status and history unchanged instead of throwing, and
-        //     the soft delete (`remove()` → `update({ status: 'archived' })`)
-        //     resolves normally. Contract: openapi.json
+        // The lifecycle action is STATUS-AWARE (issue #836). Archiving an
+        // already-`archived` asset changes nothing, so that row must not offer
+        // Archive; the one action that CAN move it — Restore — is offered in its
+        // place. Every other status offers Archive as before. The result: no row
+        // ever carries a lifecycle action that cannot change anything.
+        //   - Archive on an archived row was a silent no-op, not a confirm-then-
+        //     fail: the repeat DELETE SUCCEEDS. `isValidTransition` short-circuits
+        //     on `from === to` ("idempotent no-op transitions are allowed",
+        //     src/data/asset-repo.ts → `isValidTransition`), so
+        //     `applyStatus('archived', 'archived')` returns the status/history
+        //     unchanged and the soft delete (`remove()` → `update({ status:
+        //     'archived' })`) resolves normally. Contract: openapi.json
         //     `paths['/api/v1/assets/{id}'].delete.responses` = 204 / 404 / 409 —
-        //     there is no 422 on this route, and the handler
-        //     (src/routes/assets.ts → `app.delete('/:id')`) has no
-        //     already-archived guard. A repeat DELETE answers 204 and the asset
-        //     stays archived.
-        //   - So what is removed here is NOISE, not a confirm-then-fail: a
-        //     destructive-styled button, behind a confirmation dialog, for an
-        //     idempotent no-op. That makes it UNLIKE the two sibling controls
-        //     that gate on locally known status — the jobs table omitting Cancel
-        //     on a settled job (public/jobs-table.js, actions column) and the
-        //     detail panel omitting Restore on a non-archived asset
-        //     (public/app.js, `isArchived` gate) both suppress actions that would
-        //     really be refused. Restore remains reachable for the archived asset
-        //     from its detail panel (a row click).
+        //     no 422 on this route, and the handler (src/routes/assets.ts →
+        //     `app.delete('/:id')`) has no already-archived guard.
+        //   - Restore is the SINGLE route out of `archived`. Contract, verified
+        //     in this tree (CLAUDE.md rule 7):
+        //       openapi.json `paths['/api/v1/assets/{id}/restore']` — the only
+        //       key is `post`; its `responses` keys are exactly 200 / 404 / 410;
+        //       the single parameter is path `id` (string, required); there is NO
+        //       requestBody.
+        //       Source of truth: src/routes/assets.ts:8058-8103
+        //       (`app.post('/:id/restore')`, schema `{ 200: assetSchema, 404:
+        //       errorSchema, 410: errorSchema }` at :8063), mounted under the
+        //       `/api/v1/assets` prefix. 200 returns the FULL updated asset whose
+        //       `status` has flipped out of `archived` to `ready` (its pre-archive
+        //       status when that was `ready`) or otherwise `failed`
+        //       (`restoreTargetStatus`). 404 = unknown id OR not currently
+        //       archived; 410 = already purged (tombstone). The handler passes the
+        //       raw param to `repo.restore` WITHOUT slug resolution, so the ULID
+        //       `a.id` is required here — a slug would 404.
+        //     This matches the detail panel's Restore control (public/app.js,
+        //     `#btn-restore-asset`), which this row-level affordance saves the
+        //     operator a detail-pane round trip for; it does not get its own rules.
         //   - The determination is purely LOCAL and not racy: `status` is a core
         //     projection column present on every row and in every search tier
         //     (unlike the lock flag, #896, whose free-text projection omits
@@ -1191,25 +1200,22 @@ function buildColumns(renderCtx) {
         //     leaves it, and that re-renders the row.
         //   - The archive guards that genuinely BLOCK (delete_protected,
         //     referenced_by_job, has_children, member_of_collection — all 409)
-        //     are untouched and stay enabled. Most are not in the row projection,
-        //     so the 409 response stays the only place that can explain them
-        //     (spec §5.1, §5.4 — #896).
+        //     are untouched and stay enabled on non-archived rows. Most are not in
+        //     the row projection, so the 409 response stays the only place that
+        //     can explain them (spec §5.1, §5.4 — #896).
         // Re-drive is independent of the lifecycle axis (it is a metadata-
         // extraction recovery), so a wedged archived row still offers it.
         //
-        // The guard is scoped to the Archive control ALONE. An earlier revision
-        // returned early for an archived row, which also withheld Rename — but
-        // renaming an archived asset is a PERMITTED operation, so that removed a
-        // working affordance rather than a dead one. Contract: openapi.json
-        // `paths['/api/v1/assets/{id}'].patch` declares responses 200 / 404 /
-        // 422 only (no 409 and no status-conflict response), and its
-        // `requestBody` schema accepts a bare `{ name }` (`name`: string,
-        // minLength 1, maxLength 256). The handler (src/routes/assets.ts →
+        // The status switch is scoped to the lifecycle control ALONE — Re-drive
+        // and Rename above are unaffected. Renaming an archived asset is a
+        // PERMITTED operation: openapi.json `paths['/api/v1/assets/{id}'].patch`
+        // declares responses 200 / 404 / 422 only (no 409 and no status-conflict
+        // response), its `requestBody` schema accepts a bare `{ name }` (`name`:
+        // string, minLength 1, maxLength 256), the handler (src/routes/assets.ts →
         // `app.patch('/:id')`) carries no archived guard, and `repo.update`
         // consults `applyStatus` ONLY when `patch.status !== undefined`
         // (src/data/asset-repo.ts), so a name-only PATCH on an archived asset
-        // never reaches the terminal-state machine and answers 200. Every other
-        // permitted control therefore stays rendered on an archived row.
+        // never reaches the terminal-state machine and answers 200.
         const isArchived = a.status === 'archived';
 
         return (
@@ -1263,11 +1269,19 @@ function buildColumns(renderCtx) {
           // and carries no explanation, which is precisely what #896 asks the UI
           // to provide (spec §5.1).
           //
-          // THIS is the single control the archived check suppresses — an
-          // already-archived row gets no Archive button, while Re-drive and
-          // Rename above remain available.
+          // THIS is the status-aware lifecycle control (issue #836). An archived
+          // row offers Restore (the only route back out of `archived`); every
+          // other row offers Archive, unchanged. Re-drive and Rename above remain
+          // available in both cases. `data-name` carries the same human-readable
+          // label on both so the handler can name its subject without a second
+          // lookup (issue #919); the Restore button needs no `data-locked`, since
+          // the delete lock is an Archive-only guard.
           (isArchived
-            ? ''
+            ? '<button class="btn-ghost asset-restore-btn" data-id="' +
+              escHtml(a.id) +
+              '" data-name="' +
+              escHtml(a.name || a.slug || '') +
+              '" title="Restore this archived asset to its pre-archive status" style="font-size:12px;padding:3px 8px;">Restore</button>'
             : '<button class="btn-danger asset-delete-btn" data-id="' +
               escHtml(a.id) +
               '" data-name="' +
@@ -1355,6 +1369,13 @@ function hydrateThumbnails(tbodyEl, apiFetch) {
 //                                         derive, so the handler can explain a
 //                                         guaranteed refusal pre-flight.
 //   onRedrive(id) -> Promise            — re-drive action; table reloads after.
+//   onRestore(id, name) -> Promise      — restore action (issue #836), offered
+//                                         ONLY on an archived row. `name` is the
+//                                         row's human-readable label so the
+//                                         handler can name its subject. The table
+//                                         reloads unless the handler resolves
+//                                         `false` (a refusal it already explained,
+//                                         e.g. a 410 on a purged asset).
 //   canRename() -> boolean (optional)   — client-side mirror of the ADR-018 write
 //                                         gate (issue #927). Called at render
 //                                         time; when it is absent or answers
@@ -1692,6 +1713,30 @@ export function createAssetsTable(deps) {
         btn.disabled = true;
         btn.textContent = 'Re-driving…';
         const ok = await d.onRedrive(btn.dataset.id);
+        if (ok !== false) {
+          reload();
+        } else {
+          btn.disabled = false;
+          btn.textContent = prev;
+        }
+      });
+    });
+
+    // Restore from the row (issue #836). Rendered only on an archived row; the
+    // handler owns the POST /assets/:id/restore request and reports its own
+    // outcome. This only keeps the row click from also opening the detail pane,
+    // shows in-progress feedback, and reloads so the row shows its restored
+    // status in whichever tier is on screen. `false` means "nothing changed" (a
+    // refusal the handler has already explained, e.g. a 410 on a purged asset),
+    // and skips the reload for the same reason the archive handler does.
+    tbody.querySelectorAll('.asset-restore-btn').forEach(function (btn) {
+      btn.addEventListener('click', async function (e) {
+        e.stopPropagation();
+        if (typeof d.onRestore !== 'function') return;
+        const prev = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'Restoring…';
+        const ok = await d.onRestore(btn.dataset.id, btn.dataset.name || '');
         if (ok !== false) {
           reload();
         } else {

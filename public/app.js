@@ -2762,6 +2762,53 @@ async function renderAssetsTab(container) {
         return false;
       }
     },
+    onRestore: async function (id, name) {
+      // Restore an archived asset straight from its row (issue #836). The row
+      // only renders this control when `status === 'archived'`, and this is the
+      // single route out of that terminal state.
+      //
+      // Contract, verified in this tree (CLAUDE.md rule 7) — identical to the
+      // detail panel's #btn-restore-asset control:
+      //   openapi.json .paths["/api/v1/assets/{id}/restore"] — the only key is
+      //   `post`; `responses` keys are exactly 200 / 404 / 410; the single
+      //   parameter is path `id` (string, required); there is NO requestBody.
+      //   Source: src/routes/assets.ts:8058-8103 (`app.post('/:id/restore')`,
+      //   schema `{ 200: assetSchema, 404: errorSchema, 410: errorSchema }`
+      //   :8063), mounted under `/api/v1/assets`.
+      //   200 — the FULL updated asset: `status` has flipped out of `archived`
+      //         to `ready` (its pre-archive status when that was `ready`) or
+      //         otherwise `failed` (`restoreTargetStatus`). A `true` return
+      //         reloads the table so the row shows the new status.
+      //   404 — unknown id OR not currently archived (indistinguishable, gap
+      //         G1). The row's `id` is the ULID the handler needs: restore does
+      //         NOT resolve a slug (it passes the raw param to `repo.restore`).
+      //   410 — already purged (tombstone): permanent, not a retry.
+      const label = nameOrFallback(name, 'this asset');
+      try {
+        await apiFetch('/assets/' + encodeURIComponent(id) + '/restore', {
+          method: 'POST',
+        });
+        return true;
+      } catch (err) {
+        if (isPurgedGone(err)) {
+          // 410: the retention sweep tombstoned the asset, so restore can never
+          // succeed. Report it as a permanent fact, not a transient failure.
+          reportActionFailure(err, {
+            action: 'Restore asset',
+            detail:
+              '"' + label + '" has been purged and can no longer be restored.',
+          });
+          return false;
+        }
+        // 404 (no longer archived / unknown), 401/403, 5xx or a transport
+        // failure: report the server's own message via the shared pattern.
+        reportActionFailure(err, {
+          action: 'Restore asset',
+          detail: '"' + label + '" was not restored. Nothing has changed.',
+        });
+        return false;
+      }
+    },
   });
 
   // Bulk bar between the header and the table: the controls sit next to the
