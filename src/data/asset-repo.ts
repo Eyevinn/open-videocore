@@ -447,6 +447,22 @@ export type PackagedOutput = {
 // assets. An asset represents a piece of content; all of its transcoded
 // variants live on the one asset record so a client discovers them in a single
 // read. Each entry is self-contained (no child asset id).
+// A scaled variant of one of the asset's thumbnails (issue #1303). Produced
+// only when the extraction pipeline runs with `THUMBNAIL_MULTI_SIZE=true`;
+// absent on every asset extracted before that flag existed or with it off.
+// `fullObjectKey` is the `thumbnails[]` entry this variant was derived from, so
+// the meaning of a thumbnail INDEX is unchanged — the sizes hang off the
+// full-size key rather than renumbering anything. Only variants whose object was
+// confirmed in storage are ever recorded (see src/pipeline/thumbnail.ts).
+export type ThumbnailSize = {
+  fullObjectKey: string;
+  variant: 'small' | 'medium';
+  // Target width in pixels (the height follows the source aspect ratio).
+  width: number;
+  // MinIO object key (workspace-local) of the scaled JPEG.
+  objectKey: string;
+};
+
 export type Rendition = {
   // ULID — stable identifier for this variant.
   id: string;
@@ -640,6 +656,11 @@ export type Asset = {
   // (issue #7). Workspace-local MinIO keys; undefined until the first
   // successful extraction. A later extraction replaces the list wholesale.
   thumbnails?: string[];
+  // Scaled variants of the above, when the extraction ran with
+  // `THUMBNAIL_MULTI_SIZE=true` (issue #1303). Undefined when the flag was off
+  // (the default) or when no scaled object landed; `thumbnails` and its index
+  // meaning are unaffected either way. Replaced wholesale by a later extraction.
+  thumbnailSizes?: ThumbnailSize[];
   // Free-form, operator-defined key-value metadata (issue #12). A JSON object
   // stored alongside the fixed schema fields; values must be JSON-serializable.
   // Undefined until the operator sets any metadata. Distinct from
@@ -808,6 +829,12 @@ export type UpdateAssetInput = {
   // Set by the thumbnail pipeline (issue #7). Replaces the asset's thumbnail
   // key list wholesale. Does not change `status`.
   thumbnails?: string[];
+  // Set by the thumbnail pipeline ONLY when it ran multi-size (issue #1303).
+  // Replaces the asset's scaled-variant list wholesale; an empty list is stored
+  // as absence, so "the flag is on but nothing scaled landed" and "never ran
+  // multi-size" are the same document. Never sent by the flag-off path, so a
+  // flag-off extraction writes exactly the pre-#1303 patch.
+  thumbnailSizes?: ThumbnailSize[];
   // Free-form operator metadata (issue #12). On PATCH this is SHALLOW-MERGED
   // into any existing metadata: top-level keys present here override existing
   // keys, all other existing keys are preserved. To replace the whole object
@@ -1834,6 +1861,12 @@ export class InMemoryAssetRepository implements AssetRepository {
     }
     if (patch.thumbnails !== undefined) {
       next.thumbnails = patch.thumbnails;
+    }
+    // Multi-size variants (issue #1303). Stored as absence when empty so an
+    // asset that never ran multi-size and one whose sizes all failed are
+    // byte-identical documents.
+    if (patch.thumbnailSizes !== undefined) {
+      next.thumbnailSizes = patch.thumbnailSizes.length > 0 ? patch.thumbnailSizes : undefined;
     }
     if (patch.metadata !== undefined) {
       next.metadata = applyMetadata(existing.metadata, patch.metadata, patch.replaceMetadata ?? false);

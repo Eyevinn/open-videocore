@@ -1890,6 +1890,10 @@ function purgeableObjectIdentities(asset: Asset, sourceBucket: string): Set<stri
   for (const rendition of asset.renditions ?? []) add(rendition.objectKey);
   for (const track of asset.subtitleTracks ?? []) add(track.objectKey);
   for (const thumb of asset.thumbnails ?? []) add(thumb);
+  // Scaled thumbnail variants (issue #1303) are objects this purge removes too
+  // (archived-asset-purge-sweep.ts step 4), so they belong in the ownership
+  // comparison. Empty unless the asset was extracted multi-size.
+  for (const size of asset.thumbnailSizes ?? []) add(size.objectKey);
   return ids;
 }
 
