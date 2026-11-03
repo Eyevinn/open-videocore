@@ -60,6 +60,16 @@ import { DEFAULT_RECONCILE_GRACE_MS } from '../encore-scaler/scaler-loop.js';
 import { decideRetry, clearRetryState, makePriorAttemptCanceler } from '../encore-scaler/retry-store.js';
 import { pinInstanceForPackaging, unpinInstanceForPackaging } from '../encore-scaler/packaging-pin.js';
 import { DEFAULT_PACKAGE_STALL_TIMEOUT_MS } from './stalled-package-reconciler.js';
+// #1218: silent-hang detection over the progress samples this sweep already
+// reads. Reports stalled externalIds; the raising is done through the existing
+// failure signal (deps.onTranscodeStalled -> main.ts's onJobsDropped handler).
+import {
+  DEFAULT_TRANSCODE_STALL_TIMEOUT_MS,
+  recordProgressAndDetectStalls,
+  type ProgressObservation,
+  type StallTrackerEntry,
+  type StalledTranscode
+} from './transcode-stall-detector.js';
 // Package-step Job records (issue #976) — the same lifecycle module
 // PackagingService uses, so this OSC-native handoff leaves an identical
 // observable object behind.
@@ -190,6 +200,25 @@ export type PollerDeps = {
   // PROGRESS_INTERVAL_MS (:43-44), which throttles ingest progress writes for
   // exactly the same reason.
   progressWriteIntervalMs?: number;
+  // #1218: how long an Encore job may report the SAME progress value before it is
+  // declared stalled. A source connection dropped mid-encode can freeze ffmpeg
+  // silently — no error, Encore stays IN_PROGRESS, our job stays `running`
+  // forever and no retry ever fires. The sweep already reads each instance's
+  // IN_PROGRESS progress numbers (#830 above), so the freeze is detected off
+  // those same samples. Threaded the same way progressWriteIntervalMs is (raw
+  // value in, default applied at use); main.ts reads it from
+  // ENCORE_TRANSCODE_STALL_TIMEOUT_MS. Unset =>
+  // DEFAULT_TRANSCODE_STALL_TIMEOUT_MS.
+  transcodeStallTimeoutMs?: number;
+  // #1218: raise a stalled transcode through the EXISTING failure/retry signal.
+  // main.ts wires this to the SAME handler the scaler's onJobsDropped uses, so a
+  // stall reaches decideRetry -> settleFailedTranscode exactly like the fast
+  // "Stream ends prematurely" error already does (#727) — no parallel retry or
+  // settle path. Shape matches DroppedJob ({ encoreJobId, reason }) for that
+  // reason. Optional: absent (a non-scaler deployment, or a test that only
+  // exercises progress writes) => stalls are detected but not raised, which is
+  // exactly today's behaviour.
+  onTranscodeStalled?: (stalls: readonly StalledTranscode[]) => Promise<void>;
   // On-demand packager provisioning (epic #226, issue #244; #496). The SAME
   // closure the assets router receives as `ensurePackaging` (src/routes/assets.ts
   // opts, called at assets.ts:1484 on the manual package-start path). Threaded in
@@ -1312,6 +1341,22 @@ function progressThrottleState(deps: PollerDeps): Map<string, ProgressThrottleEn
   return state;
 }
 
+// #1218: stall-tracker state, keyed the same way the progress throttle above is
+// (per deps object, so each running poller and each test gets an isolated map
+// that is collected with it). Deliberately SEPARATE from the throttle map: that
+// map's timestamp only moves when a write is actually spent, which is not the
+// same thing as "progress advanced", so it cannot answer the stall question.
+const stallTrackerByDeps = new WeakMap<PollerDeps, Map<string, StallTrackerEntry>>();
+
+function stallTrackerState(deps: PollerDeps): Map<string, StallTrackerEntry> {
+  let state = stallTrackerByDeps.get(deps);
+  if (!state) {
+    state = new Map();
+    stallTrackerByDeps.set(deps, state);
+  }
+  return state;
+}
+
 // Read Encore's reported `progress` for every IN_PROGRESS job on ONE instance and
 // persist it onto the matching local transcode job.
 //
@@ -1357,6 +1402,11 @@ export async function syncInProgressJobProgress(
 
   let written = 0;
   const at = now();
+  // #1218: every usable sample on this page, collected BEFORE the write-throttle
+  // guards below skip it. The throttle decides whether a number is worth a
+  // CouchDB write; the stall detector needs every sample regardless, because an
+  // unchanged value is precisely the evidence it acts on.
+  const observations: ProgressObservation[] = [];
 
   for (const encoreJob of encoreJobs) {
     const externalId = encoreJob.externalId;
@@ -1364,6 +1414,8 @@ export async function syncInProgressJobProgress(
     // `progress` is optional on the schema and defaults to 0; a non-numeric or
     // absent value carries no information, so there is nothing to copy.
     if (!externalId || typeof progress !== 'number' || !Number.isFinite(progress)) continue;
+
+    observations.push({ externalId, progress });
 
     const previous = throttle.get(externalId);
     // Guard 1: Encore has not moved since the last value we persisted.
@@ -1402,6 +1454,39 @@ export async function syncInProgressJobProgress(
   // Bounded-memory housekeeping: forget jobs we have not written for in an hour.
   for (const [key, entry] of throttle) {
     if (at - entry.at > PROGRESS_THROTTLE_TTL_MS) throttle.delete(key);
+  }
+
+  // #1218: a job whose progress has not advanced within the bound is hung with no
+  // error (Encore still reports it IN_PROGRESS). Raise it through the EXISTING
+  // failure signal so it reaches the same decideRetry -> settleFailedTranscode
+  // handling a fast "Stream ends prematurely" failure already reaches (#727);
+  // nothing here settles or retries by itself. Best-effort like the rest of this
+  // function: a raising error is logged and swallowed, never thrown into the
+  // terminal reconciliation the sweep exists for.
+  const stalled = recordProgressAndDetectStalls(stallTrackerState(deps), observations, {
+    now: at,
+    stallTimeoutMs: deps.transcodeStallTimeoutMs ?? DEFAULT_TRANSCODE_STALL_TIMEOUT_MS
+  });
+  if (stalled.length > 0) {
+    for (const stall of stalled) {
+      logger.warn({
+        msg: 'encore-callback-poller: transcode progress stalled — routing to the retry/failure path',
+        externalId: stall.encoreJobId,
+        instanceId: record.instanceId,
+        reason: stall.reason
+      });
+    }
+    if (deps.onTranscodeStalled) {
+      try {
+        await deps.onTranscodeStalled(stalled);
+      } catch (err) {
+        logger.warn({
+          msg: 'encore-callback-poller: failed to raise stalled transcode(s)',
+          instanceId: record.instanceId,
+          err
+        });
+      }
+    }
   }
 
   return written;
