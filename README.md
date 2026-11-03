@@ -117,9 +117,18 @@ curl https://<your-instance>/api/v1/provision/operations/<operationId>
 ```
 
 By default the stack provisions its own MinIO instance and buckets — no storage
-configuration is required. To point the source and/or packaged-output roles at
-an existing AWS-region or S3-compatible bucket instead, pass the optional
-`sourceStorage` / `packagedStorage` blocks. See
+configuration is required. The optional `sourceStorage` / `packagedStorage`
+blocks name an operator-owned bucket for a role: `bucket`/`region`/`publicBaseUrl`
+are persisted as non-secret coordinates used when delivery URLs are emitted, and
+a `sourceStorage` block's credentials become per-service OSC secrets (a
+`packagedStorage` block's are validated and then discarded by this route). The
+bucket **name** moves the bucket jobs read and write only when the API runs with
+[`HONOUR_CUSTOM_BUCKETS`](#environment-variables) enabled; off (the default) that stays
+the stack's own. Neither setting accepts an external S3 API host: a block
+carrying `endpointUrl` is refused with a 400 (issue #641). To ingest from a
+bucket on an external S3 API host, register it with
+`POST /api/v1/storage/backends` — which does take `endpointUrl` — and pass
+`sourceBackend` on `POST /api/v1/assets/ingest-url`. See
 [Provisioning with external S3-compatible storage](docs/guides/provisioning-external-storage.md)
 for every field, worked examples, and the CDN-origin pattern.
 
