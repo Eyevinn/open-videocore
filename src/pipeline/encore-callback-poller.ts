@@ -355,10 +355,21 @@ async function enqueuePackagingJob(
 }
 
 // A produced Encore output entry (subset — matches the internal route schema).
+// `codec` (issue #1293): each videoStreams[i] is a media-analyzer VideoStream
+// declaring `val codec: String?` — nullable — in the version Encore pins,
+// se.svt.oss:media-analyzer 2.0.11 (svt/encore encore-common/build.gradle.kts:8;
+// svt/media-analyzer@release-2.0.11
+// src/main/kotlin/se/svt/oss/mediaanalyzer/file/VideoStream.kt:8). It was dropped
+// here, so no rendition settled by the poller ever had one.
+//
+// This path reads the Encore job document fetched below with an unchecked cast
+// (no zod validation), so the runtime value really can be `null` as well as
+// absent — hence `codec?: string | null` rather than `codec?: string`.
+// normaliseRenditions collapses null to undefined; see the note there.
 type EncoreOutput = {
   file?: string;
   type?: string;
-  videoStreams?: Array<{ width?: number; height?: number }>;
+  videoStreams?: Array<{ width?: number; height?: number; codec?: string | null }>;
   overallBitrate?: number;
 };
 
@@ -382,6 +393,13 @@ function normaliseRenditions(output: EncoreOutput[] | undefined): CallbackRendit
       width: stream?.width ?? 0,
       height: stream?.height ?? 0,
       objectKey: o.file ?? `rendition-${i + 1}`,
+      // First video stream's codec (issue #1293), mirroring the route's copy.
+      // Upstream is `String?`, so an explicit null is collapsed to undefined:
+      // CallbackRendition.codec is `codec?: string` (transcode.ts:267) and the
+      // read schema `codec: z.string().optional()` (src/routes/assets.ts:1031,
+      // serialiser wired at src/main.ts:256) rejects a literal null, which would
+      // break asset reads for the persisted rendition.
+      codec: stream?.codec ?? undefined,
       bitrateBps: o.overallBitrate
     };
   });
