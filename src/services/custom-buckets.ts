@@ -82,6 +82,90 @@ export function resolveStackBuckets(
   };
 }
 
+// The buckets THIS run must bind, given BOTH what the caller supplied and what
+// the stack is ALREADY bound to (review finding 2 on #1301).
+//
+// `resolveStackBuckets` above answers "what does this request alone ask for",
+// which is the right input for a FIRST provision. It is the wrong input for a
+// re-provision: provisioning converges, so a second call that omits the storage
+// blocks (the zero-config call in the docs) or re-supplies the identical bucket
+// must keep the stack on the bucket it is already bound to — otherwise the
+// zero-config retry that resumes a partially failed custom-bucket provision
+// either gets rejected as a "rebind" naming fields it never sent, or silently
+// repoints the stack at the defaults.
+//
+// Per role, in order:
+//   - A supplied bucket that DIFFERS from the stored binding is returned as-is,
+//     under EITHER flag state, so `bucketRebindRejections` sees the caller's own
+//     value and rejects it (issue #1301 AC3) with a truthful message.
+//   - A supplied bucket IDENTICAL to the stored binding, and an OMITTED block,
+//     keep the binding: not a rebind, no change, regardless of the flag.
+//   - With no binding recorded (a first provision, or a config written before
+//     these fields existed) the answer is `resolveStackBuckets`'s: the supplied
+//     bucket with the flag on, the default with it off.
+export function bindStackBuckets(
+  input: { sourceStorage?: BucketRequest; packagedStorage?: BucketRequest },
+  existing: { sourceBucket?: string; packagedBucket?: string },
+  opts: { honourCustomBuckets: boolean }
+): { sourceBucket: string; packagedBucket: string } {
+  const bind = (
+    block: BucketRequest,
+    boundRaw: string | undefined,
+    fallback: string
+  ): string => {
+    const requested = block?.bucket?.trim();
+    const bound = boundRaw && boundRaw.length > 0 ? boundRaw : undefined;
+    if (requested !== undefined && requested.length > 0) {
+      if (bound !== undefined && requested !== bound) return requested;
+      if (opts.honourCustomBuckets) return requested;
+    }
+    return bound ?? fallback;
+  };
+  return {
+    sourceBucket: bind(input.sourceStorage, existing.sourceBucket, DEFAULT_SOURCE_BUCKET),
+    packagedBucket: bind(
+      input.packagedStorage,
+      existing.packagedBucket,
+      DEFAULT_PACKAGED_BUCKET
+    )
+  };
+}
+
+// One bucket for BOTH roles is rejected (review finding 1 on #1301).
+//
+// The packaged bucket is made anonymously readable at provision time — the
+// `s3:GetObject` / `Principal {AWS: ['*']}` policy in provision.ts step 1d —
+// so players can fetch manifests and segments without a bearer token (#199).
+// The source bucket holds ingested masters and MUST stay private, which is why
+// that policy loop targets the packaged bucket alone. If both roles resolve to
+// the SAME bucket, that one policy publishes every source master to anyone who
+// can guess an object key, and `POST /api/v1/provision` is not caller
+// authenticated. `requiredBucketsFor` de-duplicates the pair, so nothing
+// downstream notices the collapse. The defined outcome is therefore REJECT,
+// before any bucket is created, bound or policied.
+//
+// The finding names the role path(s) the CALLER actually supplied, so the
+// message never points at a field that was not in the request.
+export function identicalBucketRejections(
+  input: { sourceStorage?: BucketRequest; packagedStorage?: BucketRequest },
+  buckets: { sourceBucket: string; packagedBucket: string }
+): BucketSupportError[] {
+  if (buckets.sourceBucket !== buckets.packagedBucket) return [];
+  const message =
+    `the source and packaged roles both resolve to the single bucket ` +
+    `"${buckets.sourceBucket}", which is not supported: the packaged bucket ` +
+    `is made anonymously readable (s3:GetObject for principal "*") so players ` +
+    `can fetch manifests and segments without a token, so one shared bucket ` +
+    `would make every ingested source master world-readable. Name a ` +
+    `different bucket for each role, or omit a block to take that role's ` +
+    `zero-config default.`;
+  const supplied = (['sourceStorage', 'packagedStorage'] as const).filter(
+    (role) => input[role] !== undefined
+  );
+  const fields = supplied.length > 0 ? supplied : (['sourceStorage'] as const);
+  return fields.map((role) => ({ field: `${role}.bucket`, message }));
+}
+
 // The #1300 fail-loud finding set: a `bucket` that differs from the stack
 // default is NOT used by the pipeline while `HONOUR_CUSTOM_BUCKETS` is off, so
 // accepting the request would be the accept-but-ignore failure #1299 describes.
@@ -130,6 +214,14 @@ export function validateCustomBucketSupport(
 // written before these fields existed, which is treated as "nothing bound yet"
 // and never rejected). Comparison is exact: bucket names are case-sensitive in
 // S3, so a case difference IS a different bucket.
+//
+// `desired` MUST be `bindStackBuckets`'s output, not `resolveStackBuckets`'s:
+// the question this guard answers is "did the CALLER ask to move this stack to
+// a different bucket", so an omitted block and an identical re-supply must
+// arrive here already equal to the binding and produce no finding (review
+// finding 2). Passing the flag-resolved set instead rejects the zero-config
+// re-provision of a custom-bound stack, which also blocks resuming a partially
+// failed one.
 export function bucketRebindRejections(
   existing: { sourceBucket?: string; packagedBucket?: string },
   desired: { sourceBucket: string; packagedBucket: string }

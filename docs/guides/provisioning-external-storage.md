@@ -81,11 +81,25 @@ With the flag on:
 - Delivery URLs are emitted against the same bucket the job wrote, because the
   stored binding and the stored storage coordinates are written from one value.
 
+### The two roles must use different buckets
+
+A request where the source and packaged roles resolve to the **same** bucket is
+rejected with `400` before anything is created, naming the field(s) you sent.
+Packaged output is made anonymously readable so players can fetch manifests and
+segments without a token; source masters must stay private. One shared bucket
+would put that public-read policy on the bucket holding your masters, so there
+is no configuration in which it is allowed. Note that this also catches naming
+`openvideocore-packaged` as your source bucket while the packaged role takes its
+default.
+
 ### Changing the bucket of an existing stack
 
 Provisioning is idempotent: calling it again for a name that already exists
-converges on that stack. Calling it again with a **different** bucket is
-**rejected**, and the operation fails before anything is created or rewritten.
+converges on that stack. Omitting the storage blocks entirely, or re-supplying
+the bucket the stack is **already** bound to, keeps that binding — this is the
+call to repeat to converge, or to resume a provision that failed partway
+through. Calling it again with a **different** bucket is **rejected**, and the
+operation fails before anything is created or rewritten.
 
 Nothing is migrated by a rebind: existing objects stay in the bucket they were
 written to, stored object keys keep resolving against it, and delivery URLs you
@@ -215,8 +229,11 @@ part of the packager's `OutputFolder` contract, not the bucket name itself.
   own object-storage endpoint.
 - `endpointUrl` is rejected with a 400: a second object store cannot be
   addressed by the pipeline yet.
+- The source and packaged roles must name different buckets; one shared bucket
+  is rejected with a 400 because the packaged bucket is anonymously readable.
 - Re-provisioning an existing stack with a different bucket is rejected.
-  Existing objects are not migrated.
+  Existing objects are not migrated. Omitting the blocks, or re-supplying the
+  bound bucket, converges (and resumes a partially failed provision).
 - Credentials (`secretAccessKey`, `sessionToken`) are stored as OSC secrets and
   never as plaintext parameters (ADR-002). Only `bucket`, `endpointUrl`, and
   `region` are persisted.

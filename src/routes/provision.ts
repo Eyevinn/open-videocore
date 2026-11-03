@@ -81,8 +81,10 @@ import { computeStackReadiness } from '../services/stack-readiness.js';
 import {
   DEFAULT_PACKAGED_BUCKET,
   DEFAULT_SOURCE_BUCKET,
+  bindStackBuckets,
   bucketRebindRejections,
   honourCustomBucketsEnabled,
+  identicalBucketRejections,
   resolveStackBuckets,
   validateCustomBucketSupport
 } from '../services/custom-buckets.js';
@@ -1029,6 +1031,27 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         { sourceStorage, packagedStorage },
         { honourCustomBuckets }
       );
+      // ONE bucket for BOTH roles is rejected here, before anything is bound,
+      // created or policied (review finding 1 on #1301). Step 1d below makes
+      // the PACKAGED bucket anonymously readable so tokenless players can GET
+      // manifests and segments (#199), and `requiredBucketsFor` de-duplicates
+      // the pair, so a request naming the same bucket twice would quietly end
+      // up with that single policy applied to the bucket holding the ingested
+      // source masters. This route is not caller authenticated, so the result
+      // would be world-readable source media. Rejected as a validation error
+      // with the supplied field(s) named, exactly like the #640 guard above.
+      const identicalBucketErrors = identicalBucketRejections(
+        { sourceStorage, packagedStorage },
+        requestedBuckets
+      );
+      if (identicalBucketErrors.length > 0) {
+        return reply.code(400).send({
+          error:
+            'the source and packaged roles must use different buckets: ' +
+            identicalBucketErrors.map((e) => e.field).join(', '),
+          unsupported: identicalBucketErrors
+        });
+      }
       // With honouring OFF, a supplied non-default bucket is NOT what the
       // pipeline will use. Surface that at ERROR with the exact field(s) so the
       // divergence #1299 describes is visible in the logs of a deployment that
@@ -1045,12 +1068,19 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             "so jobs read and write this stack's own buckets (issue #1301)"
         );
       }
-      const boundSourceBucket = requestedBuckets.sourceBucket;
-      const boundPackagedBucket = requestedBuckets.packagedBucket;
+      // The buckets this run binds the stack to. Initialised from the request
+      // alone — correct for a FIRST provision — and re-derived from the request
+      // PLUS the stored binding once the parameter store has been read in the
+      // background flow below (`bindStackBuckets`), so a re-provision that
+      // omits the storage blocks keeps the bucket the stack is already bound to
+      // instead of silently repointing it at the defaults (review finding 2).
+      // Every bucket-touching step below runs after that re-derivation.
+      let boundSourceBucket = requestedBuckets.sourceBucket;
+      let boundPackagedBucket = requestedBuckets.packagedBucket;
       // The buckets whose creation MUST succeed for this stack to work, in the
       // order they are created. De-duplicated so naming one bucket for both
       // roles does not create it twice.
-      const requiredBuckets = requiredBucketsFor(requestedBuckets);
+      let requiredBuckets = requiredBucketsFor(requestedBuckets);
 
       // `storageMetadata` records the NON-SECRET coordinates of each role, and
       // its `bucket` is what delivery-URL emission uses (packaging.ts
@@ -1275,8 +1305,72 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               // desired buckets ARE the defaults, which is what every such
               // stack has stored, so the finding set is empty and this path
               // behaves exactly as before #1301.
+              //
+              // The comparison is against what the CALLER asked for, not
+              // against the flag-resolved set (review finding 2):
+              // `bindStackBuckets` keeps the stored binding for a role whose
+              // block was omitted or re-supplied identically, so the
+              // zero-config re-provision published in the docs — and the retry
+              // that resumes a partially failed custom-bucket provision, whose
+              // 'provisioning'/'failed' marker already records the bound
+              // buckets — converge instead of being rejected for fields the
+              // request never contained.
               if (existing) {
-                const rebinds = bucketRebindRejections(existing, requestedBuckets);
+                const bound = bindStackBuckets(
+                  { sourceStorage, packagedStorage },
+                  existing,
+                  { honourCustomBuckets }
+                );
+                boundSourceBucket = bound.sourceBucket;
+                boundPackagedBucket = bound.packagedBucket;
+                requiredBuckets = requiredBucketsFor(bound);
+                // An OMITTED block means "this role keeps whatever the stack is
+                // bound to", so the non-secret coordinates must report that
+                // bucket too — otherwise a resumed provision would persist
+                // delivery coordinates for the default bucket while jobs read
+                // and write the inherited one, which is exactly the #1299
+                // divergence. A SUPPLIED block is left untouched here (its
+                // flag-off handling is validateCustomBucketSupport's finding).
+                if (!sourceStorage) {
+                  storageMetadata.source = {
+                    backend: 'minio',
+                    bucket: boundSourceBucket
+                  };
+                }
+                if (!packagedStorage) {
+                  storageMetadata.packaged = {
+                    backend: 'minio',
+                    bucket: boundPackagedBucket
+                  };
+                }
+                // A stored binding can also collapse both roles onto one
+                // bucket (a config written before the pre-flight guard above
+                // existed, or a stack whose other role was bound separately),
+                // and the anonymous-read policy would then expose the source
+                // masters. Fail the operation before anything is created.
+                const identicalBound = identicalBucketRejections(
+                  { sourceStorage, packagedStorage },
+                  bound
+                );
+                if (identicalBound.length > 0) {
+                  app.log.error(
+                    { name, unsupported: identicalBound },
+                    'refusing to provision a stack whose source and packaged ' +
+                      'roles resolve to one bucket; the anonymous-read ' +
+                      'packaged policy would publish the source masters ' +
+                      '(issue #1301)'
+                  );
+                  ops.update(op.id, {
+                    status: 'failed',
+                    completedAt: Date.now(),
+                    error:
+                      'the source and packaged roles must use different ' +
+                      'buckets: ' +
+                      identicalBound.map((r) => r.message).join(' ')
+                  });
+                  return;
+                }
+                const rebinds = bucketRebindRejections(existing, bound);
                 if (rebinds.length > 0) {
                   app.log.error(
                     { name, rebinds },
