@@ -247,6 +247,70 @@ describe('extractThumbnails with the flag OFF (unchanged behaviour)', () => {
     expect('scaled' in extractor.calls[0][0]).toBe(false);
     expect((await repo.get(asset.id))?.thumbnailSizes).toBeUndefined();
   });
+
+  // ROLLBACK path: the flag is turned back off after a multi-size run. Because
+  // `thumbnails` is replaced wholesale by every extraction, the size list that
+  // hangs off it (via `fullObjectKey`) must be replaced too — otherwise the
+  // asset keeps `thumbnailSizes` entries whose `fullObjectKey` names a key that
+  // is no longer in `thumbnails[]`. The flag-off path therefore sends
+  // `thumbnailSizes: []`, which both repositories store as absence.
+  it('ROLLBACK: a flag-off re-extraction CLEARS a previously written thumbnailSizes', async () => {
+    const repo = new InMemoryAssetRepository();
+    const asset = await repo.create({ name: 'x', objectKey: 'ingest/x' });
+    const { storage, written } = fakeStorage();
+    const extractor = multiSizeExtractor(written);
+
+    // 1. Flag ON at timecode 5 — sizes land and are recorded.
+    await extractThumbnails(
+      { assetId: asset.id, objectKey: 'ingest/x', timecodes: [5] },
+      { assets: repo, storage, extractor, multiSize: true }
+    );
+    const afterOn = await repo.get(asset.id);
+    expect(afterOn?.thumbnailSizes).toHaveLength(THUMBNAIL_SIZE_VARIANTS.length);
+    expect(afterOn?.thumbnailSizes?.every((s) => s.fullObjectKey === thumbnailObjectKey(asset.id, 5))).toBe(
+      true
+    );
+
+    // 2. Flag back OFF, re-extracted at a DIFFERENT timecode. `thumbnails` is
+    //    replaced, so the old full key is gone from the index.
+    const result = await extractThumbnails(
+      { assetId: asset.id, objectKey: 'ingest/x', timecodes: [9] },
+      { assets: repo, storage, extractor, multiSize: false }
+    );
+
+    const afterOff = await repo.get(asset.id);
+    expect(result).toEqual([thumbnailObjectKey(asset.id, 9)]);
+    expect(afterOff?.thumbnails).toEqual([thumbnailObjectKey(asset.id, 9)]);
+    // The stale list is GONE — not merely empty, stored as absence.
+    expect(afterOff?.thumbnailSizes).toBeUndefined();
+    // And the invariant holds: every recorded size names a current thumbnail.
+    for (const size of afterOff?.thumbnailSizes ?? []) {
+      expect(afterOff?.thumbnails).toContain(size.fullObjectKey);
+    }
+  });
+
+  // The same clear must survive the document round-trip: a flag-off patch on a
+  // document that already HAS structural.thumbnailSizes must drop the field.
+  it('ROLLBACK: the cleared list is absent from the persisted document too', async () => {
+    const repo = new InMemoryAssetRepository();
+    const asset = await repo.create({ name: 'x', objectKey: 'ingest/x' });
+    const { storage, written } = fakeStorage();
+    const extractor = multiSizeExtractor(written);
+
+    await extractThumbnails(
+      { assetId: asset.id, objectKey: 'ingest/x', timecodes: [5] },
+      { assets: repo, storage, extractor, multiSize: true }
+    );
+    await extractThumbnails(
+      { assetId: asset.id, objectKey: 'ingest/x', timecodes: [5] },
+      { assets: repo, storage, extractor, multiSize: false }
+    );
+
+    const stored = await repo.get(asset.id);
+    const doc = AssetDocumentSchema.parse(toAssetDocument(stored!));
+    expect(doc.structural.thumbnailSizes).toBeUndefined();
+    expect(fromAssetDocument(doc).thumbnailSizes).toBeUndefined();
+  });
 });
 
 describe('extractThumbnails with the flag ON', () => {

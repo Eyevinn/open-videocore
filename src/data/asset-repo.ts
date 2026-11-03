@@ -659,7 +659,9 @@ export type Asset = {
   // Scaled variants of the above, when the extraction ran with
   // `THUMBNAIL_MULTI_SIZE=true` (issue #1303). Undefined when the flag was off
   // (the default) or when no scaled object landed; `thumbnails` and its index
-  // meaning are unaffected either way. Replaced wholesale by a later extraction.
+  // meaning are unaffected either way. Replaced wholesale by a later
+  // extraction, INCLUDING a flag-off one, which clears it — so every
+  // `fullObjectKey` here always names a key in the current `thumbnails`.
   thumbnailSizes?: ThumbnailSize[];
   // Free-form, operator-defined key-value metadata (issue #12). A JSON object
   // stored alongside the fixed schema fields; values must be JSON-serializable.
@@ -829,11 +831,13 @@ export type UpdateAssetInput = {
   // Set by the thumbnail pipeline (issue #7). Replaces the asset's thumbnail
   // key list wholesale. Does not change `status`.
   thumbnails?: string[];
-  // Set by the thumbnail pipeline ONLY when it ran multi-size (issue #1303).
-  // Replaces the asset's scaled-variant list wholesale; an empty list is stored
-  // as absence, so "the flag is on but nothing scaled landed" and "never ran
-  // multi-size" are the same document. Never sent by the flag-off path, so a
-  // flag-off extraction writes exactly the pre-#1303 patch.
+  // Set by the thumbnail pipeline on EVERY extraction (issue #1303). Replaces
+  // the asset's scaled-variant list wholesale; an empty list is stored as
+  // absence, so "the flag is on but nothing scaled landed", "ran with the flag
+  // off" and "never ran multi-size" are all the same document. The flag-off
+  // path sends `[]` rather than omitting the field, so it CLEARS any list left
+  // by an earlier flag-on run — `thumbnails` is replaced wholesale by every
+  // run, so a size list keyed on `fullObjectKey` can never outlive it.
   thumbnailSizes?: ThumbnailSize[];
   // Free-form operator metadata (issue #12). On PATCH this is SHALLOW-MERGED
   // into any existing metadata: top-level keys present here override existing

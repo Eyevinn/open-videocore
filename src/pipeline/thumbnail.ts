@@ -32,7 +32,10 @@
 // change; the variants that landed are recorded separately as `thumbnailSizes`.
 // Each variant is verified with the same `statObject` check as the full frame,
 // so a partial result records exactly what exists. With the flag off this file
-// behaves exactly as it did before #1303.
+// extracts exactly the frames it did before #1303 and stores an identical
+// document — the one difference is that it sends `thumbnailSizes: []`, which
+// CLEARS any list left behind by an earlier flag-on run (both repositories
+// store an empty list as absence, so the document shape is unchanged).
 //
 // Unlike metadata extraction this is NOT fire-and-forget from a detached path:
 // the route awaits it and reports success/failure to the caller. It is still
@@ -260,9 +263,19 @@ export async function extractThumbnails(
     throw new Error('thumbnail extraction produced no stored images');
   }
 
-  // With the flag off this is the pre-#1303 patch, unchanged: `thumbnails` only.
+  // With the flag off, `thumbnailSizes` is sent as an EMPTY list rather than
+  // omitted. Omitting it left any list written by an earlier flag-ON run in
+  // place, so after a flag-off re-extraction at different timecodes the
+  // surviving `thumbnailSizes[].fullObjectKey` values could name keys no longer
+  // present in `thumbnails[]` — stale entries pointing at objects this run
+  // never wrote, which is exactly what the rollback path (flag back off) does.
+  // `thumbnails` is replaced wholesale by every run, so its size list must be
+  // too. Both repositories store an empty list as absence
+  // (asset-repo.ts applyPatch, couch-asset-repo.ts applyPatch) and
+  // toAssetDocument omits it when empty, so the stored document is byte-
+  // identical to the pre-#1303 one when the flag is off.
   if (!multiSize) {
-    await deps.assets.update(assetId, { thumbnails: storedKeys });
+    await deps.assets.update(assetId, { thumbnails: storedKeys, thumbnailSizes: [] });
     return storedKeys;
   }
 
