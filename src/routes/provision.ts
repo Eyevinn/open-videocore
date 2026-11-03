@@ -74,6 +74,18 @@ import {
   profilesBucketAnonymousReadPolicy
 } from '../services/profile-index-publisher.js';
 import { computeStackReadiness } from '../services/stack-readiness.js';
+// Custom source/packaged bucket support (issue #1301). The default bucket names,
+// the `HONOUR_CUSTOM_BUCKETS` flag reader, the per-run bucket resolution and the
+// two fail-loud finding sets all live in one module so the provision route and
+// the runtime bindings share a single definition.
+import {
+  DEFAULT_PACKAGED_BUCKET,
+  DEFAULT_SOURCE_BUCKET,
+  bucketRebindRejections,
+  honourCustomBucketsEnabled,
+  resolveStackBuckets,
+  validateCustomBucketSupport
+} from '../services/custom-buckets.js';
 import {
   checkStackReachability,
   type StackReachabilityDeps,
@@ -97,15 +109,32 @@ import type { WorkspaceEncoreScalerRegistry } from '../encore-scaler/workspace-r
 // Buckets created on the freshly provisioned MinIO instance. These names are
 // referenced by Encore (input/source) and, downstream, by the on-demand Encore
 // packager (OutputFolder) when packaging is first executed (epic #226).
-const SOURCE_BUCKET = 'openvideocore-source';
-const PACKAGED_BUCKET = 'openvideocore-packaged';
+//
+// These are the DEFAULTS. Since issue #1301 the operator may name a different
+// bucket per role (`sourceStorage.bucket` / `packagedStorage.bucket`) and, with
+// `HONOUR_CUSTOM_BUCKETS` on, that name is what this run creates and persists —
+// see requiredBucketsFor() and services/custom-buckets.ts. The single source of
+// truth for the default names is that module, so the provision route and the
+// runtime bindings cannot disagree about them.
+const SOURCE_BUCKET = DEFAULT_SOURCE_BUCKET;
+const PACKAGED_BUCKET = DEFAULT_PACKAGED_BUCKET;
 
 // The two buckets a provisioned stack CANNOT work without: ingest lands in the
 // source bucket and packaged output lands in the packaged bucket, so a failure
 // to create either must fail the provision. The profiles bucket
 // (PROFILES_BUCKET, issue #1208) is deliberately NOT in this list — it has a
 // working fallback (ADR-026 D2) and is therefore created best-effort below.
-const REQUIRED_BUCKETS = [SOURCE_BUCKET, PACKAGED_BUCKET] as const;
+//
+// Per-run rather than a constant since #1301: the required set is whatever
+// buckets THIS stack is bound to. De-duplicated, because an operator may name
+// the SAME bucket for both roles and `makeBucket` on an existing bucket is a
+// pointless second round-trip (bucketExists already makes the loop idempotent).
+export function requiredBucketsFor(buckets: {
+  sourceBucket: string;
+  packagedBucket: string;
+}): string[] {
+  return [...new Set([buckets.sourceBucket, buckets.packagedBucket])];
+}
 
 // Sensitive credentials are supplied by the operator as environment variables
 // (ADR-002, 12-factor config) — never in the request body. During provisioning
@@ -118,7 +147,21 @@ const REQUIRED_BUCKETS = [SOURCE_BUCKET, PACKAGED_BUCKET] as const;
 // written to the parameter store (only the non-secret coordinates are). Actual
 // credential injection into services is the follow-up sub-issue (#212).
 const externalStorageSchema = z.object({
-  bucket: z.string().min(1),
+  // Honoured only when the API runs with HONOUR_CUSTOM_BUCKETS enabled (issue
+  // #1301). The bucket is then created on, and read/written against, the
+  // stack's OWN object-storage endpoint and credentials — not an external
+  // endpoint. With the flag off, jobs use the stack's default bucket and this
+  // value only affects the stored coordinates and emitted delivery URLs (#1299).
+  bucket: z
+    .string()
+    .min(1)
+    .describe(
+      'Bucket name for this role. Honoured only when the API is started with ' +
+        'HONOUR_CUSTOM_BUCKETS enabled, in which case the stack creates and ' +
+        "uses this bucket on its OWN object-storage endpoint. Re-provisioning " +
+        'an existing stack with a different bucket is rejected: existing ' +
+        'objects are not migrated.'
+    ),
   accessKeyId: z.string().min(1),
   secretAccessKey: z.string().min(1),
   region: z.string().min(1).optional(),
@@ -969,6 +1012,52 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             }
           : { backend: 'minio', bucket: defaultBucket };
 
+      // Custom-bucket honouring (issue #1301), decided ONCE per request and
+      // used by every bucket-touching step below — bucket creation, the
+      // anonymous-read packaged policy, the object-store credential record and
+      // all three `storeStackConfig` writes — so the bucket the pipeline reads
+      // and writes, the bucket the policy is applied to, and the bucket reported
+      // in `StackConfig` cannot diverge.
+      //
+      // OFF by default: with `HONOUR_CUSTOM_BUCKETS` unset these resolve to
+      // SOURCE_BUCKET/PACKAGED_BUCKET, which is exactly the pre-#1301
+      // behaviour. `validateCustomBucketSupport` is the matching fail-loud
+      // finding set for that state (the #1300 guard); it is exported rather
+      // than wired here because wiring it is #1300's own contract change.
+      const honourCustomBuckets = honourCustomBucketsEnabled();
+      const requestedBuckets = resolveStackBuckets(
+        { sourceStorage, packagedStorage },
+        { honourCustomBuckets }
+      );
+      // With honouring OFF, a supplied non-default bucket is NOT what the
+      // pipeline will use. Surface that at ERROR with the exact field(s) so the
+      // divergence #1299 describes is visible in the logs of a deployment that
+      // has not enabled the flag. The same finding set is the body #1300's
+      // guard returns as a 400 when it lands.
+      const unusedBucketFindings = validateCustomBucketSupport(
+        { sourceStorage, packagedStorage },
+        { honourCustomBuckets }
+      );
+      if (unusedBucketFindings.length > 0) {
+        app.log.error(
+          { name, unsupported: unusedBucketFindings },
+          'a requested bucket will NOT be used: HONOUR_CUSTOM_BUCKETS is off, ' +
+            "so jobs read and write this stack's own buckets (issue #1301)"
+        );
+      }
+      const boundSourceBucket = requestedBuckets.sourceBucket;
+      const boundPackagedBucket = requestedBuckets.packagedBucket;
+      // The buckets whose creation MUST succeed for this stack to work, in the
+      // order they are created. De-duplicated so naming one bucket for both
+      // roles does not create it twice.
+      const requiredBuckets = requiredBucketsFor(requestedBuckets);
+
+      // `storageMetadata` records the NON-SECRET coordinates of each role, and
+      // its `bucket` is what delivery-URL emission uses (packaging.ts
+      // externalPublicBaseUrl, routes/assets.ts). With honouring on it is the
+      // same value as `boundSourceBucket`/`boundPackagedBucket` above, which is
+      // the consistency #1299 asked for: the emitted URL and the bucket the job
+      // actually wrote are one bucket, not two.
       const storageMetadata = {
         source: storageBackendFor(sourceStorage, SOURCE_BUCKET),
         packaged: storageBackendFor(packagedStorage, PACKAGED_BUCKET)
@@ -1168,6 +1257,45 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               // is why refreshExistingCreatedAt() re-reads before the final
               // write and lets the persisted value win.
               storedRecordKnownAbsent = existing === undefined;
+
+              // Re-provisioning an EXISTING stack with a CHANGED bucket is
+              // rejected (issue #1301, acceptance criterion 3).
+              //
+              // Provisioning converges on an existing stack, so without this
+              // check a second call naming a different bucket would repoint
+              // every future job at a bucket holding none of the stack's
+              // objects. Nothing migrates them: the objects stay where they
+              // are, asset object keys keep resolving against the old bucket,
+              // and already-emitted delivery URLs keep pointing at it. The
+              // defined outcome is REJECT, before anything is created or
+              // written, with a message naming both bucket names and the two
+              // ways forward (bucketRebindRejections, services/custom-buckets.ts).
+              //
+              // Unreachable for a default-bucket stack: with the flag off the
+              // desired buckets ARE the defaults, which is what every such
+              // stack has stored, so the finding set is empty and this path
+              // behaves exactly as before #1301.
+              if (existing) {
+                const rebinds = bucketRebindRejections(existing, requestedBuckets);
+                if (rebinds.length > 0) {
+                  app.log.error(
+                    { name, rebinds },
+                    'refusing to re-provision an existing stack onto a ' +
+                      'different bucket; existing objects are not migrated ' +
+                      '(issue #1301)'
+                  );
+                  ops.update(op.id, {
+                    status: 'failed',
+                    completedAt: Date.now(),
+                    error:
+                      'cannot re-provision this stack onto a different ' +
+                      'bucket: ' +
+                      rebinds.map((r) => r.message).join(' ')
+                  });
+                  return;
+                }
+              }
+
               // A completed stack: converge, return its coordinates, create
               // nothing. isReadyStack treats a legacy status-less config as
               // ready (param-store.ts:102).
@@ -1321,8 +1449,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                   minioEndpoint: '',
                   couchdbUrl: '',
                   redisUrl: '',
-                  sourceBucket: SOURCE_BUCKET,
-                  packagedBucket: PACKAGED_BUCKET,
+                  // The buckets THIS run binds the stack to (issue #1301).
+                  // Equal to the defaults unless HONOUR_CUSTOM_BUCKETS is on and
+                  // the request named a bucket, so the marker already records
+                  // what a retry must converge on.
+                  sourceBucket: boundSourceBucket,
+                  packagedBucket: boundPackagedBucket,
                   // Non-secret per-stack access key id (issue #1094). Recorded
                   // on the marker too, so the mode survives a retry.
                   ...(objectStorePlan.perStack
@@ -1506,7 +1638,22 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         });
         const delay = (ms: number) =>
           new Promise((resolve) => setTimeout(resolve, ms));
-        for (const bucket of REQUIRED_BUCKETS) {
+        // Provision OR verify every bucket this stack is bound to, including an
+        // operator-named one (issue #1301). The contract is the S3 API of the
+        // stack's own object store, verified against the installed client:
+        // `bucketExists(bucketName: string): Promise<boolean>` and
+        // `makeBucket(bucketName, region?, makeOpts?): Promise<void>`
+        // (minio@8 node_modules/minio/dist/esm/internal/client.d.mts:203,207).
+        // bucketExists-then-makeBucket keeps a re-provision idempotent: an
+        // existing bucket — the operator's own, pre-created with objects in it —
+        // is adopted untouched rather than re-created.
+        //
+        // FAIL LOUD on exhaustion (issue #1301): after the bounded retries the
+        // error is re-thrown with the bucket and role named, so the operation
+        // reports WHICH bucket could not be created or reached instead of a bare
+        // S3 error. A custom bucket is the likely culprit (a typo, or a name
+        // already taken on the endpoint), and the stack is useless without it.
+        for (const bucket of requiredBuckets) {
           let attempts = 0;
           while (true) {
             try {
@@ -1517,7 +1664,18 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               break;
             } catch (err) {
               attempts++;
-              if (attempts >= 20) throw err;
+              if (attempts >= 20) {
+                const roles = [
+                  bucket === boundSourceBucket ? 'source' : undefined,
+                  bucket === boundPackagedBucket ? 'packaged' : undefined
+                ].filter((r): r is string => r !== undefined);
+                throw new Error(
+                  `could not create or reach the ${roles.join('/')} bucket ` +
+                    `"${bucket}" on this stack's object-storage endpoint: ` +
+                    `${err instanceof Error ? err.message : String(err)}`,
+                  { cause: err }
+                );
+              }
               await delay(5000);
             }
           }
@@ -1607,7 +1765,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           '</CORSConfiguration>'
         ].join('');
         const corsPayload = Buffer.from(corsXml, 'utf-8');
-        for (const bucket of REQUIRED_BUCKETS) {
+        for (const bucket of requiredBuckets) {
           let attempts = 0;
           while (true) {
             try {
@@ -1646,7 +1804,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               Effect: 'Allow',
               Principal: { AWS: ['*'] },
               Action: ['s3:GetObject'],
-              Resource: [`arn:aws:s3:::${PACKAGED_BUCKET}/*`]
+              Resource: [`arn:aws:s3:::${boundPackagedBucket}/*`]
             }
           ]
         });
@@ -1654,7 +1812,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           let attempts = 0;
           while (true) {
             try {
-              await minioClient.setBucketPolicy(PACKAGED_BUCKET, packagedPolicy);
+              await minioClient.setBucketPolicy(boundPackagedBucket, packagedPolicy);
               break;
             } catch {
               attempts++;
@@ -1896,7 +2054,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // re-attempts the same (deterministic) secret names and values.
         if (objectStorePlan.perStack) {
           const objectStoreCreds: ExternalStorageCredentials = {
-            bucket: SOURCE_BUCKET,
+            bucket: boundSourceBucket,
             accessKeyId: objectStorePlan.credential.accessKeyId,
             secretAccessKey: objectStorePlan.credential.secretAccessKey,
             endpointUrl: minioEndpoint
@@ -1961,8 +2119,13 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             minioEndpoint,
             couchdbUrl: stripCredentials(couchdbUrl),
             redisUrl,
-            sourceBucket: SOURCE_BUCKET,
-            packagedBucket: PACKAGED_BUCKET,
+            // The buckets this stack is BOUND to (issue #1301). These are the
+            // values every runtime binding resolves against
+            // (services/workspace-stack.ts config.sourceBucket /
+            // config.packagedBucket, and main.ts's packager coordinates), so
+            // this is the write that makes a custom bucket load-bearing.
+            sourceBucket: boundSourceBucket,
+            packagedBucket: boundPackagedBucket,
             // Optional pipeline instance names (issue #215 fields, populated by
             // #216). Present only when the request opted in and the instance was
             // created; omitted otherwise so opted-out stacks carry no field.
@@ -2188,8 +2351,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 minioEndpoint: '',
                 couchdbUrl: '',
                 redisUrl: '',
-                sourceBucket: SOURCE_BUCKET,
-                packagedBucket: PACKAGED_BUCKET,
+                // Preserve the bound buckets on the partial write (issue
+                // #1301), for the same reason as the access key id: the
+                // surviving instances already hold these buckets, so a retry
+                // must converge on them rather than re-deriving the defaults.
+                sourceBucket: boundSourceBucket,
+                packagedBucket: boundPackagedBucket,
                 // Preserve the per-stack access key id on the partial write
                 // (issue #1094). The instances that survived this failure were
                 // created with it, so dropping it here would make a retry (or

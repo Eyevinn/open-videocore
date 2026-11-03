@@ -29,6 +29,13 @@ import {
   makeScalerConfigStore,
   type StackConfig
 } from './services/param-store.js';
+// Shared default bucket names (issue #1301). Same module the provision route
+// resolves bound buckets from, so the process-wide fallback below and the
+// buckets a stack is actually created with have one definition.
+import {
+  DEFAULT_PACKAGED_BUCKET,
+  DEFAULT_SOURCE_BUCKET
+} from './services/custom-buckets.js';
 import { saveSecret } from '@osaas/client-core';
 import {
   StorageBackendRegistry,
@@ -1445,10 +1452,25 @@ async function stackRedisForAmbientStack(): Promise<IORedis | undefined> {
   return (await scalerRegistry.resolveStackRedis(stackName)).redis;
 }
 
-// Bucket names are stack-invariant (created at provision time, see provision.ts)
-// so a static default is correct for every workspace.
-const sourceBucket = process.env['MINIO_SOURCE_BUCKET'] ?? 'openvideocore-source';
-const outputBucket = process.env['MINIO_PACKAGED_BUCKET'] ?? 'openvideocore-packaged';
+// PROCESS-WIDE FALLBACK bucket names, for the env-override (single global
+// object store) path and for a request that resolves to no stack.
+//
+// NOT the per-stack truth. Since issue #1301 a stack may be bound to an
+// operator-named bucket (`sourceStorage.bucket` / `packagedStorage.bucket` with
+// `HONOUR_CUSTOM_BUCKETS` on), recorded as `StackConfig.sourceBucket` /
+// `StackConfig.packagedBucket`. Every per-stack consumer resolves THOSE:
+// `WorkspaceConnections.{sourceBucket,packagedBucket}` come from the stored
+// config (services/workspace-stack.ts), and the on-demand packager reads
+// `stackCfg.packagedBucket` below. These two constants are only the last
+// fallback when no stack config supplies one, which is why they stay
+// env-overridable (12-factor, ADR-002) rather than hard-coded.
+//
+// The defaults are the shared ones from services/custom-buckets.ts so this
+// fallback and the bucket names the provision route creates cannot drift.
+const sourceBucket =
+  process.env['MINIO_SOURCE_BUCKET'] ?? DEFAULT_SOURCE_BUCKET;
+const outputBucket =
+  process.env['MINIO_PACKAGED_BUCKET'] ?? DEFAULT_PACKAGED_BUCKET;
 
 // #1226: object storage for the transcode OUTPUT bucket of the stack the caller
 // is currently running inside. Both transcode-completion paths (the callback

@@ -230,7 +230,8 @@
                     "properties": {
                       "bucket": {
                         "type": "string",
-                        "minLength": 1
+                        "minLength": 1,
+                        "description": "Bucket name for this role. Honoured only when the API is started with HONOUR_CUSTOM_BUCKETS enabled, in which case the stack creates and uses this bucket on its OWN object-storage endpoint. Re-provisioning an existing stack with a different bucket is rejected: existing objects are not migrated."
                       },
                       "accessKeyId": {
                         "type": "string",
@@ -269,7 +270,8 @@
                     "properties": {
                       "bucket": {
                         "type": "string",
-                        "minLength": 1
+                        "minLength": 1,
+                        "description": "Bucket name for this role. Honoured only when the API is started with HONOUR_CUSTOM_BUCKETS enabled, in which case the stack creates and uses this bucket on its OWN object-storage endpoint. Re-provisioning an existing stack with a different bucket is rejected: existing objects are not migrated."
                       },
                       "accessKeyId": {
                         "type": "string",
