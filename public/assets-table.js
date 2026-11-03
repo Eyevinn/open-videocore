@@ -1374,8 +1374,12 @@ function hydrateThumbnails(tbodyEl, apiFetch) {
 //                                         row's human-readable label so the
 //                                         handler can name its subject. The table
 //                                         reloads unless the handler resolves
-//                                         `false` (a refusal it already explained,
-//                                         e.g. a 410 on a purged asset).
+//                                         `false`, which means "the row on screen
+//                                         is still accurate" (a refusal it already
+//                                         explained that changed nothing). A
+//                                         refusal that leaves the row stale —
+//                                         404 not-archived/unknown, 410 purged —
+//                                         resolves `true` so the row is re-read.
 //   canRename() -> boolean (optional)   — client-side mirror of the ADR-018 write
 //                                         gate (issue #927). Called at render
 //                                         time; when it is absent or answers
@@ -1726,9 +1730,14 @@ export function createAssetsTable(deps) {
     // handler owns the POST /assets/:id/restore request and reports its own
     // outcome. This only keeps the row click from also opening the detail pane,
     // shows in-progress feedback, and reloads so the row shows its restored
-    // status in whichever tier is on screen. `false` means "nothing changed" (a
-    // refusal the handler has already explained, e.g. a 410 on a purged asset),
-    // and skips the reload for the same reason the archive handler does.
+    // status in whichever tier is on screen. `false` means "the row on screen is
+    // still accurate" — a refusal the handler has already explained that changed
+    // nothing (a 403, a 5xx, a dropped connection) — and skips the reload for the
+    // same reason the archive handler does. A refusal that proves the row STALE
+    // (404 not-archived/unknown, 410 purged) resolves `true` instead, so the
+    // reload below re-reads the row away; a handler that retires its own control
+    // on a terminal outcome relies on that, since the re-enable branch here only
+    // runs for `false`.
     tbody.querySelectorAll('.asset-restore-btn').forEach(function (btn) {
       btn.addEventListener('click', async function (e) {
         e.stopPropagation();
