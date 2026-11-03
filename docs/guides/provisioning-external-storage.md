@@ -45,15 +45,11 @@ and wired into the provision request body at lines 253-255.
 |---|---|---|
 | `bucket` | **Yes** | Name of the operator-owned bucket for this role. Always persisted as a non-secret coordinate and used when delivery URLs are emitted. It replaces the bucket the transcode/packaging pipeline reads and writes **only** when the API runs with `HONOUR_CUSTOM_BUCKETS` enabled — see [What a storage block actually redirects](#what-a-storage-block-actually-redirects). |
 | `accessKeyId` | **Yes** | Access key ID for the bucket. |
-| `secretAccessKey` | **Yes** | Secret access key. Stored as an OSC secret, never in plaintext (see below). |
+| `secretAccessKey` | **Yes** | Secret access key. On `sourceStorage` it is stored as an OSC secret, never in plaintext; on `packagedStorage` this route validates it and then discards it (see below). |
 | `region` | No | Region of the bucket (e.g. `eu-north-1`). Omit for providers that ignore region. |
 | `endpointUrl` | No | Full URL of the S3 API endpoint. Must be a valid URL — but **supplying it currently fails the provision request with 400** (issue #641): this route cannot point a stack role at an external S3 API host. Omit it; the stack's own object-storage endpoint is used. See Example 2. (The same field on `POST /api/v1/storage/backends` *is* honoured — see below.) |
-| `sessionToken` | No | Temporary session token for short-lived / assumed-role credentials. Stored as an OSC secret. |
+| `sessionToken` | No | Temporary session token for short-lived / assumed-role credentials. Stored as an OSC secret on `sourceStorage`; discarded after validation on `packagedStorage` (see below). |
 | `publicBaseUrl` | No | Public HTTPS base URL under which objects in this bucket are served (CDN origin). Used for `packagedStorage` so player-facing manifests resolve to your delivery domain rather than the raw bucket endpoint. |
-
-> Note: `publicBaseUrl` is introduced by issue #213. If your checkout predates
-> that change the field is not yet accepted by the schema; the rest of this
-> guide applies unchanged and `publicBaseUrl` becomes available once #213 lands.
 
 Anything the schema does not list is rejected — the request body is validated,
 so a typo'd field name fails fast rather than being silently ignored.
@@ -128,21 +124,30 @@ new stack for the new bucket.
 ## Credentials are OSC secrets, never plaintext parameters
 
 This is the load-bearing rule (ADR-002): `secretAccessKey` and `sessionToken`
-are **secrets**. During provisioning each is registered as a per-service OSC
+are **secrets**. Where this route registers them at all — which is the
+`sourceStorage` role only, see [What a storage block
+records](#what-a-storage-block-records) — each is registered as a per-service OSC
 secret and referenced from the service configuration via a `{{secrets.<name>}}`
 placeholder. The literal value never reaches a `createInstance` body, never
 appears in a provision response, and — critically — is never written to the
-parameter store.
+parameter store. A `packagedStorage` block's credentials are not registered
+anywhere by this route: they are schema-validated and then dropped.
 
 Only the **non-secret coordinates** of an external bucket are persisted: the
-`bucket` name, the `endpointUrl`, the `region`, and the `publicBaseUrl`. You can
-confirm this in `src/routes/provision.ts`: the `storageBackendFor` helper (lines
-1000-1015) copies only `bucket`, `endpointUrl`, `region`, and `publicBaseUrl` into
-the stored `StorageBackendConfig`, and the block comment at lines 994-999 states
+`bucket` name, the `region`, and the `publicBaseUrl`. You can confirm this in
+`src/routes/provision.ts`: the `storageBackendFor` helper (lines 1000-1015)
+copies only `bucket`, `endpointUrl`, `region`, and `publicBaseUrl` into the
+stored `StorageBackendConfig`, and the block comment at lines 994-999 states
 explicitly that `accessKeyId`/`secretAccessKey`/`sessionToken` are deliberately
 not read into that object because they are secrets. As a result
 `GET /api/v1/provision/:name` returns those coordinates for each role but never a
 credential.
+
+`endpointUrl` is in that list in the *stored type* but is unreachable from this
+route: `validateStorageRedirection` (`src/routes/provision.ts:218-244`) returns a
+400 for any block carrying `endpointUrl` before `storageBackendFor` ever runs, so
+no stack provisioned through `POST /api/v1/provision` can have an `endpointUrl`
+persisted for either role.
 
 Practically: it is safe to inspect a provisioned stack's stored config and to
 share it for debugging. It is never safe to expect a credential to be readable
@@ -150,24 +155,31 @@ back — like every OSC secret, these are write-once and are not echoed.
 
 ## What a storage block records
 
-Separately from the bucket binding, a block has two effects that happen in
-**either** configuration of the flag above — and it is worth being precise about
-both, because neither of them is "the pipeline now uses your bucket".
+Separately from the bucket binding, a block has effects that happen in
+**either** configuration of the flag above — two of them for the source role, one
+for the packaged role — and it is worth being precise about them, because none of
+them is "the pipeline now uses your bucket".
 
-1. **It pre-registers your credentials as per-service OSC secrets.** In
-   `src/routes/provision.ts` the `sourceStorage` branch calls
+1. **A `sourceStorage` block pre-registers your credentials as per-service OSC
+   secrets.** In `src/routes/provision.ts` the `sourceStorage` branch calls
    `applyCredentialMapping` with `encoreCredentialMapping` and
    `ffmpegS3CredentialMapping` for the two source-reading service ids
    (`src/routes/provision.ts:2096-2110`), so `secretAccessKey`/`sessionToken`
-   land as `{{secrets.<name>}}` references the runtime paths can resolve. Note
-   this is the `sourceStorage` branch only — a `packagedStorage` block's
-   credentials are validated and stored as secrets but no packager credential
-   mapping is applied on this route.
-2. **It persists your bucket, region, endpoint and public origin as non-secret
+   land as `{{secrets.<name>}}` references the runtime paths can resolve. This is
+   the **source role only**, in either flag state. A `packagedStorage` block's
+   credentials are not pre-registered at all on this route:
+   `packagerCredentialMapping` is never called from `src/routes/provision.ts`
+   (its only caller is the storage backend registry,
+   `src/services/storage-backend-registry.ts:260-264`), so they are
+   schema-validated and then dropped — no secret is minted and nothing is written
+   to the parameter store for them.
+2. **Either block persists your bucket, region and public origin as non-secret
    coordinates.** `storageBackendFor` (`src/routes/provision.ts:1000-1015`)
    builds a `StorageBackendConfig` with `backend: 'external'` plus `bucket`,
-   `endpointUrl`, `region`, and `publicBaseUrl`. Those coordinates are consumed
-   when **delivery URLs are emitted**: `externalPublicBaseUrl`
+   `region`, and `publicBaseUrl`. (The helper also copies `endpointUrl`, but a
+   block carrying that field is already rejected with a 400 before this code
+   runs, so it is never persisted from this route.) Those coordinates are
+   consumed when **delivery URLs are emitted**: `externalPublicBaseUrl`
    (`src/pipeline/packaging.ts:160`) prefers `publicBaseUrl` verbatim and
    otherwise derives `<endpointUrl>/<bucket>` path-style, and
    `src/routes/assets.ts:4911-4912` reads the per-role backend to build the URLs
@@ -291,9 +303,13 @@ source/packaged buckets only if the API runs with `HONOUR_CUSTOM_BUCKETS` enable
 — see [What a storage block records](#what-a-storage-block-records).
 
 To get a request the API accepts, drop `endpointUrl` and keep the bucket. The
-role's coordinates are then stored and its credentials pre-registered, and the
-bucket is bound (flag on) or the stack's own buckets stay bound (flag off) —
-either way on the stack's own object-storage endpoint:
+role's non-secret coordinates (`bucket`, `region`, `publicBaseUrl`) are then
+stored, and the bucket is bound (flag on) or the stack's own buckets stay bound
+(flag off) — either way on the stack's own object-storage endpoint. The
+credentials in this `packagedStorage` block are **not** pre-registered as
+secrets: this route validates them and then discards them (see [What a storage
+block records](#what-a-storage-block-records)); only a `sourceStorage` block's
+credentials become per-service OSC secrets here.
 
 ```bash
 curl -X POST https://<your-instance>/api/v1/provision \
@@ -446,14 +462,16 @@ registry's `packagerCredentialMapping`,
 - MinIO is the zero-config default; external storage is purely additive and
   opt-in per role.
 - Supply `sourceStorage` and/or `packagedStorage` to name an operator-owned
-  bucket for a role and record its credentials and coordinates.
+  bucket for a role and record its non-secret coordinates. Only a
+  `sourceStorage` block's credentials are recorded (as per-service OSC secrets);
+  a `packagedStorage` block's are validated and then discarded by this route.
 - Only the **bucket name** can be redirected, and only with
   `HONOUR_CUSTOM_BUCKETS` enabled on the API. The bucket lives on the stack's
   own object-storage endpoint. With the flag off (the default) a block only
-  pre-registers credentials as per-service OSC secrets and persists
-  `bucket`/`region`/`publicBaseUrl` as non-secret coordinates for delivery-URL
-  emission, while jobs keep reading and writing the stack's own
-  `openvideocore-source` / `openvideocore-packaged`.
+  persists `bucket`/`region`/`publicBaseUrl` as non-secret coordinates for
+  delivery-URL emission — plus, for `sourceStorage` only, pre-registers that
+  role's credentials as per-service OSC secrets — while jobs keep reading and
+  writing the stack's own `openvideocore-source` / `openvideocore-packaged`.
 - `endpointUrl` is rejected with a 400: a second object store cannot be
   addressed by the pipeline yet (issue #641).
 - The source and packaged roles must name different buckets; one shared bucket
@@ -467,9 +485,10 @@ registry's `packagerCredentialMapping`,
   probe/metadata extraction in place on your host; the transcode submit carries
   no per-job endpoint or credential, so the transcode read is not redirected
   there (ADR-021 C1/C2).
-- Credentials (`secretAccessKey`, `sessionToken`) are stored as OSC secrets and
-  never as plaintext parameters (ADR-002). Only `bucket`, `endpointUrl`,
-  `region`, and `publicBaseUrl` are persisted.
+- Where credentials (`secretAccessKey`, `sessionToken`) are kept at all — the
+  `sourceStorage` role on this route — they are stored as OSC secrets and never
+  as plaintext parameters (ADR-002). Only `bucket`, `region`, and
+  `publicBaseUrl` are persisted.
 - Use `publicBaseUrl` on `packagedStorage` to serve packaged output through a
   CDN origin — it is the one field in the block that changes an emitted URL.
 - The packager's `OutputFolder` must end in a single trailing slash

@@ -118,9 +118,10 @@ curl https://<your-instance>/api/v1/provision/operations/<operationId>
 
 By default the stack provisions its own MinIO instance and buckets — no storage
 configuration is required. The optional `sourceStorage` / `packagedStorage`
-blocks name an operator-owned bucket for a role: the credentials become
-per-service OSC secrets and `bucket`/`region`/`endpointUrl`/`publicBaseUrl` are
-persisted as non-secret coordinates used when delivery URLs are emitted. The
+blocks name an operator-owned bucket for a role: `bucket`/`region`/`publicBaseUrl`
+are persisted as non-secret coordinates used when delivery URLs are emitted, and
+a `sourceStorage` block's credentials become per-service OSC secrets (a
+`packagedStorage` block's are validated and then discarded by this route). The
 bucket **name** moves the bucket jobs read and write only when the API runs with
 [`HONOUR_CUSTOM_BUCKETS`](#environment-variables) enabled; off (the default) that stays
 the stack's own. Neither setting accepts an external S3 API host: a block
