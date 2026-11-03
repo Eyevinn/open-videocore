@@ -45,7 +45,8 @@ import {
 import {
   DRM_ERROR_CODES,
   DRM_STATUSES,
-  DRM_SYSTEMS,
+  DRM_SYSTEM_ID_PATTERN,
+  PRESERVED_DRM,
   PROTECTION_SCHEMES,
   TRACK_TYPE_GROUPS,
   drmEnabled
@@ -179,10 +180,28 @@ const SceneDetectionSchema = z.object({
 // content key cannot reach CouchDB even if a caller tries to hand one over —
 // Zod strips the unknown member on parse.
 //
-// Validation is tight where the ADR fixes a vocabulary (status, scheme,
-// systems, track groups, errorCode are enums, so a document carrying an
-// out-of-enum value is REJECTED rather than silently read back) and permissive
-// only where the value is provider-supplied free text (URLs, `error`).
+// Validation is tight where the ADR fixes a vocabulary (status, scheme, track
+// groups and errorCode are enums, and a system id must match the CPIX
+// `cpix:UUIDType` pattern, so a document carrying an out-of-vocabulary value is
+// REJECTED rather than silently read back) and permissive only where the value
+// is provider-supplied free text (`error`).
+// A DRM system id: the registered common-encryption UUID CPIX carries in
+// `DRMSystem@systemId`, validated against the `cpix:UUIDType` pattern from the
+// CPIX 2.3 schema (see `DRM_SYSTEM_ID_PATTERN`, src/types/drm.ts, which cites
+// cpix.xsd:6-10 / :114). Never a product name — CLAUDE.md rule 1, ADR-008 §5.3.
+const DrmSystemIdSchema = z
+  .string()
+  .regex(DRM_SYSTEM_ID_PATTERN, 'must be a common-encryption system id (UUID)');
+
+// A provider-supplied service URL (licence endpoint, application certificate).
+// Shape-validated as an absolute URL so a relative path or a stray free-text
+// value cannot be persisted and later handed to a player, but NOT restricted to
+// https: the `clearkey-dev` adapter (ADR-008 D1) is a local development key
+// source and legitimately serves over http on localhost. Transport security for
+// the real path is enforced where the call is made (ADR-008 G2: CPIX/SPEKE over
+// HTTPS), not by the persistence schema.
+const DrmServiceUrlSchema = z.string().url();
+
 const AssetDrmKeyIdSchema = z.object({
   trackGroup: z.enum(TRACK_TYPE_GROUPS),
   // The key IDENTIFIER (a UUID from the key provider). Never the key itself.
@@ -193,12 +212,12 @@ export const AssetDrmSchema = z.object({
   status: z.enum(DRM_STATUSES),
   providerId: z.string(),
   scheme: z.enum(PROTECTION_SCHEMES),
-  systems: z.array(z.enum(DRM_SYSTEMS)),
+  systems: z.array(DrmSystemIdSchema),
   keyIds: z.array(AssetDrmKeyIdSchema),
   // Per-system licence service URL, partial: a provider may supply URLs for a
   // subset of the requested systems.
-  licenceUrls: z.record(z.enum(DRM_SYSTEMS), z.string()).optional(),
-  certificateUrl: z.string().optional(),
+  licenceUrls: z.record(DrmSystemIdSchema, DrmServiceUrlSchema).optional(),
+  certificateUrl: DrmServiceUrlSchema.optional(),
   requestedAt: z.string(),
   protectedAt: z.string().optional(),
   // Already redacted/truncated upstream (ADR-008 §10) — provider error bodies
@@ -697,8 +716,21 @@ export function toAssetDocument(
   //   2. the asset actually carries a block — so an asset that never requested
   //      protection round-trips with the field absent (back-compat), exactly as
   //      for `packagedOutput`.
-  if (drmEnabled() && asset.drm) {
-    doc.structural.drm = drmToDoc(asset.drm);
+  if (drmEnabled()) {
+    if (asset.drm) {
+      doc.structural.drm = drmToDoc(asset.drm);
+    }
+  } else if (asset[PRESERVED_DRM]) {
+    // Flag OFF but the document we were built from already held a block: write
+    // it back verbatim instead of dropping it. Every CouchDB write seam is
+    // `toDoc(patch(fromDoc(current)))` with no merge of the prior body
+    // (couch-asset-repo.ts), so without this an unrelated write — a rename, a
+    // thumbnail, a status change — would permanently delete key identifiers,
+    // licence URLs and `protectedAt`. The kill switch stops the feature; it
+    // must not destroy state (ADR-008 D9). Nothing NEW is ever written with the
+    // flag off: `asset.drm` is still ignored, and an asset that never had a
+    // persisted block still round-trips with the field absent.
+    doc.structural.drm = drmToDoc(asset[PRESERVED_DRM]);
   }
   if (asset.subtitlesError) {
     doc.structural.subtitlesError = asset.subtitlesError;
@@ -921,6 +953,14 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
     // block left in the document by an earlier flag-on run is NOT read back, so
     // nothing DRM-related can reach a response while the feature is off.
     drm: drmEnabled() ? drmFromDoc(doc.structural?.drm) : undefined,
+    // ...but it is not LOST either: with the flag off, a block already in the
+    // document is parked on the symbol-keyed preservation carrier so the next
+    // write puts it back unchanged (see `PRESERVED_DRM`, src/types/drm.ts, and
+    // the write gate in `toAssetDocument`). Absent from the object entirely
+    // when the flag is on or when there is nothing persisted to preserve.
+    ...(!drmEnabled() && doc.structural?.drm
+      ? { [PRESERVED_DRM]: drmFromDoc(doc.structural.drm) as AssetDrm }
+      : {}),
     subtitlesError: doc.structural?.subtitlesError,
     // Scene-detection metadata (issue #115). Absent structural.sceneDetection
     // maps to `undefined` (never detected) rather than `null`; the flat type

@@ -21,10 +21,11 @@ import { currentDocumentStackName } from '../services/request-stack-context.js';
 import type {
   DrmErrorCode,
   DrmStatus,
-  DrmSystem,
+  DrmSystemId,
   ProtectionScheme,
   TrackTypeGroup
 } from '../types/drm.js';
+import { PRESERVED_DRM } from '../types/drm.js';
 
 // ---------------------------------------------------------------------------
 // Asset model + lifecycle
@@ -468,12 +469,15 @@ export type PackagedOutput = {
 //                     exists so per-asset provider selection stays additive
 //                     (ADR-008 §5.2).
 //   - scheme:         the common-encryption scheme the package was built with.
-//   - systems:        the DRM systems the package is signalled for.
+//   - systems:        the DRM systems the package is signalled for, each given
+//                     as its registered common-encryption system id (the CPIX
+//                     `DRMSystem@systemId` UUID — see `DrmSystemId`,
+//                     src/types/drm.ts). Never a product name (rule 1/§5.3).
 //   - keyIds:         IDENTIFIERS ONLY, one entry per track type group. ADR-008
 //                     D4: content keys are never persisted, never logged and
 //                     never returned by any API, so this type carries no `key`
 //                     member and no raw bytes anywhere.
-//   - licenceUrls:    per-system licence service URL, when the provider
+//   - licenceUrls:    licence service URL per system id, when the provider
 //                     supplied one. Licence requests never pass through this
 //                     API — the player talks to the provider directly (§9 N4).
 //   - certificateUrl: application certificate URL, where the system needs one.
@@ -491,10 +495,14 @@ export type AssetDrm = {
   status: DrmStatus;
   providerId: string;
   scheme: ProtectionScheme;
-  systems: DrmSystem[];
+  systems: DrmSystemId[];
   // Key identifiers per track type group — no key material (ADR-008 D4).
   keyIds: { trackGroup: TrackTypeGroup; keyId: string }[];
-  licenceUrls?: Partial<Record<DrmSystem, string>>;
+  // Keyed by system id. A PARTIAL set by nature: a provider may return a
+  // licence URL for only some of the requested systems, and the key space is
+  // the open registry of system ids rather than a closed enum, so absence of a
+  // key is simply "none supplied for that system".
+  licenceUrls?: Record<DrmSystemId, string>;
   certificateUrl?: string;
   requestedAt: string;
   protectedAt?: string;
@@ -720,6 +728,16 @@ export type Asset = {
   // slot with the flag off, so no schemaVersion bump is required and the clear
   // path is unchanged. Never carries key material (D4).
   drm?: AssetDrm;
+  // Flag-off preservation carrier (ADR-008 D9). Populated by
+  // `fromAssetDocument` ONLY when `DRM_ENABLED` is off and the document already
+  // holds a `structural.drm` block, and read ONLY by `toAssetDocument`, which
+  // writes it straight back — so an unrelated write with the flag off cannot
+  // delete protection state that an earlier flag-on run persisted. Symbol-keyed
+  // on purpose: invisible to `JSON.stringify` (so it can never reach a response
+  // or a log), copied by object spread (so it survives every patch helper). See
+  // the `PRESERVED_DRM` comment in src/types/drm.ts. Not domain state — no
+  // route, service or projection reads it.
+  [PRESERVED_DRM]?: AssetDrm;
   // ABR renditions produced by transcoding (issue #8). Populated on the SOURCE
   // asset when a transcode job completes; undefined until then.
   renditions?: Rendition[];

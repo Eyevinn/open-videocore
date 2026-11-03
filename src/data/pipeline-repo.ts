@@ -15,7 +15,7 @@ import type { StepErrorDetail } from '../pipeline/step-error-detail.js';
 // Shared DRM vocabulary (ADR-008 §5.1), imported from the same module the asset
 // model uses so the per-execution request and the persisted asset state cannot
 // drift apart.
-import type { DrmSystem, ProtectionScheme } from '../types/drm.js';
+import type { DrmSystemId, ProtectionScheme } from '../types/drm.js';
 import { drmEnabled } from '../types/drm.js';
 
 const ulid = monotonicFactory();
@@ -97,7 +97,7 @@ export type PipelineExecution = {
   //
   // Request intent only — it carries no key material and no key identifiers
   // (ADR-008 D4); the resulting state lands on the asset as `Asset.drm`.
-  drm?: { requested: true; providerId?: string; systems?: DrmSystem[]; scheme?: ProtectionScheme };
+  drm?: { requested: true; providerId?: string; systems?: DrmSystemId[]; scheme?: ProtectionScheme };
   // The canonical location the packaged output actually landed at, resolved
   // after post-package relocation (issue #208, ADR-011). When a per-execution
   // `destinationBucket` override is set, PackagingService server-side-copies the

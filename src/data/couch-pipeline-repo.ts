@@ -20,7 +20,7 @@ import type {
 import { cloneDrmRequest } from './pipeline-repo.js';
 import type { PipelineStepName } from '../pipeline/pipelines.js';
 import { stepErrorDetailSchema } from '../pipeline/step-error-detail.js';
-import { DRM_SYSTEMS, PROTECTION_SCHEMES, drmEnabled } from '../types/drm.js';
+import { PROTECTION_SCHEMES, drmEnabled, isDrmSystemId } from '../types/drm.js';
 import type { StoredDoc, StackCouch } from './couchdb.js';
 import { monotonicFactory } from 'ulid';
 
@@ -254,7 +254,10 @@ function isDrmRequest(value: unknown): value is NonNullable<PipelineExecution['d
     if (!Array.isArray(v['systems'])) {
       return false;
     }
-    if (!v['systems'].every((s) => DRM_SYSTEMS.includes(s as (typeof DRM_SYSTEMS)[number]))) {
+    // Each entry must be a common-encryption system id (the CPIX
+    // `DRMSystem@systemId` UUID — `isDrmSystemId`, src/types/drm.ts), not a
+    // product name: CLAUDE.md rule 1 / ADR-008 §5.3.
+    if (!v['systems'].every((s) => isDrmSystemId(s))) {
       return false;
     }
   }

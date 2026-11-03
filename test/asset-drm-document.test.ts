@@ -16,6 +16,24 @@ import {
   fromAssetDocument
 } from '../src/data/asset-document.js';
 import { InMemoryPipelineRepository } from '../src/data/pipeline-repo.js';
+import { PRESERVED_DRM } from '../src/types/drm.js';
+
+// Common-encryption System IDs. A DRM system is identified by this registered
+// UUID and never by a product name (CLAUDE.md rule 1, ADR-008 §5.3).
+//
+// Contract sources (fetched 2026-11-03):
+//   - CPIX 2.3 schema, Dash-Industry-Forum/CPIX@master `XmlSchema/cpix.xsd`:
+//     `DRMSystemType/@systemId` is `type="cpix:UUIDType" use="required"`
+//     (cpix.xsd:114); `UUIDType` is an `xs:string` restricted to
+//     `[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}`
+//     (cpix.xsd:6-10).
+//   - Allocated values: DASH-IF Content Protection Identifiers registry,
+//     https://dashif.org/identifiers/content_protection/ — the three ids below
+//     are the registry entries for the three widely deployed key systems, taken
+//     verbatim from that table.
+const SYSTEM_ID_A = 'edef8ba9-79d6-4ace-a3c8-27dcd51d21ed';
+const SYSTEM_ID_B = '9a04f079-9840-4286-ab92-e65be0885f95';
+const SYSTEM_ID_C = '94ce86fb-07ff-4f43-adb8-93d2fa968ca2';
 
 // A fully populated AssetDrm — every optional member present, so the round-trip
 // test covers the whole ADR-008 §8 shape rather than just the required core.
@@ -23,7 +41,7 @@ const FULL_DRM: AssetDrm = {
   status: 'protected',
   providerId: 'primary',
   scheme: 'cbcs',
-  systems: ['widevine', 'playready', 'fairplay'],
+  systems: [SYSTEM_ID_A, SYSTEM_ID_B, SYSTEM_ID_C],
   keyIds: [
     { trackGroup: 'AUDIO', keyId: '6f1d0a7c-6d9e-4e7a-9a3c-1f2b4d5e6a70' },
     { trackGroup: 'SD', keyId: '7a2e1b8d-7eaf-4f8b-8b4d-2a3c5e6f7b81' },
@@ -31,9 +49,9 @@ const FULL_DRM: AssetDrm = {
     { trackGroup: 'UHD1', keyId: '9c403da0-90c1-4bad-ad6f-4c5e70819da3' }
   ],
   licenceUrls: {
-    widevine: 'https://licence.example/wv',
-    playready: 'https://licence.example/pr',
-    fairplay: 'https://licence.example/fp'
+    [SYSTEM_ID_A]: 'https://licence.example/a',
+    [SYSTEM_ID_B]: 'https://licence.example/b',
+    [SYSTEM_ID_C]: 'https://licence.example/c'
   },
   certificateUrl: 'https://licence.example/app.cer',
   requestedAt: '2026-11-01T10:00:00.000Z',
@@ -82,7 +100,7 @@ describe('ADR-008 §8 DRM asset document slot (issue #1259), DRM_ENABLED=true', 
       status: 'pending',
       providerId: 'primary',
       scheme: 'cenc',
-      systems: ['widevine'],
+      systems: [SYSTEM_ID_A],
       keyIds: [],
       requestedAt: '2026-11-01T10:00:00.000Z'
     };
@@ -131,7 +149,7 @@ describe('ADR-008 §8 DRM asset document slot (issue #1259), DRM_ENABLED=true', 
     const base = await makeAsset(FULL_DRM);
     const bad: Record<string, unknown>[] = [
       { scheme: 'cbc1' },
-      { systems: ['widevine', 'somethingelse'] },
+      { systems: [SYSTEM_ID_A, 'somethingelse'] },
       { keyIds: [{ trackGroup: 'UHD2', keyId: 'x' }] },
       { errorCode: 'provider_exploded' }
     ];
@@ -184,6 +202,148 @@ describe('ADR-008 D9 kill switch: DRM_ENABLED off (issue #1259)', () => {
     const doc = toAssetDocument(asset);
     expect(fromAssetDocument(AssetDocumentSchema.parse(doc)).drm).toBeUndefined();
   });
+
+  // The kill switch must stop the FEATURE, not destroy persisted state. Every
+  // CouchDB write seam is toDoc(patch(fromDoc(current))) with no merge of the
+  // prior body (src/data/couch-asset-repo.ts update()), so a block the read gate
+  // refuses to load would be deleted by the next unrelated write.
+  it('writes an already-persisted drm block straight back with the flag off', async () => {
+    process.env['DRM_ENABLED'] = 'true';
+    const persisted = AssetDocumentSchema.parse(toAssetDocument(await makeAsset(FULL_DRM)));
+    expect(persisted.structural.drm).toBeDefined();
+
+    process.env['DRM_ENABLED'] = 'false';
+    const back = fromAssetDocument(persisted);
+    // Still invisible as domain state...
+    expect(back.drm).toBeUndefined();
+    // ...but the next write puts the block back byte-for-byte.
+    const rewritten = toAssetDocument(back);
+    expect(rewritten.structural.drm).toStrictEqual(persisted.structural.drm);
+    expect(AssetDocumentSchema.safeParse(rewritten).success).toBe(true);
+  });
+
+  it('survives an unrelated patch with the flag off (rename, thumbnails, status)', async () => {
+    process.env['DRM_ENABLED'] = 'true';
+    const persisted = AssetDocumentSchema.parse(toAssetDocument(await makeAsset(FULL_DRM)));
+
+    process.env['DRM_ENABLED'] = 'false';
+    // The shape every patch helper uses: spread the asset, change a field.
+    const patched = {
+      ...fromAssetDocument(persisted),
+      name: 'renamed while the flag was off',
+      thumbnails: ['thumbs/asset-1/0001.jpg'],
+      status: 'ready' as const
+    };
+    const rewritten = toAssetDocument(patched);
+    expect(rewritten.descriptive.title).toBe('renamed while the flag was off');
+    expect(rewritten.structural.drm).toStrictEqual(persisted.structural.drm);
+
+    // And toggling the flag back on finds the asset exactly as it was.
+    process.env['DRM_ENABLED'] = 'true';
+    expect(fromAssetDocument(AssetDocumentSchema.parse(rewritten)).drm).toStrictEqual(FULL_DRM);
+  });
+
+  it('keeps the preserved block out of every string-keyed view of the asset', async () => {
+    process.env['DRM_ENABLED'] = 'true';
+    const persisted = AssetDocumentSchema.parse(toAssetDocument(await makeAsset(FULL_DRM)));
+
+    process.env['DRM_ENABLED'] = 'false';
+    const back = fromAssetDocument(persisted);
+    // Routes send the domain object directly (reply.send(asset)), so the carrier
+    // must not serialise: JSON.stringify ignores symbol-keyed properties.
+    const serialised = JSON.stringify(back);
+    expect(serialised).not.toContain('licence.example');
+    expect(serialised).not.toContain('6f1d0a7c-6d9e-4e7a-9a3c-1f2b4d5e6a70');
+    expect(serialised).not.toContain('drm');
+    // `drm` itself is a declared member, present-but-undefined (and so dropped
+    // by JSON.stringify above); what must NOT exist is a string-keyed carrier
+    // holding the preserved block.
+    expect(back.drm).toBeUndefined();
+    expect(Object.values(back)).not.toContainEqual(FULL_DRM);
+    // It is reachable only through the symbol, and only for the mappers.
+    expect(back[PRESERVED_DRM]).toStrictEqual(FULL_DRM);
+  });
+
+  it('preserves nothing for an asset that never had a persisted block', async () => {
+    const asset = await makeAsset(FULL_DRM);
+    const back = fromAssetDocument(AssetDocumentSchema.parse(toAssetDocument(asset)));
+    // Flag off throughout: nothing was ever persisted, so there is nothing to
+    // preserve and the in-memory `drm` is still ignored on the way out.
+    expect(back[PRESERVED_DRM]).toBeUndefined();
+    expect('drm' in toAssetDocument(back).structural).toBe(false);
+  });
+});
+
+// Validation of the system id and of provider-supplied URLs (review findings 3
+// and 4 on PR #1317).
+describe('ADR-008 structural.drm field validation (issue #1259)', () => {
+  beforeEach(() => {
+    process.env['DRM_ENABLED'] = 'true';
+  });
+
+  it('round-trips licenceUrls covering only a subset of the requested systems', async () => {
+    const subset: AssetDrm = {
+      ...FULL_DRM,
+      systems: [SYSTEM_ID_A, SYSTEM_ID_B, SYSTEM_ID_C],
+      // The provider returned a URL for one of the three requested systems.
+      licenceUrls: { [SYSTEM_ID_B]: 'https://licence.example/b' }
+    };
+    const doc = AssetDocumentSchema.parse(toAssetDocument(await makeAsset(subset)));
+    expect(Object.keys(doc.structural.drm?.licenceUrls ?? {})).toEqual([SYSTEM_ID_B]);
+    expect(fromAssetDocument(doc).drm).toStrictEqual(subset);
+  });
+
+  it('round-trips an empty licenceUrls map distinctly from an absent one', async () => {
+    const none: AssetDrm = { ...FULL_DRM, licenceUrls: {} };
+    const doc = AssetDocumentSchema.parse(toAssetDocument(await makeAsset(none)));
+    expect(doc.structural.drm?.licenceUrls).toStrictEqual({});
+    expect(fromAssetDocument(doc).drm?.licenceUrls).toStrictEqual({});
+  });
+
+  it('rejects a system id that is not a common-encryption UUID', async () => {
+    const base = await makeAsset(FULL_DRM);
+    const bad = ['acme-key-system', '', 'edef8ba9-79d6-4ace-a3c8', `urn:uuid:${SYSTEM_ID_A}`];
+    for (const value of bad) {
+      const doc = toAssetDocument(base) as unknown as {
+        structural: { drm: Record<string, unknown> };
+      };
+      doc.structural.drm = { ...doc.structural.drm, systems: [value] };
+      expect(AssetDocumentSchema.safeParse(doc).success).toBe(false);
+    }
+  });
+
+  it('rejects a licenceUrls key that is not a system id', async () => {
+    const doc = toAssetDocument(await makeAsset(FULL_DRM)) as unknown as {
+      structural: { drm: Record<string, unknown> };
+    };
+    doc.structural.drm = {
+      ...doc.structural.drm,
+      licenceUrls: { 'some-name': 'https://licence.example/x' }
+    };
+    expect(AssetDocumentSchema.safeParse(doc).success).toBe(false);
+  });
+
+  it('accepts an upper-case system id (cpix:UUIDType is case-insensitive)', async () => {
+    const upper: AssetDrm = { ...FULL_DRM, systems: [SYSTEM_ID_A.toUpperCase()], licenceUrls: {} };
+    const doc = AssetDocumentSchema.parse(toAssetDocument(await makeAsset(upper)));
+    expect(doc.structural.drm?.systems).toEqual([SYSTEM_ID_A.toUpperCase()]);
+  });
+
+  it('rejects a licence or certificate URL that is not an absolute URL', async () => {
+    const base = await makeAsset(FULL_DRM);
+    const bad: Record<string, unknown>[] = [
+      { licenceUrls: { [SYSTEM_ID_A]: '/relative/licence' } },
+      { licenceUrls: { [SYSTEM_ID_A]: 'not a url at all' } },
+      { certificateUrl: 'app.cer' }
+    ];
+    for (const override of bad) {
+      const doc = toAssetDocument(base) as unknown as {
+        structural: { drm: Record<string, unknown> };
+      };
+      doc.structural.drm = { ...doc.structural.drm, ...override };
+      expect(AssetDocumentSchema.safeParse(doc).success).toBe(false);
+    }
+  });
 });
 
 describe('ADR-008 §8 PipelineExecution.drm (issue #1259)', () => {
@@ -194,12 +354,17 @@ describe('ADR-008 §8 PipelineExecution.drm (issue #1259)', () => {
       assetId: 'asset-1',
       pipelineName: 'full',
       steps: ['transcode'],
-      drm: { requested: true, providerId: 'primary', systems: ['widevine'], scheme: 'cbcs' }
+      drm: {
+        requested: true,
+        providerId: 'primary',
+        systems: [SYSTEM_ID_A],
+        scheme: 'cbcs'
+      }
     });
     expect(execution.drm).toStrictEqual({
       requested: true,
       providerId: 'primary',
-      systems: ['widevine'],
+      systems: [SYSTEM_ID_A],
       scheme: 'cbcs'
     });
     const read = await repo.get(execution.id);
