@@ -866,8 +866,71 @@ const thumbnailUrlSchema = z.object({
   objectKey: z.string(),
   url: z.string(),
   expiresAt: z.string(),
-  expiresInSeconds: z.number()
+  expiresInSeconds: z.number(),
+  // Which rendition `objectKey`/`url` actually point at (issue #1304). Equal to
+  // the requested `?size` when that variant was recorded for this frame, and
+  // `full` when it was not — so a caller can tell a served small from a
+  // fallback without a second request. Always present; `full` for every
+  // request that does not pass `?size` and for every pre-#1303 asset.
+  size: z.enum(['small', 'medium', 'full'])
 });
+
+// Thumbnail size selector (issue #1304). The thumbnail is still addressed by
+// its ARRAY INDEX; `size` only chooses which rendition of that index's frame is
+// served, so `thumbnails: string[]`, its ordering and the meaning of an index
+// are all unchanged and a client that never sends `size` sees exactly the
+// pre-#1304 behaviour.
+export const THUMBNAIL_SIZE_PARAMS = ['small', 'medium', 'full'] as const;
+export type ThumbnailSizeParam = (typeof THUMBNAIL_SIZE_PARAMS)[number];
+
+const thumbnailSizeQuerySchema = z.object({
+  size: z
+    .enum(THUMBNAIL_SIZE_PARAMS)
+    .default('full')
+    .describe(
+      'Which rendition of the thumbnail at this index to serve: `small` ' +
+        '(360px wide), `medium` (1280px wide), or `full` — the unscaled ' +
+        'extracted frame, and the default. Scaled renditions exist only for ' +
+        'assets whose extraction ran with THUMBNAIL_MULTI_SIZE=true (issue ' +
+        '#1303). When the requested size was never recorded for this frame ' +
+        '(older assets, or a partial extraction) the FULL-size object is ' +
+        'served instead and the response is still 200 — a missing size is ' +
+        'never a 404. An unrecognised value is rejected with 400.'
+    )
+});
+
+// Resolve (full-size key, requested size) to the object key to serve.
+//
+// CONTRACT verified: `ThumbnailSize` — src/data/asset-repo.ts:457 — is
+// `{ fullObjectKey, variant: 'small' | 'medium', width, objectKey }`, carried on
+// `Asset.thumbnailSizes` (src/data/asset-repo.ts:665) and persisted by
+// `ThumbnailSizeSchema` (src/data/asset-document.ts:101).
+//
+// The lookup goes through those RECORDED entries rather than rewriting the full
+// key into `thumb_<t>s_360.jpg` / `_1280.jpg`, even though that is the naming
+// the extraction pipeline uses (`scaledThumbnailObjectKey`,
+// src/pipeline/thumbnail.ts:148, widths from `THUMBNAIL_SIZE_VARIANTS` —
+// medium 1280, small 360). Only variants whose object was CONFIRMED in storage
+// are ever recorded, and the list is replaced wholesale by every extraction
+// including a flag-off one (asset-repo.ts:1872, pipeline/thumbnail.ts:278), so
+// a recorded entry always names a live object of the current `thumbnails`
+// generation. A key reconstructed by string surgery would, for an asset
+// extracted before #1303 or a frame whose scaled job failed, name an object
+// that does not exist — and this route would hand the caller a signed URL that
+// 404s at the object store instead of a usable image.
+function resolveThumbnailSizeKey(
+  asset: Asset,
+  fullObjectKey: string,
+  size: ThumbnailSizeParam
+): { objectKey: string; size: ThumbnailSizeParam } {
+  if (size === 'full') return { objectKey: fullObjectKey, size: 'full' };
+  const recorded = (asset.thumbnailSizes ?? []).find(
+    (variant) => variant.fullObjectKey === fullObjectKey && variant.variant === size
+  );
+  return recorded
+    ? { objectKey: recorded.objectKey, size }
+    : { objectKey: fullObjectKey, size: 'full' };
+}
 
 // Export / re-wrap request (issue #19): the target container format and an
 // optional name for the new child asset. The supported formats are validated
@@ -7012,14 +7075,24 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // also the fallback the ops UI drops back to when a deployment cannot presign
   // (public/thumbnail-url.js, issue #801). Coverage:
   // test/thumbnail-unauthenticated-fetch.test.ts.
-  //   200 — image/jpeg stream
+  //   200 — image/jpeg stream (X-Thumbnail-Size names the rendition served)
+  //   400 — unrecognised `?size` value
   //   404 — unknown asset or out-of-range index
   //   501 — storage not configured
   app.get(
     '/:id/thumbnails/:index',
     {
-      
-      schema: { params: z.object({ id: z.string(), index: z.string() }) }
+
+      schema: {
+        params: z.object({ id: z.string(), index: z.string() }),
+        // Same `?size` selector as the URL-issuing sibling below (issue #1304).
+        // Added here for consistency: the two routes serve the same object by
+        // the same index, so a caller that can ask the signer for a small
+        // rendition can ask the proxy for it too, and server-to-server callers
+        // (the only users of this route) benefit from the same bandwidth saving.
+        // Omitting the parameter serves the full frame exactly as before.
+        querystring: thumbnailSizeQuerySchema
+      }
     },
     async (request, reply) => {
       if (!storageFor) return reply.code(501).send({ error: 'not_configured' });
@@ -7030,11 +7103,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (isNaN(idx) || idx < 0 || idx >= keys.length) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // A size that was never recorded falls back to the full frame (#1304) —
+      // the index resolved, so this is a 200 with a bigger image, never a 404.
+      const resolved = resolveThumbnailSizeKey(asset, keys[idx], request.query.size);
       const storage = storageFor();
-      const stream = await storage.getObject(keys[idx]);
+      const stream = await storage.getObject(resolved.objectKey);
       return reply
         .header('Content-Type', 'image/jpeg')
         .header('Cache-Control', 'public, max-age=86400')
+        // Which rendition the bytes actually are, since the body cannot say so.
+        // Lets a caller detect the fallback without a second request.
+        .header('X-Thumbnail-Size', resolved.size)
         .send(stream);
     }
   );
@@ -7058,7 +7137,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // signed, scoped to one object and expires after THUMBNAIL_URL_TTL_SECONDS
   // (default 5 minutes). The bucket itself stays private — an unsigned or
   // expired request to the same object is refused by object storage.
-  //   200 — { url, expiresAt, ... }
+  //   200 — { url, expiresAt, size, ... }
+  //   400 — unrecognised `?size` value
   //   404 — unknown/foreign asset or out-of-range index (existence not leaked)
   //   501 — object storage is not configured on this deployment
   //   502 — object storage failed to sign the URL
@@ -7067,6 +7147,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     {
       schema: {
         params: z.object({ id: z.string(), index: z.string() }),
+        // Optional size selector (issue #1304); default `full` = pre-#1304
+        // behaviour. An unrecognised value is refused at the boundary with the
+        // router's standard validation 400 before the handler runs.
+        querystring: thumbnailSizeQuerySchema,
         response: {
           200: thumbnailUrlSchema,
           404: errorSchema,
@@ -7088,10 +7172,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
       const keys = asset.thumbnails ?? [];
       const idx = Number.parseInt(request.params.index, 10);
-      const objectKey = Number.isNaN(idx) ? undefined : keys[idx];
-      if (idx < 0 || objectKey === undefined) {
+      const fullObjectKey = Number.isNaN(idx) ? undefined : keys[idx];
+      if (idx < 0 || fullObjectKey === undefined) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // Size resolution happens AFTER the index check and can never turn a
+      // resolvable index into a 404 (issue #1304): a size that was not recorded
+      // for this frame degrades to the full-size key and still answers 200.
+      const resolved = resolveThumbnailSizeKey(asset, fullObjectKey, request.query.size);
+      const objectKey = resolved.objectKey;
 
       const ttl = thumbnailUrlTtlSeconds();
       // Signing can still reach the store (region lookup) and fails on bad
@@ -7120,7 +7209,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         objectKey,
         url,
         expiresAt,
-        expiresInSeconds: ttl
+        expiresInSeconds: ttl,
+        size: resolved.size
       });
     }
   );
