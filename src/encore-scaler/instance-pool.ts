@@ -54,9 +54,11 @@ import {
 } from './osc-error.js';
 import {
   clearSpawnFailure,
+  isGatewayTimeoutStatus,
   recordSpawnFailure,
   spawnFailureSecrets
 } from './spawn-failure.js';
+import { UPLOAD_PART_SIZE_OPTION } from './upload-part-size.js';
 
 // Encore's OSC service identifier. Not hardcoded at the call sites — sourced
 // from the provisioning contract (STACK_SERVICES / provision route) via this
@@ -411,6 +413,108 @@ async function waitForSpawnedInstanceReady(
   });
 }
 
+// #1286: after the LAST create attempt has ended in a gateway timeout, how long
+// the spawn keeps asking OSC for the same instance name before it gives up.
+//
+// Why there is anything to wait for: a 504 on createInstance is the ingress' 60s
+// limit being hit while the platform is still creating the instance, and the
+// create behind it usually completes (#1071 established that; successful creates
+// take roughly 18-33s, so the ones that cross 60s are the slow ones rather than
+// the failed ones). The retry loop above already adopts the instance when a
+// RETRY collides with it ("Name is already taken"), but that only works if the
+// create finishes while an attempt is still being made. When all three attempts
+// time out first, the instance that lands afterwards used to belong to nobody:
+// the spawn threw, the next tick built a NEW name
+// (scaler{workspace}{ownerTag}{Date.now().toString(36)}), and the completed
+// instance survived as an extra until the orphan reaper removed it — while a
+// second create was already running against a platform that had just told us it
+// was slow.
+//
+// 90s is sized on the thing being waited for: the create was at 60s when the
+// gateway cut it off, and the platform-side create is ahead of that, so this is
+// about a further minute and a half of "has it landed yet?". It is also cheap —
+// the tick is blocked by the spawn either way, and the readiness wait that
+// follows a successful adoption is 15 minutes (DEFAULT_SPAWN_READY_TIMEOUT_MS),
+// so 90s is small against the budget the spawn already has.
+export const DEFAULT_SPAWN_ADOPT_PROBE_TIMEOUT_MS = 90_000;
+
+// How often that probe re-asks. Matches the retry loop's own first back-off step
+// (5s) rather than inventing a new cadence: each probe is one getInstance, so at
+// most 19 of them per failed spawn.
+export const DEFAULT_SPAWN_ADOPT_PROBE_INTERVAL_MS = 5_000;
+
+// The probe only runs when the timed-out create ACTUALLY RAN for about this long
+// (#1286).
+//
+// A 504 means "nobody answered in time", and the only reason to watch the name
+// afterwards is that the request may still be in flight on the platform side.
+// That is true of the create the incident is about: it had been running at the
+// ingress' 60s limit when the gateway gave up. It is NOT true of a 504 that
+// comes back immediately — an ingress or proxy refusing the request before it
+// reached the control plane never started a create, so there is no instance
+// coming and the 90s probe would only delay the next attempt.
+//
+// 20s is deliberately well below the 60s ingress limit (a deployment behind a
+// shorter-limit gateway still gets the probe) and well above the "refused on the
+// spot" case. It is a floor on evidence, not an estimate of the limit.
+export const SPAWN_ADOPT_PROBE_MIN_CREATE_DURATION_MS = 20_000;
+
+// Watch one instance name for a bounded time and return the instance if OSC
+// starts reporting it (#1286).
+//
+// Every probe goes through tryGetInstance, so the same two properties as the
+// in-loop adoption hold: a probe that itself fails is "could not confirm" and
+// never replaces the create's error (#1071 review finding 4), and `undefined` is
+// never read as proof of absence (@osaas/client-core lib/core.js:140-150
+// swallows every failure but 401). The FIRST probe is issued immediately, before
+// any sleep: the create has been running for at least the gateway's limit by
+// now, so it may well have completed already.
+async function probeForGatewayTimedOutInstance(
+  config: EncoreScalerConfig,
+  name: string,
+  sat: string
+): Promise<OscInstance | undefined> {
+  const budgetMs =
+    config.spawnAdoptProbeTimeoutMs ?? DEFAULT_SPAWN_ADOPT_PROBE_TIMEOUT_MS;
+  const intervalMs =
+    config.spawnAdoptProbeIntervalMs ?? DEFAULT_SPAWN_ADOPT_PROBE_INTERVAL_MS;
+  if (budgetMs <= 0) return undefined;
+  const deadline = Date.now() + budgetMs;
+  for (let probe = 1; ; probe += 1) {
+    const existing = await tryGetInstance(config, ENCORE_SERVICE_ID, name, sat);
+    if (existing) {
+      console.warn(
+        '[encore-scaler] spawn: instance %s appeared after the create timed out at ' +
+          'the gateway (workspace=%s probe=%d) — adopting it instead of letting the ' +
+          'next tick create a new name (#1286)',
+        name,
+        config.workspaceId,
+        probe
+      );
+      return existing;
+    }
+    // The sleep is clamped to what is left of the budget, so a budget shorter
+    // than one interval still ends on time and never overshoots it.
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return undefined;
+    await new Promise((r) => setTimeout(r, Math.min(intervalMs, remaining)));
+    if (Date.now() >= deadline) {
+      // One last look at the deadline itself: the instance may have appeared
+      // during the final sleep, and the whole point is not to abandon it.
+      const last = await tryGetInstance(config, ENCORE_SERVICE_ID, name, sat);
+      if (last) {
+        console.warn(
+          '[encore-scaler] spawn: instance %s appeared on the last probe after the ' +
+            'create timed out at the gateway (workspace=%s) — adopting it (#1286)',
+          name,
+          config.workspaceId
+        );
+      }
+      return last;
+    }
+  }
+}
+
 // Mutable bookkeeping threaded through a single spawn so its failure path can
 // report HOW MUCH was attempted and WHICH short-lived credentials were in play
 // (#1071).
@@ -597,6 +701,10 @@ async function spawnPooledInstance(
   // distinction src/routes/provision.ts already makes for rollback (#417/#736).
   let instanceAdopted = false;
   let listenerAdopted = false;
+  // #1286: when the create call now being made started, so its failure path can
+  // tell a request that ran into the gateway's limit from one that was refused
+  // on the spot.
+  let attemptStartedAt = Date.now();
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     progress.attempts += 1;
     try {
@@ -613,6 +721,16 @@ async function spawnPooledInstance(
       if (config.profilesUrl) {
         instanceBody['profilesUrl'] = config.profilesUrl;
       }
+      // Size the OUTPUT upload's multipart parts (issue #1221). Sent
+      // independently of `s3Config` above: the credentials may come from the
+      // static env pair instead of a resolved stack config, and this is a
+      // transport tunable, not a credential. The option's declared type is
+      // `string` (a decimal byte count, like its "104857600" default), so the
+      // number is stringified rather than sent as JSON number — see
+      // upload-part-size.ts for the instance-API schema this is verified against.
+      if (config.uploadPartSizeBytes !== undefined) {
+        instanceBody[UPLOAD_PART_SIZE_OPTION] = String(config.uploadPartSizeBytes);
+      }
       // Say what is being created before the call: a create that hangs or
       // fails at the gateway otherwise leaves no record of having been tried.
       console.info(
@@ -622,6 +740,10 @@ async function spawnPooledInstance(
         attempt,
         maxAttempts
       );
+      // #1286: how long this attempt ran. A 504 only means "the create may
+      // still be happening" if the request was actually in flight long enough
+      // for that to be true — see SPAWN_ADOPT_PROBE_MIN_CREATE_DURATION_MS.
+      attemptStartedAt = Date.now();
       instance = (await createInstance(
         config.oscContext,
         ENCORE_SERVICE_ID,
@@ -697,7 +819,54 @@ async function spawnPooledInstance(
       // whose text was never matched, while any message merely containing '503'
       // was retried as though it were one.
       const isTransient = isTransientOscError(err);
-      if (!isTransient || attempt === maxAttempts) throw err;
+      if (!isTransient) throw err;
+      if (attempt === maxAttempts) {
+        // #1286 LAST-ATTEMPT ADOPT PROBE. Every attempt has now ended at the
+        // gateway without the create ever reporting back, so the adopt-on-
+        // "already taken" path above never had a collision to work with — and
+        // the create it was waiting for is very likely still running. Giving up
+        // here is what let the next tick build a NEW name and start a SECOND
+        // create while the platform was already slow, leaving the instance that
+        // finished to the orphan reaper.
+        //
+        // Only a request that really reached the gateway's limit is worth
+        // watching for; anything else (a non-timeout 5xx, a 504 refused on the
+        // spot, a transport failure with no status) throws exactly as before.
+        const elapsed = Date.now() - attemptStartedAt;
+        if (
+          isGatewayTimeoutStatus(oscHttpCode(err)) &&
+          elapsed >= SPAWN_ADOPT_PROBE_MIN_CREATE_DURATION_MS
+        ) {
+          console.warn(
+            '[encore-scaler] spawn: all %d create attempts for Encore instance %s ' +
+              'timed out at the gateway after %dms (workspace=%s) — watching the ' +
+              'same name instead of giving up on it (#1286)',
+            maxAttempts,
+            name,
+            elapsed,
+            config.workspaceId
+          );
+          const appeared = await probeForGatewayTimedOutInstance(config, name, sat);
+          if (appeared) {
+            instance = appeared;
+            // Adopted, never created by this spawn: the cleanup path below must
+            // not destroy it (#1071, the adopted-vs-created rule
+            // src/routes/provision.ts applies to rollback — #417/#736).
+            instanceAdopted = true;
+            break;
+          }
+          console.warn(
+            '[encore-scaler] spawn: Encore instance %s never appeared after the ' +
+              'gateway timeouts (workspace=%s) — failing the spawn with the create ' +
+              'error; the next spawn for this workspace is backed off (#1286)',
+            name,
+            config.workspaceId
+          );
+        }
+        // The CREATE's error is what propagates, never the probe's — the probe
+        // is total (tryGetInstance) precisely so it cannot replace it.
+        throw err;
+      }
       // Exponential back-off: 5s, 10s.
       await new Promise((r) => setTimeout(r, attempt * 5_000));
     }

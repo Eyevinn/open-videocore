@@ -11,6 +11,12 @@
         "type": "http",
         "scheme": "bearer",
         "description": "OSC access token (injected by the OSC login wall in production)"
+      },
+      "xJwtAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-jwt",
+        "description": "OSC access token as `Bearer <token>` in the platform ingress header. Accepted as a fallback when Authorization is absent or carries no token, so a caller following OSC tooling (which sends the service access token in `x-jwt`) is not rejected 401 (issue #1256). Include the `Bearer ` prefix in the value."
       }
     },
     "schemas": {}
@@ -58,6 +64,18 @@
                         "sourceDigest",
                         "builtAt",
                         "packageVersion"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "features": {
+                      "type": "object",
+                      "properties": {
+                        "authGateRegistered": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "authGateRegistered"
                       ],
                       "additionalProperties": false
                     },
@@ -171,6 +189,7 @@
                     "status",
                     "service",
                     "build",
+                    "features",
                     "resolver",
                     "ingest"
                   ],
@@ -211,7 +230,8 @@
                     "properties": {
                       "bucket": {
                         "type": "string",
-                        "minLength": 1
+                        "minLength": 1,
+                        "description": "Bucket name for this role. Honoured only when the API is started with HONOUR_CUSTOM_BUCKETS enabled, in which case the stack creates and uses this bucket on its OWN object-storage endpoint. Re-provisioning an existing stack with a different bucket is rejected: existing objects are not migrated."
                       },
                       "accessKeyId": {
                         "type": "string",
@@ -250,7 +270,8 @@
                     "properties": {
                       "bucket": {
                         "type": "string",
-                        "minLength": 1
+                        "minLength": 1,
+                        "description": "Bucket name for this role. Honoured only when the API is started with HONOUR_CUSTOM_BUCKETS enabled, in which case the stack creates and uses this bucket on its OWN object-storage endpoint. Re-provisioning an existing stack with a different bucket is rejected: existing objects are not migrated."
                       },
                       "accessKeyId": {
                         "type": "string",
@@ -380,16 +401,18 @@
         }
       },
       "get": {
+        "description": "List the stacks provisioned on this deployment. Order is part of the contract: stacks are returned in creation order \u2014 the oldest stack first, each newly provisioned stack appended last. The first element is the default stack: a request that sends no X-Stack-Name header is routed to it, and it is the stack whose transcode profile index is served as the deployment default. Provisioning or deprovisioning another stack never changes which stack is first, and a new stack never appears in the middle of this list. Stacks provisioned before this deployment began recording creation times carry no recorded creation time: they sort before every stack created after it, ordered among themselves by name. A deployment that had exactly one such stack therefore keeps it as the default, but a deployment that had several has no stored record of their original order, so its default may change once \u2014 to the name-first of them \u2014 when it starts recording creation times. Set the DEFAULT_STACK_NAME environment variable to pin a specific stack as the default; a pinned stack is returned first regardless of creation order, and the pin is ignored if no stack of that name is provisioned.",
         "responses": {
           "200": {
-            "description": "Default Response",
+            "description": "Provisioned stack names in creation order, oldest first. Element 0 is the default stack for requests without an X-Stack-Name header.",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "array",
                   "items": {
                     "type": "string"
-                  }
+                  },
+                  "description": "Provisioned stack names in creation order, oldest first. Element 0 is the default stack for requests without an X-Stack-Name header."
                 }
               }
             }
@@ -2418,6 +2441,10 @@
                     "packagingError": {
                       "type": "string"
                     },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
+                    },
                     "renditions": {
                       "type": "array",
                       "items": {
@@ -3004,6 +3031,10 @@
                           },
                           "packagingError": {
                             "type": "string"
+                          },
+                          "packagedOutputStale": {
+                            "type": "boolean",
+                            "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                           },
                           "renditions": {
                             "type": "array",
@@ -3735,6 +3766,10 @@
                           "packagingError": {
                             "type": "string"
                           },
+                          "packagedOutputStale": {
+                            "type": "boolean",
+                            "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
+                          },
                           "renditions": {
                             "type": "array",
                             "items": {
@@ -4287,6 +4322,10 @@
                           },
                           "packagingError": {
                             "type": "string"
+                          },
+                          "packagedOutputStale": {
+                            "type": "boolean",
+                            "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                           },
                           "renditions": {
                             "type": "array",
@@ -4916,6 +4955,10 @@
                     "packagingError": {
                       "type": "string"
                     },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
+                    },
                     "renditions": {
                       "type": "array",
                       "items": {
@@ -5519,6 +5562,10 @@
                     },
                     "packagingError": {
                       "type": "string"
+                    },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                     },
                     "renditions": {
                       "type": "array",
@@ -6300,6 +6347,10 @@
                     "packagingError": {
                       "type": "string"
                     },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
+                    },
                     "renditions": {
                       "type": "array",
                       "items": {
@@ -6920,6 +6971,10 @@
                     },
                     "packagingError": {
                       "type": "string"
+                    },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                     },
                     "renditions": {
                       "type": "array",
@@ -7640,6 +7695,10 @@
                           },
                           "packagingError": {
                             "type": "string"
+                          },
+                          "packagedOutputStale": {
+                            "type": "boolean",
+                            "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                           },
                           "renditions": {
                             "type": "array",
@@ -8952,6 +9011,29 @@
             }
           },
           "409": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "422": {
             "description": "Default Response",
             "content": {
               "application/json": {
@@ -10766,6 +10848,10 @@
                     "packagingError": {
                       "type": "string"
                     },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
+                    },
                     "renditions": {
                       "type": "array",
                       "items": {
@@ -11701,6 +11787,10 @@
                     "packagingError": {
                       "type": "string"
                     },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
+                    },
                     "renditions": {
                       "type": "array",
                       "items": {
@@ -11986,6 +12076,21 @@
         "parameters": [
           {
             "schema": {
+              "type": "string",
+              "enum": [
+                "small",
+                "medium",
+                "full"
+              ],
+              "default": "full"
+            },
+            "in": "query",
+            "name": "size",
+            "required": false,
+            "description": "Which rendition of the thumbnail at this index to serve: `small` (360px wide), `medium` (1280px wide), or `full` \u2014 the unscaled extracted frame, and the default. Scaled renditions exist only for assets whose extraction ran with THUMBNAIL_MULTI_SIZE=true (issue #1303). When the requested size was never recorded for this frame (older assets, or a partial extraction) the FULL-size object is served instead and the response is still 200 \u2014 a missing size is never a 404. An unrecognised value is rejected with 400."
+          },
+          {
+            "schema": {
               "type": "string"
             },
             "in": "path",
@@ -12011,6 +12116,21 @@
     "/api/v1/assets/{id}/thumbnails/{index}/url": {
       "get": {
         "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "small",
+                "medium",
+                "full"
+              ],
+              "default": "full"
+            },
+            "in": "query",
+            "name": "size",
+            "required": false,
+            "description": "Which rendition of the thumbnail at this index to serve: `small` (360px wide), `medium` (1280px wide), or `full` \u2014 the unscaled extracted frame, and the default. Scaled renditions exist only for assets whose extraction ran with THUMBNAIL_MULTI_SIZE=true (issue #1303). When the requested size was never recorded for this frame (older assets, or a partial extraction) the FULL-size object is served instead and the response is still 200 \u2014 a missing size is never a 404. An unrecognised value is rejected with 400."
+          },
           {
             "schema": {
               "type": "string"
@@ -12053,6 +12173,14 @@
                     },
                     "expiresInSeconds": {
                       "type": "number"
+                    },
+                    "size": {
+                      "type": "string",
+                      "enum": [
+                        "small",
+                        "medium",
+                        "full"
+                      ]
                     }
                   },
                   "required": [
@@ -12061,7 +12189,8 @@
                     "objectKey",
                     "url",
                     "expiresAt",
-                    "expiresInSeconds"
+                    "expiresInSeconds",
+                    "size"
                   ],
                   "additionalProperties": false
                 }
@@ -12506,6 +12635,10 @@
                     },
                     "packagingError": {
                       "type": "string"
+                    },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                     },
                     "renditions": {
                       "type": "array",
@@ -13616,6 +13749,10 @@
                     "packagingError": {
                       "type": "string"
                     },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
+                    },
                     "renditions": {
                       "type": "array",
                       "items": {
@@ -14175,6 +14312,10 @@
                     },
                     "packagingError": {
                       "type": "string"
+                    },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                     },
                     "renditions": {
                       "type": "array",
@@ -14827,6 +14968,10 @@
                     },
                     "packagingError": {
                       "type": "string"
+                    },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                     },
                     "renditions": {
                       "type": "array",
@@ -15596,6 +15741,10 @@
                     "packagingError": {
                       "type": "string"
                     },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
+                    },
                     "renditions": {
                       "type": "array",
                       "items": {
@@ -16144,6 +16293,10 @@
                     },
                     "packagingError": {
                       "type": "string"
+                    },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                     },
                     "renditions": {
                       "type": "array",
@@ -16695,6 +16848,10 @@
                     },
                     "packagingError": {
                       "type": "string"
+                    },
+                    "packagedOutputStale": {
+                      "type": "boolean",
+                      "description": "True when the packaged output (`manifestUrls`, `packagedOutput`) was produced from an EARLIER encode than the current `renditions` \u2014 set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints `manifestUrls`."
                     },
                     "renditions": {
                       "type": "array",
@@ -18553,6 +18710,10 @@
                               },
                               "height": {
                                 "type": "number"
+                              },
+                              "codec": {
+                                "type": "string",
+                                "nullable": true
                               }
                             },
                             "additionalProperties": true
@@ -21693,6 +21854,10 @@
                                 "type": "number",
                                 "description": "How many scale-ups have failed in a row for this workspace. Reset to 0 by a successful spawn, so 1 is a fresh blip while a climbing number means the scaler has been unable to grow for a while."
                               },
+                              "httpCode": {
+                                "type": "number",
+                                "description": "HTTP status the failed instance-create returned, when it had one. 504 (or 408) means the request timed out at the gateway while the platform was probably still creating the instance: the spawn watches that name for a bounded time and adopts it if it appears, and the next scale-up for this workspace is held off rather than starting a second create. Absent for a transport-level failure, which carries no status."
+                              },
                               "message": {
                                 "type": "string",
                                 "description": "Error text from the failed spawn, redacted at write time: credentials, tokens, URLs and bare network locations (host, host:port, IP:port) are stripped, as is any HTML markup, because upstream error text can echo the request the spawn sent. This endpoint is unauthenticated, so the field carries the SHAPE of the failure, not its details."
@@ -24701,6 +24866,12 @@
                         "secretAccessKey"
                       ],
                       "additionalProperties": false
+                    },
+                    "warnings": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
                     }
                   },
                   "required": [
@@ -26178,6 +26349,12 @@
                         "secretAccessKey"
                       ],
                       "additionalProperties": false
+                    },
+                    "warnings": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
                     }
                   },
                   "required": [
@@ -26672,6 +26849,9 @@
   "security": [
     {
       "bearerAuth": []
+    },
+    {
+      "xJwtAuth": []
     }
   ],
   "tags": [

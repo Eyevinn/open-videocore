@@ -168,3 +168,21 @@ object, do not scrape the log. It is not yet unblocked on implementation certain
 
 OSC friction logged in the agents repo:
 `docs/osc-feedback/incoming-ffmpeg-s3-job-log-discards-ffmpeg-stderr-on-success.md`.
+
+### Live run result (2026-10-28, issue #1192)
+
+Items 1 and 3 above are closed. Items 2 and 4 are still open: no long-log or non-zero-exit
+job was run. The full capture (objects and redacted job logs) is in
+`docs/contracts/eyevinn-ffmpeg-s3-job-and-logs.json` under
+`sceneCutReadback.viaS3Object.liveRun`.
+
+- The `framemd5`-to-S3 shape completes: both jobs reached `SuccessCriteriaMet`, the
+  published image's ffmpeg has the muxer, and the object appeared at the dest key.
+- The object holds one row per selected frame; for a 12s clip with cuts at 3s, 6s and 9s
+  it had exactly three rows (pts 75, 150, 225 at `#tb 1/25`).
+- **The `#tb` header is the source stream's timebase and is not constant**: `1/25` for that
+  clip, `1/12800` for a single-segment mp4. The parser must read it.
+- A clip with no scene change produces a **header-only** object (job still exits 0).
+- The log of an exit-0 job holds only the wrapper's own lines, no `showinfo`/`pts_time`.
+- The log contains the presigned input URL with its signature (valid 6 hours); redact before
+  retaining or forwarding it.

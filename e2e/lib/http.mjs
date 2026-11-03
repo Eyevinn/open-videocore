@@ -5,11 +5,12 @@
  *  - the platform ingress (nginx) wants `x-jwt: Bearer <service access token>` (the header the platform's own
  *    call-service-endpoint tool sends; osaas-ai src/mcp/tools/services.ts) and answers every anonymous call with its
  *    own 401, /health included;
- *  - the application then wants `Authorization: Bearer <non-empty>` (src/auth/middleware.ts extractToken, a pure
- *    presence check in src/auth/workspace.ts) and answers 401 {"error":"unauthorized","message":"missing access
- *    token"} without it. The ingress does NOT turn x-jwt into Authorization (verified through the platform's own
- *    call-service-endpoint on /api/v1/assets/). /health needs no Authorization.
- * `appToken` defaults to the same token; pass '' to send x-jwt alone and reach the application's own gate.
+ *  - the application then wants a non-empty bearer token (src/auth/middleware.ts extractToken, a pure presence check in
+ *    src/auth/workspace.ts): `Authorization: Bearer <token>` first, falling back to `x-jwt: Bearer <token>` since issue
+ *    #1256, and answers 401 {"error":"unauthorized","message":"missing access token"} with neither. The ingress does NOT
+ *    turn x-jwt into Authorization (verified through the platform's own call-service-endpoint on /api/v1/assets/), which
+ *    is why the application accepts x-jwt itself. /health needs no Authorization.
+ * `appToken` defaults to the same token; pass '' to send x-jwt alone, which the application now accepts (#1256).
  * @param {{ baseUrl: string, token?: string, appToken?: string, authHeader?: string, fetchImpl?: typeof fetch, timeoutMs?: number }} opts
  */
 export function createClient({ baseUrl, token, appToken = token, authHeader = 'x-jwt', fetchImpl = fetch, timeoutMs = 30_000 }) {

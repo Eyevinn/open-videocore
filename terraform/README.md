@@ -160,10 +160,11 @@ coordinates (`name`, `minioEndpoint`, `couchdbUrl`, `redisUrl`).
 
 By default the stack provisions its own MinIO instance and buckets — no storage
 configuration is required. The optional `sourceStorage` / `packagedStorage`
-blocks record an operator-owned bucket for a role (credentials as per-service OSC
+blocks name an operator-owned bucket for a role (credentials as per-service OSC
 secrets, `bucket`/`region`/`endpointUrl`/`publicBaseUrl` as non-secret
-coordinates for delivery-URL emission); they do **not** move the bucket the
-pipeline reads and writes, and a block carrying `endpointUrl` is refused with a
+coordinates for delivery-URL emission); the bucket **name** moves the bucket jobs
+read and write only when the API runs with `HONOUR_CUSTOM_BUCKETS` enabled, and a
+block carrying `endpointUrl` is refused with a
 400 (issue #641). To ingest from a bucket on an external S3 API host, register it
 with `POST /api/v1/storage/backends` and pass `sourceBackend` on
 `POST /api/v1/assets/ingest-url` instead. To opt into extra pipeline services,

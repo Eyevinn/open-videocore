@@ -373,6 +373,91 @@ export function destinationEndpointRefusal(
   );
 }
 
+// Why a JOB that names such a destination has to be refused AT SUBMIT TIME
+// (issue #1280), and why the condition is narrower than the delivery one above.
+//
+// A package/execute job's output is moved to its requested destination by the
+// post-package relocation (ADR-011): `relocatePackagedOutput` server-side-copies
+// every packaged object with the stack's OWN object-storage client
+// (src/pipeline/output-relocation.ts:136-153, called from
+// src/routes/internal.ts:490), and the destination it is given has already been
+// reduced to a bucket + key prefix by `parseDestination`
+// (output-relocation.ts:49-80) — a form that carries NO endpoint. The `s3://`
+// spelling a registered external backend resolves to
+// (`backendOutputDestination`, src/services/storage-backend-registry.ts:
+// 1055-1072) is stripped by that same parser, so the relocation targets a bucket
+// of that literal name ON OUR OWN ENDPOINT. Nothing in the job path ever reads
+// the destination's `endpointUrl` (StorageBackendRecord.endpointUrl,
+// storage-backend-registry.ts:93), and no credential for a foreign endpoint can
+// be reconstructed here (see the paragraph above `destinationEndpointRefusal`).
+//
+// So a job that references such a destination is accepted and then quietly
+// writes its output somewhere the operator never asked for — exactly the
+// indistinguishable-destination confusion the delivery route refuses rather than
+// reports a false success for. The refusal therefore moves to submit time, with
+// the SAME 422 `destination_unreachable` shape (src/routes/assets.ts:933).
+//
+// NARROWER CONDITION: this answers a refusal only when THIS request has a
+// resolved object-store endpoint to compare the claim against. With no resolved
+// stack storage (`WorkspaceConnections.s3Config` undefined,
+// src/services/workspace-stack.ts:152 — the no-storage / unconfigured path)
+// there is no relocation target at all and nothing to contradict, so the
+// pre-existing accept-and-resolve behaviour is left exactly as it was; the
+// delivery route's stricter "refuse when not comparable" reading belongs to an
+// operation that is about to copy bytes right now.
+//
+// Returns a human-readable reason to refuse the submit, or undefined when the
+// job may proceed (no endpoint claim, the claim names our own endpoint, or this
+// request has no resolved object-store endpoint).
+export function jobDestinationEndpointRefusal(
+  destinationEndpointUrl: string | undefined,
+  stackStorageEndpoint: string | undefined
+): string | undefined {
+  if (stackStorageEndpoint === undefined || stackStorageEndpoint.length === 0) {
+    return undefined;
+  }
+  if (destinationEndpointRefusal(destinationEndpointUrl, stackStorageEndpoint) === undefined) {
+    return undefined;
+  }
+  return (
+    `the requested output destination is registered at endpoint "${destinationEndpointUrl}", ` +
+    `which this API cannot write job output to: packaged output is relocated with the object-storage ` +
+    `credentials of this stack's own endpoint ("${stackStorageEndpoint}"), and a destination's secret ` +
+    `access key is stored write-only in OSC per-service secrets and cannot be read back. The job was ` +
+    `NOT submitted; register a destination bucket on this stack's object store, or omit the destination ` +
+    `to use the default output path`
+  );
+}
+
+// The REGISTRATION-TIME counterpart of the refusal above (issue #1280, second
+// half: "Registration should say that the endpoint will not be used for job
+// output"). Registering a destination at a foreign endpoint is not an error —
+// the record is still a valid, listable destination, and the coordinates may be
+// consumed by an operator or a future out-of-process writer — but an operator
+// who registers one has no way to learn that a package/execute job referencing
+// it will be REFUSED (and was previously accepted and relocated elsewhere). So
+// registration answers 201 with a warning rather than silently accepting.
+//
+// Uses the SAME comparison as the submit-time refusal, so the warning and the
+// refusal can never disagree: anything warned about here is exactly what a job
+// submit refuses.
+//
+// Returns the warning sentence, or undefined when there is nothing to warn about.
+export function jobOutputEndpointWarning(
+  destinationEndpointUrl: string | undefined,
+  stackStorageEndpoint: string | undefined
+): string | undefined {
+  if (jobDestinationEndpointRefusal(destinationEndpointUrl, stackStorageEndpoint) === undefined) {
+    return undefined;
+  }
+  return (
+    `endpoint "${destinationEndpointUrl}" will NOT be used for job output: packaged output from an ` +
+    `execute or package job is relocated with this stack's own object-storage credentials, so a job ` +
+    `referencing this destination is refused at submit (422 destination_unreachable). The registration ` +
+    `itself is unaffected`
+  );
+}
+
 // The comparable authority (lowercased host plus explicit port) of a storage
 // endpoint. Accepts a bare `host:port` as well as a full URL, because both
 // forms occur: `StackConfig.minioEndpoint` is a URL and an operator-registered

@@ -419,6 +419,38 @@ describe('shared table states', () => {
   });
 });
 
+describe('ops UI has no inline event-handler attributes (issue #824)', () => {
+  // Kept from #841 after #801 removed the inline `onerror` it set out to fix: helmet's default CSP sets
+  // `script-src-attr 'none'`, which `script-src 'unsafe-inline'` does not cover, so an inline handler is
+  // silently dead in production. This standing guard stops one from being reintroduced anywhere in public/.
+  it('keeps public/ free of inline event-handler attributes', async () => {
+    // Standing guard so the fix cannot regress anywhere in the ops UI.
+    const { readdirSync, readFileSync, statSync } = await import('node:fs');
+    // vitest resolves paths from the project root; import.meta.url is not a
+    // file: URL under the happy-dom environment.
+    const root = process.cwd() + '/public/';
+
+    const files: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of readdirSync(dir)) {
+        const full = dir + entry;
+        if (statSync(full).isDirectory()) walk(full + '/');
+        else if (/\.(js|html)$/.test(entry)) files.push(full);
+      }
+    };
+    walk(root);
+    expect(files.length).toBeGreaterThan(0);
+
+    // Matches an HTML attribute handler (`onerror="…"`, including one written
+    // inside a JS string), but not a property assignment (`el.onclick = fn`).
+    const inlineHandler = /["'\s](on[a-z]{3,})\s*=\s*\\?["']/i;
+    const offenders = files
+      .filter((f) => inlineHandler.test(readFileSync(f, 'utf8')))
+      .map((f) => f.slice(root.length));
+    expect(offenders).toEqual([]);
+  });
+});
+
 // ─── Thumbnails (issue #801) ──────────────────────────────────────────────────
 //
 // An <img> GET carries no Authorization header, so the list cell can never point
@@ -546,5 +578,125 @@ describe('thumbnail cells resolve a presigned URL (issue #801)', () => {
     expect(calls.some((c) => c.includes('/thumbnails/'))).toBe(false);
     expect(t.el.querySelector('tbody img')).toBeNull();
     expect(t.el.querySelector('tbody .thumb-placeholder')).not.toBeNull();
+  });
+});
+
+// ─── Status-aware lifecycle action (issue #836) ───────────────────────────────
+//
+// An already-`archived` asset cannot be archived again (DELETE is an idempotent
+// no-op), so that row must offer Restore — the only route out of `archived` —
+// instead of Archive. Every other status keeps Archive. No row offers a
+// lifecycle action that cannot change anything.
+//
+// Verified contract (CLAUDE.md rule 7):
+//   POST /api/v1/assets/{id}/restore — openapi.json
+//     .paths["/api/v1/assets/{id}/restore"].post, responses 200 / 404 / 410,
+//     single path param `id`, no requestBody. Source: src/routes/assets.ts:
+//     8058-8103 (`app.post('/:id/restore')`). 200 returns the restored asset
+//     (now `ready` or `failed`).
+describe('status-aware lifecycle action: Archive vs Restore (issue #836)', () => {
+  const restoreBtn = (c: ParentNode) =>
+    c.querySelector('.asset-restore-btn') as HTMLButtonElement | null;
+  const archiveBtn = (c: ParentNode) =>
+    c.querySelector('.asset-delete-btn') as HTMLButtonElement | null;
+
+  it('offers Restore and withholds Archive on an archived row', async () => {
+    const { apiFetch } = fakeApi({
+      assets: () => ({
+        items: [{ id: 'arch1', name: 'Gone', status: 'archived', createdAt: '2026-01-01T00:00:00Z' }],
+        total: 1,
+      }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    const row = t.el.querySelector('tbody tr[data-row-key]') as HTMLElement;
+    const restore = restoreBtn(row)!;
+    expect(restore).toBeTruthy();
+    expect((restore.textContent || '').trim()).toBe('Restore');
+    expect(restore.dataset.id).toBe('arch1');
+    // The no-op Archive control is gone from the archived row.
+    expect(archiveBtn(row)).toBeNull();
+    expect((row.textContent || '')).not.toContain('Archive');
+  });
+
+  it('offers Archive and withholds Restore on a non-archived row (unchanged)', async () => {
+    const { apiFetch } = fakeApi({
+      assets: () => ({
+        items: [{ id: 'a1', name: 'Live', status: 'ready', createdAt: '2026-01-01T00:00:00Z' }],
+        total: 1,
+      }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    const row = t.el.querySelector('tbody tr[data-row-key]') as HTMLElement;
+    const archive = archiveBtn(row)!;
+    expect(archive).toBeTruthy();
+    expect((archive.textContent || '').trim()).toBe('Archive');
+    expect(restoreBtn(row)).toBeNull();
+  });
+
+  it('clicking Restore calls onRestore with the row id and reloads the table', async () => {
+    let fetches = 0;
+    const { apiFetch } = fakeApi({
+      assets: () => {
+        fetches += 1;
+        // First load shows the archived asset; after Restore + reload it is ready.
+        const status = fetches === 1 ? 'archived' : 'ready';
+        return {
+          items: [{ id: 'arch1', name: 'Gone', status, createdAt: '2026-01-01T00:00:00Z' }],
+          total: 1,
+        };
+      },
+    });
+    const onRestore = vi.fn(async () => true);
+    const t = createAssetsTable({ ...deps(), apiFetch, onRestore, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    const firstRow = t.el.querySelector('tbody tr[data-row-key]') as HTMLElement;
+    restoreBtn(firstRow)!.click();
+    await tick();
+    await tick();
+
+    expect(onRestore).toHaveBeenCalledWith('arch1', 'Gone');
+    // A successful restore reloads: the list was re-fetched...
+    expect(fetches).toBeGreaterThanOrEqual(2);
+    // ...and the row now shows the restored (non-archived) status, so it offers
+    // Archive again and no longer offers Restore.
+    const reloadedRow = t.el.querySelector('tbody tr[data-row-key]') as HTMLElement;
+    expect(archiveBtn(reloadedRow)).toBeTruthy();
+    expect(restoreBtn(reloadedRow)).toBeNull();
+  });
+
+  it('does not reload when the restore handler reports no change', async () => {
+    let fetches = 0;
+    const { apiFetch } = fakeApi({
+      assets: () => {
+        fetches += 1;
+        return {
+          items: [{ id: 'arch1', name: 'Gone', status: 'archived', createdAt: '2026-01-01T00:00:00Z' }],
+          total: 1,
+        };
+      },
+    });
+    const onRestore = vi.fn(async () => false);
+    const t = createAssetsTable({ ...deps(), apiFetch, onRestore, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    const row = t.el.querySelector('tbody tr[data-row-key]') as HTMLElement;
+    const btn = restoreBtn(row)!;
+    btn.click();
+    await tick();
+
+    expect(onRestore).toHaveBeenCalledTimes(1);
+    expect(fetches).toBe(1);
+    // The button is re-enabled with its original label for a retry.
+    expect(btn.disabled).toBe(false);
+    expect((btn.textContent || '').trim()).toBe('Restore');
   });
 });

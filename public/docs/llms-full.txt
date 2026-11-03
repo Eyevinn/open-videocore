@@ -22,6 +22,9 @@ Response 200 (application/json)
     "builtAt": "string",
     "packageVersion": "string"
   },
+  "features": {
+    "authGateRegistered": true
+  },
   "resolver": {
     "degraded": true,
     "mode": "none",
@@ -67,7 +70,10 @@ Provisioning
 
   List provisioned stacks.
 
+  List the stacks provisioned on this deployment. Order is part of the contract: stacks are returned in creation order — the oldest stack first, each newly provisioned stack appended last. The first element is the default stack: a request that sends no X-Stack-Name header is routed to it, and it is the stack whose transcode profile index is served as the deployment default. Provisioning or deprovisioning another stack never changes which stack is first, and a new stack never appears in the middle of this list. Stacks provisioned before this deployment began recording creation times carry no recorded creation time: they sort before every stack created after it, ordered among themselves by name. A deployment that had exactly one such stack therefore keeps it as the default, but a deployment that had several has no stored record of their original order, so its default may change once — to the name-first of them — when it starts recording creation times. Set the DEFAULT_STACK_NAME environment variable to pin a specific stack as the default; a pinned stack is returned first regardless of creation order, and the pin is ignored if no stack of that name is provisioned.
+
   Response
+Provisioned stack names in creation order, oldest first. Element 0 is the default stack for requests without an X-Stack-Name header.
 Response 200 (application/json)
 [
   "string"
@@ -615,6 +621,7 @@ Response 201 (application/json)
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 - sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
+- packagedOutputStale — True when the packaged output (manifestUrls, packagedOutput) was produced from an EARLIER encode than the current renditions — set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints manifestUrls.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/by-external-id/{namespace}/{id}
@@ -671,6 +678,7 @@ Response 200 (application/json)
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 - sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
+- packagedOutputStale — True when the packaged output (manifestUrls, packagedOutput) was produced from an EARLIER encode than the current renditions — set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints manifestUrls.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/by-tams-address
@@ -855,6 +863,7 @@ Response 200 (application/json)
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 - sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
+- packagedOutputStale — True when the packaged output (manifestUrls, packagedOutput) was produced from an EARLIER encode than the current renditions — set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints manifestUrls.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   PATCH /api/v1/assets/{id}
@@ -921,6 +930,7 @@ Response 200 (application/json)
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 - sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
+- packagedOutputStale — True when the packaged output (manifestUrls, packagedOutput) was produced from an EARLIER encode than the current renditions — set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints manifestUrls.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   DELETE /api/v1/assets/{id}
@@ -1039,6 +1049,7 @@ Response 201 (application/json)
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 - sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
+- packagedOutputStale — True when the packaged output (manifestUrls, packagedOutput) was produced from an EARLIER encode than the current renditions — set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints manifestUrls.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/comments
@@ -1344,6 +1355,7 @@ Response 201 (application/json)
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 - sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
+- packagedOutputStale — True when the packaged output (manifestUrls, packagedOutput) was produced from an EARLIER encode than the current renditions — set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints manifestUrls.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/external-ids
@@ -1427,6 +1439,7 @@ Response 200 (application/json)
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 - sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
+- packagedOutputStale — True when the packaged output (manifestUrls, packagedOutput) was produced from an EARLIER encode than the current renditions — set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints manifestUrls.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   DELETE /api/v1/assets/{id}/external-ids/{namespace}/{externalId}
@@ -1552,6 +1565,7 @@ Response 200 (application/json)
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 - sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
+- packagedOutputStale — True when the packaged output (manifestUrls, packagedOutput) was produced from an EARLIER encode than the current renditions — set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints manifestUrls.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   DELETE /api/v1/assets/{id}/lock
@@ -1603,6 +1617,7 @@ Response 200 (application/json)
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 - sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
+- packagedOutputStale — True when the packaged output (manifestUrls, packagedOutput) was produced from an EARLIER encode than the current renditions — set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints manifestUrls.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   PUT /api/v1/assets/{id}/metadata
@@ -1660,6 +1675,7 @@ Response 200 (application/json)
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 - sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
+- packagedOutputStale — True when the packaged output (manifestUrls, packagedOutput) was produced from an EARLIER encode than the current renditions — set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints manifestUrls.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   POST /api/v1/assets/{id}/multipart/initiate
@@ -1862,6 +1878,7 @@ Response 200 (application/json)
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 - sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
+- packagedOutputStale — True when the packaged output (manifestUrls, packagedOutput) was produced from an EARLIER encode than the current renditions — set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints manifestUrls.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/review-state
@@ -1939,6 +1956,7 @@ Response 200 (application/json)
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 - sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
+- packagedOutputStale — True when the packaged output (manifestUrls, packagedOutput) was produced from an EARLIER encode than the current renditions — set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints manifestUrls.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/storage-usage
@@ -2088,6 +2106,7 @@ Response 200 (application/json)
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 - sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
+- packagedOutputStale — True when the packaged output (manifestUrls, packagedOutput) was produced from an EARLIER encode than the current renditions — set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints manifestUrls.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   DELETE /api/v1/assets/{id}/tags/{tag}
@@ -2142,6 +2161,7 @@ Response 200 (application/json)
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 - sourceSizeBytes — Byte length of the stored source object, as recorded when ingest completed. Omitted — never 0 — when no length was ever recorded for the current object key, e.g. an asset ingested through a finalize path that could not learn the size. A present value always describes the current objectKey.
+- packagedOutputStale — True when the packaged output (manifestUrls, packagedOutput) was produced from an EARLIER encode than the current renditions — set when a re-encode completes and no new package follows it. Omitted (never false) when the two agree. The manifests are left in place and keep playing the previous package; re-run packaging to resolve it, which clears this flag and repoints manifestUrls.
 - retention — Retention window for an archived asset (issue #1034). Present only while status is archived; absent on every other asset.
 
   GET /api/v1/assets/{id}/thumbnails
@@ -2189,9 +2209,10 @@ Response 200 (application/json)
   Get a single extracted thumbnail.
 
   Parameters
-Name | In | Type | Required
-id | path | string | required
-index | path | string | required
+Name | In | Type | Required | Description
+size | query | string (small, medium, full) | optional | Which rendition of the thumbnail at this index to serve: small (360px wide), medium (1280px wide), or full — the unscaled extracted frame, and the default. Scaled renditions exist only for assets whose extraction ran with THUMBNAIL_MULTI_SIZE=true (issue #1303). When the requested size was never recorded for this frame (older assets, or a partial extraction) the FULL-size object is served instead and the response is still 200 — a missing size is never a 404. An unrecognised value is rejected with 400.
+id | path | string | required |
+index | path | string | required |
   Response
 Response 200
 (no body)
@@ -2199,9 +2220,10 @@ Response 200
   GET /api/v1/assets/{id}/thumbnails/{index}/url
 
   Parameters
-Name | In | Type | Required
-id | path | string | required
-index | path | string | required
+Name | In | Type | Required | Description
+size | query | string (small, medium, full) | optional | Which rendition of the thumbnail at this index to serve: small (360px wide), medium (1280px wide), or full — the unscaled extracted frame, and the default. Scaled renditions exist only for assets whose extraction ran with THUMBNAIL_MULTI_SIZE=true (issue #1303). When the requested size was never recorded for this frame (older assets, or a partial extraction) the FULL-size object is served instead and the response is still 200 — a missing size is never a 404. An unrecognised value is rejected with 400.
+id | path | string | required |
+index | path | string | required |
   Response
 Response 200 (application/json)
 {
@@ -2210,7 +2232,8 @@ Response 200 (application/json)
   "objectKey": "string",
   "url": "string",
   "expiresAt": "string",
-  "expiresInSeconds": 0
+  "expiresInSeconds": 0,
+  "size": "small"
 }
 
   GET /api/v1/assets/{id}/tracks
@@ -2806,7 +2829,8 @@ Response 200 (application/json)
         "at": 0,
         "attempts": 0,
         "consecutiveFailures": 0,
-        "message": "string"
+        "message": "string",
+        "httpCode": 0
       }
     }
   ],
@@ -3757,7 +3781,8 @@ Request body (application/json)
       "videoStreams": [
         {
           "width": null,
-          "height": null
+          "height": null,
+          "codec": null
         }
       ],
       "overallBitrate": 0
@@ -4257,6 +4282,8 @@ Runtime config is saved and reloaded at boot. The values are written to the para
 
 The warm floor is the exception: set ENCORE_MIN_INSTANCES to 1 or more (and restart) for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. A minInstances sent to the config endpoint is validated, persisted and echoed back, but the already-running scaler keeps enforcing the floor it read at boot; the persisted floor is applied at the next boot, ahead of the variable, so changing the enforced floor through the API takes one restart. See GET /api/v1/scaler/status for the pool's live state and the Auto-scaler reference for every field.
 
+A pool can be held below the queue on purpose. When an instance-create times out at the gateway (504), the platform is usually still building the instance — so the spawn keeps watching the name it already asked for and adopts that instance if it appears (ENCORE_SPAWN_ADOPT_PROBE_TIMEOUT_MS, default 90s), and scale-up for that workspace is then held off for about two minutes (ENCORE_SPAWN_GATEWAY_BACKOFF_MS, default 120000; set 0 to disable) instead of starting a second create against a platform that just reported it was slow. Only a gateway timeout causes the hold-off. GET /api/v1/scaler/status reports spawnFailure.httpCode, so a 504 there identifies the pause as this back-off rather than a pool that has stopped growing for an unknown reason.
+
 Optional services
 
 Add-on capabilities beyond the core stack are provisioned per workspace, on demand:
@@ -4589,7 +4616,7 @@ curl -X POST https://<your-instance>/api/v1/provision \
 
     curl https://<your-instance>/api/v1/provision/operations/<operationId>
 
-    By default the stack provisions its own object storage and buckets — no storage configuration required. To record an operator-owned bucket for a role, pass the optional sourceStorage / packagedStorage blocks — see provision in the reference. These blocks register the credentials as per-service secrets and persist bucket/region/endpointUrl/publicBaseUrl as non-secret coordinates used when delivery URLs are emitted; they do not move the bucket the pipeline reads and writes, and a block carrying endpointUrl is refused with a 400. To ingest from a bucket on an external S3 API host, register it with storage backends (which does take endpointUrl) and pass sourceBackend on ingest-url.
+    By default the stack provisions its own object storage and buckets — no storage configuration required. To have the stack use buckets you name instead, pass the optional sourceStorage / packagedStorage blocks and start the API with HONOUR_CUSTOM_BUCKETS enabled; the buckets are then created on the stack's own object-storage endpoint and every job is bound to them. With the flag off (the default) those blocks only register the credentials as per-service secrets and persist bucket/region/publicBaseUrl as non-secret coordinates used when delivery URLs are emitted — jobs keep using the stack's own buckets. Only the bucket name can ever be redirected: a supplied endpointUrl is rejected with a 400. See provision in the reference. To ingest from a bucket on an external S3 API host, register it with storage backends (which does take endpointUrl) and pass sourceBackend on ingest-url.
 
   -
     Bootstrap transcoding profiles
@@ -4602,7 +4629,7 @@ curl -X POST https://<your-instance>/api/v1/provision \
 
 Environment variables
 
-On Open Source Cloud only the settings exposed by the service's deploy form are configurable — the required credentials above plus the optional ENCORE_* tuning knobs. The others are injected automatically by the deploy step or fixed by the platform, and can only be set directly when you run open-videocore yourself (self-hosted). The OSC-configurable column below marks which is which.
+On Open Source Cloud only the settings exposed by the service's deploy form are configurable — the required credentials above plus the optional transcoder-pool knobs (ENCORE_MAX_INSTANCES, ENCORE_MIN_INSTANCES, ENCORE_IDLE_TIMEOUT_MS). The others are injected automatically by the deploy step or fixed by the platform, and can only be set directly when you run open-videocore yourself (self-hosted). The OSC-configurable column below marks which is which.
 
   Variable | Required | OSC-configurable | Description
     OSC_ACCESS_TOKEN | Yes | Injected | Personal Access Token. Injected automatically at deploy time on OSC.
@@ -4614,7 +4641,11 @@ On Open Source Cloud only the settings exposed by the service's deploy form are 
     ENCORE_MAX_INSTANCES | No | Yes | Max transcoder instances the auto-scaler may run per workspace (default 3). Can be changed at runtime with PATCH /api/v1/scaler/config; that change is persisted and reloaded at boot, so this value applies to a deployment never configured through the API. See Operating a workspace.
     ENCORE_MIN_INSTANCES | No | Yes | Warm floor of transcoder instances kept running even when idle (default 0 — scale to zero). A minInstances sent to the runtime config endpoint is not applied to the already-running scaler, but it is persisted and reloaded at boot with precedence over this variable — so changing the enforced floor through the API takes one restart, and this variable is the floor for a deployment never configured through the API. See Operating a workspace.
     ENCORE_IDLE_TIMEOUT_MS | No | Yes | Idle time before a transcoder instance is torn down (default 300000). Can be changed at runtime with PATCH /api/v1/scaler/config; like ENCORE_MAX_INSTANCES that change is persisted and reloaded at boot, so after a restart the persisted value wins and this variable is the value for a deployment never configured through the API.
+    ENCORE_SPAWN_ADOPT_PROBE_TIMEOUT_MS | No | No | How long a scale-up keeps asking for the transcoder instance name it already requested, after every create attempt ended in a gateway timeout (504/408), in milliseconds (default 90000). A create that times out at the gateway usually completes behind it, so the spawn watches that same name for this long and adopts the instance if it appears, rather than requesting a new name on the next tick. An absent, unparseable or negative value falls back to the default; 0 does not disable the probe — only values above zero are honoured, so 0 leaves the default in force. Self-hosted only — not configurable on Open Source Cloud (the deploy form exposes no field for it). See Operating a workspace.
+    ENCORE_SPAWN_GATEWAY_BACKOFF_MS | No | No | How long the next scale-up for a workspace is held off after a spawn that ended in a gateway timeout, in milliseconds (default 120000, i.e. 2 minutes). Only a gateway timeout triggers it; any other spawn failure never delays the retry. An absent, unparseable or negative value falls back to the default; 0 disables the hold-off, so scale-up may retry on the next tick. Self-hosted only — not configurable on Open Source Cloud (the deploy form exposes no field for it). See Operating a workspace.
     PUBLIC_BASE_URL | No | No | Publicly-reachable base URL of this instance, used to build the profile index URL handed to each transcoder. Self-hosted only — not configurable on Open Source Cloud (the OSC deploy form exposes no field for it, and OSC injects no self-URL). Left unset on OSC, transcoders fall back to the remote default profiles index.
+    SCENE_POLL_BUDGET_SECONDS | No | No | How long one scene-detection job may be polled before it is given up on, in seconds (default 1500, i.e. 25 minutes). An absent, unparseable or non-positive value falls back to the default. The value is then clamped to 5/6 of SCENE_URL_TTL_SECONDS, the lifetime of the presigned source URL the detector decodes as its input: a budget outliving that URL would not wait longer, it would fail mid-decode with a 403. So raising this alone does nothing above that ceiling — raise both together. A clamp is not a startup error; it is warn-logged once per detection run, and detection is dispatched detached from the request that triggered it, so that log line is the only notice. Self-hosted only — not configurable on Open Source Cloud (the deploy form exposes no field for it).
+    SCENE_URL_TTL_SECONDS | No | No | Lifetime of the presigned source URL handed to the scene detector, in seconds (default 1800, i.e. 30 minutes). An absent, unparseable or non-positive value falls back to the default. It is also the ceiling SCENE_POLL_BUDGET_SECONDS is clamped against — 5/6 of this value, which is exactly the 1500 budget default against the 1800 TTL default — so in practice the two are halves of one setting: a longer detection budget needs this raised first. Self-hosted only — not configurable on Open Source Cloud (the deploy form exposes no field for it).
 
 ---
 
@@ -4631,6 +4662,14 @@ Every request — other than health checks and the internal service callbacks �
 Authorization: Bearer <your-osc-access-token>
 
 In production on OSC, this is enforced by the platform's login wall in front of the instance. The token is your OSC Personal Access Token — the same one used in Installation to deploy the instance.
+
+The x-jwt header
+
+The same token is also accepted in an x-jwt header, with the same Bearer prefix:
+
+x-jwt: Bearer <your-osc-access-token>
+
+This is the header the platform's own ingress authenticates, and the one OSC's client tooling sends when it calls a deployed service endpoint. The ingress does not copy it into Authorization, so a caller that follows that tooling would otherwise clear the wall and then be rejected by the application with 401 missing access token. Send either header; Authorization wins when both are present and carry a token. Neither header present (or neither carrying a Bearer <token> value) is still a 401.
 
 Errors & conventions
 

@@ -12,6 +12,12 @@
 // (`awsAccessKeyId`, `awsSecretAccessKey`, `s3EndpointUrl` — the MinIO endpoint,
 // per ADR-001), so we use that instead.
 //
+// issue #1303: behind THUMBNAIL_MULTI_SIZE each frame can also request scaled
+// variants. They are NOT bundled into the full-frame invocation — the service
+// detects exactly ONE output per command — so each variant is a separate job
+// that reads back the full frame just written. See scaledThumbnailFrameCmdLine
+// for the contract citations.
+//
 // OSC FRICTION (logged, issue #6): eyevinn-ffmpeg-s3 exposes no structured job
 // result and ffprobe is not accessible — see
 // docs/osc-feedback/submitted-2026-06-02-issue6-metadata.md.
@@ -26,7 +32,7 @@ import {
 } from '@osaas/client-core';
 import { FFPROBE_SERVICE_ID } from '../services/stack.js';
 import { pollOscJobUntilDone } from './osc-job-poll.js';
-import type { FrameExtractor, FrameTarget } from './thumbnail.js';
+import type { FrameExtractor, FrameTarget, ScaledFrameTarget } from './thumbnail.js';
 
 export type OscJobApi = {
   context: Context;
@@ -54,6 +60,41 @@ export function thumbnailFrameCmdLine(sourceUrl: string, frame: FrameTarget, buc
   return `-y -ss ${frame.timecodeSeconds} -i "${sourceUrl}" -frames:v 1 -f image2 "s3://${bucket}/${frame.objectKey}"`;
 }
 
+// Build an ffmpeg command that derives ONE scaled JPEG from the ALREADY-WRITTEN
+// full-size frame (issue #1303). Single input, single output — the only shape
+// eyevinn-ffmpeg-s3 supports:
+//
+//   - MULTIPLE `s3://` OUTPUTS IN ONE INVOCATION DO NOT WORK. Per the pinned
+//     contract docs/contracts/eyevinn-ffmpeg-s3-job-and-logs.json, symbol
+//     `rewriteCmdString output detection` (upstream src/ffmpeg.ts:90-99): "The
+//     output is the LAST argument that does not start with `-`" — exactly one
+//     output is detected, rewritten to a local staging path and uploaded
+//     (`uploadResult single-file S3 branch`, upstream src/ffmpeg.ts:337-345,
+//     uploads ONLY the file whose basename equals the dest basename). Any
+//     earlier `s3://` argument is treated as an INPUT and presigned to an HTTPS
+//     GET URL (`aws s3 presign for s3:// inputs`, upstream src/ffmpeg.ts:60-79)
+//     — and the image2 muxer cannot write to a presigned HTTP endpoint (issue
+//     #92). So each size needs its own job. Multiple `-i` inputs in one command
+//     are separately forbidden here (issue #332).
+//   - The derive input is handed as `s3://bucket/<fullKey>`, which the job
+//     presigns itself, so our request body carries no signature. Deriving from
+//     the stored full frame (a ~100 KB JPEG) instead of re-seeking the source
+//     keeps the extra cost tiny and guarantees the variants show the SAME frame.
+//
+// `-vf scale=<width>:-2` preserves aspect ratio with an even height (required by
+// the encoder's chroma subsampling), and `-q:v` is explicit per variant. The
+// full-size command above is untouched, so full-size quality does not change.
+export function scaledThumbnailFrameCmdLine(
+  fullObjectKey: string,
+  scaled: ScaledFrameTarget,
+  bucket: string
+): string {
+  return (
+    `-y -i "s3://${bucket}/${fullObjectKey}" -vf scale=${scaled.width}:-2 ` +
+    `-q:v ${scaled.quality} -frames:v 1 -f image2 "s3://${bucket}/${scaled.objectKey}"`
+  );
+}
+
 function thumbnailJobName(): string {
   const rand = Math.random().toString(36).slice(2, 8);
   const ts = Date.now().toString(36).slice(-6);
@@ -65,10 +106,20 @@ function thumbnailJobName(): string {
 // job ends in a failure status so the caller can attribute the failure to this
 // one frame (issue #332).
 async function extractOneFrame(api: OscJobApi, sourceUrl: string, frame: FrameTarget, sat: string): Promise<void> {
+  await runOneFfmpegJob(api, thumbnailFrameCmdLine(sourceUrl, frame, api.s3Bucket), sat);
+}
+
+// Dispatch ONE ephemeral eyevinn-ffmpeg-s3 job for an already-built command
+// line and wait for it. Body fields per the pinned contract
+// docs/contracts/eyevinn-ffmpeg-s3-job-and-logs.json -> `job.createJob.bodyFields`
+// (`name`, `cmdLineArgs`, `awsAccessKeyId`, `awsSecretAccessKey`,
+// `s3EndpointUrl`); the four credential/command fields are the only ones
+// confirmed by an upstream source (readme.md:43-47).
+async function runOneFfmpegJob(api: OscJobApi, cmdLineArgs: string, sat: string): Promise<void> {
   const name = thumbnailJobName();
   await api.createJob(api.context, FFPROBE_SERVICE_ID, sat, {
     name,
-    cmdLineArgs: thumbnailFrameCmdLine(sourceUrl, frame, api.s3Bucket),
+    cmdLineArgs,
     awsAccessKeyId: api.s3AccessKey,
     awsSecretAccessKey: api.s3SecretKey,
     s3EndpointUrl: api.s3Endpoint
@@ -83,6 +134,25 @@ async function extractOneFrame(api: OscJobApi, sourceUrl: string, frame: FrameTa
       await api.removeJob(api.context, FFPROBE_SERVICE_ID, name, sat);
     } catch {
       // ignore cleanup failure
+    }
+  }
+}
+
+// Derive every requested scaled variant of one full frame (issue #1303), each as
+// its own single-input/single-output job. Best-effort by design: a size that
+// fails is simply never written, and the orchestrator records only the objects
+// its `statObject` check confirms. No-op when the frame carries no `scaled`
+// targets — i.e. the entire flag-off path.
+async function deriveScaledFrames(api: OscJobApi, frame: FrameTarget, sat: string): Promise<void> {
+  for (const scaled of frame.scaled ?? []) {
+    try {
+      await runOneFfmpegJob(
+        api,
+        scaledThumbnailFrameCmdLine(frame.objectKey, scaled, api.s3Bucket),
+        sat
+      );
+    } catch {
+      // Non-fatal: the full-size frame for this timecode already landed.
     }
   }
 }
@@ -104,7 +174,18 @@ export function makeOscThumbnailExtractor(api: OscJobApi): FrameExtractor {
         await extractOneFrame(api, sourceUrl, frame, sat);
       } catch (err) {
         failures.push(err instanceof Error ? err.message : String(err));
+        // The full frame is the INPUT of every scaled derivation below, so if it
+        // did not land there is nothing to derive from (issue #1303).
+        continue;
       }
+      // Scaled variants (issue #1303), only present when THUMBNAIL_MULTI_SIZE is
+      // on. Each runs as its OWN job reading the full frame just written — the
+      // service detects exactly one output per command (see
+      // scaledThumbnailFrameCmdLine). A scaled job failing is NEVER fatal and is
+      // NOT counted in `failures`: the full frame already landed, so the run is a
+      // success at the index level, and the orchestrator's statObject check
+      // decides which sizes get recorded.
+      await deriveScaledFrames(api, frame, sat);
     }
     if (failures.length === frames.length) {
       throw new Error(`all ${frames.length} thumbnail frame job(s) failed: ${failures.join('; ')}`);

@@ -29,6 +29,13 @@ import {
   makeScalerConfigStore,
   type StackConfig
 } from './services/param-store.js';
+// Shared default bucket names (issue #1301). Same module the provision route
+// resolves bound buckets from, so the process-wide fallback below and the
+// buckets a stack is actually created with have one definition.
+import {
+  DEFAULT_PACKAGED_BUCKET,
+  DEFAULT_SOURCE_BUCKET
+} from './services/custom-buckets.js';
 import { saveSecret } from '@osaas/client-core';
 import {
   StorageBackendRegistry,
@@ -110,8 +117,13 @@ import { makeOscProbeRunner } from './pipeline/osc-ffprobe.js';
 import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-extractor.js';
 import { makeOscSubtitleGenerator } from './pipeline/osc-auto-subtitles.js';
 import type { SubtitleGenerator } from './pipeline/subtitle-generator.js';
-import { makeOscSceneDetector } from './pipeline/osc-scene-detect.js';
+import {
+  makeFfmpegS3SceneDetector,
+  configuredScenePollBudgetMs
+} from './pipeline/osc-scene-detect-ffmpeg-s3.js';
+import { sceneUrlTtlSeconds } from './pipeline/scene-detector.js';
 import type { SceneDetector } from './pipeline/scene-detector.js';
+import type { SceneDetectObjectStore } from './services/workspace-stack.js';
 import { makeOscThumbnailExtractor } from './pipeline/osc-thumbnail.js';
 import type { FrameExtractor } from './pipeline/thumbnail.js';
 import { makeOscRewrapRunner } from './pipeline/osc-rewrap.js';
@@ -200,6 +212,7 @@ import type { StackReachabilityDeps } from './services/stack-reachability.js';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
 import { valkeyConnectionId } from './encore-scaler/valkey-connection-id.js';
 import { resolveJobThroughputCap } from './encore-scaler/job-throughput-cap.js';
+import { resolveUploadPartSizeBytes } from './encore-scaler/upload-part-size.js';
 import { decideRetry, clearRetryState, makePriorAttemptCanceler } from './encore-scaler/retry-store.js';
 import { decodeEncoreJobId } from './data/job-repo.js';
 import { DEPLOYMENT_CONTEXT } from './auth/workspace.js';
@@ -290,12 +303,25 @@ await app.register(fastifySwagger, {
       { name: 'admin', description: 'Operational status and background service control' },
       { name: 'logs', description: 'Cursor-paged operational log stream' },
     ],
+    // Both headers the auth middleware accepts are declared, so the published
+    // contract matches src/auth/middleware.ts extractToken (issue #1256):
+    // `Authorization: Bearer <token>` first, `x-jwt: Bearer <token>` as the
+    // fallback. Declaring only bearerAuth told generated clients and the
+    // api-docs "Authorize" dialog that the x-jwt route did not exist.
+    //
+    // `x-jwt` is modelled as an apiKey-in-header scheme because that is the
+    // only OpenAPI 3 scheme type for a named custom header; the VALUE is still
+    // `Bearer <token>`, which the description states since the scheme type
+    // cannot express it.
     components: {
       securitySchemes: {
-        bearerAuth: { type: 'http', scheme: 'bearer', description: 'OSC access token (injected by the OSC login wall in production)' }
+        bearerAuth: { type: 'http', scheme: 'bearer', description: 'OSC access token (injected by the OSC login wall in production)' },
+        xJwtAuth: { type: 'apiKey', in: 'header', name: 'x-jwt', description: 'OSC access token as `Bearer <token>` in the platform ingress header. Accepted as a fallback when Authorization is absent or carries no token, so a caller following OSC tooling (which sends the service access token in `x-jwt`) is not rejected 401 (issue #1256). Include the `Bearer ` prefix in the value.' }
       }
     },
-    security: [{ bearerAuth: [] }]
+    // Either scheme alone is sufficient — separate array members are OR, a
+    // single member with both keys would mean AND.
+    security: [{ bearerAuth: [] }, { xJwtAuth: [] }]
   },
   transform: jsonSchemaTransform
 });
@@ -353,7 +379,11 @@ await app.register(healthRouter, {
   ingestSignals: () => ({
     storageAvailable,
     hasEnvMinio: Boolean(process.env['MINIO_URL'])
-  })
+  }),
+  // Read per request against the ROOT instance, so it reflects the
+  // registerAuth(app) call further down this file rather than this router's
+  // registration-time view of the decorators (see HealthRouterOptions).
+  authGateRegistered: () => app.hasDecorator('authenticate')
 });
 app.get('/healthz', async () => ({ status: 'ok' }));
 
@@ -444,7 +474,8 @@ const storageBackendRegistry = new StorageBackendRegistry(
 // builders — so a freshly provisioned optional service is picked up on the next
 // pipeline run with NO API restart. When object storage is unavailable the
 // builders are omitted and the steps stay disabled (graceful skip). The
-// runner-tuning knobs (AUTO_SUBTITLES_WRITES_S3, SCENE_DETECT_PATH) are NOT
+// runner-tuning knobs (AUTO_SUBTITLES_WRITES_S3, and for scene detection
+// SCENE_POLL_BUDGET_SECONDS paired with SCENE_URL_TTL_SECONDS) are NOT
 // activation switches and remain here.
 const storageBackedForOptionalSteps = Boolean(process.env['MINIO_URL']) || Boolean(paramStore);
 const optionalStepBuilders = storageBackedForOptionalSteps
@@ -456,12 +487,34 @@ const optionalStepBuilders = storageBackedForOptionalSteps
           instanceName,
           writesToS3: process.env['AUTO_SUBTITLES_WRITES_S3'] === 'true'
         }),
-      sceneDetector: (instanceName: string): SceneDetector =>
-        makeOscSceneDetector({
+      // Scene detection runs as an ephemeral eyevinn-ffmpeg-s3 job (issue
+      // #1192, ADR-027 D1) — NOT against an eyevinn-function-scenes instance,
+      // which cannot return cut timecodes through any documented endpoint
+      // (#797). `instanceName` therefore no longer selects the service: it stays
+      // the stack record's ACTIVATION flag for this optional step (issue #217),
+      // and retiring the field itself is #1193's job. The legacy runner
+      // (makeOscSceneDetector) and its pinned request contract are left in place
+      // for that issue to remove.
+      sceneDetector: (instanceName: string, s3: SceneDetectObjectStore): SceneDetector =>
+        makeFfmpegS3SceneDetector({
           context: oscContext,
-          getInstance,
-          instanceName,
-          path: process.env['SCENE_DETECT_PATH']
+          createJob,
+          getJob,
+          getLogsForInstance,
+          removeJob,
+          s3Endpoint: s3.endpoint,
+          s3AccessKey: s3.accessKey,
+          s3SecretKey: s3.secretKey,
+          s3Bucket: s3.bucket,
+          readCutObject: s3.readObject,
+          removeCutObject: s3.removeObject,
+          // Poll budget comes from configuration, not from the runner's own
+          // default (ADR-027 D8.2): SCENE_POLL_BUDGET_SECONDS if set, else the
+          // 25-minute default — and in either case clamped by the runner to the
+          // presigned-GET lifetime that SCENE_URL_TTL_SECONDS configures, so the
+          // two env vars cannot drift into a guaranteed mid-decode 403.
+          pollBudgetMs: configuredScenePollBudgetMs(),
+          urlTtlSeconds: sceneUrlTtlSeconds()
         })
     }
   : {};
@@ -1090,6 +1143,57 @@ const encoreSpawnReadyTimeoutMs =
   Number.isFinite(encoreSpawnReadyTimeoutMsRaw) && encoreSpawnReadyTimeoutMsRaw > 0
     ? encoreSpawnReadyTimeoutMsRaw
     : undefined;
+// Multipart part size (bytes) every spawned transcoder uploads its OUTPUTS with
+// (issue #1221). OBSERVED: a single multi-GB output (an archive/mastering
+// profile's one large file) fails its upload after a complete, successful
+// encode with a connection-pool acquisition timeout, while many-small-output
+// profiles on the same source and object store upload in about a second.
+// HYPOTHESIS, NOT ESTABLISHED: that the transcoder's default multipart part size
+// (100 MB) causes it. The deployed service's own source says the credentialed
+// upload path is the CRT client, whereas that error text comes from the standard
+// client (built only on the anonymous branch, which never reads this option), so
+// this setting may have no effect on the path that fails. It is a tunable, not a
+// fix for #1221. The default sent is the service's own 100 MB, i.e. no behaviour
+// change unless an operator sets ENCORE_S3_MULTIPART_PART_SIZE_BYTES. Invalid or
+// out-of-bounds values fall back to the default and say so. See
+// src/encore-scaler/upload-part-size.ts.
+const encoreUploadPartSizeBytes = resolveUploadPartSizeBytes(
+  process.env['ENCORE_S3_MULTIPART_PART_SIZE_BYTES'],
+  (reason) =>
+    app.log.warn(
+      { reason },
+      'ENCORE_S3_MULTIPART_PART_SIZE_BYTES ignored — transcoder output uploads use the built-in part size'
+    )
+);
+// Issue #1286. Two bounds on how a create that timed out AT THE GATEWAY is
+// handled, both optional and both defaulted in the scaler itself
+// (DEFAULT_SPAWN_ADOPT_PROBE_TIMEOUT_MS / DEFAULT_SPAWN_GATEWAY_BACKOFF_MS):
+//   ENCORE_SPAWN_ADOPT_PROBE_TIMEOUT_MS — how long the spawn keeps asking for the
+//     SAME instance name after every attempt 504'd, because the create behind a
+//     504 usually completes and the instance that lands is the one we want (the
+//     alternative is a new name next tick and an extra instance for the reaper).
+//   ENCORE_SPAWN_GATEWAY_BACKOFF_MS — how long the next scale-up is held off
+//     after such a spawn, so the scaler does not start a second create against a
+//     platform that just told us it was slow. 0 disables the hold-off.
+// Invalid/absent => the built-in default. Negative is treated as absent; 0 is
+// honoured for the back-off only, where it has a meaning.
+const encoreSpawnAdoptProbeTimeoutMsRaw = parseInt(
+  process.env['ENCORE_SPAWN_ADOPT_PROBE_TIMEOUT_MS'] || '',
+  10
+);
+const encoreSpawnAdoptProbeTimeoutMs =
+  Number.isFinite(encoreSpawnAdoptProbeTimeoutMsRaw) &&
+  encoreSpawnAdoptProbeTimeoutMsRaw > 0
+    ? encoreSpawnAdoptProbeTimeoutMsRaw
+    : undefined;
+const encoreSpawnGatewayBackoffMsRaw = parseInt(
+  process.env['ENCORE_SPAWN_GATEWAY_BACKOFF_MS'] || '',
+  10
+);
+const encoreSpawnGatewayBackoffMs =
+  Number.isFinite(encoreSpawnGatewayBackoffMsRaw) && encoreSpawnGatewayBackoffMsRaw >= 0
+    ? encoreSpawnGatewayBackoffMsRaw
+    : undefined;
 // Bounded timeout (issue #273) for the failed-transcode reconciliation sweep: a
 // transcode still non-terminal after this long whose Encore record has been
 // garbage-collected (getJobStatus -> 404/undefined) is declared failed rather
@@ -1348,10 +1452,25 @@ async function stackRedisForAmbientStack(): Promise<IORedis | undefined> {
   return (await scalerRegistry.resolveStackRedis(stackName)).redis;
 }
 
-// Bucket names are stack-invariant (created at provision time, see provision.ts)
-// so a static default is correct for every workspace.
-const sourceBucket = process.env['MINIO_SOURCE_BUCKET'] ?? 'openvideocore-source';
-const outputBucket = process.env['MINIO_PACKAGED_BUCKET'] ?? 'openvideocore-packaged';
+// PROCESS-WIDE FALLBACK bucket names, for the env-override (single global
+// object store) path and for a request that resolves to no stack.
+//
+// NOT the per-stack truth. Since issue #1301 a stack may be bound to an
+// operator-named bucket (`sourceStorage.bucket` / `packagedStorage.bucket` with
+// `HONOUR_CUSTOM_BUCKETS` on), recorded as `StackConfig.sourceBucket` /
+// `StackConfig.packagedBucket`. Every per-stack consumer resolves THOSE:
+// `WorkspaceConnections.{sourceBucket,packagedBucket}` come from the stored
+// config (services/workspace-stack.ts), and the on-demand packager reads
+// `stackCfg.packagedBucket` below. These two constants are only the last
+// fallback when no stack config supplies one, which is why they stay
+// env-overridable (12-factor, ADR-002) rather than hard-coded.
+//
+// The defaults are the shared ones from services/custom-buckets.ts so this
+// fallback and the bucket names the provision route creates cannot drift.
+const sourceBucket =
+  process.env['MINIO_SOURCE_BUCKET'] ?? DEFAULT_SOURCE_BUCKET;
+const outputBucket =
+  process.env['MINIO_PACKAGED_BUCKET'] ?? DEFAULT_PACKAGED_BUCKET;
 
 // #1226: object storage for the transcode OUTPUT bucket of the stack the caller
 // is currently running inside. Both transcode-completion paths (the callback
@@ -1581,9 +1700,19 @@ function activateScaler(redisUrl: string): void {
     // Readiness budget for a freshly created instance (issue #1071): sized for
     // OSC provisioning a new worker node, not just a pod start.
     spawnReadyTimeoutMs: encoreSpawnReadyTimeoutMs,
+    // Gateway-timeout handling for a create that 504'd (issue #1286): adopt the
+    // instance the platform is still building instead of asking for a new name
+    // next tick, and hold the next create off while the platform is slow.
+    spawnAdoptProbeTimeoutMs: encoreSpawnAdoptProbeTimeoutMs,
+    spawnGatewayBackoffMs: encoreSpawnGatewayBackoffMs,
     // Point each spawned Encore instance at our own public profile index so it
     // loads the operator-managed profiles from CouchDB (issue #84).
     profilesUrl: encoreScalerProfilesUrl,
+    // Size each spawned instance's OUTPUT upload (issue #1221): an operator-set
+    // tunable for the transcoder's multipart part size. Unset sends the service's
+    // own default (no behaviour change). Whether it affects the large-output
+    // upload failure is not established; see upload-part-size.ts.
+    uploadPartSizeBytes: encoreUploadPartSizeBytes,
     // …and point it at THAT STACK's profile index (issue #1164), resolved from
     // the stack itself on EVERY boot (issue #1271). The scaler's loop key is the
     // EFFECTIVE stack identity the transcode request resolved to (issue #615),

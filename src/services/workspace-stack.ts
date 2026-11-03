@@ -76,7 +76,25 @@ import { logObjectStoreClient } from './object-store-stack-identity.js';
 // the OPTIONAL step skips gracefully — identical to the previous env-var path.
 export type OptionalStepBuilders = {
   subtitleGenerator?: (instanceName: string) => SubtitleGenerator;
-  sceneDetector?: (instanceName: string) => SceneDetector;
+  // Scene detection additionally needs the stack's OWN object-store coordinates
+  // (issue #1192 / ADR-027 D1): the detector runs an ephemeral eyevinn-ffmpeg-s3
+  // job whose cut list is written back into this stack's bucket with the native
+  // S3 writer and then read with the stack's own credentials, exactly like the
+  // clip and re-wrap runners. Those values are per-stack and only known here, so
+  // they are passed to the builder rather than captured from boot-time env.
+  sceneDetector?: (instanceName: string, s3: SceneDetectObjectStore) => SceneDetector;
+};
+
+// Per-stack object-store context handed to the scene-detector builder.
+export type SceneDetectObjectStore = {
+  endpoint: string;
+  accessKey: string;
+  secretKey: string;
+  bucket: string;
+  // Read the finished cut-list object back; resolves undefined when absent.
+  readObject: (objectKey: string) => Promise<string | undefined>;
+  // Best-effort delete of the cut-list object once it has been read.
+  removeObject: (objectKey: string) => Promise<void>;
 };
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
@@ -340,9 +358,34 @@ function buildConnectionsFromStack(
     config.autoSubtitlesInstanceName && optionalSteps.subtitleGenerator
       ? optionalSteps.subtitleGenerator(config.autoSubtitlesInstanceName)
       : undefined;
+  // Scene detection (issue #1192 / ADR-027): the detector reads its cut list
+  // back out of this stack's source bucket with the stack's own credentials —
+  // the same pair the job body carries for the native S3 writer — so the
+  // object-store context is assembled here, where both are resolved.
   const sceneDetector =
     config.sceneDetectInstanceName && optionalSteps.sceneDetector
-      ? optionalSteps.sceneDetector(config.sceneDetectInstanceName)
+      ? optionalSteps.sceneDetector(config.sceneDetectInstanceName, {
+          endpoint: config.minioEndpoint,
+          accessKey: objectStoreCredential.accessKeyId,
+          secretKey: objectStoreCredential.secretAccessKey,
+          bucket: config.sourceBucket,
+          readObject: async (objectKey: string): Promise<string | undefined> => {
+            const storage = storageFor();
+            // An absent object is a FAILURE for the caller, not an empty result
+            // (ADR-027 D3) — it reports it as such; stat first so "missing" is
+            // distinguishable from "unreadable".
+            if (!(await storage.statObject(objectKey))) return undefined;
+            const stream = await storage.getObject(objectKey);
+            const chunks: Buffer[] = [];
+            for await (const chunk of stream) {
+              chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
+            }
+            return Buffer.concat(chunks).toString('utf8');
+          },
+          removeObject: async (objectKey: string): Promise<void> => {
+            await storageFor().removeObject(objectKey);
+          }
+        })
       : undefined;
 
   return {
@@ -975,6 +1018,24 @@ export class WorkspaceStackResolver {
   // invisible to the resolver's "first listed stack" path. The subsequent
   // per-name load goes through loadStackConfigWithMigration, which is what
   // performs the rewrite.
+  //
+  // Order (issue #1165): the returned array is in creation order — oldest
+  // first, newest appended last — because that is ParamStore.listStackNames'
+  // documented contract (param-store.ts, `listStackNames` on the ParamStore
+  // interface) and the HTTP client imposes it with compareStackCreationOrder
+  // instead of passing the config service's unspecified `items` order through.
+  // Every default-stack resolution in this class takes element [0], so that
+  // ordering is the default-stack rule: the default is the first-created stack
+  // and provisioning another stack cannot change it. When an operator has set
+  // DEFAULT_STACK_NAME the client hoists that stack to element [0] instead, and
+  // the same "element [0] is the default" rule then honours the pin.
+  // Do not re-sort, reverse, or de-duplicate the result here.
+  //
+  // One caveat the contract states explicitly: stacks provisioned before
+  // creation times were recorded carry no instant, so several such stacks are
+  // ordered by name and their relative order is not the order they were created
+  // in. DEFAULT_STACK_NAME is the remedy for a deployment that needs a specific
+  // one of them to remain the default.
   private async listStackNamesWithMigration(ps: ParamStore): Promise<string[]> {
     const direct = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
     if (direct.length > 0) return direct;
@@ -1070,6 +1131,11 @@ export class WorkspaceStackResolver {
         // resolver uses the FIRST listed stack as the default. If the list is
         // empty here but the provision route logged a successful write, the
         // write key and the list prefix disagree — a read-side namespace/key bug.
+        //
+        // "First listed" is now "first CREATED" (issue #1165): the listing is
+        // creation-ordered, so this default is STABLE across later provisions.
+        // The `listed` field below is therefore also the ordering evidence — if
+        // the default ever appears to move, compare consecutive log lines.
         const names = await this.listStackNamesWithMigration(ps);
         this.log?.info?.(
           { source: 'default', namespace, listed: names },

@@ -72,11 +72,24 @@ export type DroppedJob = {
 //                          spawn-failure.ts redactSpawnFailureMessage) — it is
 //                          served over HTTP, and OSC error text can echo the
 //                          credentials/URLs/token the spawn request carried.
+//   - httpCode:            the HTTP status the underlying OSC call failed with,
+//                          when it had one (@osaas/client-core reports a non-ok
+//                          response as a FetchError carrying `httpCode`; a
+//                          transport-level failure carries none, so this is
+//                          OPTIONAL — see oscHttpCode in
+//                          src/encore-scaler/osc-error.ts). #1286 asked for it
+//                          both on the wire (the redacted message strips HTML, so
+//                          "504" is no longer reliably readable from it) and as
+//                          pool state: the scale-up gate backs the NEXT spawn off
+//                          when the last one ended in a gateway timeout, and that
+//                          decision has to be made structurally rather than by
+//                          re-parsing the message.
 export type SpawnFailureRecord = {
   at: number;
   attempts: number;
   consecutiveFailures: number;
   message: string;
+  httpCode?: number;
 };
 
 export type EncoreScalerConfig = {
@@ -152,6 +165,24 @@ export type EncoreScalerConfig = {
   // would keep polling forever after we stopped waiting. Unset uses
   // DEFAULT_SPAWN_READY_POLL_INTERVAL_MS (1s, the SDK's own cadence).
   spawnReadyPollIntervalMs?: number;
+  // #1286: bound (ms) on the ADOPT PROBE that runs after every create attempt
+  // has ended in a gateway timeout. The create behind a 504 usually completes on
+  // the platform side, so the spawn keeps asking for the SAME name for a while
+  // before giving up — otherwise the next tick invents a new name and the
+  // instance that lands later is never adopted (it becomes the extra instance
+  // the orphan reaper has to remove). Unset uses
+  // DEFAULT_SPAWN_ADOPT_PROBE_TIMEOUT_MS.
+  spawnAdoptProbeTimeoutMs?: number;
+  // #1286: how often (ms) that probe re-asks. Unset uses
+  // DEFAULT_SPAWN_ADOPT_PROBE_INTERVAL_MS.
+  spawnAdoptProbeIntervalMs?: number;
+  // #1286: how long (ms) after a spawn that ended in a gateway timeout the
+  // scale-up gate refuses to start ANOTHER create for this workspace. A 504 is
+  // the platform telling us it is slow; starting a second create against it on
+  // the very next tick adds load to the thing that is already struggling and
+  // risks a second instance nobody asked for. Unset uses
+  // DEFAULT_SPAWN_GATEWAY_BACKOFF_MS; set to 0 to disable.
+  spawnGatewayBackoffMs?: number;
   // #778: how long (ms) an instance must have been continuously observed as
   // orphaned before the reaper destroys it. Guards a spawn in progress, which
   // holds a live OSC instance with no pool record for as long as
@@ -179,6 +210,16 @@ export type EncoreScalerConfig = {
   // operator-managed profiles in CouchDB (issue #84). When unset the Encore
   // instance uses its service default.
   profilesUrl?: string;
+  // Multipart part size, in BYTES, every spawned instance uploads its outputs
+  // with (issue #1221). Set on the instance-create body as the service's
+  // `s3MultipartMinPartsize` option. An operator tunable, not a fix: whether it
+  // affects the large-output upload failure seen in #1221 is not established, and
+  // lowering it also lowers the multipart threshold (see
+  // src/encore-scaler/upload-part-size.ts, which also holds the bounds and the
+  // contract sources). Unset => the option is omitted and the instance keeps the
+  // service default, which is the behaviour when ENCORE_S3_MULTIPART_PART_SIZE_BYTES
+  // is not set.
+  uploadPartSizeBytes?: number;
   // Invoked after a queued job is successfully dispatched to an Encore instance
   // (after the Redis mapping/status writes). The scaler has no job repository of
   // its own, so main.ts wires this up to advance the corresponding Job from
@@ -319,6 +360,28 @@ export type EncoreInstanceRecord = {
   // ever killing an instance with a genuine in-flight transcode when the tracked
   // activeJobs count has diverged from the instance's real IN_PROGRESS state.
   draining?: boolean;
+  // #1219: epoch ms at which `draining` was set by an OPERATOR CANCEL
+  // (cancelled-job-reclaim.ts recordOperatorCancel) rather than by scale-down.
+  //
+  // The provenance matters because `draining` carries two different meanings to
+  // scale-down. A drain written by scale-down itself implies the instance was
+  // ALREADY a teardown candidate (idle-and-aged, or holding abandoned work) and
+  // is only being held until its real work clears — so destroying it the moment
+  // that work clears is correct. A drain written by a cancel implies nothing of
+  // the kind: the instance may be warm, healthy and nowhere near its idle
+  // timeout, and the cancel may well be honoured in seconds. Destroying it then
+  // would turn every routine cancel into instance churn (the exact failure
+  // cancelled-job-reclaim.ts:50-55 promises not to cause).
+  //
+  // So scale-down treats this stamp as "keep out of routing, but do NOT count
+  // as evidence for teardown": an instance whose ONLY candidacy reason is a
+  // cancel-set drain is destroyed only on positive evidence — a job that has
+  // demonstrably ignored its cancel, or the ordinary idle-and-aged condition.
+  // Cleared again (with `draining`) once Encore confirms the cancel was
+  // honoured, which returns the instance to service. Only ever set on a record
+  // that was NOT already draining, so it can never overwrite or clear an
+  // operator- or scale-down-initiated drain.
+  cancelDrainingSince?: number;
   // #1071: epoch ms at which a spawn gave up waiting for this instance to report
   // `running` and left it ALIVE rather than destroying it. The instance exists on
   // OSC and is probably still coming up (node provisioning), so it is tracked
@@ -459,6 +522,26 @@ export const keys = {
   // chance to GET that instance's /encoreJobs/{uuid} endpoint. See
   // src/encore-scaler/packaging-pin.ts.
   pendingPackaging: (instanceId: string) => `encore:pending-packaging:${instanceId}`,
+  // #1219: epoch ms (decimal string) at which an OPERATOR cancelled this job,
+  // written by the scaler client's cancel path for a job that had already been
+  // dispatched. Keyed by our externalId (encoreJobId, globally unique like
+  // jobUuid) with the same 24h TTL as the other dispatch-time keys, so it stays
+  // resolvable for exactly as long as the job URL it refers to.
+  //
+  // Why the timestamp is recorded at all: a delivered cancel does not guarantee
+  // the job STOPS. A frozen transcode answers the cancel endpoint 200 and keeps
+  // running (#1219), so the job stays QUEUED/IN_PROGRESS in Encore's own active
+  // set forever. Scale-down reads "real in-flight work" from that set and so
+  // drains — never tears down — the instance holding it, which is why the only
+  // way to stop such a job used to be destroying the Encore instance by hand.
+  //
+  // This key is what lets the scaler tell the two apart: an active Encore job
+  // the operator explicitly cancelled MORE than the grace window ago is work
+  // nobody wants, so it stops protecting its instance from teardown. The
+  // timestamp (not a bare flag) is what provides the grace window — a cancel
+  // Encore is about to honour normally must not trigger a teardown.
+  // See src/encore-scaler/cancelled-job-reclaim.ts.
+  jobCancelRequested: (encoreJobId: string) => `encore:job-cancel-requested:${encoreJobId}`,
   // #778: hash of orphan-candidate instanceId -> epoch ms (string) of the FIRST
   // sweep that saw a scaler-owned Encore instance running on OSC with no pool
   // record. The orphan reaper only destroys an instance that is still orphaned

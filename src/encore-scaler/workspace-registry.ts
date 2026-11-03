@@ -66,6 +66,15 @@ export type WorkspaceEncoreScalerConfig = {
   // worker node, not just a pod starting on an existing one. Undefined uses
   // DEFAULT_SPAWN_READY_TIMEOUT_MS (instance-pool, 15 min).
   spawnReadyTimeoutMs?: number;
+  // #1286: how a create that timed out AT THE GATEWAY is handled, forwarded to
+  // every per-workspace loop. The first bounds how long the spawn keeps asking
+  // for the same instance name after every attempt 504'd (the create behind a
+  // 504 usually completes, so the instance that lands is the one we want); the
+  // second holds the NEXT scale-up off so a second create is not started while
+  // the platform is slow. Undefined uses DEFAULT_SPAWN_ADOPT_PROBE_TIMEOUT_MS /
+  // DEFAULT_SPAWN_GATEWAY_BACKOFF_MS.
+  spawnAdoptProbeTimeoutMs?: number;
+  spawnGatewayBackoffMs?: number;
   // Redis connection string forwarded to each spawned callback listener.
   redisUrl: string;
   // Optional per-stack Valkey resolver (issue #615). When supplied, called once
@@ -108,6 +117,12 @@ export type WorkspaceEncoreScalerConfig = {
   // Forwarded to every spawned Encore instance as its `profilesUrl` so it loads
   // operator-managed profiles from this API's public index (issue #84).
   profilesUrl?: string;
+  // Forwarded to every spawned Encore instance as the multipart part size (in
+  // bytes) it uploads its outputs with (issue #1221). Process-global: it is a
+  // property of the upload client inside the transcoder, not of a stack, so
+  // unlike profilesUrl/s3Config it has no per-stack resolver. Unset => the
+  // option is omitted and instances keep the service default.
+  uploadPartSizeBytes?: number;
   // Optional per-stack rewrite of `profilesUrl` (issue #1164). When supplied,
   // called with the loop key (the EFFECTIVE stack identity the transcode request
   // resolved to) and preferred over the process-global `profilesUrl` above.
@@ -435,12 +450,20 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       // wait for it rather than timing out and tearing the half-born instance
       // down.
       spawnReadyTimeoutMs: this.config.spawnReadyTimeoutMs,
+      // #1286: adopt the instance a gateway-timed-out create is still building
+      // instead of asking for a new name on the next tick, and hold that next
+      // create off while the platform is slow.
+      spawnAdoptProbeTimeoutMs: this.config.spawnAdoptProbeTimeoutMs,
+      spawnGatewayBackoffMs: this.config.spawnGatewayBackoffMs,
       oscContext: this.config.oscContext,
       redis,
       redisUrl,
       getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
       s3Config,
       profilesUrl,
+      // #1221: operator-set multipart part size for the output upload on every
+      // instance this loop spawns. Unset => omitted (service default).
+      uploadPartSizeBytes: this.config.uploadPartSizeBytes,
       onDispatched: this.config.onDispatched,
       onEncodeDispatched: this.config.onEncodeDispatched,
       reconcileFailedTranscodes: this.config.reconcileFailedTranscodes,
@@ -592,6 +615,9 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
             // getOrCreate, so a re-discovered pool and a freshly created one
             // never disagree about which stack's profiles its instances load.
             profilesUrl: await this.resolveLoopProfilesUrl(workspaceId),
+            // #1221: same upload part size as getOrCreate's loop, so a
+            // re-discovered pool spawns replacements configured identically.
+            uploadPartSizeBytes: this.config.uploadPartSizeBytes,
             onDispatched: this.config.onDispatched
           };
           await reconcilePoolFromOsc(scalerConfig).catch(() => {

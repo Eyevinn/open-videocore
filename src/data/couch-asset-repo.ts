@@ -408,6 +408,10 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.manifestUrls !== undefined) {
       next.manifestUrls = patch.manifestUrls;
       next.packagingError = undefined;
+      // ...and the packaged-output-stale marker (issue #1290) — same invariant
+      // as the in-memory repo (data/asset-repo.ts): a manifests repoint resolves
+      // the recorded disagreement with `renditions`, whoever writes it.
+      next.packagedOutputStale = undefined;
     }
     if (patch.packagingError !== undefined) {
       next.packagingError = patch.packagingError;
@@ -415,11 +419,22 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.packagedOutput !== undefined) {
       next.packagedOutput = patch.packagedOutput;
     }
+    // Packaged-output staleness (issue #1290). `true` marks, `false` clears —
+    // stored as absence, same sentinel handling as the in-memory repo.
+    if (patch.packagedOutputStale !== undefined) {
+      next.packagedOutputStale = patch.packagedOutputStale ? true : undefined;
+    }
     if (patch.renditions !== undefined) {
       next.renditions = patch.renditions;
     }
     if (patch.thumbnails !== undefined) {
       next.thumbnails = patch.thumbnails;
+    }
+    // Multi-size variants (issue #1303). Empty list -> absence, so the document
+    // of an asset that never ran multi-size is byte-identical to one whose
+    // scaled jobs all failed. Mirrors InMemoryAssetRepository.update.
+    if (patch.thumbnailSizes !== undefined) {
+      next.thumbnailSizes = patch.thumbnailSizes.length > 0 ? patch.thumbnailSizes : undefined;
     }
     if (patch.metadata !== undefined) {
       next.metadata = applyMetadata(existing.metadata, patch.metadata, patch.replaceMetadata ?? false);

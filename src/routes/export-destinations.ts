@@ -42,6 +42,16 @@
 // REACHABILITY (ADR-018 D3): registration-time reachability validation is
 // OPTIONAL and NOT required here; it is inherited from the injected registry's
 // own `validate` config (issue #550) unchanged — this router adds no probe.
+//
+// AUTH (issue #1282): because this surface is a VIEW over the SAME storage
+// records as /storage/backends, it must apply the SAME authentication rule. It
+// previously had NO gate, so an anonymous caller could list and register
+// destinations (and read back the non-secret coordinates of every output-role
+// backend) while the identical records behind GET /api/v1/storage/backends
+// correctly answered 401. The router now attaches the shared 401 presence gate
+// `authGate` (src/auth/middleware.ts) as its FIRST preHandler, exactly as
+// storageRouter (routes/storage.ts) and assetsRouter (routes/assets.ts) do.
+// Authorisation (the 403 role matrix) is deliberately unchanged here.
 
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
@@ -57,6 +67,11 @@ import {
 } from '../services/storage-backend-registry.js';
 import { InvalidPathTemplateError } from '../services/destination-path-template.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
+import { authGate } from '../auth/middleware.js';
+// Issue #1280: the single comparison that decides whether this stack can write
+// job output to a destination's own endpoint. Shared with the submit-time
+// refusal in routes/assets.ts so the warning and the refusal cannot disagree.
+import { jobOutputEndpointWarning } from '../pipeline/asset-delivery.js';
 
 export type ExportDestinationsRouterOptions = {
   // The SAME registry the /storage/backends surface uses (ADR-018 D1: reuse the
@@ -64,6 +79,14 @@ export type ExportDestinationsRouterOptions = {
   // wired, e.g. no param store / OSC secrets) every route responds 501, mirroring
   // the /storage/backends degradation (storage.ts:224-237).
   storageBackendRegistry?: StorageBackendRegistry;
+  // The object-storage endpoint this deployment's jobs relocate output on, used
+  // to warn at registration time that a destination's OWN endpoint will not be
+  // used for job output (issue #1280). Production reads it from the resolved
+  // stack per request (`request.connections.s3Config.endpoint`,
+  // src/services/workspace-stack.ts:152), which this option overrides;
+  // injectable here for tests. Undefined with no resolved stack storage — then
+  // there is no endpoint to compare against and no warning is emitted.
+  objectStoreEndpoint?: string;
 };
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
@@ -126,6 +149,15 @@ const destinationListSchema = z.object({
   destinations: z.array(destinationViewSchema)
 });
 
+// The register (201) response: the redacted view PLUS any non-fatal warnings
+// about the registration that was just accepted (issue #1280). Additive and
+// optional — a registration with nothing to warn about serialises exactly as
+// before, and the list/get views are unchanged. The warnings carry endpoint and
+// bucket coordinates only, never credential material.
+const registeredDestinationSchema = destinationViewSchema.extend({
+  warnings: z.array(z.string()).optional()
+});
+
 // Registration-time 400 body. Covers BOTH the issue #574 path-template rejection
 // (`error: 'invalid_path_template'`, optional offending `token`) AND the generic
 // request-validation envelope fastify-type-provider-zod emits for a malformed
@@ -186,6 +218,16 @@ export const exportDestinationsRouter: FastifyPluginAsync<
   // address the SAME records for the SAME tenant (ADR-017 D2).
   const workspaceId = STACK_CONFIG_NAMESPACE;
 
+  // 401 presence gate (issue #1282), registered FIRST so an anonymous request is
+  // rejected before any handler reads or writes a storage record. This is the
+  // SAME hook, resolved from the SAME module, that the /storage/backends view of
+  // these records attaches (routes/storage.ts: `app.addHook('preHandler',
+  // authGate(app))`). Plugin-scoped and lazy: authGate resolves
+  // `app.authenticate` at request time and no-ops when registerAuth was never
+  // called, so unit tests that build this router in isolation are unaffected
+  // while the real app (src/main.ts registerAuth) enforces the gate.
+  app.addHook('preHandler', authGate(app));
+
   app.setErrorHandler((err, _request, reply) => {
     // The OSC-managed default is not deletable (ADR-017 D3) -> 409. This surface
     // keeps its established 409 contract for the default: issue #679 folded the
@@ -239,7 +281,11 @@ export const exportDestinationsRouter: FastifyPluginAsync<
   };
 
   // Register a named export destination (an output-role external backend).
-  //   201 — redacted destination view (secret never echoed)
+  //   201 — redacted destination view (secret never echoed), plus `warnings`
+  //         when the registration is accepted but will not behave as an
+  //         operator might expect: a destination registered at its OWN
+  //         `endpointUrl` is NOT used for job output (issue #1280), and a job
+  //         referencing it is refused at submit.
   //   422 — registration-time reachability/permission validation failed (#550)
   //   501 — registry / OSC secret storage not configured
   app.post(
@@ -248,7 +294,7 @@ export const exportDestinationsRouter: FastifyPluginAsync<
       schema: {
         body: registerDestinationSchema,
         response: {
-          201: destinationViewSchema,
+          201: registeredDestinationSchema,
           400: pathTemplateErrorSchema,
           422: validationErrorSchema,
           501: errorSchema
@@ -267,7 +313,16 @@ export const exportDestinationsRouter: FastifyPluginAsync<
         });
       }
       const view = await registry.register(workspaceId, request.body);
-      return reply.code(201).send(view);
+      // Issue #1280: the destination is registered, but if it declares its own
+      // endpoint, job output will not go there — say so on the response rather
+      // than leaving the operator to discover it from a job that never arrives.
+      const warning = jobOutputEndpointWarning(
+        view.endpointUrl,
+        opts.objectStoreEndpoint ?? request.connections?.s3Config?.endpoint
+      );
+      return reply
+        .code(201)
+        .send({ ...view, ...(warning ? { warnings: [warning] } : {}) });
     }
   );
 

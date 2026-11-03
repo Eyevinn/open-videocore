@@ -30,6 +30,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import Fastify from 'fastify';
+import { z } from 'zod';
 import { serializerCompiler, validatorCompiler } from 'fastify-type-provider-zod';
 
 import { internalRouter } from './internal.js';
@@ -43,6 +44,12 @@ import {
 } from '../pipeline/encode-completion-event.js';
 
 type Delivered = { event: string; payload: unknown };
+
+// Mirrors the read-side `codec` field contract on a rendition:
+// `codec: z.string().optional()` (renditionSchema, src/routes/assets.ts:1031),
+// compiled into the asset response serialiser at src/main.ts:256. Used to assert
+// a stored rendition's codec never holds a value that read path would reject.
+const readCodecField = z.string().optional();
 
 // Build the app + a real dispatcher whose fetch stub records the delivered
 // { event, payload } envelopes so we can assert on the encode.completed payload.
@@ -232,5 +239,139 @@ describe('encode-completion event emission on transcode completion (issue #693)'
     expect(parsed.width).toBeUndefined();
     // Duration still derives from the attempt log.
     expect(parsed.encodeDurationMs).toBe(12_000);
+  });
+
+  // issue #1293: a callback whose output DOES carry a per-stream codec. The
+  // video-stream schema (videoStreamSchema, src/routes/internal.ts) now models
+  // `codec` and normaliseRenditions reads it off the first video stream, so the
+  // value reaches both the stored Rendition (Rendition.codec,
+  // src/data/asset-repo.ts:459, written by transcode.ts:446) and the
+  // encode-completion event's optional `codec`
+  // (encodeCompletionEventSchema, src/pipeline/encode-completion-event.ts:171).
+  // Upstream the field is NULLABLE on a VideoStream (`val codec: String?` —
+  // svt/media-analyzer@release-2.0.11, .../file/VideoStream.kt:8, the version
+  // Encore pins per encore-common/build.gradle.kts:8), so our schema models it
+  // nullish: a callback reporting no videoStreams (the older fixture above, which
+  // still yields undefined) or an explicit `codec: null` (the case below) is
+  // accepted rather than rejected.
+  it('#1293: carries the first video stream codec onto the stored rendition and the event', async () => {
+    const { app, jobs, assets, delivered } = await buildApp([ENCODE_COMPLETION_EVENT_TYPE]);
+    const { assetId, externalId } = await seedRunningTranscode(jobs, assets, {
+      startedAt: '2026-09-14T10:00:00.000Z',
+      endedAt: '2026-09-14T10:00:20.000Z'
+    });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/internal/encore-callback',
+      payload: {
+        externalId,
+        status: 'SUCCESSFUL',
+        output: [
+          {
+            file: 'transcode/asset/job/1080.mp4',
+            type: 'VideoFile',
+            // A media-analyzer VideoStream: codec alongside the dimensions, plus
+            // sibling fields we deliberately do not model (passthrough).
+            videoStreams: [
+              { width: 1920, height: 1080, codec: 'h264', profile: 'high', bitDepth: 8 }
+            ],
+            overallBitrate: 5_000_000
+          },
+          {
+            file: 'transcode/asset/job/720.mp4',
+            type: 'VideoFile',
+            videoStreams: [{ width: 1280, height: 720, codec: 'hevc' }],
+            overallBitrate: 3_000_000
+          }
+        ]
+      }
+    });
+    expect(res.statusCode).toBe(200);
+    await new Promise((r) => setImmediate(r));
+
+    // Persisted on the asset: one rendition per output, each with ITS OWN codec.
+    const stored = (await assets.get(assetId))?.renditions ?? [];
+    expect(stored.map((r) => r.codec)).toEqual(['h264', 'hevc']);
+    expect(stored[0].width).toBe(1920);
+
+    // And surfaced on the encode-completion event (first rendition).
+    const encodeEvents = delivered.filter((d) => d.event === ENCODE_COMPLETION_EVENT_TYPE);
+    expect(encodeEvents).toHaveLength(1);
+    const parsed = encodeCompletionEventSchema.parse(encodeEvents[0].payload);
+    expect(parsed.codec).toBe('h264');
+    expect(parsed.renditionCount).toBe(2);
+  });
+
+  // issue #1293 (review follow-up): the pinned upstream contract declares
+  // `val codec: String?` (svt/media-analyzer@release-2.0.11,
+  // src/main/kotlin/se/svt/oss/mediaanalyzer/file/VideoStream.kt:8; pinned at
+  // svt/encore encore-common/build.gradle.kts:8 -> media-analyzer 2.0.11), and
+  // Encore sets no Jackson default-property-inclusion, so a stream with no
+  // detected codec arrives as an explicit `"codec": null`.
+  //
+  // Two things must hold for that payload:
+  //   1. The callback is still ACCEPTED (200) — a nullish schema, not
+  //      `z.string().optional()`, which rejects null and would 400 a SUCCESSFUL
+  //      completion, leaving the job unsettled.
+  //   2. The null is collapsed to ABSENT on the stored rendition, because the
+  //      read schema is `codec: z.string().optional()`
+  //      (renditionSchema, src/routes/assets.ts:1031, serialiser wired at
+  //      src/main.ts:256) and would fail to serialise a literal null.
+  it('#1293: accepts codec:null and stores the rendition with codec absent, not null', async () => {
+    const { app, jobs, assets, delivered } = await buildApp([ENCODE_COMPLETION_EVENT_TYPE]);
+    const { assetId, externalId } = await seedRunningTranscode(jobs, assets, {
+      startedAt: '2026-09-14T10:00:00.000Z',
+      endedAt: '2026-09-14T10:00:20.000Z'
+    });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/internal/encore-callback',
+      payload: {
+        externalId,
+        status: 'SUCCESSFUL',
+        output: [
+          {
+            file: 'transcode/asset/job/1080.mp4',
+            type: 'VideoFile',
+            // No codec detected upstream -> serialised as null, not omitted.
+            videoStreams: [{ width: 1920, height: 1080, codec: null }],
+            overallBitrate: 5_000_000
+          },
+          {
+            file: 'transcode/asset/job/720.mp4',
+            type: 'VideoFile',
+            videoStreams: [{ width: 1280, height: 720, codec: 'hevc' }],
+            overallBitrate: 3_000_000
+          }
+        ]
+      }
+    });
+    // (1) Body validation must not reject the completion.
+    expect(res.statusCode).toBe(200);
+    await new Promise((r) => setImmediate(r));
+
+    const stored = (await assets.get(assetId))?.renditions ?? [];
+    expect(stored).toHaveLength(2);
+    // (2) Absent, NOT null — a literal null breaks read-side serialisation.
+    expect(stored[0].codec).toBeUndefined();
+    expect(stored[0].codec).not.toBeNull();
+    // Dimensions still land, and a real codec on a sibling output still carries.
+    expect(stored[0].width).toBe(1920);
+    expect(stored[1].codec).toBe('hevc');
+
+    // Each stored rendition's codec must satisfy the read-side field contract
+    // `codec: z.string().optional()` (renditionSchema, src/routes/assets.ts:1031,
+    // serialised via src/main.ts:256). A literal null throws here.
+    for (const r of stored) {
+      expect(() => readCodecField.parse(r.codec)).not.toThrow();
+    }
+
+    // The event's optional codec is simply absent for the first rendition.
+    const encodeEvents = delivered.filter((d) => d.event === ENCODE_COMPLETION_EVENT_TYPE);
+    expect(encodeEvents).toHaveLength(1);
+    const parsed = encodeCompletionEventSchema.parse(encodeEvents[0].payload);
+    expect(parsed.codec).toBeUndefined();
   });
 });

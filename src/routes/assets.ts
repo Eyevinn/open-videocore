@@ -198,6 +198,7 @@ import { parseDestination } from '../pipeline/output-relocation.js';
 import {
   deliverAssetObject,
   destinationEndpointRefusal,
+  jobDestinationEndpointRefusal,
   type DeliveryFailureReason,
   type DeliveryObjectClient
 } from '../pipeline/asset-delivery.js';
@@ -865,8 +866,71 @@ const thumbnailUrlSchema = z.object({
   objectKey: z.string(),
   url: z.string(),
   expiresAt: z.string(),
-  expiresInSeconds: z.number()
+  expiresInSeconds: z.number(),
+  // Which rendition `objectKey`/`url` actually point at (issue #1304). Equal to
+  // the requested `?size` when that variant was recorded for this frame, and
+  // `full` when it was not — so a caller can tell a served small from a
+  // fallback without a second request. Always present; `full` for every
+  // request that does not pass `?size` and for every pre-#1303 asset.
+  size: z.enum(['small', 'medium', 'full'])
 });
+
+// Thumbnail size selector (issue #1304). The thumbnail is still addressed by
+// its ARRAY INDEX; `size` only chooses which rendition of that index's frame is
+// served, so `thumbnails: string[]`, its ordering and the meaning of an index
+// are all unchanged and a client that never sends `size` sees exactly the
+// pre-#1304 behaviour.
+export const THUMBNAIL_SIZE_PARAMS = ['small', 'medium', 'full'] as const;
+export type ThumbnailSizeParam = (typeof THUMBNAIL_SIZE_PARAMS)[number];
+
+const thumbnailSizeQuerySchema = z.object({
+  size: z
+    .enum(THUMBNAIL_SIZE_PARAMS)
+    .default('full')
+    .describe(
+      'Which rendition of the thumbnail at this index to serve: `small` ' +
+        '(360px wide), `medium` (1280px wide), or `full` — the unscaled ' +
+        'extracted frame, and the default. Scaled renditions exist only for ' +
+        'assets whose extraction ran with THUMBNAIL_MULTI_SIZE=true (issue ' +
+        '#1303). When the requested size was never recorded for this frame ' +
+        '(older assets, or a partial extraction) the FULL-size object is ' +
+        'served instead and the response is still 200 — a missing size is ' +
+        'never a 404. An unrecognised value is rejected with 400.'
+    )
+});
+
+// Resolve (full-size key, requested size) to the object key to serve.
+//
+// CONTRACT verified: `ThumbnailSize` — src/data/asset-repo.ts:457 — is
+// `{ fullObjectKey, variant: 'small' | 'medium', width, objectKey }`, carried on
+// `Asset.thumbnailSizes` (src/data/asset-repo.ts:665) and persisted by
+// `ThumbnailSizeSchema` (src/data/asset-document.ts:101).
+//
+// The lookup goes through those RECORDED entries rather than rewriting the full
+// key into `thumb_<t>s_360.jpg` / `_1280.jpg`, even though that is the naming
+// the extraction pipeline uses (`scaledThumbnailObjectKey`,
+// src/pipeline/thumbnail.ts:148, widths from `THUMBNAIL_SIZE_VARIANTS` —
+// medium 1280, small 360). Only variants whose object was CONFIRMED in storage
+// are ever recorded, and the list is replaced wholesale by every extraction
+// including a flag-off one (asset-repo.ts:1872, pipeline/thumbnail.ts:278), so
+// a recorded entry always names a live object of the current `thumbnails`
+// generation. A key reconstructed by string surgery would, for an asset
+// extracted before #1303 or a frame whose scaled job failed, name an object
+// that does not exist — and this route would hand the caller a signed URL that
+// 404s at the object store instead of a usable image.
+function resolveThumbnailSizeKey(
+  asset: Asset,
+  fullObjectKey: string,
+  size: ThumbnailSizeParam
+): { objectKey: string; size: ThumbnailSizeParam } {
+  if (size === 'full') return { objectKey: fullObjectKey, size: 'full' };
+  const recorded = (asset.thumbnailSizes ?? []).find(
+    (variant) => variant.fullObjectKey === fullObjectKey && variant.variant === size
+  );
+  return recorded
+    ? { objectKey: recorded.objectKey, size }
+    : { objectKey: fullObjectKey, size: 'full' };
+}
 
 // Export / re-wrap request (issue #19): the target container format and an
 // optional name for the new child asset. The supported formats are validated
@@ -1267,6 +1331,26 @@ const assetSchema = z.object({
   // packaging completes; `packagingError` carries the last packaging failure.
   manifestUrls: manifestUrlsSchema.optional(),
   packagingError: z.string().optional(),
+  // The packaged output no longer matches the asset's current renditions
+  // (issue #1290). Present and `true` ONLY after an encode succeeded on an asset
+  // that already had `manifestUrls`, until a package repoints them; absent means
+  // not stale. `manifestUrls` and GET /:id/delivery are deliberately unchanged
+  // while it is set — playback over the previous package keeps working — so this
+  // flag is the only way a caller can tell that `manifestUrls` and `renditions`
+  // describe different encodes. Contract: `Asset.packagedOutputStale`
+  // (src/data/asset-repo.ts), persisted at `structural.packagedOutputStale`
+  // (src/data/asset-document.ts).
+  packagedOutputStale: z
+    .boolean()
+    .optional()
+    .describe(
+      'True when the packaged output (`manifestUrls`, `packagedOutput`) was ' +
+        'produced from an EARLIER encode than the current `renditions` — set ' +
+        'when a re-encode completes and no new package follows it. Omitted ' +
+        '(never false) when the two agree. The manifests are left in place and ' +
+        'keep playing the previous package; re-run packaging to resolve it, ' +
+        'which clears this flag and repoints `manifestUrls`.'
+    ),
   // ABR renditions produced by transcoding (issue #8, redesigned #79). Absent
   // until a transcode job completes; each entry is an embedded variant of this
   // single asset (no child assets).
@@ -1515,6 +1599,10 @@ type AssetsRouterOptions = {
   // src/pipeline/asset-delivery.ts). Production reads it from the resolved
   // stack (`request.connections.s3Config.endpoint`,
   // src/services/workspace-stack.ts:152); injectable here for tests.
+  //
+  // Issue #1280: the SAME endpoint is the one a package/execute job's output
+  // would be relocated on, so it is also what a job-submit destination claim is
+  // compared against (`stackStorageEndpointFor` / resolveJobDestination).
   deliveryEndpoint?: string;
 };
 
@@ -1865,6 +1953,10 @@ function purgeableObjectIdentities(asset: Asset, sourceBucket: string): Set<stri
   for (const rendition of asset.renditions ?? []) add(rendition.objectKey);
   for (const track of asset.subtitleTracks ?? []) add(track.objectKey);
   for (const thumb of asset.thumbnails ?? []) add(thumb);
+  // Scaled thumbnail variants (issue #1303) are objects this purge removes too
+  // (archived-asset-purge-sweep.ts step 4), so they belong in the ownership
+  // comparison. Empty unless the asset was extracted multi-size.
+  for (const size of asset.thumbnailSizes ?? []) add(size.objectKey);
   return ids;
 }
 
@@ -2799,6 +2891,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     return true;
   }
 
+  // The object-storage endpoint THIS request's bytes live on: the resolved
+  // stack's `s3Config.endpoint` (src/services/workspace-stack.ts:152), with the
+  // injectable `deliveryEndpoint` option taking precedence exactly as the
+  // delivery route reads it. Used to refuse a job whose named output destination
+  // is registered at a different endpoint (issue #1280). Undefined when no stack
+  // storage is resolved for the request.
+  function stackStorageEndpointFor(request: {
+    connections?: { s3Config?: { endpoint: string } | undefined } | null;
+  }): string | undefined {
+    return opts.deliveryEndpoint ?? request.connections?.s3Config?.endpoint;
+  }
+
   // Resolve a package/publish job's requested output destination into the single
   // per-execution `destinationBucket` string the ADR-011 relocation path already
   // consumes. Accepts AT MOST ONE of three mutually-exclusive output-destination
@@ -2824,6 +2928,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // or backend_role). When none is supplied the job uses the provisioned default
   // (fully backwards compatible).
   //
+  // EXTERNAL ENDPOINT (issue #1280): either NAMED path may resolve to a backend
+  // registered at its own `endpointUrl`. The relocation this resolver feeds has
+  // no way to reach that endpoint — it copies with the stack's own storage client
+  // to a bucket NAME (see `jobDestinationEndpointRefusal`,
+  // src/pipeline/asset-delivery.ts) — so such a job is refused here with the SAME
+  // 422 `destination_unreachable` shape POST /:id/deliver returns, instead of
+  // being accepted and writing its output to the wrong store.
+  //
   // Returns:
   //   { ok: true, destinationBucket } — the resolved override string (or
   //     undefined when none was supplied: the job uses the provisioned default).
@@ -2839,10 +2951,35 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // `destination` carries a template. Ignored on the inline-override and
       // externalBackend paths (which are not templated).
       assetId?: string;
+      // The object-storage endpoint THIS request's stack is authenticated
+      // against (`WorkspaceConnections.s3Config.endpoint`,
+      // src/services/workspace-stack.ts:152), used to refuse a named
+      // destination/backend registered at a DIFFERENT endpoint (issue #1280).
+      // Undefined (no resolved stack storage) leaves the pre-#1280 behaviour
+      // unchanged — see `jobDestinationEndpointRefusal`.
+      stackStorageEndpoint?: string;
     },
     reply: import('fastify').FastifyReply
   ): Promise<{ ok: true; destinationBucket?: string } | { ok: false }> {
-    const { destination, externalBackend, destinationBucket, assetId } = args;
+    const { destination, externalBackend, destinationBucket, assetId, stackStorageEndpoint } =
+      args;
+    // Refuse a job whose named destination/backend declares an endpoint this
+    // API cannot write output to (issue #1280). Same 422 `destination_unreachable`
+    // envelope the delivery route sends (DELIVERY_FAILURE_RESPONSE,
+    // src/routes/assets.ts:933) so one error code covers "this destination is
+    // not writable from here" on both surfaces.
+    function refuseExternalEndpoint(
+      ref: string,
+      endpointUrl: string | undefined
+    ): boolean {
+      const refusal = jobDestinationEndpointRefusal(endpointUrl, stackStorageEndpoint);
+      if (!refusal) return false;
+      reply.code(422).send({
+        error: 'destination_unreachable',
+        message: `destination "${ref}" cannot receive this job's output: ${refusal}`
+      });
+      return true;
+    }
     // Mutual exclusion across all three output-destination expressions: at most
     // ONE may be supplied. More than one is ambiguous -> 400 (issue #573 / #549).
     // Each feature keeps its own pre-existing 400 error shape rather than a new
@@ -2913,6 +3050,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         });
         return { ok: false };
       }
+      // Issue #1280: the backend is write-capable in role terms, but if it lives
+      // at its own endpoint the relocation cannot reach it — refuse rather than
+      // resolve a destination whose output would land on our own store.
+      if (refuseExternalEndpoint(externalBackend, record.endpointUrl)) {
+        return { ok: false };
+      }
       return { ok: true, destinationBucket: backendOutputDestination(record) };
     }
 
@@ -2931,6 +3074,23 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         message: 'storage-backend registry is not configured'
       });
       return { ok: false };
+    }
+    // Issue #1280: read the destination RECORD first so its `endpointUrl` can be
+    // checked before resolution — `resolveDestinationBucket` returns only the
+    // `<bucket>/<prefix>/` string (storage-backend-registry.ts:983-998), which
+    // carries no endpoint. Resolved through the SAME `resolveForOutput` the
+    // delivery route uses for this purpose (assets.ts, POST /:id/deliver), under
+    // the SAME workspace namespace this path resolves the bucket in. An unknown
+    // reference (or the implicit default) answers undefined and falls through to
+    // resolveDestinationBucket's own, unchanged error semantics.
+    if (stackStorageEndpoint !== undefined && stackStorageEndpoint.length > 0) {
+      const record = await opts.storageBackendRegistry.resolveForOutput(
+        STACK_CONFIG_NAMESPACE,
+        destination
+      );
+      if (record && refuseExternalEndpoint(destination, record.endpointUrl)) {
+        return { ok: false };
+      }
     }
     try {
       const resolved = await opts.storageBackendRegistry.resolveDestinationBucket(
@@ -6010,6 +6170,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //         is missing from the bucket the transcode step would read. The #1058
   //         stack-routing gate runs FIRST (is this the right stack at all?), then
   //         the #1059 readiness gate (are the bytes actually there?).
+  //   422 — (pipeline mode, issue #1280) `destination_unreachable` — the named
+  //         `destination` is registered at an object-storage endpoint this stack
+  //         cannot write job output to, so the job is refused rather than
+  //         relocated to a same-named bucket on this stack's own store
   //   501 — required service not configured on this deployment
   //   502 — Encore submission failed, or (pipeline mode, issue #1059)
   //         `source_verification_failed` — the object store could not be asked
@@ -6035,6 +6199,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           400: z.object({ error: z.string(), message: z.string() }),
           404: z.object({ error: z.string() }),
           409: z.object({ error: z.string(), message: z.string() }),
+          // Issue #1280: the named destination is registered at an endpoint this
+          // stack cannot write job output to. Same envelope every other 422 on
+          // this router uses.
+          422: z.object({ error: z.string(), message: z.string() }),
           501: z.object({ error: z.string(), message: z.string() }),
           502: z.object({ error: z.string(), message: z.string() })
         }
@@ -6068,7 +6236,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           {
             destination: request.body.destination,
             destinationBucket: request.body.destinationBucket,
-            assetId: asset.id
+            assetId: asset.id,
+            // Issue #1280: refuse a destination registered at an endpoint this
+            // stack cannot write job output to, before the pipeline starts.
+            stackStorageEndpoint: stackStorageEndpointFor(request)
           },
           reply
         );
@@ -6209,7 +6380,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           destination: request.body.destination,
           externalBackend: request.body.externalBackend,
           destinationBucket: request.body.destinationBucket,
-          assetId: asset.id
+          assetId: asset.id,
+          // Issue #1280: refuse a destination/backend registered at an endpoint
+          // this stack cannot write job output to, before the execution starts.
+          stackStorageEndpoint: stackStorageEndpointFor(request)
         },
         reply
       );
@@ -6901,14 +7075,24 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // also the fallback the ops UI drops back to when a deployment cannot presign
   // (public/thumbnail-url.js, issue #801). Coverage:
   // test/thumbnail-unauthenticated-fetch.test.ts.
-  //   200 — image/jpeg stream
+  //   200 — image/jpeg stream (X-Thumbnail-Size names the rendition served)
+  //   400 — unrecognised `?size` value
   //   404 — unknown asset or out-of-range index
   //   501 — storage not configured
   app.get(
     '/:id/thumbnails/:index',
     {
-      
-      schema: { params: z.object({ id: z.string(), index: z.string() }) }
+
+      schema: {
+        params: z.object({ id: z.string(), index: z.string() }),
+        // Same `?size` selector as the URL-issuing sibling below (issue #1304).
+        // Added here for consistency: the two routes serve the same object by
+        // the same index, so a caller that can ask the signer for a small
+        // rendition can ask the proxy for it too, and server-to-server callers
+        // (the only users of this route) benefit from the same bandwidth saving.
+        // Omitting the parameter serves the full frame exactly as before.
+        querystring: thumbnailSizeQuerySchema
+      }
     },
     async (request, reply) => {
       if (!storageFor) return reply.code(501).send({ error: 'not_configured' });
@@ -6919,11 +7103,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (isNaN(idx) || idx < 0 || idx >= keys.length) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // A size that was never recorded falls back to the full frame (#1304) —
+      // the index resolved, so this is a 200 with a bigger image, never a 404.
+      const resolved = resolveThumbnailSizeKey(asset, keys[idx], request.query.size);
       const storage = storageFor();
-      const stream = await storage.getObject(keys[idx]);
+      const stream = await storage.getObject(resolved.objectKey);
       return reply
         .header('Content-Type', 'image/jpeg')
         .header('Cache-Control', 'public, max-age=86400')
+        // Which rendition the bytes actually are, since the body cannot say so.
+        // Lets a caller detect the fallback without a second request.
+        .header('X-Thumbnail-Size', resolved.size)
         .send(stream);
     }
   );
@@ -6947,7 +7137,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // signed, scoped to one object and expires after THUMBNAIL_URL_TTL_SECONDS
   // (default 5 minutes). The bucket itself stays private — an unsigned or
   // expired request to the same object is refused by object storage.
-  //   200 — { url, expiresAt, ... }
+  //   200 — { url, expiresAt, size, ... }
+  //   400 — unrecognised `?size` value
   //   404 — unknown/foreign asset or out-of-range index (existence not leaked)
   //   501 — object storage is not configured on this deployment
   //   502 — object storage failed to sign the URL
@@ -6956,6 +7147,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     {
       schema: {
         params: z.object({ id: z.string(), index: z.string() }),
+        // Optional size selector (issue #1304); default `full` = pre-#1304
+        // behaviour. An unrecognised value is refused at the boundary with the
+        // router's standard validation 400 before the handler runs.
+        querystring: thumbnailSizeQuerySchema,
         response: {
           200: thumbnailUrlSchema,
           404: errorSchema,
@@ -6977,10 +7172,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
       const keys = asset.thumbnails ?? [];
       const idx = Number.parseInt(request.params.index, 10);
-      const objectKey = Number.isNaN(idx) ? undefined : keys[idx];
-      if (idx < 0 || objectKey === undefined) {
+      const fullObjectKey = Number.isNaN(idx) ? undefined : keys[idx];
+      if (idx < 0 || fullObjectKey === undefined) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // Size resolution happens AFTER the index check and can never turn a
+      // resolvable index into a 404 (issue #1304): a size that was not recorded
+      // for this frame degrades to the full-size key and still answers 200.
+      const resolved = resolveThumbnailSizeKey(asset, fullObjectKey, request.query.size);
+      const objectKey = resolved.objectKey;
 
       const ttl = thumbnailUrlTtlSeconds();
       // Signing can still reach the store (region lookup) and fails on bad
@@ -7009,7 +7209,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         objectKey,
         url,
         expiresAt,
-        expiresInSeconds: ttl
+        expiresInSeconds: ttl,
+        size: resolved.size
       });
     }
   );

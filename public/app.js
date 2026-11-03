@@ -805,6 +805,39 @@ function renderStorageBackendsList(backends) {
 // the UI (a stricter-than-API client constraint is safe — the API still accepts
 // it). Everything is framework-free so the field/validation logic is directly
 // unit-testable.
+//
+// ─── The three remaining registration fields (issue #870) ────────────────────
+//
+// Re-verified against the CURRENT contract (per CLAUDE.md rule 7) — the six
+// fields above are only two thirds of what the endpoint accepts:
+//   - POST /api/v1/storage/backends body = `registerBackendSchema`,
+//     src/routes/storage.ts:129-141 (nine properties, mirrored verbatim in
+//     openapi.json "/api/v1/storage/backends".post.requestBody; required there
+//     is exactly name/bucket/accessKeyId/secretAccessKey). The three this form
+//     never offered:
+//       role          storage.ts:133  z.enum(['source','packaged','both','archive']).default('both')
+//       sessionToken  storage.ts:139  z.string().min(1).optional()   — SECRET
+//       publicBaseUrl storage.ts:140  z.string().url().optional()
+//   - PATCH /api/v1/storage/backends/{id} = `updateBackendSchema`,
+//     src/routes/storage.ts:179-189 — carries the same three, all optional, so
+//     the edit form can offer them too; its `.refine` (:193-201) constrains only
+//     the accessKeyId/secretAccessKey pair, never the session token.
+//   - The redacted view `backendViewSchema` (src/routes/storage.ts:150-168)
+//     returns `role`, `publicBaseUrl` and `hasSessionToken`, and models a
+//     registered session token as the SAME `'***redacted***'` marker as the
+//     secret key (`credentials.sessionToken`, :166) — so the token gets exactly
+//     the secret-field treatment: password input, never seeded from a response,
+//     never cached.
+//   - `publicBaseUrl` is what makes packaged output publicly playable from a
+//     backend: GET /api/v1/assets/{id}/delivery resolves the packaged-role
+//     backend's public origin through `externalPublicBaseUrl(stackStorage
+//     ?.packaged)` (src/routes/assets.ts:4751) and emits URLs on that origin
+//     instead of falling through to the authorized stream proxy. The help text
+//     says so, because an operator cannot infer it from the field name.
+//
+// All three are optional in the schema, so an operator who ignores them
+// registers exactly what they register today (an omitted `role` is defaulted to
+// 'both' server-side, which is also what the select pre-selects).
 const STORAGE_SECRET_PLACEHOLDER = '••••••••  (unchanged)';
 
 // The six form fields in render order. `secret:true` marks the password input
@@ -819,6 +852,61 @@ const STORAGE_BACKEND_FORM_FIELDS = [
   { key: 'secretAccessKey', label: 'Secret access key', type: 'password', secret: true, placeholder: '' },
 ];
 
+// The four documented `role` values, in schema order, with operator-facing
+// copy. Mirrors `registerBackendSchema.role` (src/routes/storage.ts:133) and
+// `backendViewSchema.role` (:153) exactly — a value not in this list is a value
+// the API would 422.
+const STORAGE_BACKEND_ROLE_OPTIONS = [
+  { value: 'source', label: 'source — holds ingested source bytes' },
+  { value: 'packaged', label: 'packaged — holds packaged/delivery output' },
+  { value: 'both', label: 'both — source and packaged (default)' },
+  { value: 'archive', label: 'archive — cold destination for relocated sources' },
+];
+const STORAGE_BACKEND_ROLE_VALUES = STORAGE_BACKEND_ROLE_OPTIONS.map((o) => o.value);
+const STORAGE_BACKEND_DEFAULT_ROLE = 'both';
+
+// The three optional fields added by issue #870, rendered as their own group
+// after the required six. They deliberately do NOT carry the
+// `storage-backend-input` class: that class names the required core six (the
+// submit path reads every control by `[data-field]`, so the group is fully
+// wired either way), and keeping it stable means a form with these three
+// untouched is byte-for-byte the registration it is today.
+//   control: 'select' | 'input'; `secret:true` gets the secretAccessKey
+//   treatment; `help` renders as an aria-describedby hint.
+const STORAGE_BACKEND_OPTIONAL_FIELDS = [
+  {
+    key: 'role',
+    label: 'Role',
+    control: 'select',
+    options: STORAGE_BACKEND_ROLE_OPTIONS,
+    defaultValue: STORAGE_BACKEND_DEFAULT_ROLE,
+    help: 'Which side of the pipeline this backend serves. Defaults to "both"; '
+      + 'pick "archive" for a cold tier that only receives relocated sources.',
+  },
+  {
+    key: 'publicBaseUrl',
+    label: 'Public base URL (optional)',
+    control: 'input',
+    type: 'url',
+    placeholder: 'https://cdn.example.com/media',
+    help: 'The public origin this bucket is served from — a CDN or gateway in '
+      + 'front of it. Setting it is what makes packaged output playable '
+      + 'directly from this backend: /delivery then advertises URLs on this '
+      + 'origin instead of proxying the stream. Leave blank if the bucket is '
+      + 'not publicly readable.',
+  },
+  {
+    key: 'sessionToken',
+    label: 'Session token (optional)',
+    control: 'input',
+    type: 'password',
+    secret: true,
+    placeholder: '',
+    help: 'For temporary credentials (STS-style). Handled exactly like the '
+      + 'secret access key: never echoed back by the API and never cached here.',
+  },
+];
+
 // Pure, network-free validation of the raw field values (issue #681). `mode` is
 // 'add' | 'edit'. Returns { valid, errors, patch/body }. Error messages are
 // actionable per the acceptance criteria. On 'edit' an untouched secret (empty
@@ -827,7 +915,7 @@ const STORAGE_BACKEND_FORM_FIELDS = [
 // one without the other — updateBackendSchema.refine, storage.ts:190-201).
 function validateStorageBackendForm(mode, values) {
   const v = {};
-  for (const f of STORAGE_BACKEND_FORM_FIELDS) {
+  for (const f of STORAGE_BACKEND_FORM_FIELDS.concat(STORAGE_BACKEND_OPTIONAL_FIELDS)) {
     v[f.key] = typeof values[f.key] === 'string' ? values[f.key].trim() : '';
   }
   const errors = {};
@@ -864,21 +952,60 @@ function validateStorageBackendForm(mode, values) {
     errors.secretAccessKey = 'Secret access key is required.';
   }
 
+  // ── The three optional fields (issue #870) ──────────────────────────────────
+  // None of them is ever required, in either mode: all three are `.optional()`
+  // (or `.default()`) in registerBackendSchema (src/routes/storage.ts:133,139,
+  // 140), so an empty value must produce no error AND must not appear in the
+  // body — an omitted field is exactly today's registration.
+
+  // role: only the four enum members are sendable. An empty value is "let the
+  // server default it to 'both'" (storage.ts:133), which is what the select
+  // pre-selects anyway, so both paths register identically.
+  if (v.role && !STORAGE_BACKEND_ROLE_VALUES.includes(v.role)) {
+    errors.role = 'Role must be one of: ' + STORAGE_BACKEND_ROLE_VALUES.join(', ') + '.';
+  }
+
+  // publicBaseUrl: z.string().url() server-side (storage.ts:140). Same
+  // friendlier, protocol-specific message as endpointUrl.
+  if (v.publicBaseUrl && !/^https?:\/\/.+/i.test(v.publicBaseUrl)) {
+    errors.publicBaseUrl = 'Public base URL must start with http:// or https://';
+  } else if (v.publicBaseUrl && !errors.publicBaseUrl) {
+    try {
+      // eslint-disable-next-line no-new
+      new URL(v.publicBaseUrl);
+    } catch (_) {
+      errors.publicBaseUrl = 'Public base URL is not a valid URL.';
+    }
+  }
+
+  // sessionToken: z.string().min(1).optional() (storage.ts:139) — no format to
+  // check, and (like secretAccessKey) a blank value on edit means "leave the
+  // stored token alone", so there is nothing to reject.
+  const sessionTokenTyped = v.sessionToken.length > 0;
+
   const valid = Object.keys(errors).length === 0;
   if (!valid) return { valid: false, errors: errors };
+
+  // Append the optional trio to a body, each only when the operator supplied it.
+  function withOptional(target) {
+    if (v.role) target.role = v.role;
+    if (v.publicBaseUrl) target.publicBaseUrl = v.publicBaseUrl;
+    if (sessionTokenTyped) target.sessionToken = v.sessionToken;
+    return target;
+  }
 
   if (isAdd) {
     return {
       valid: true,
       errors: {},
-      body: {
+      body: withOptional({
         name: v.name,
         endpointUrl: v.endpointUrl,
         bucket: v.bucket,
         region: v.region,
         accessKeyId: v.accessKeyId,
         secretAccessKey: v.secretAccessKey,
-      },
+      }),
     };
   }
 
@@ -894,7 +1021,7 @@ function validateStorageBackendForm(mode, values) {
     body.accessKeyId = v.accessKeyId;
     body.secretAccessKey = v.secretAccessKey;
   }
-  return { valid: true, errors: {}, body: body };
+  return { valid: true, errors: {}, body: withOptional(body) };
 }
 
 // Pure render of the add/edit form (issue #681). Framework-free and network-free
@@ -970,6 +1097,93 @@ function renderStorageBackendForm(mode, backend) {
 
     form.appendChild(fieldWrap);
   });
+
+  // ── Optional registration fields (issue #870) ───────────────────────────────
+  // role / publicBaseUrl / sessionToken. Grouped in their own <fieldset> with a
+  // <legend> so AT announces them as one set of optional extras rather than
+  // three more required-looking inputs, and so an operator who does not need
+  // them can skip the group in one go. Every control is labelled, and every
+  // help text is wired through aria-describedby (WCAG 2.1 AA: 1.3.1, 3.3.2).
+  const optionalGroup = document.createElement('fieldset');
+  optionalGroup.className = 'storage-backend-optional-group';
+  const legend = document.createElement('legend');
+  legend.textContent = 'Optional';
+  optionalGroup.appendChild(legend);
+
+  STORAGE_BACKEND_OPTIONAL_FIELDS.forEach(function(f) {
+    const fieldWrap = document.createElement('div');
+    fieldWrap.className = 'form-field storage-backend-field storage-backend-optional-field';
+
+    const inputId = 'sbf-' + f.key;
+    const hintId = inputId + '-hint';
+    const label = document.createElement('label');
+    label.setAttribute('for', inputId);
+    label.textContent = f.label;
+    fieldWrap.appendChild(label);
+
+    let control;
+    if (f.control === 'select') {
+      control = document.createElement('select');
+      f.options.forEach(function(o) {
+        const opt = document.createElement('option');
+        opt.value = o.value;
+        opt.textContent = o.label;
+        control.appendChild(opt);
+      });
+      // Pre-select the backend's current role on edit (it is in the redacted
+      // view, backendViewSchema.role storage.ts:153); on add, the schema default
+      // 'both' — so a form the operator never touches registers what it does
+      // today.
+      const current = isEdit && typeof b.role === 'string'
+        && STORAGE_BACKEND_ROLE_VALUES.includes(b.role)
+        ? b.role
+        : (f.defaultValue || STORAGE_BACKEND_DEFAULT_ROLE);
+      control.value = current;
+    } else {
+      control = document.createElement('input');
+      control.type = f.type;
+      if (f.secret) {
+        // Same treatment as secretAccessKey: never seeded from a response (the
+        // API returns the token as the '***redacted***' marker, storage.ts:166),
+        // never offered to the password manager, blank on edit = leave stored
+        // token unchanged.
+        control.value = '';
+        control.autocomplete = 'new-password';
+        control.placeholder = isEdit && b.hasSessionToken === true
+          ? STORAGE_SECRET_PLACEHOLDER
+          : (f.placeholder || '');
+      } else {
+        control.value = isEdit && b[f.key] != null ? String(b[f.key]) : '';
+        control.placeholder = f.placeholder || '';
+      }
+    }
+    control.id = inputId;
+    control.name = f.key;
+    // NOT `storage-backend-input`: that class names the required core six.
+    control.className = 'storage-backend-optional-input';
+    control.dataset.field = f.key;
+    control.required = false;
+    control.setAttribute('aria-describedby', hintId);
+    fieldWrap.appendChild(control);
+
+    const hint = document.createElement('div');
+    hint.id = hintId;
+    hint.className = 'form-hint';
+    hint.textContent = f.secret && isEdit && b.hasSessionToken === true
+      ? 'Leave blank to keep the stored session token. Type a new value to replace it. ' + f.help
+      : f.help;
+    fieldWrap.appendChild(hint);
+
+    const errEl = document.createElement('div');
+    errEl.className = 'form-error';
+    errEl.dataset.errorFor = f.key;
+    errEl.setAttribute('role', 'alert');
+    fieldWrap.appendChild(errEl);
+
+    optionalGroup.appendChild(fieldWrap);
+  });
+
+  form.appendChild(optionalGroup);
 
   // Actions row: Save, Test connection, Cancel + inline result/status areas.
   const actions = document.createElement('div');
@@ -2355,6 +2569,31 @@ async function renderAssetsTab(container) {
   // selection, which is the state its controls render as disabled.
   let bulkBar = null;
 
+  // Host for a row action's PERSISTENT outcome notice (issue #933's
+  // `.msg-unrecoverable`, reached from the row-level Restore below). It is a
+  // sibling of the table, not a cell inside it, for two reasons: the table
+  // rebuilds its own `tbody` on every reload, which would wipe a notice mounted
+  // there; and a terminal outcome has to outlive the row it is about — a purged
+  // asset leaves the list entirely on the next read. Placed directly after the
+  // header so it reads BEFORE the table it refers to (DOM order == reading
+  // order); the notice itself carries role="alert" (WCAG 2.1 AA 4.1.3).
+  const rowActionMsg = document.createElement('div');
+  rowActionMsg.id = 'assets-row-action-msg';
+  rowActionMsg.className = 'assets-row-action-msg';
+  main.appendChild(rowActionMsg);
+
+  // The live row control for `assetId`, or null when that row is not on screen.
+  // Matched by walking `dataset.id` rather than building a selector, so an id
+  // this client did not author never has to be CSS-escaped.
+  const rowRestoreControl = function (assetId) {
+    if (!assetsTable || !assetsTable.el) return null;
+    const btns = assetsTable.el.querySelectorAll('.asset-restore-btn');
+    for (let i = 0; i < btns.length; i++) {
+      if (btns[i].dataset.id === assetId) return btns[i];
+    }
+    return null;
+  };
+
   assetsTable = createAssetsTable({
     apiFetch,
     renderBadge,
@@ -2544,6 +2783,102 @@ async function renderAssetsTab(container) {
         reportActionFailure(err, {
           action: 'Re-drive metadata extraction',
           detail: 'Asset ' + id + ' is unchanged.',
+        });
+        return false;
+      }
+    },
+    onRestore: async function (id, name) {
+      // Restore an archived asset straight from its row (issue #836). The row
+      // only renders this control when `status === 'archived'`, and this is the
+      // single route out of that terminal state.
+      //
+      // Contract, verified in this tree (CLAUDE.md rule 7) — identical to the
+      // detail panel's #btn-restore-asset control:
+      //   openapi.json .paths["/api/v1/assets/{id}/restore"] — the only key is
+      //   `post`; `responses` keys are exactly 200 / 404 / 410; the single
+      //   parameter is path `id` (string, required); there is NO requestBody.
+      //   Source: src/routes/assets.ts:8058-8103 (`app.post('/:id/restore')`,
+      //   schema `{ 200: assetSchema, 404: errorSchema, 410: errorSchema }`
+      //   :8063), mounted under `/api/v1/assets`.
+      //   200 — the FULL updated asset: `status` has flipped out of `archived`
+      //         to `ready` (its pre-archive status when that was `ready`) or
+      //         otherwise `failed` (`restoreTargetStatus`). A `true` return
+      //         reloads the table so the row shows the new status.
+      //   404 — unknown id OR not currently archived (indistinguishable, gap
+      //         G1). The row's `id` is the ULID the handler needs: restore does
+      //         NOT resolve a slug (it passes the raw param to `repo.restore`).
+      //         `reply.code(404).send({ error: 'not_found' })`, assets.ts:8080.
+      //   410 — already purged (tombstone): permanent, not a retry.
+      //         `reply.code(410).send({ error: 'gone', message: 'asset has been
+      //         purged' })`, assets.ts:8075, reached when
+      //         `repo.getState(id).kind === 'tombstone'` (assets.ts:8072-8077).
+      //
+      // RETURN VALUE == "reload the table". The table reloads unless this
+      // resolves `false` (public/assets-table.js:1732-1746), so `false` means
+      // strictly "the row on screen is still accurate". Every outcome below that
+      // proves the row is STALE therefore resolves `true` — the reload is how the
+      // row stops lying, and (for the 410) how the control disappears for good.
+      const label = nameOrFallback(name, 'this asset');
+      // Clear the previous row-action outcome before starting a new one, exactly
+      // as the detail panel clears #action-msg on each click: a terminal notice
+      // about an earlier asset must not sit next to this asset's result.
+      rowActionMsg.innerHTML = '';
+      try {
+        await apiFetch('/assets/' + encodeURIComponent(id) + '/restore', {
+          method: 'POST',
+        });
+        return true;
+      } catch (err) {
+        if (isPurgedGone(err)) {
+          // 410: the retention sweep tombstoned the asset, so restore can never
+          // succeed — the same terminal outcome the detail panel renders at
+          // #btn-restore-asset (issue #933). Mirrored here deliberately, down to
+          // the two parts styling alone cannot carry:
+          //   * NOT reportActionFailure. That is this app's one signal for "the
+          //     action failed", and every refusal it humanizes ends in "try
+          //     again" (ACTION_FAILURE_REASON_COPY) — the single instruction a
+          //     tombstone can never satisfy. The shared `.msg-unrecoverable`
+          //     notice states the outcome as final instead, and persists (no 6s
+          //     auto-dismiss) because this outcome never changes.
+          //   * The Restore control is REMOVED, not disabled. A greyed-out button
+          //     reads as "not right now"; there is no "right now" for a purged
+          //     asset, so the affordance goes away entirely.
+          renderPurgedUnrecoverable(rowActionMsg, {
+            id: 'row-restore-gone-notice',
+            subject: quotedOrEmpty(name, id),
+            serverMessage: err.message,
+            retire: [rowRestoreControl(id)],
+          });
+          // Reload (NOT `false`): a tombstone is no longer a listed asset, so
+          // this row is stale and the reload is what retires it for good — the
+          // same assetsTable.reload() the detail panel's 410 path issues. The
+          // `true` return IS that reload (assets-table.js:1741-1746), which also
+          // means the table never re-enables the button this path just removed.
+          return true;
+        }
+        if (err && err.status === 404) {
+          // 404: the API has nothing to restore — either this id is unknown or
+          // the asset is no longer archived (gap G1, the same body for both). The
+          // outcome is retryable in class, so it is reported the ordinary way,
+          // but the ROW IS KNOWN-STALE: it is still offering Restore for a
+          // lifecycle state the API says it is not in. So this reloads, for the
+          // same reason onRename reloads on 404 (above) and the detail panel
+          // re-reads on 404.
+          reportActionFailure(err, {
+            action: 'Restore asset',
+            detail:
+              '"' + label + '" was not restored — the API reports nothing to ' +
+              'restore, so either it is no longer archived or the id is ' +
+              'unknown. The list has been re-read from the API.',
+          });
+          return true;
+        }
+        // 401/403 from the auth gate, a 5xx, or a transport failure: nothing
+        // changed server-side as far as this client can tell, so the row stays
+        // as it is (no reload) and the control comes back for a retry.
+        reportActionFailure(err, {
+          action: 'Restore asset',
+          detail: '"' + label + '" was not restored. Nothing has changed.',
         });
         return false;
       }
@@ -3349,12 +3684,18 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     // No auth header needed, so use a plain fetch rather than apiFetch.
     // Fall back to the known-good 'program' profile if the fetch fails or is empty.
     var encodeProfiles = ['program'];
+    // Declared SpEL parameters per profile, derived from the `items[].yaml` the
+    // SAME list response carries (issue #869). Empty object = nothing in the
+    // picker is parametrised, which is also what an older deployment or a stub
+    // without `items` yields.
+    var profileParams = {};
     try {
       const profilesResp = await fetch('/api/v1/profiles');
       if (profilesResp.ok) {
         const profilesData = await profilesResp.json();
         if (profilesData && Array.isArray(profilesData.profiles) && profilesData.profiles.length > 0) {
           encodeProfiles = profilesData.profiles;
+          profileParams = profileParamsIndex(profilesData.items);
         } else {
           console.warn('GET /profiles returned no profiles; falling back to default ["program"]');
         }
@@ -3412,7 +3753,14 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       pipelineOptions,
       '</select>',
       '<select id="profile-select" class="input" title="Encode profile (for pipelines with a transcode step)">',
-      encodeProfiles.map(function(p) { return '<option value="' + escHtml(p) + '">' + escHtml(p) + '</option>'; }).join(''),
+      // A parametrised profile is marked in the option itself (issue #869), so
+      // the operator can tell there is something to set BEFORE running. The
+      // value stays the bare profile name — that is what `profile` carries.
+      encodeProfiles.map(function(p) {
+        return '<option value="' + escHtml(p) + '"' +
+          ' title="' + escHtml(profileOptionTitle(p, profileParams[p])) + '">' +
+          escHtml(profileOptionLabel(p, profileParams[p])) + '</option>';
+      }).join(''),
       '</select>',
       '<button id="btn-run-pipeline" class="btn-ghost">Run Pipeline</button>',
     ].join('');
@@ -3451,11 +3799,39 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       }
     }
 
+    // Host for the selected profile's parameter form (issue #869). Sits under
+    // the run row so the fields read as belonging to the profile above them.
+    const profileParamsDiv = document.createElement('div');
+    profileParamsDiv.id = 'profile-params-area';
+    body.appendChild(profileParamsDiv);
+
+    // Draw (or clear) the parameter form for whatever is selected now. Nothing
+    // is drawn when the pipeline has no transcode step, or when the chosen
+    // profile declares no params — so the control is unchanged for every
+    // non-parametrised profile.
+    function updateProfileParams() {
+      var hasTranscode = ENCODE_PIPELINES.indexOf(pipelineSel.value) !== -1;
+      var params = hasTranscode ? profileParams[profileSel.value] : null;
+      var wanted = params && params.length > 0 ? profileSel.value : '';
+      // Idempotent for an unchanged selection: the run handler calls this from
+      // its `finally`, and a rejected run must not throw away the values that
+      // caused the rejection — nor the inline message explaining them.
+      if (profileParamsDiv.dataset.paramsProfile === wanted) return;
+      profileParamsDiv.dataset.paramsProfile = wanted;
+      var fieldset = renderProfileParamsForm(profileParamsDiv, profileSel.value, params);
+      // The hint only exists while the form does, so the picker points at it
+      // only then — a dangling aria-describedby would reference nothing.
+      if (fieldset) profileSel.setAttribute('aria-describedby', 'profile-params-hint');
+      else profileSel.removeAttribute('aria-describedby');
+    }
+
     function updateProfileVisibility() {
       var hasTranscode = ENCODE_PIPELINES.indexOf(pipelineSel.value) !== -1;
       profileSel.style.display = hasTranscode ? '' : 'none';
+      updateProfileParams();
     }
     pipelineSel.addEventListener('change', updateProfileVisibility);
+    profileSel.addEventListener('change', updateProfileParams);
     updateProfileVisibility();
 
     // Action buttons — static labels, no dynamic content
@@ -3528,6 +3904,19 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       var hasTranscode = ENCODE_PIPELINES.indexOf(pipeline) !== -1;
       var body2 = { pipeline: pipeline };
       if (hasTranscode) body2.profile = profileSel.value;
+      // Parametrised profile overrides (issue #869). Flat string map, top-level
+      // sibling of `profile` (openapi.json
+      // .paths["/api/v1/assets/{id}/execute"].post.requestBody; schema source
+      // src/routes/assets.ts:433/376). Only EDITED fields are collected, and the
+      // key is omitted entirely when nothing was edited — so a run with no edits
+      // posts the same body as before and the profile's own defaults apply.
+      var paramInputs = profileParamsDiv.querySelectorAll('.profile-param-input');
+      var paramsError = profileParamsDiv.querySelector('#profile-params-error');
+      if (paramsError) paramsError.textContent = '';
+      if (hasTranscode) {
+        var editedParams = collectProfileParams(profileParamsDiv);
+        if (Object.keys(editedParams).length > 0) body2.profileParams = editedParams;
+      }
 
       // Loading state: disable the button (and selects) and show progress so the
       // user gets immediate feedback that the dispatch is in flight.
@@ -3535,6 +3924,7 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       runBtn.disabled = true;
       pipelineSel.disabled = true;
       profileSel.disabled = true;
+      [].forEach.call(paramInputs, function(input) { input.disabled = true; });
       runBtn.textContent = 'Running…';
       showMsg(actionMsg, 'Queuing pipeline…', 'info');
 
@@ -3552,10 +3942,19 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
         actionMsg.innerHTML = '';
         // err.message carries the API error detail (apiFetch extracts body.error/message).
         showMsg(actionMsg, 'Error: ' + err.message, 'error');
+        // A rejected parameter key is a problem with the fields, so the server's
+        // own sentence — which names the accepted key set for this profile
+        // (src/pipeline/profile-params.ts:132-138, surfaced as the 400
+        // `unknown_profile_params` body `message`) — is repeated next to them.
+        // role="alert" on that element announces it without moving focus.
+        if (paramsError && err.body && err.body.error === 'unknown_profile_params') {
+          paramsError.textContent = err.message;
+        }
       } finally {
         runBtn.disabled = false;
         pipelineSel.disabled = false;
         profileSel.disabled = false;
+        [].forEach.call(paramInputs, function(input) { input.disabled = false; });
         runBtn.textContent = prevLabel;
         updateProfileVisibility();
       }
@@ -7158,10 +7557,12 @@ async function renderStorageTab(container) {
       addBtn.focus();
     }
 
-    // Read the six field values off the rendered inputs.
+    // Read every field value off the rendered controls — the required core six
+    // AND the optional role/publicBaseUrl/sessionToken group (issue #870), which
+    // is why this selects on `[data-field]` rather than on one class.
     function readValues() {
       const out = {};
-      form.querySelectorAll('.storage-backend-input').forEach(function(inp) {
+      form.querySelectorAll('[data-field]').forEach(function(inp) {
         out[inp.dataset.field] = inp.value;
       });
       return out;
@@ -7178,6 +7579,16 @@ async function renderStorageTab(container) {
       testResultEl.className = 'storage-backend-test-result';
       const values = readValues();
       const secret = (values.secretAccessKey || '').trim();
+      // A backend registered with temporary credentials only authenticates with
+      // its session token, and the stored token is never recoverable
+      // (`credentials.sessionToken` comes back as the redacted marker,
+      // storage.ts:166) — so the probe has to carry whatever the operator typed
+      // into this form. testConnectionBodySchema (storage.ts:207-210) accepts
+      // `sessionToken` as an optional min(1) string and the route forwards it
+      // (storage.ts:501-508) into the probe target
+      // (storage-backend-registry.ts:830-837). Blank stays absent: the body
+      // builder drops a falsy value (app.js:2299-2301).
+      const sessionToken = (values.sessionToken || '').trim();
       if (!backendId) {
         testResultEl.textContent =
           'Save the backend first, then use Test connection to probe it.';
@@ -7194,7 +7605,11 @@ async function renderStorageTab(container) {
       testResultEl.textContent = 'Testing…';
       try {
         // Shared probe helper (issue #683) — same call the per-row action uses.
-        const result = await testStorageBackendConnection(backendId, secret);
+        const result = await testStorageBackendConnection(
+          backendId,
+          secret,
+          { sessionToken: sessionToken }
+        );
         // Response contract: { status: 'connected' | 'unreachable', message }.
         const ok = result && result.status === 'connected';
         testResultEl.textContent =
@@ -7217,7 +7632,9 @@ async function renderStorageTab(container) {
       const firstErr = applyStorageBackendFormErrors(form, result.errors);
       if (!result.valid) {
         if (firstErr) {
-          const el = form.querySelector('.storage-backend-input[data-field="' + firstErr + '"]');
+          // `[data-field]` so an error on one of the optional fields (#870) is
+          // focusable too.
+          const el = form.querySelector('[data-field="' + firstErr + '"]');
           if (el) el.focus();
         }
         return;
@@ -7363,12 +7780,14 @@ async function renderStorageTab(container) {
   // spinner while in flight, then Connected / Unreachable (+ message on failure
   // or timeout). Disables the row's Test button for the duration so a double
   // click can't launch two probes.
-  async function runRowTest(row, backendId, secret) {
+  // `extra` is the optional { sessionToken } passed straight to the probe
+  // helper, which drops it when blank (app.js:2299-2301).
+  async function runRowTest(row, backendId, secret, extra) {
     const btn = row.querySelector('.storage-backend-test-conn');
     if (btn) btn.disabled = true;
     setStorageBackendRowProbing(row);
     try {
-      const result = await testStorageBackendConnection(backendId, secret);
+      const result = await testStorageBackendConnection(backendId, secret, extra);
       applyStorageBackendRowTestResult(row, result);
     } catch (err) {
       // Network / HTTP failure or the client-side 10s timeout: render as an
@@ -7409,6 +7828,38 @@ async function renderStorageTab(container) {
       label.appendChild(input);
       body.appendChild(label);
 
+      // Temporary credentials: a backend registered with a session token only
+      // authenticates with that token, and the stored one is not recoverable
+      // server-side (the view returns the redacted marker, storage.ts:166;
+      // registry.testConnection builds the probe target from the CALLER's
+      // `secret.sessionToken` alone, storage-backend-registry.ts:830-837). So
+      // when the row's view reports `hasSessionToken === true` we offer an
+      // optional token field and forward it; without it such a backend could
+      // never pass its own Test connection. Rows without a stored token get no
+      // extra field, so their probe body is unchanged.
+      let tokenInput = null;
+      if (cached.hasSessionToken === true) {
+        const tokenLabel = document.createElement('label');
+        tokenLabel.className = 'form-field';
+        tokenLabel.textContent = 'Session token';
+        tokenInput = document.createElement('input');
+        tokenInput.type = 'password';
+        tokenInput.className = 'storage-test-session-token';
+        tokenInput.autocomplete = 'off';
+        tokenLabel.appendChild(tokenInput);
+        body.appendChild(tokenLabel);
+
+        const tokenHint = document.createElement('div');
+        tokenHint.id = 'storage-test-session-token-hint';
+        tokenInput.setAttribute('aria-describedby', tokenHint.id);
+        tokenHint.className = 'form-hint storage-test-session-token-hint';
+        tokenHint.textContent =
+          'This backend was registered with a session token. The stored token ' +
+          'cannot be read back, so re-enter it to probe with temporary ' +
+          'credentials. Leave blank to probe with the key pair alone.';
+        body.appendChild(tokenHint);
+      }
+
       const errEl = document.createElement('div');
       errEl.className = 'storage-test-error';
       errEl.setAttribute('role', 'alert');
@@ -7438,8 +7889,11 @@ async function renderStorageTab(container) {
           input.focus();
           return;
         }
+        // Optional: absent for rows with no stored token, and dropped by the
+        // body builder when the operator leaves it blank.
+        const sessionToken = tokenInput ? tokenInput.value.trim() : '';
         close();
-        runRowTest(row, backendId, secret);
+        runRowTest(row, backendId, secret, { sessionToken: sessionToken });
       });
       input.focus();
     });
@@ -8767,6 +9221,219 @@ var ENCODE_PIPELINES = PIPELINE_CATALOG
   .filter(function(p) { return p.steps.indexOf('transcode') !== -1; })
   .map(function(p) { return p.name; });
 
+// ─── Parametrised transcode profiles (issue #869) ────────────────────────────
+//
+// A profile can expose knobs: its YAML references `profileParams` through SpEL,
+// e.g. `crf: #{profileParams['crf']?:23}`. Until now the run control could only
+// name a profile, so a parametrised profile could only ever run with its
+// built-in defaults even though the API has accepted overrides since #287/#288.
+//
+// CONTRACT, read before this call was written (CLAUDE.md rule 7) — from this
+// repo's own route source and generated spec, never from the issue text:
+//   - POST /api/v1/assets/{id}/execute — openapi.json
+//     .paths["/api/v1/assets/{id}/execute"].post.requestBody: an object with
+//     `required: ["pipeline"]`, `additionalProperties: false`, and the optional
+//     siblings `profile` (string, minLength 1) and
+//     `profileParams: { type: 'object', additionalProperties: { type: 'string' } }`.
+//     So profileParams is a TOP-LEVEL FLAT STRING MAP alongside `profile` — not
+//     nested under it, and every value must be a string. Source of truth:
+//     `profileParams: profileParamsSchema.optional()` on the execute body
+//     (src/routes/assets.ts:433) over
+//     `const profileParamsSchema = z.record(z.string(), z.string())`
+//     (src/routes/assets.ts:376). The spec assigns this operation no
+//     operationId; it is keyed by path + method. The run control already posts
+//     to this exact route, so no new endpoint is introduced here.
+//   - 400 `unknown_profile_params` — a key the chosen profile does not declare
+//     is rejected at submit time with a message naming the accepted set
+//     (src/routes/assets.ts:5695-5760 -> validateProfileParams,
+//     src/pipeline/profile-params.ts:95-141). apiFetch prefers `body.message`
+//     (app.js:573), so that sentence is what the operator reads.
+//   - GET /api/v1/profiles — 200 `{ profiles: string[], items: [{ name, yaml,
+//     runnable, createdAt, updatedAt }] }` (listResponseSchema,
+//     src/routes/profiles.ts:121-124, items built at :173). `items[].yaml` is
+//     the same document the Profiles tab's View YAML button renders AND the one
+//     the server derives the accepted key set from, so the picker reads the
+//     declared params straight off the list response it already fetches: no
+//     extra request, and no second source of truth to drift.
+//
+// The key set is DERIVED from the YAML, never hardcoded. The regex below is the
+// client-side twin of SPEL_PROFILE_PARAM_REF (src/pipeline/profile-params.ts:43)
+// — Spring Expression Language map indexing, single OR double quotes — so the
+// form offers exactly the keys the server will accept, and nothing else.
+var PROFILE_PARAM_REF = /profileParams\[\s*(?:'([^']+)'|"([^"]+)")\s*\]/g;
+
+// The same reference WITH its SpEL Elvis default (`?:`), which is where the
+// declared default lives: `?:23`, `?:"medium"`, `?:'expr:not(mod(n,96))'`. The
+// quoted branches win over the bare one so a default containing `:` or `(` is
+// captured whole; the bare branch stops at the closing `}` of the `#{…}` block.
+var PROFILE_PARAM_DEFAULT_REF =
+  /profileParams\[\s*(?:'([^']+)'|"([^"]+)")\s*\]\s*\?:\s*(?:'([^']*)'|"([^"]*)"|([^}\s]*))/g;
+
+// Extract the parameters a profile YAML declares, in first-appearance order, as
+// `[{ key, defaultValue }]`. `defaultValue` is the declared SpEL default with
+// its quotes stripped, or '' when the reference carries none (the profile then
+// has no default to prefill — the field stays empty and is only sent if typed
+// into). Keys are de-duplicated: the same param is usually referenced several
+// times in one ladder (suffix + the encoder option it feeds). A profile that
+// references none returns [] — i.e. "not parametrised".
+function declaredProfileParams(profileYaml) {
+  if (!profileYaml) return [];
+  const yaml = String(profileYaml);
+  const defaults = {};
+  for (const match of yaml.matchAll(PROFILE_PARAM_DEFAULT_REF)) {
+    const key = match[1] || match[2];
+    if (!key || Object.prototype.hasOwnProperty.call(defaults, key)) continue;
+    // The first default the document states for a key is the one shown; a
+    // well-formed profile repeats the same default at every reference.
+    const value = match[3] !== undefined ? match[3]
+      : match[4] !== undefined ? match[4]
+      : (match[5] || '');
+    defaults[key] = value;
+  }
+  const params = [];
+  const seen = {};
+  for (const match of yaml.matchAll(PROFILE_PARAM_REF)) {
+    const key = match[1] || match[2];
+    if (!key || seen[key]) continue;
+    seen[key] = true;
+    params.push({
+      key: key,
+      defaultValue: Object.prototype.hasOwnProperty.call(defaults, key) ? defaults[key] : '',
+    });
+  }
+  return params;
+}
+
+// Build a `name -> [{ key, defaultValue }]` index from the `items` of the
+// profiles list response. Only parametrised profiles get an entry, so a lookup
+// miss means "this profile takes no params". Tolerates a response without
+// `items` (an older deployment, or a stubbed fetch): the picker then simply
+// marks nothing, which is the pre-#869 behaviour.
+function profileParamsIndex(items) {
+  const index = {};
+  (Array.isArray(items) ? items : []).forEach(function(item) {
+    if (!item || typeof item.name !== 'string') return;
+    const params = declaredProfileParams(item.yaml);
+    if (params.length > 0) index[item.name] = params;
+  });
+  return index;
+}
+
+// How a parametrised profile reads in the picker. The option VALUE stays the
+// bare profile name (that is what `profile` carries on the wire); only the
+// label is annotated, so the operator can see there is something to set before
+// running rather than discovering it in the output filename.
+function profileOptionLabel(name, params) {
+  if (!params || params.length === 0) return name;
+  return name + ' — ' + params.length + (params.length === 1 ? ' parameter' : ' parameters');
+}
+
+// The option's tooltip: which keys this profile declares, and what happens if
+// you leave them alone.
+function profileOptionTitle(name, params) {
+  if (!params || params.length === 0) {
+    return 'Encode profile (for pipelines with a transcode step)';
+  }
+  return 'Parametrised profile. Declares: ' +
+    params.map(function(p) { return p.key; }).join(', ') +
+    '. Each parameter keeps the profile’s own default unless you change it.';
+}
+
+var PROFILE_PARAMS_LEGEND = 'Profile parameters';
+var PROFILE_PARAMS_HINT =
+  'Prefilled with the defaults the profile declares. Only the values you change ' +
+  'are sent; anything you leave as-is stays on the profile’s own default. Clear a ' +
+  'field to fall back to its default.';
+
+// Render the parameter form for the selected profile into `hostEl`, replacing
+// whatever was there. `params` is the output of declaredProfileParams(); an
+// empty list renders nothing at all, so a non-parametrised profile looks exactly
+// as it did before #869. Returns the fieldset, or null when nothing was drawn.
+//
+// A real fieldset/legend (the shape renderSearchMetadataFilter and
+// public/external-ids.js already use) so the fields are announced as one group,
+// each input keeps a `<label for>`, and the hint is wired with aria-describedby.
+function renderProfileParamsForm(hostEl, profileName, params) {
+  if (!hostEl) return null;
+  hostEl.innerHTML = '';
+  if (!params || params.length === 0) return null;
+
+  const fieldset = document.createElement('fieldset');
+  fieldset.className = 'profile-params-fieldset';
+  fieldset.id = 'profile-params';
+
+  const legend = document.createElement('legend');
+  legend.className = 'profile-params-legend';
+  // Name the profile in the legend: the form's contents change with the picker,
+  // so the group has to say which profile it is describing.
+  legend.textContent = PROFILE_PARAMS_LEGEND + ' — ' + profileName;
+  fieldset.appendChild(legend);
+
+  const hint = document.createElement('div');
+  hint.className = 'form-hint';
+  hint.id = 'profile-params-hint';
+  hint.textContent = PROFILE_PARAMS_HINT;
+  fieldset.appendChild(hint);
+  fieldset.setAttribute('aria-describedby', 'profile-params-hint');
+
+  const row = document.createElement('div');
+  row.className = 'form-row profile-params-row';
+  params.forEach(function(param) {
+    const id = 'profile-param-' + param.key;
+    const wrap = document.createElement('div');
+    wrap.className = 'form-field grow';
+    const label = document.createElement('label');
+    label.setAttribute('for', id);
+    // Profile YAML is operator-supplied, so the key is set as text, never HTML.
+    label.textContent = param.key;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.id = id;
+    input.className = 'input profile-param-input';
+    input.dataset.paramKey = param.key;
+    // The declared default is both the starting value and the baseline the
+    // submit compares against, so an untouched field sends nothing.
+    input.dataset.paramDefault = param.defaultValue;
+    input.value = param.defaultValue;
+    if (param.defaultValue) input.placeholder = param.defaultValue;
+    wrap.appendChild(label);
+    wrap.appendChild(input);
+    row.appendChild(wrap);
+  });
+  fieldset.appendChild(row);
+
+  // Where the API's own 400 `unknown_profile_params` message lands — next to the
+  // fields it is about, not only in the page-level action message.
+  const error = document.createElement('div');
+  error.className = 'form-error profile-params-error';
+  error.id = 'profile-params-error';
+  error.setAttribute('role', 'alert');
+  fieldset.appendChild(error);
+
+  hostEl.appendChild(fieldset);
+  return fieldset;
+}
+
+// Read the form into the flat string map the execute body takes. ONLY edited
+// values travel: a field still holding its declared default (or cleared) is
+// omitted so the profile's own default applies server-side — which keeps a run
+// with no edits byte-identical to the pre-#869 request. Values are trimmed;
+// each lands as a single encoder token, so stray whitespace is never intended.
+function collectProfileParams(hostEl) {
+  const params = {};
+  if (!hostEl) return params;
+  const inputs = hostEl.querySelectorAll('.profile-param-input');
+  [].forEach.call(inputs, function(input) {
+    const key = input.dataset.paramKey;
+    if (!key) return;
+    const value = String(input.value == null ? '' : input.value).trim();
+    if (value === '') return;
+    if (value === String(input.dataset.paramDefault == null ? '' : input.dataset.paramDefault)) return;
+    params[key] = value;
+  });
+  return params;
+}
+
 var STEP_ICONS = {
   'extract-metadata': '🔬',
   'thumbnail': '🖼',
@@ -9956,6 +10623,12 @@ export {
   validateStorageBackendForm,
   applyStorageBackendFormErrors,
   STORAGE_SECRET_PLACEHOLDER,
+  // The role / publicBaseUrl / sessionToken group (issue #870). Exported so a
+  // test can assert the select offers exactly the four documented role values
+  // and that each optional field is omitted from the body when left untouched.
+  STORAGE_BACKEND_OPTIONAL_FIELDS,
+  STORAGE_BACKEND_ROLE_OPTIONS,
+  STORAGE_BACKEND_DEFAULT_ROLE,
   // Remove-with-confirmation flow (issue #682). Exported so a DOM/unit test can
   // exercise the confirmation dialog + the 409 in-use message formatter.
   openStorageBackendRemoveDialog,
@@ -10123,6 +10796,19 @@ export {
   setupTabs,
   auditTabWiring,
   reportTabWiring,
+  // Parametrised transcode profiles in the run control (issue #869). Exported so
+  // a DOM/unit test can drive the REAL extraction, picker marking, form builder
+  // and submit-time collection — the same code path renderAssetDetailBody uses —
+  // against the profile YAML shape the server derives its accepted key set from,
+  // without standing up a server.
+  declaredProfileParams,
+  profileParamsIndex,
+  profileOptionLabel,
+  profileOptionTitle,
+  renderProfileParamsForm,
+  collectProfileParams,
+  PROFILE_PARAMS_LEGEND,
+  PROFILE_PARAMS_HINT,
   // Remaining-retention-window text for the restore action (issue #891).
   // Exported so a DOM/unit test can exercise the pure formatter directly on a
   // hand-built `retention` object, without standing up a server. The formatter
