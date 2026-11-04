@@ -18,6 +18,13 @@
 // responsible for stripping credentials before handing values to storeStackConfig
 // (see stripCredentials).
 
+// TYPE-ONLY import, so there is no runtime cycle: drm/drm-config.ts imports
+// `ParamStore`/`StackConfig` from here with `import type` as well, and both
+// sides are erased at compile time. The DRM model lives next to the key
+// provider that consumes it rather than here, so this module keeps owning only
+// the store protocol.
+import type { DrmStackConfig } from '../drm/drm-config.js';
+
 // Non-secret coordinates for one storage role (source or packaged), persisted
 // so downstream routes and deprovision can resolve which backend a stack uses
 // without re-reading the request body (issue #211). NO secret values here:
@@ -170,6 +177,21 @@ export type StackConfig = {
     source: StorageBackendConfig;
     packaged: StorageBackendConfig;
   };
+  // Per-stack DRM provider COORDINATES (ADR-008 §5.2, D5/D6; issue #1295).
+  // NON-SECRET ONLY: key-server URL, licence/certificate URLs, system ids,
+  // enums and an operator-chosen label. The provider CREDENTIAL is an operator
+  // environment variable (ADR-008 §5.2's env table) and never enters this
+  // store — `assertNoDrmCredentials` below enforces that as defence in depth,
+  // the same way the #211 storage block is checked.
+  //
+  // DRM config is per stack because that is the scoping StackConfig already
+  // has (ADR-008 D6); there is deliberately no `workspaceId` inside the block.
+  //
+  // Optional for back-compat, mirroring `status?` and the fields above: a stack
+  // provisioned before this field existed has no value here and MUST still load
+  // without error. Absence means "no DRM configured for this stack", which with
+  // `DRM_ENABLED` off (the default, ADR-008 D9) is also the only readable state.
+  drm?: DrmStackConfig;
   // The OSC instances that make up the stack, for deprovision (#29).
   services: { serviceId: string; instanceName: string }[];
 };
@@ -462,6 +484,60 @@ function assertNoCredentials(config: StackConfig): void {
       ) {
         throw new Error(
           `refusing to store credential-bearing endpointUrl for storage role "${role}" in the parameter store`
+        );
+      }
+    }
+  }
+
+  assertNoDrmCredentials(config.drm);
+}
+
+// Defence-in-depth for the DRM block (ADR-008 §5.2 / D5, issue #1295), exactly
+// mirroring the #211 storage check above. `DrmStackConfig` has no secret member
+// by construction, but a regression upstream could spread a raw `PUT
+// /api/v1/drm/config` body (which an operator might wrongly populate with a
+// username, password, token or client key) straight into it. Reject any such
+// key, and refuse a URL with embedded userinfo, so a provider credential can
+// never reach the parameter store.
+//
+// The thrown message names the FIELD only and never interpolates the value, so
+// a mistakenly supplied credential is not echoed into a log line or an error
+// response (ADR-008 §10 "Logging and error redaction").
+function assertNoDrmCredentials(drm: DrmStackConfig | undefined): void {
+  if (!drm) return;
+  const block = drm as unknown as Record<string, unknown>;
+  // Verbatim the env-backed credentials of ADR-008 §5.2's table, plus the
+  // generic shapes a hand-written body is likely to use.
+  const SECRET_KEYS = [
+    'username',
+    'password',
+    'token',
+    'secret',
+    'clientCert',
+    'clientKey',
+    'privateKey',
+    'apiKey',
+    'credentials'
+  ];
+  for (const secretKey of SECRET_KEYS) {
+    if (secretKey in block) {
+      throw new Error(
+        `refusing to store secret field "${secretKey}" for DRM configuration in the parameter store`
+      );
+    }
+  }
+  if (typeof block['keyServerUrl'] === 'string' && hasCredentials(block['keyServerUrl'])) {
+    throw new Error(
+      'refusing to store credential-bearing keyServerUrl for DRM configuration in the parameter store'
+    );
+  }
+  for (const urlMap of ['licenceUrls', 'certificateUrls'] as const) {
+    const value = block[urlMap];
+    if (typeof value !== 'object' || value === null) continue;
+    for (const [systemId, url] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof url === 'string' && hasCredentials(url)) {
+        throw new Error(
+          `refusing to store credential-bearing ${urlMap} entry for DRM system "${systemId}" in the parameter store`
         );
       }
     }
