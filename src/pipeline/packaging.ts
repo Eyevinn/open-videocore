@@ -37,8 +37,20 @@
 
 import type { AssetRepository, ManifestUrls, PackagedOutput } from '../data/asset-repo.js';
 import type { JobRepository } from '../data/job-repo.js';
-import type { PipelineRepository } from '../data/pipeline-repo.js';
+import type { PipelineExecution, PipelineRepository } from '../data/pipeline-repo.js';
 import type { StorageBackendConfig } from '../services/param-store.js';
+import type {
+  DrmErrorCode,
+  DrmSystemId,
+  ProtectionScheme
+} from '../types/drm.js';
+import type {
+  ContentKey,
+  DrmSignalling,
+  KeyProvider,
+  KeyRequest
+} from '../drm/key-provider.js';
+import { resolveDrmSystemIds } from '../drm/key-provider.js';
 import { emitAudit, originActor, type AuditEmitter, type AuditErrorLog } from '../data/audit-emit.js';
 import { logPipelineEvent, type PipelineLogSink } from '../services/pipeline-log.js';
 import {
@@ -194,6 +206,349 @@ export type PackagingJob = {
 // live Valkey, and so the transport stays swappable.
 export interface PackageQueue {
   enqueue(job: PackagingJob): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// EncryptingPackagingRunner — the packaging port that CAN carry encryption
+// (ADR-008 §7.1, decision D8; issue #1263).
+//
+// WHY A SECOND PORT AND NOT A WIDER `PackageQueue`. `PackageQueue.enqueue`
+// above is the contract the deployed packaging library actually understands:
+// `{ jobId, url }` and nothing else (verified from its own redisListener, see
+// `PackagingJob`). Encryption is a capability the deployed library does NOT
+// have today, so the clear path must stay byte-identical while the encrypting
+// shape exists as a declared, testable superset. `PackagingJob` is therefore
+// UNCHANGED and every encrypting job is `PackagingJob & { encryption? }` — a
+// strict superset, so the existing queue adapter and every pre-existing
+// packaging test keep working untouched.
+//
+// CONTRACT SOURCES VERIFIED BEFORE WRITING (CLAUDE.md rule 7)
+//   - `PackagingJob` / `PackageQueue` — this file, :187-197 (the queue envelope
+//     verified against the packaging library's redisListener.ts).
+//   - `ProtectionScheme`, `DrmSystemId`, `DrmErrorCode` — src/types/drm.ts
+//     (`PROTECTION_SCHEMES`, `DrmSystemId` + `DRM_SYSTEM_ID_PATTERN`,
+//     `DRM_ERROR_CODES` which already contains `'drm_unsupported'`).
+//   - `KeyProvider`, `KeyRequest`, `ContentKey`, `DrmSignalling` —
+//     src/drm/key-provider.ts:74-165.
+//   - The per-execution request shape — `PipelineExecution['drm']`
+//     (`{ requested: true; providerId?; systems?; scheme? }`),
+//     src/data/pipeline-repo.ts:100, cloned by `cloneDrmRequest` there.
+//
+// DEVIATION FROM THE ISSUE TEXT, name only: issue #1263 writes the capability
+// and parameter types in terms of `DrmSystem`. No such symbol exists — the DRM
+// vocabulary module exports `DrmSystemId` (src/types/drm.ts), deliberately an
+// open string type carrying a registered common-encryption system id rather
+// than a closed vendor-named enum (ADR-008 §5.3 / CLAUDE.md rule 1). The real
+// exported symbol is used here; nothing is invented.
+// ---------------------------------------------------------------------------
+
+// What a packaging runner can actually do, as answered by the runner itself.
+//
+// `schemes` / `systems` are only meaningful when `encryption` is true; an
+// `encryption: false` runner answers with empty lists (there is no scheme it
+// could apply). Read fresh on every call — see `probeEncryptionCapability`.
+export type PackagingCapabilities = {
+  encryption: boolean;
+  schemes: ProtectionScheme[];
+  systems: DrmSystemId[];
+};
+
+// The encryption instruction handed to a runner that reports `encryption: true`.
+//
+// !! TRANSIENT KEY MATERIAL — MUST NOT BE PERSISTED OR LOGGED !!
+// `keys[].key` is a raw 16-byte content key, base64-encoded. It is the same
+// material `ContentKey.key` carries (src/drm/key-provider.ts:112-126) and is
+// bound by the same rule (ADR-008 D4 / §10 "Key material"): it lives ONLY in
+// the call stack that builds the packaging job. This type must never be
+// persisted (the stored shape is `AssetDrm`, which has no `key` member),
+// never written to a log or audit entry, never returned in an HTTP response,
+// and never embedded in a type that is. Hold it in a local, hand it to the
+// runner, drop the reference. Everything else here (`keyId`, `pssh`,
+// `protectionSystems`, `hlsKeyUri`) is signalling, not secret.
+export type EncryptionParams = {
+  scheme: ProtectionScheme;
+  // `label` identifies which track group the key binds to (the
+  // `ContentKey.trackGroup` value, e.g. 'SD'); `keyId` is the UUID key
+  // identifier — the only part of a key that is ever persisted.
+  // `key`: base64 of the raw 16 key bytes. TRANSIENT — see the warning above.
+  keys: { label: string; keyId: string; key: string }[];
+  // Base64 PSSH box per system id (`DrmSignalling.pssh`). Partial by nature: a
+  // provider may answer for only some of the requested systems.
+  pssh: Partial<Record<DrmSystemId, string>>;
+  hlsKeyUri?: string;
+  protectionSystems: DrmSystemId[];
+};
+
+// The port (ADR-008 §7.1, D8). A superset of `PackageQueue`: `enqueue` accepts
+// every job `PackageQueue.enqueue` accepts, plus an optional `encryption`
+// block, so an `EncryptingPackagingRunner` is usable anywhere a `PackageQueue`
+// is — but not the reverse.
+export interface EncryptingPackagingRunner {
+  capabilities(): Promise<PackagingCapabilities>;
+  enqueue(job: PackagingJob & { encryption?: EncryptionParams }): Promise<void>;
+}
+
+// The capability answer of the runner this deployment actually has.
+//
+// CORRECT AS OF TODAY, and verified rather than assumed: the deployed packaging
+// library exposes no encryption option on any of its three relevant surfaces —
+//   C1  shaka-packager-s3 `src/packager.ts`  — builds the packager argv from
+//       `{ source, dest, stagingDir, noImplicitAudio, ... }`; no key, keyId,
+//       scheme, pssh or `--enable_*_encryption` argument is constructible.
+//   C2  encore-packager `src/config.ts`      — the instance config surface
+//       (`RedisUrl`, `RedisQueue`, `OutputFolder`, `AwsAccessKeyId`,
+//       `AwsSecretAccessKey`, `S3EndpointUrl`, `CallbackUrl`,
+//       `PersonalAccessToken`); no encryption field.
+//   C3  encore-packager `src/redisListener.ts` — the queue envelope this module
+//       enqueues onto is `{ jobId, url }` (see `PackagingJob` above); there is
+//       no slot in which encryption parameters could be passed per job.
+// So the honest answer is "no", and the gate below turns that into an immediate,
+// machine-readable refusal instead of a package that silently comes out clear.
+export const NO_ENCRYPTION_CAPABILITY: Readonly<PackagingCapabilities> =
+  Object.freeze({ encryption: false, schemes: [], systems: [] });
+
+// Adapt the existing clear-only queue to the port.
+//
+// NOT CACHED (issue #1263 constraint): `capabilities()` builds a FRESH object
+// every call, so no result is memoised across pipeline executions and an
+// operator who swaps in an encrypting runner never has a stale "no" served from
+// a previous execution. The arrays are copied for the same reason a frozen
+// default would otherwise leak: a caller mutating the answer must not be able
+// to change what the next probe reports.
+export function clearPackagingRunner(
+  queue: PackageQueue
+): EncryptingPackagingRunner {
+  return {
+    async capabilities(): Promise<PackagingCapabilities> {
+      return {
+        encryption: NO_ENCRYPTION_CAPABILITY.encryption,
+        schemes: [...NO_ENCRYPTION_CAPABILITY.schemes],
+        systems: [...NO_ENCRYPTION_CAPABILITY.systems]
+      };
+    },
+    async enqueue(
+      job: PackagingJob & { encryption?: EncryptionParams }
+    ): Promise<void> {
+      // Defence in depth behind the gate: this runner cannot encrypt, so being
+      // handed encryption parameters is a programming error, not a job to run
+      // clear. Failing loudly is the only safe answer — silently dropping the
+      // block would publish unprotected output under a protected request.
+      // The thrown message names NO key material (ADR-008 §10).
+      if (job.encryption) {
+        throw new Error(
+          'packaging runner does not support encryption; refusing to enqueue an encrypted job as clear'
+        );
+      }
+      // Pass only the fields the queue contract defines (`PackagingJob`), never
+      // the widened object.
+      await queue.enqueue({ jobId: job.jobId, url: job.url });
+    }
+  };
+}
+
+// Probe the runner. A thin, deliberately un-memoised wrapper that exists so the
+// "never cached" constraint has ONE place it can be read and tested, and so the
+// gate below cannot accidentally be given a cached answer.
+export async function probeEncryptionCapability(
+  runner: EncryptingPackagingRunner
+): Promise<PackagingCapabilities> {
+  return runner.capabilities();
+}
+
+// The refusal a DRM-requesting package step gets when the runner cannot
+// encrypt. `status` and `errorCode` are the issue #1263 contract; `errorCode`
+// is typed from `DRM_ERROR_CODES` (src/types/drm.ts) rather than a loose string
+// so it cannot drift from the asset-level error vocabulary.
+export type DrmUnsupportedRefusal = {
+  status: 409;
+  error: Extract<DrmErrorCode, 'drm_unsupported'>;
+  errorCode: Extract<DrmErrorCode, 'drm_unsupported'>;
+  message: string;
+};
+
+export const DRM_UNSUPPORTED_REFUSAL: Readonly<DrmUnsupportedRefusal> =
+  Object.freeze({
+    status: 409,
+    error: 'drm_unsupported',
+    errorCode: 'drm_unsupported',
+    message:
+      'DRM protection was requested but the packaging runner for this stack cannot encrypt output; re-run without drm, or deploy a packaging runner that reports encryption support'
+  });
+
+// The other two ways a runner can be unable to do what was asked. A runner that
+// reports `encryption: true` still cannot apply a protection scheme it does not
+// implement, nor signal a DRM system it does not know, and BOTH are the same
+// class of failure as `encryption: false` — the capability answer does not
+// cover the request. They therefore refuse with the same `409 drm_unsupported`
+// shape (`DrmUnsupportedRefusal`) and differ only in `message`.
+//
+// WHY THEY EXIST: without them the gate reduced the requested systems to the
+// runner-supported intersection and proceeded even when that intersection was
+// EMPTY, enqueueing `protectionSystems: []` / `pssh: {}` alongside real content
+// keys — encrypted output carrying no DRM signalling at all, reported to the
+// caller as `{ ok: true, encrypted: true }`. Unplayable output is not a
+// success; an unsatisfiable request must fail loud, before any key is minted.
+//
+// The messages name no system id, scheme or key material: they are static
+// operator-facing text (ADR-008 §10 "Logging and error redaction"), exactly
+// like DRM_UNSUPPORTED_REFUSAL above.
+export const DRM_SYSTEMS_UNSUPPORTED_REFUSAL: Readonly<DrmUnsupportedRefusal> =
+  Object.freeze({
+    status: 409,
+    error: 'drm_unsupported',
+    errorCode: 'drm_unsupported',
+    message:
+      'DRM protection was requested but the packaging runner for this stack supports none of the requested DRM systems; request a system the runner reports, or deploy a packaging runner that supports one'
+  });
+
+export const DRM_SCHEME_UNSUPPORTED_REFUSAL: Readonly<DrmUnsupportedRefusal> =
+  Object.freeze({
+    status: 409,
+    error: 'drm_unsupported',
+    errorCode: 'drm_unsupported',
+    message:
+      'DRM protection was requested with a protection scheme the packaging runner for this stack does not support; request a scheme the runner reports, or deploy a packaging runner that supports it'
+  });
+
+// Outcome of the packaging step gate. Discriminated so a caller cannot read
+// `refusal` on the proceed path or forget to handle the refusal path.
+export type PackagingStepOutcome =
+  | { ok: true; encrypted: boolean }
+  | { ok: false; refusal: DrmUnsupportedRefusal };
+
+export type PackagingStepRequest = {
+  job: PackagingJob;
+  // The per-execution DRM request as persisted (`PipelineExecution['drm']`).
+  // ABSENT means "no protection requested" — the clear path, which must behave
+  // exactly as it did before this port existed.
+  drm?: NonNullable<PipelineExecution['drm']>;
+};
+
+export type PackagingStepDeps = {
+  runner: EncryptingPackagingRunner;
+  // Only consulted on the supported path. Optional because today's runner never
+  // reports `encryption: true`, so the gate refuses before any key provider is
+  // needed — a deployment with no provider wired is still correct.
+  keyProvider?: KeyProvider;
+  // Bounds the key acquisition (ADR-008 §12 gives the key step a whole-step
+  // deadline); `KeyProvider.acquire` takes a MANDATORY signal
+  // (src/drm/key-provider.ts:149-165).
+  signal?: AbortSignal;
+};
+
+// Fast-fail gate + enqueue for one `package` step (issue #1263 part 3).
+//
+// ORDER IS THE CONTRACT: the capability probe happens FIRST and EVERY
+// `409 drm_unsupported` returns BEFORE `KeyProvider.acquire()` is called, so a
+// request that cannot possibly be fulfilled never mints a content key, never
+// contacts the key provider, and never leaves key material in a call stack.
+// "Cannot be fulfilled" is all three of: the runner cannot encrypt at all; it
+// cannot apply the requested protection scheme; it supports none of the
+// requested DRM systems. None of the three may degrade into a partial
+// success — encrypted output with missing or empty DRM signalling is unplayable
+// and must never be reported as `{ ok: true }`.
+// The clear path (no `drm`) does not probe for capability at all and enqueues
+// exactly the `{ jobId, url }` envelope it always did.
+export async function enqueuePackagingStep(
+  deps: PackagingStepDeps,
+  req: PackagingStepRequest
+): Promise<PackagingStepOutcome> {
+  if (!req.drm) {
+    await deps.runner.enqueue({ jobId: req.job.jobId, url: req.job.url });
+    return { ok: true, encrypted: false };
+  }
+
+  // Probed per call — never cached between executions.
+  const caps = await probeEncryptionCapability(deps.runner);
+  if (!caps.encryption) {
+    return { ok: false, refusal: DRM_UNSUPPORTED_REFUSAL };
+  }
+
+  // Supported path. Unreachable with today's runner (see
+  // NO_ENCRYPTION_CAPABILITY) and deliberately written against the real
+  // `KeyProvider` contract rather than a placeholder, so the day a runner does
+  // report encryption support there is no invented shape to unpick.
+  // STILL BEFORE ANY KEY IS MINTED: narrow `encryption: true` down to what this
+  // runner can actually apply to THIS request. Both checks refuse rather than
+  // silently degrade — see DRM_SCHEME_UNSUPPORTED_REFUSAL /
+  // DRM_SYSTEMS_UNSUPPORTED_REFUSAL for why an empty result must not proceed.
+  //
+  // Scheme: the per-execution override (`PipelineExecution['drm'].scheme`,
+  // src/data/pipeline-repo.ts:100) when given, else the runner's own first
+  // reported scheme. A runner that claims encryption but reports NO scheme
+  // (`caps.schemes` empty, `PackagingCapabilities` above) can apply none, so
+  // `scheme === undefined` refuses too instead of falling back to a guess.
+  const scheme: ProtectionScheme | undefined =
+    req.drm.scheme ?? caps.schemes[0];
+  if (scheme === undefined || !caps.schemes.includes(scheme)) {
+    return { ok: false, refusal: DRM_SCHEME_UNSUPPORTED_REFUSAL };
+  }
+  // Systems: `resolveDrmSystemIds` (src/drm/key-provider.ts:69-71) applies the
+  // configured-or-default list, then the intersection with `caps.systems` keeps
+  // only the ones this runner can signal. An EMPTY intersection means nothing
+  // the caller asked for can be protected — refuse.
+  const systems = resolveDrmSystemIds(req.drm.systems).filter((id) =>
+    caps.systems.includes(id)
+  );
+  if (systems.length === 0) {
+    return { ok: false, refusal: DRM_SYSTEMS_UNSUPPORTED_REFUSAL };
+  }
+  if (!deps.keyProvider) {
+    throw new Error(
+      'packaging runner reports encryption support but no key provider is wired'
+    );
+  }
+  const request: KeyRequest = {
+    contentId: req.job.jobId,
+    systems,
+    scheme,
+    trackGroups: ['SD']
+  };
+  const { keys, signalling } = await deps.keyProvider.acquire(
+    request,
+    deps.signal ?? AbortSignal.timeout(60_000)
+  );
+  await deps.runner.enqueue({
+    jobId: req.job.jobId,
+    url: req.job.url,
+    encryption: toEncryptionParams(scheme, systems, keys, signalling)
+  });
+  return { ok: true, encrypted: true };
+}
+
+// Map the key provider's answer onto the runner's encryption block.
+//
+// TRANSIENT: the returned object carries key material (see `EncryptionParams`).
+// It is returned, handed straight to `enqueue`, and dropped — never logged,
+// never persisted. `ContentKey.key` is `Uint8Array` (16 bytes,
+// src/drm/key-provider.ts:118) and the port wants base64, which is the only
+// conversion here.
+function toEncryptionParams(
+  scheme: ProtectionScheme,
+  systems: DrmSystemId[],
+  keys: ContentKey[],
+  signalling: DrmSignalling
+): EncryptionParams {
+  const pssh: Partial<Record<DrmSystemId, string>> = {};
+  for (const system of systems) {
+    const value = signalling.pssh[system];
+    if (value !== undefined) {
+      pssh[system] = value;
+    }
+  }
+  return {
+    scheme,
+    keys: keys.map((k) => ({
+      label: k.trackGroup,
+      keyId: k.keyId,
+      key: Buffer.from(k.key).toString('base64')
+    })),
+    pssh,
+    ...(signalling.hlsKeyUri !== undefined
+      ? { hlsKeyUri: signalling.hlsKeyUri }
+      : {}),
+    protectionSystems: systems
+  };
 }
 
 // The interface issue #8's Encore callback handler depends on. Keeping the
