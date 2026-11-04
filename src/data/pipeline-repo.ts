@@ -12,6 +12,11 @@
 import { monotonicFactory } from 'ulid';
 import type { PipelineStepName } from '../pipeline/pipelines.js';
 import type { StepErrorDetail } from '../pipeline/step-error-detail.js';
+// Shared DRM vocabulary (ADR-008 §5.1), imported from the same module the asset
+// model uses so the per-execution request and the persisted asset state cannot
+// drift apart.
+import type { DrmSystemId, ProtectionScheme } from '../types/drm.js';
+import { drmEnabled } from '../types/drm.js';
 
 const ulid = monotonicFactory();
 
@@ -79,6 +84,20 @@ export type PipelineExecution = {
   // back to the provisioned instance-level default. Persisted so the pipeline
   // and delivery endpoint can both resolve the destination actually used.
   destinationBucket?: string;
+  // Optional per-execution DRM request (ADR-008 §8 / issue #1259), mirroring
+  // `destinationBucket` above: an OPTIONAL override supplied at execution
+  // creation time, persisted so the later package stage resolves what the caller
+  // actually asked for instead of re-deriving it.
+  //
+  // `requested: true` is the only permitted value — absence IS "no protection
+  // requested", so there is one representation of the clear path (the
+  // `Asset.packagedOutputStale` marker convention). The three optional members
+  // are per-execution overrides of the stack-level defaults (ADR-008 §5.2):
+  // omitted means "use the stack configuration".
+  //
+  // Request intent only — it carries no key material and no key identifiers
+  // (ADR-008 D4); the resulting state lands on the asset as `Asset.drm`.
+  drm?: { requested: true; providerId?: string; systems?: DrmSystemId[]; scheme?: ProtectionScheme };
   // The canonical location the packaged output actually landed at, resolved
   // after post-package relocation (issue #208, ADR-011). When a per-execution
   // `destinationBucket` override is set, PackagingService server-side-copies the
@@ -103,6 +122,12 @@ export interface PipelineRepository {
     pipelineName: string;
     steps: PipelineStepName[];
     destinationBucket?: string;
+    // Per-execution DRM request (ADR-008, issue #1259), accepted at creation
+    // time exactly like `destinationBucket`. Dropped unless `DRM_ENABLED` is on
+    // (ADR-008 D9), so a flag-off execution record is identical to a pre-#1259
+    // one. Not patchable: an execution's request does not change mid-flight,
+    // mirroring `destinationBucket`'s absence from the `update` patch type.
+    drm?: PipelineExecution['drm'];
   }): Promise<PipelineExecution>;
   get(id: string): Promise<PipelineExecution | undefined>;
   update(
@@ -136,6 +161,7 @@ export class InMemoryPipelineRepository implements PipelineRepository {
     pipelineName: string;
     steps: PipelineStepName[];
     destinationBucket?: string;
+    drm?: PipelineExecution['drm'];
   }): Promise<PipelineExecution> {
     const now = new Date().toISOString();
     const id = ulid();
@@ -148,6 +174,8 @@ export class InMemoryPipelineRepository implements PipelineRepository {
       ...(input.destinationBucket !== undefined
         ? { destinationBucket: input.destinationBucket }
         : {}),
+      // DRM request (ADR-008 D9): recorded only with the flag on.
+      ...(drmEnabled() && input.drm !== undefined ? { drm: cloneDrmRequest(input.drm) } : {}),
       createdAt: now,
       updatedAt: now
     };
@@ -254,6 +282,23 @@ function clone(execution: PipelineExecution): PipelineExecution {
       : {}),
     ...(execution.relocatedPackagingIds !== undefined
       ? { relocatedPackagingIds: [...execution.relocatedPackagingIds] }
-      : {})
+      : {}),
+    // The DRM request (#1259) is a nested object with a nested array, so — like
+    // `resolvedOutputLocation` above — it is copied rather than shared.
+    ...(execution.drm !== undefined ? { drm: cloneDrmRequest(execution.drm) } : {})
+  };
+}
+
+// Deep-copy a per-execution DRM request (#1259) field by field, so neither the
+// store nor a caller can mutate the other's object and no non-contract member
+// rides along. Exported-shape-identical to `PipelineExecution['drm']`.
+export function cloneDrmRequest(
+  drm: NonNullable<PipelineExecution['drm']>
+): NonNullable<PipelineExecution['drm']> {
+  return {
+    requested: true,
+    ...(drm.providerId !== undefined ? { providerId: drm.providerId } : {}),
+    ...(drm.systems !== undefined ? { systems: [...drm.systems] } : {}),
+    ...(drm.scheme !== undefined ? { scheme: drm.scheme } : {})
   };
 }
