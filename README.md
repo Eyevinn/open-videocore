@@ -182,7 +182,9 @@ Seeds the profile store from the default Encore test profiles. The ops dashboard
 | `ENCORE_MIN_INSTANCES` | No | Minimum Encore instances the auto-scaler keeps warm per workspace even when idle (default `0` — scale to zero). Set to `1` or more to keep a warm floor for production / latency-sensitive shared pools. A `minInstances` sent to `PATCH /api/v1/scaler/config` is not applied to the already-running scaler, but it is persisted and, since #1078, loaded at boot with precedence over this variable — so changing the enforced floor through the API takes one restart. See [Auto-scaler warm floor](#auto-scaler-warm-floor-cost-vs-reliability) for the cost-vs-reliability trade-off. |
 | `ENCORE_IDLE_TIMEOUT_MS` | No | Idle time before an Encore instance is torn down, in milliseconds (default `300000`, i.e. 5 minutes). Sets the boot-time value; it can be overridden at runtime without a restart via `PATCH /api/v1/scaler/config` (`idleTimeoutMs`, minimum `10000`). That change is persisted to the parameter store **and reloaded at boot** (#1078), so after a restart the persisted value wins; this variable is the value for a deployment never configured through the API. |
 | `ENCORE_SPAWN_ADOPT_PROBE_TIMEOUT_MS` | No | How long a scale-up keeps asking the platform for the instance name it already requested, after every create attempt ended in a **gateway timeout** (504/408), in milliseconds (default `90000`, i.e. 90 seconds). A create that times out at the gateway usually completes behind it, so the spawn watches that same name for this long and adopts the instance if it shows up, instead of inventing a new name on the next tick and leaving the late arrival for the orphan reaper. An absent, unparseable or negative value falls back to the default; `0` does **not** disable the probe — only values greater than zero are honoured, so `0` is treated as absent and the default applies. Not exposed by the OSC deploy form (see ADR-026 C9), so on a catalog deploy this is the default. |
-| `ENCORE_SPAWN_GATEWAY_BACKOFF_MS` | No | How long the next scale-up for a workspace is held off after a spawn that ended in a gateway timeout, in milliseconds (default `120000`, i.e. 2 minutes). A 504 is the platform telling us it is slow, so the scaler waits instead of starting a second create against it on the very next tick. Only a gateway timeout triggers the hold-off — any other spawn failure (a `403`, a rejected body, a transport error) never delays the retry. An absent, unparseable or negative value falls back to the default; `0` **disables** the hold-off, so scale-up may retry on the next tick. `GET /api/v1/scaler/status` reports `spawnFailure.httpCode`, so a pool that is standing still because of this hold-off can be told apart from one that is failing for another reason. Not exposed by the OSC deploy form (see ADR-026 C9), so on a catalog deploy this is the default. |
+| `ENCORE_SPAWN_GATEWAY_BACKOFF_MS` | No | How long the next scale-up for a workspace is held off after a spawn that ended in a gateway timeout, in milliseconds (default `120000`, i.e. 2 minutes) — the **first** such failure's hold-off; each consecutive failure doubles it, up to `ENCORE_SPAWN_BACKOFF_MAX_MS`, and the first successful spawn resets it. A 504 is the platform telling us it is slow, so the scaler waits instead of starting a second create against it on the very next tick. A gateway timeout and a transport failure (`fetch failed` — nobody answered at all) trigger the hold-off; any other spawn failure (a `403`, a rejected body) never delays the retry. An absent, unparseable or negative value falls back to the default; `0` **disables** the hold-off, so scale-up may retry on the next tick. `GET /api/v1/scaler/status` reports `spawnFailure.httpCode`, so a pool that is standing still because of this hold-off can be told apart from one that is failing for another reason. Not exposed by the OSC deploy form (see ADR-026 C9), so on a catalog deploy this is the default. |
+| `ENCORE_MAX_CONCURRENT_SPAWNS` | No | How many transcoder spawns this API instance may have in flight at once, **across every workspace it serves** (default `1`). Each spawn creates two service instances, so two ingresses, and each ingress goes through the cluster's admission webhook (observed at 15-19s each when the platform is busy); the per-workspace gates cannot see each other, so two workspaces with queued work used to start their creates in the same instant and overlapping bursts took out the platform's controllers. A workspace that cannot get a slot is not queued: it logs why and retries on its next tick, and the rest of that tick (scale-down, the orphan sweep, dispatch) runs as usual. Raise it only on a cluster you have verified can take the parallel creates. An absent, unparseable value, or anything below `1`, falls back to the default — there is no "unlimited" setting. Not exposed by the OSC deploy form (see ADR-026 C9), so on a catalog deploy this is the default. |
+| `ENCORE_SPAWN_BACKOFF_MAX_MS` | No | Ceiling on the scale-up hold-off once repeated failures have lengthened it, in milliseconds (default `1800000`, i.e. 30 minutes). The hold-off starts at `ENCORE_SPAWN_GATEWAY_BACKOFF_MS` and doubles with each consecutive failed spawn, so a platform that keeps refusing the create is asked less and less often; without a ceiling the doubling would park scale-up for hours after a bad afternoon. The first successful spawn clears the record and the hold-off starts over at the base value. An absent, unparseable or non-positive value falls back to the default, and a value below the base hold-off is ignored in favour of the base — it can never shorten the first hold-off. Not exposed by the OSC deploy form (see ADR-026 C9), so on a catalog deploy this is the default. |
 | `ENCORE_S3_ENDPOINT` | No | Static object-store endpoint URL passed to Encore instances so they can read source media. **Normally leave this unset on OSC** — the endpoint is read per stack from the provisioned stack's own config in the parameter store. Set it only for local development, or as a fallback for deployments with no provisioned stack config. It is a *fallback*, not an override: when a stack does have a stored endpoint, that stored endpoint is what the transcoder gets, and this value is not used for that stack. When it is unset *and* no endpoint can be resolved from a stack's stored config, transcode submission fails loudly with an error naming the cause, rather than silently spawning a transcoder with no endpoint (which used to surface as an unexplained 404 on the `s3://` input). |
 | `ENCORE_S3_INTERNAL_ENDPOINT` | No | Set to `off` (also `false`/`0`/`no`/`disabled`) to stop handing spawned Encore instances the **in-cluster** object-store Service address (`http://<instance>.minio-minio.svc.cluster.local:8080`) and use the stack's public endpoint instead. Default is on: the address is looked up from the platform itself (the `getInternalEndpoint` API, which returns the instance's `serviceDns`), falling back to deriving it from the stack's stored public endpoint when the platform cannot answer — and it is used **only after a live health probe from this API succeeds**. Otherwise the public endpoint is used and a warning is logged, so a cross-cluster deployment keeps working unchanged. This exists because one long single-connection read of a large source through the public ingress is severed mid-stream (see `docs/investigations/294-minio-ingress-longlived-connections.md`); routing the transcoder's reads/writes in-cluster takes the ingress out of that data path. Client-facing URLs (presigned uploads, playback, API responses) always stay public. This applies to the endpoint read from a provisioned stack's config; a static `ENCORE_S3_ENDPOINT` is used verbatim on its own path and never passes through this resolver. Full audit: `docs/investigations/991-internal-object-store-endpoint-paths.md`. |
 | `ENCORE_S3_INTERNAL_PORT` | No | Service port used for the in-cluster object-store endpoint (default `8080`, the S3 API port). An invalid value falls back to the default rather than failing startup. The platform's `getInternalEndpoint` currently reports no ports for object-store instances (`ports: []`), so this default is what is actually used; if the platform starts reporting ports, the reported one is preferred over this. |
@@ -500,16 +502,39 @@ to persist.
 > latency/headroom decision, not a fix for in-flight work — it does not change
 > which instances are eligible for teardown, only the floor they stop at.
 
-One more thing can hold a pool below where the queue says it should be: after a
-spawn whose instance-create timed out at the gateway (504), scale-up for that
-workspace is **deliberately** held off for about two minutes
+Two more things can hold a pool below where the queue says it should be, and both
+are deliberate.
+
+First, the hold-off after a failed spawn. After a spawn whose instance-create
+timed out at the gateway (504), or failed with no answer at all (`fetch failed`),
+scale-up for that workspace waits about two minutes
 (`ENCORE_SPAWN_GATEWAY_BACKOFF_MS`, default `120000`; `0` disables it) so the
 scaler does not start a second create against a platform that just told us it was
 slow, and so the instance the timed-out create is probably still building has time
-to appear and be adopted (`ENCORE_SPAWN_ADOPT_PROBE_TIMEOUT_MS`). `GET
-/api/v1/scaler/status` reports `spawnFailure.httpCode` for exactly this reason —
-a `504` there means the pause is the back-off doing its job, not a pool that has
-stopped growing for an unknown reason.
+to appear and be adopted (`ENCORE_SPAWN_ADOPT_PROBE_TIMEOUT_MS`). Each
+*consecutive* failure doubles that wait, up to `ENCORE_SPAWN_BACKOFF_MAX_MS`
+(default 30 minutes), and the first successful spawn resets it — so a platform
+that is briefly slow costs one short pause, while one that has refused the same
+create ten times running is left alone. `GET /api/v1/scaler/status` reports
+`spawnFailure.httpCode` and `spawnFailure.consecutiveFailures` for exactly this
+reason — a `504` with a climbing count means the pause is the back-off doing its
+job, not a pool that has stopped growing for an unknown reason.
+
+Second, the spawn cap. At most `ENCORE_MAX_CONCURRENT_SPAWNS` spawns (default
+`1`) are *creating instances* at any moment across **all** workspaces this
+deployment serves, because each one creates two ingresses through the cluster's
+admission webhook and simultaneous bursts are what overload the platform. A
+workspace that arrives second retries on its next tick, and keeps the rest of
+that tick (scale-down, the orphan sweep, dispatch) meanwhile. The slot is held
+only for the creates and released before the spawn waits for its instances to
+report ready — so what the second workspace waits for is the first one's two
+creates (seconds normally; a few minutes at worst, if those creates are
+themselves timing out at the gateway and the adopt probe runs), **not** the up to
+15 minutes of node provisioning a readiness wait can cover. In both cases the
+scaler log says
+which gate held the spawn and what it is waiting for — `spawn cap reached`,
+`spawn hold-off active` or `adoption pending`, each with its numbers — so the
+reason is readable in a pod tail without a log-aggregation query.
 
 #### What the idle clock measures
 

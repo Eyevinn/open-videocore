@@ -533,6 +533,45 @@ async function probeForGatewayTimedOutInstance(
 // error text can be scrubbed of them before it is served over HTTP.
 type SpawnProgress = { attempts: number; secrets: string[] };
 
+// Optional callbacks a caller can hang off the phases of a spawn.
+//
+// `onCreatesSettled` (#1322 review finding 3) is called exactly once, at the
+// moment this spawn will issue no further createInstance call — both halves (the
+// transcoder instance and its paired callback listener) have been created or
+// adopted — and BEFORE the readiness waits are awaited.
+//
+// That boundary exists because the two phases of a spawn load the platform very
+// differently. The create phase is what goes through the cluster's ingress
+// admission webhook (two ingresses, 15-19s apiece under load) and is the burst
+// the deployment-wide spawn cap exists to damp (spawn-admission.ts). The
+// readiness phase that follows is a once-a-second getInstanceHealth poll against
+// an instance that already exists, for up to DEFAULT_SPAWN_READY_TIMEOUT_MS (15
+// minutes, because OSC may be provisioning a whole worker node) — it puts no
+// create pressure on the webhook at all. Holding an admission slot across it
+// would park every other workspace's scale-up for the whole node-provisioning
+// wait to damp a burst that was over in seconds.
+//
+// It is NOT called when the spawn fails before that point; the caller is
+// expected to release in a `finally` as well (SpawnSlot.release is idempotent),
+// so an early throw still gives the slot back.
+export type SpawnHooks = {
+  onCreatesSettled?: () => void;
+};
+
+// Run a spawn hook without letting it affect the spawn.
+//
+// A hook is caller bookkeeping (releasing an admission slot), not a step of the
+// spawn: a throwing hook must not fail an instance that was created fine, nor be
+// mistaken for an OSC failure by the spawn-failure record.
+function runSpawnHook(hook: (() => void) | undefined, label: string): void {
+  if (hook === undefined) return;
+  try {
+    hook();
+  } catch (err) {
+    console.warn('[encore-scaler] spawn: %s hook threw (ignored):', label, err);
+  }
+}
+
 // Spawn a fresh Encore OSC instance and register it in the pool. The instance
 // name is unique per spawn so concurrent scale-ups never collide.
 // Retries up to 3 times on transient 5xx OSC infrastructure errors (e.g.
@@ -546,13 +585,17 @@ type SpawnProgress = { attempts: number; secrets: string[] };
 // the next tick, leaving "at cap" and "cannot spawn" indistinguishable on the
 // wire. A success clears the record. Both are best-effort: the bookkeeping must
 // never mask the real error, nor fail a spawn that actually worked.
+//
+// `hooks.onCreatesSettled` (#1322 review) fires once this spawn will make no
+// further createInstance call — see SpawnHooks below.
 export async function spawnInstance(
   config: EncoreScalerConfig,
-  maxAttempts = 3
+  maxAttempts = 3,
+  hooks?: SpawnHooks
 ): Promise<EncoreInstanceRecord> {
   const progress: SpawnProgress = { attempts: 0, secrets: [] };
   try {
-    const record = await spawnPooledInstance(config, maxAttempts, progress);
+    const record = await spawnPooledInstance(config, maxAttempts, progress, hooks);
     try {
       await clearSpawnFailure(config.redis, config.workspaceId);
     } catch {
@@ -677,7 +720,8 @@ async function createOrAdoptCallbackListener(
 async function spawnPooledInstance(
   config: EncoreScalerConfig,
   maxAttempts: number,
-  progress: SpawnProgress
+  progress: SpawnProgress,
+  hooks?: SpawnHooks
 ): Promise<EncoreInstanceRecord> {
   const sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
   progress.secrets.push(sat);
@@ -975,6 +1019,18 @@ async function spawnPooledInstance(
       if (!callback) throw lastCallbackErr;
       listenerCreated = true;
       listenerUrl = instanceUrl(callback);
+      // #1322 review finding 3: both halves now exist, so this spawn is done
+      // asking the platform to create anything — every remaining step is the
+      // readiness poll and the pool write. Tell the caller here, so an
+      // admission slot taken to serialise CREATES is not also held for the
+      // readiness budget (up to DEFAULT_SPAWN_READY_TIMEOUT_MS = 15 minutes of
+      // node provisioning), which would block every other workspace's scale-up
+      // long after the webhook burst this spawn caused was over.
+      //
+      // Deliberately after `listenerCreated`/`listenerUrl` are set, not before:
+      // on this line the cleanup path already knows about both halves, so the
+      // hook cannot run on a spawn whose listener is still unaccounted for.
+      runSpawnHook(hooks?.onCreatesSettled, 'onCreatesSettled');
       // #1170: both halves are now provisioning; wait for them CONCURRENTLY
       // rather than one after the other. Each wait keeps its own deadline and
       // cadence (waitForSpawnedInstanceReady), and Promise.all rejects with the
