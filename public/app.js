@@ -39,7 +39,9 @@ import { copyableIdCellHtml, slugCellHtml, wireCopyIdButtons } from './copy-id.j
 // Running-build indicator (issue #828). Reads the build identity of the live
 // deployment from GET /health and renders it in the header. Contract grounding
 // for the /health `build` object lives in public/build-info.js.
-import { initBuildIndicator } from './build-info.js';
+// HEALTH_PATH is re-used by the watch-folder availability read (issue #871) so
+// the root-relative, un-prefixed /health path is spelled once in the UI.
+import { initBuildIndicator, HEALTH_PATH } from './build-info.js';
 // Shared detail-panel primitives (issue #963): the collapsed "Raw" disclosure
 // that holds the full server record, and the copyable field value built on the
 // copy-id.js control. Factored out because the pipeline-execution detail view
@@ -7995,8 +7997,116 @@ async function renderStorageTab(container) {
   await loadBuckets();
 }
 
+// ─── Watch-folder availability (issue #871) ──────────────────────────────────
+// Why this reads /health and not the per-bucket route:
+//
+// GET /storage/buckets/{bucket}/watch-folder (src/routes/storage.ts:642, 200 body
+// `watchFolderBucketSchema` at src/routes/storage.ts:125 => { enabled, running,
+// bucket }) reports only whether the watcher is pointed at THIS bucket. On a
+// deployment with no watch-folder service at all it still answers 200 with
+// { enabled: false, running: false } — indistinguishable from a configured but
+// idle one. Rendering an active toggle off that reading means the only way to
+// learn the feature is unavailable is to press it and read the 501
+// `not_configured` (src/routes/storage.ts:678-682).
+//
+// The deployment-level signal lives on GET /health — the only `get` under the
+// `/health` path in openapi.json, handler `healthRouter` in src/routes/health.ts,
+// 200 body `healthResponseSchema` (src/routes/health.ts:96). Its
+// `ingest.watchFolder` member is `ingestMethodSchema` (src/routes/health.ts:36-41):
+//     { available: boolean, reason?: 'no-storage-endpoint' | 'not-enabled'
+//                                   | 'missing-storage-endpoint' }
+// `reason` is present only when `available` is false, and the three values are
+// classified by `watchFolderMethod` in src/services/ingest-availability.ts.
+//
+// The reasons are deliberately NOT flattened to "unavailable": `not-enabled` is
+// an opt-in flag the operator can set, while `missing-storage-endpoint` /
+// `no-storage-endpoint` are provisioning gaps. Different remedy, different text.
+const WATCH_FOLDER_UNAVAILABLE_COPY = Object.freeze({
+  'not-enabled':
+    'Watch-folder ingest is switched off on this deployment: the WATCH_FOLDER_ENABLED ' +
+    'flag is not set to "true". That is a configuration flag — set it and restart the ' +
+    'API to offer watch-folder ingest.',
+  'missing-storage-endpoint':
+    'Watch-folder ingest is switched on, but this deployment has no single object ' +
+    'storage endpoint (MINIO_URL) for it to watch. That is a provisioning gap — point ' +
+    'the deployment at a storage endpoint to offer watch-folder ingest.',
+  'no-storage-endpoint':
+    'This deployment has no object storage endpoint configured, so there is no bucket ' +
+    'to watch. That is a provisioning gap — configure object storage to offer ' +
+    'watch-folder ingest.',
+});
+
+// Shown when /health says unavailable but carries a reason this UI does not know
+// — a value added to the enum after this build. Still accurate, just less
+// specific, so a new reason degrades to a plain statement rather than silence.
+const WATCH_FOLDER_UNAVAILABLE_FALLBACK =
+  'Watch-folder ingest is not available on this deployment.';
+
+function watchFolderUnavailableText(reason) {
+  return (reason && WATCH_FOLDER_UNAVAILABLE_COPY[reason]) || WATCH_FOLDER_UNAVAILABLE_FALLBACK;
+}
+
+// Read `ingest.watchFolder` from /health. Resolves with that object, or null on
+// ANY failure (unreachable, non-2xx, unparseable, missing/!boolean `available`).
+// Null means "cannot tell" and the caller then behaves exactly as before this
+// change — fail-open, same discipline as loadOptionalStepAvailability (#790):
+// an unreadable signal must never hide a control that does work. /health is
+// unauthenticated and NOT under the /api/v1 prefix (src/main.ts:380), so this
+// goes through plain fetch rather than apiFetch.
+async function fetchWatchFolderAvailability() {
+  if (typeof fetch !== 'function') return null;
+  try {
+    const res = await fetch(window.location.origin + HEALTH_PATH, { cache: 'no-store' });
+    if (!res || !res.ok) return null;
+    const health = await res.json();
+    const wf = health && health.ingest && health.ingest.watchFolder;
+    if (!wf || typeof wf.available !== 'boolean') return null;
+    return wf;
+  } catch (_) {
+    return null;
+  }
+}
+
+// The unavailable state: a disabled control plus a persistent line saying why.
+// Not showMsg() — that self-removes after 6s, and the explanation has to stay as
+// long as the control it explains. The state is carried by `disabled` + the
+// "(unavailable)" word, never by colour alone (WCAG 1.4.1), and the note is tied
+// to the button with aria-describedby so it is announced on focus (WCAG 1.3.1).
+function renderWatchFolderUnavailable(wfEl, reason) {
+  const text = watchFolderUnavailableText(reason);
+  const noteId = 'storage-watch-folder-unavailable';
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn-sm';
+  btn.disabled = true;
+  btn.textContent = '▶ Enable watch folder (unavailable)';
+  btn.title = text;
+  btn.setAttribute('aria-describedby', noteId);
+
+  const note = document.createElement('div');
+  note.id = noteId;
+  note.className = 'mt8 text-muted';
+  note.style.fontSize = '12px';
+  note.textContent = text;
+
+  wfEl.appendChild(btn);
+  wfEl.appendChild(note);
+}
+
 async function renderWatchFolderToggle(wfEl, bucket) {
   wfEl.innerHTML = '';
+
+  // Deployment-level availability first (issue #871): when the service is not
+  // configured at all, show the disabled state and make no per-bucket request.
+  // The on-click 501 path below is kept as the backstop for the race where
+  // configuration changes between this render and the click.
+  const availability = await fetchWatchFolderAvailability();
+  if (availability && availability.available === false) {
+    renderWatchFolderUnavailable(wfEl, availability.reason);
+    return;
+  }
+
   let status;
   try {
     status = await apiFetch('/storage/buckets/' + encodeURIComponent(bucket) + '/watch-folder');
@@ -10817,6 +10927,17 @@ export {
   // retention window wired) — see formatRetentionRemaining's own comment for
   // the exact contract citations.
   formatRetentionRemaining,
+  // Watch-folder toggle suppression on deployments where the service is not
+  // configured (issue #871). Exported so a DOM test can drive the REAL renderer
+  // — the same code path openBucketBrowser uses — against a stubbed /health, and
+  // assert that an unavailable reading disables the control, explains itself, and
+  // issues no per-bucket request. The copy map and formatter are exported too so
+  // the three reasons can be pinned without a round trip.
+  renderWatchFolderToggle,
+  fetchWatchFolderAvailability,
+  watchFolderUnavailableText,
+  WATCH_FOLDER_UNAVAILABLE_COPY,
+  WATCH_FOLDER_UNAVAILABLE_FALLBACK,
 };
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
