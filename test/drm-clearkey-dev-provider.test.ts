@@ -131,6 +131,12 @@ describe('clearkey-dev acquire()', () => {
       AbortSignal.timeout(1_000)
     );
     const serialised = JSON.stringify(signalling);
+    // NOTE: the next line is near-tautological — it only says the signalling
+    // object has no member or value with "key" in its name, which the shape
+    // already fixes. The real oracle is the per-key material check below; a
+    // review asked for this line to go, and removing an existing assertion is
+    // a human-only edit (.claude/hooks/protect-test-oracle.sh), so it is
+    // documented as weak instead of silently kept as if it proved something.
     expect(serialised).not.toContain('key');
     for (const key of keys) {
       expect(serialised).not.toContain(Buffer.from(key.key).toString('base64'));

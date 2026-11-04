@@ -15,6 +15,15 @@
 // request documents, X3 the SPEKE v1 reference request document). The goldens
 // were checked element-by-element against X2/X3.
 //
+// ONE KNOWN DEVIATION IS BAKED INTO cpix-request-speke-v1.xml: its root
+// `id="01K9ZP4V7R8HTQ2B6WMNXE3C5D"` is not a valid `xs:ID` (cpix.xsd:194),
+// because an `xs:ID` is an NCName and a ULID starts with a digit. That is the
+// v1 wire format, not a mistake — the reasoning, the contracts and the
+// alternative are written out at the root-element comment in
+// src/drm/cpix-request.ts and pinned by the last describe block in this file.
+// A comment cannot live inside the golden itself: it is compared byte-for-byte,
+// so anything in the file is also on the wire.
+//
 // NOTHING HERE TOUCHES A NETWORK OR A CREDENTIAL: the builder is pure string
 // construction, and no test in this file constructs a URL, a provider
 // coordinate or an environment credential.
@@ -357,5 +366,184 @@ describe('system id configuration', () => {
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
       );
     }
+  });
+});
+
+// A namespace prefix and a placeholder local name are NAMES, not text: they are
+// interpolated into `xmlns:<prefix>` and `<prefix:Name/>`, outside any quotes,
+// where attribute escaping is no remedy (escaping `<` inside a tag name only
+// produces a document no parser accepts). The builder therefore REJECTS a name
+// that is not an XML NCName — `Namespaces in XML 1.1` production [4]
+// (https://www.w3.org/TR/xml-names11/) — rather than escaping it. These cases
+// are the injection attempts that reach a tag name.
+describe('CPIX/SPEKE request builder — extension namespace identifiers', () => {
+  const validExtension = {
+    prefix: 'ext',
+    uri: 'urn:example:cpix-extension',
+    placeholderElements: ['KeyFormat']
+  };
+
+  const build = (extensionNamespace: {
+    prefix: string;
+    uri: string;
+    placeholderElements: readonly string[];
+  }): string =>
+    buildCpixRequest(SINGLE_KEY_REQUEST, {
+      spekeVersion: '1.0',
+      newKeyId: explodingMint,
+      extensionNamespace
+    }).document;
+
+  it('rejects a prefix that is not an NCName', () => {
+    for (const prefix of [
+      'ext"',
+      'ext<x',
+      'ext/x',
+      'ext>x',
+      'e x',
+      'ext:more',
+      '1ext',
+      '-ext',
+      '',
+      'ext=" onx',
+      'ext&x'
+    ]) {
+      expect(() => build({ ...validExtension, prefix })).toThrow(
+        'cpix request: extension namespace prefix is not an XML NCName'
+      );
+    }
+  });
+
+  it('rejects a placeholder element name that is not an NCName', () => {
+    for (const name of [
+      'Key"Format',
+      'Key<Format',
+      'KeyFormat/><cpix:Secret',
+      'Key>Format',
+      'Key Format',
+      'Key:Format',
+      '1KeyFormat',
+      '',
+      'KeyFormat xmlns:evil="urn:x"'
+    ]) {
+      expect(() => build({ ...validExtension, placeholderElements: [name] })).toThrow(
+        'cpix request: extension placeholder element name is not an XML NCName'
+      );
+    }
+  });
+
+  it('rejects a prefix that would rebind a namespace the dialect binds itself', () => {
+    for (const prefix of ['cpix', 'pskc', 'ds', 'enc', 'xml', 'xmlns']) {
+      expect(() => build({ ...validExtension, prefix })).toThrow('is reserved');
+    }
+  });
+
+  it('rejects an empty extension namespace uri', () => {
+    expect(() => build({ ...validExtension, uri: '' })).toThrow(
+      'cpix request: extension namespace uri is required'
+    );
+  });
+
+  it('rejects a bad extension namespace on the v2 path too, not just where it is emitted', () => {
+    // v2 ignores the extension when building, so an invalid prefix would
+    // otherwise only surface the day a stack is switched to v1.
+    expect(() =>
+      buildCpixRequest(SINGLE_KEY_REQUEST, {
+        spekeVersion: '2.0',
+        newKeyId: explodingMint,
+        extensionNamespace: { ...validExtension, prefix: 'ext"' }
+      })
+    ).toThrow('is not an XML NCName');
+  });
+
+  it('still accepts a well-formed extension and emits no raw delimiter', () => {
+    const document = build({
+      ...validExtension,
+      placeholderElements: ['KeyFormat', 'KeyFormatVersions', 'ProtectionHeader']
+    });
+    expect(document).toContain('<ext:KeyFormat/>');
+    expect(document).toContain('<ext:KeyFormatVersions/>');
+    expect(document).toContain('<ext:ProtectionHeader/>');
+    // Every `<` in the document opens a real element or closes one: no tag name
+    // carries a quote, an equals sign or a second `<`.
+    for (const tag of document.match(/<[^<>]*>/g) ?? []) {
+      // Only a tag's NAME is checked for XML-significant characters: an
+      // attribute VALUE legitimately carries quotes (`id="..."`, and the XML
+      // declaration itself), and values are escaped rather than rejected.
+      const name = tag.replace(/^<[?/]?/, '').split(/[\s/>?]/)[0] ?? '';
+      expect(name).toMatch(
+        /^(?:xml|(?:[A-Za-z_][A-Za-z0-9_.\-]*:)?[A-Za-z_][A-Za-z0-9_.\-]*)$/
+      );
+      // An extension placeholder is an empty element, so its whole tag is just
+      // the name — nothing from configuration can have escaped into it.
+      if (!name.startsWith('ext:')) continue;
+      expect(tag).not.toContain('"');
+    }
+  });
+});
+
+// `@minPixels`/`@maxPixels` are `xs:integer` (cpix.xsd:36-43). `String(value)`
+// of a fractional, huge or non-finite number is not an `xs:integer` lexical
+// form, so the builder refuses the bounds instead of emitting a document the
+// provider rejects.
+describe('CPIX/SPEKE request builder — video pixel bounds validation', () => {
+  const build = (bounds: Record<string, { minPixels?: number; maxPixels?: number }>): string =>
+    buildCpixRequest(MULTI_GROUP_REQUEST, {
+      spekeVersion: '2.0',
+      newKeyId: explodingMint,
+      videoPixelBounds: bounds
+    }).document;
+
+  it('rejects bounds that are not non-negative safe integers', () => {
+    for (const bad of [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, 1e21]) {
+      expect(() => build({ SD: { maxPixels: bad } })).toThrow(
+        'maxPixels for track group SD must be a non-negative integer'
+      );
+      expect(() => build({ HD: { minPixels: bad } })).toThrow(
+        'minPixels for track group HD must be a non-negative integer'
+      );
+    }
+  });
+
+  it('rejects an inverted band, which would bind a key to nothing', () => {
+    expect(() => build({ HD: { minPixels: 2073600, maxPixels: 414720 } })).toThrow(
+      'minPixels for track group HD exceeds maxPixels'
+    );
+  });
+
+  it('accepts zero and the largest safe integer', () => {
+    const document = build({ SD: { minPixels: 0, maxPixels: Number.MAX_SAFE_INTEGER } });
+    expect(document).toContain(
+      `<cpix:VideoFilter minPixels="0" maxPixels="${Number.MAX_SAFE_INTEGER}"/>`
+    );
+  });
+});
+
+// The v1 root `@id` is a DELIBERATE, documented schema deviation, not an
+// oversight: `CpixType/@id` is `xs:ID` (cpix.xsd:194) and an `xs:ID` is an
+// NCName (XML Schema Part 2 §3.3.8), which cannot start with a digit, while the
+// v1 wire format — the ticket's "Output shape" and the verified v1 reference
+// request document, whose own `@id` is a bare digit-leading identifier — puts
+// the bare content id there. Same resolution as `playlist="master"`: the wire
+// format wins and the deviation is written down. This test pins the deviation
+// so it cannot be changed silently; moving v1 to a synthetic NCName `@id` plus
+// `@contentId` is a wire-format decision for ADR-008 §6.
+describe('CPIX/SPEKE request builder — v1 @id is a recorded xs:ID deviation', () => {
+  it('emits the bare content id on v1 and the schema-safe @contentId on v2', () => {
+    const ulidContentId = '01K9ZP4V7R8HTQ2B6WMNXE3C5D';
+    const v1 = buildCpixRequest(
+      { ...SINGLE_KEY_REQUEST, contentId: ulidContentId },
+      { spekeVersion: '1.0', newKeyId: explodingMint }
+    ).document;
+    const v2 = buildCpixRequest(
+      { ...SINGLE_KEY_REQUEST, contentId: ulidContentId },
+      { spekeVersion: '2.0', newKeyId: explodingMint }
+    ).document;
+    expect(v1).toContain(`<cpix:CPIX id="${ulidContentId}"`);
+    // Leading digit: the value is NOT an NCName, i.e. not a valid xs:ID.
+    expect(/^[A-Za-z_]/.test(ulidContentId)).toBe(false);
+    // v2 has no such problem — @contentId is xs:string (cpix.xsd:195).
+    expect(v2).toContain(`<cpix:CPIX contentId="${ulidContentId}"`);
+    expect(v2).not.toContain('<cpix:CPIX id=');
   });
 });
