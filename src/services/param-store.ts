@@ -503,6 +503,35 @@ function assertNoCredentials(config: StackConfig): void {
 // The thrown message names the FIELD only and never interpolates the value, so
 // a mistakenly supplied credential is not echoed into a log line or an error
 // response (ADR-008 §10 "Logging and error redaction").
+// The keys a persisted DRM block may carry. Declared locally (like SECRET_KEYS
+// above) so this module keeps its type-only dependency on the DRM model and no
+// runtime cycle appears; the `satisfies` clause plus `UnlistedDrmField` below
+// make any drift from `DrmStackConfig` a compile error rather than a field that
+// silently stops being storable. drm/drm-config.ts owns the same list as
+// `DRM_STACK_CONFIG_FIELD_NAMES` and projects to it before calling us — this is
+// the defence-in-depth copy at the store boundary.
+const DRM_ALLOWED_KEYS = [
+  'enabled',
+  'providerKind',
+  'providerId',
+  'label',
+  'keyServerUrl',
+  'spekeVersion',
+  'authMode',
+  'scheme',
+  'systems',
+  'licenceUrls',
+  'certificateUrls',
+  'trackGroups'
+] as const satisfies readonly (keyof DrmStackConfig)[];
+
+type UnlistedDrmField = Exclude<
+  keyof DrmStackConfig,
+  (typeof DRM_ALLOWED_KEYS)[number]
+>;
+const _allDrmKeysAllowed: UnlistedDrmField extends never ? true : never = true;
+void _allDrmKeysAllowed;
+
 function assertNoDrmCredentials(drm: DrmStackConfig | undefined): void {
   if (!drm) return;
   const block = drm as unknown as Record<string, unknown>;
@@ -525,6 +554,18 @@ function assertNoDrmCredentials(drm: DrmStackConfig | undefined): void {
         `refusing to store secret field "${secretKey}" for DRM configuration in the parameter store`
       );
     }
+  }
+  // A name denylist only catches the names it knows, and `storeStackConfig`
+  // persists this block verbatim via JSON.stringify. So the real guard is the
+  // allowlist: any key that is not a known DRM coordinate is refused, which
+  // covers a credential under an unanticipated name (`clientSecret`, `pwd`,
+  // `sessionKey`) as well as a typo'd field that would otherwise be stored and
+  // never read. The message names the KEY only, never its value.
+  for (const key of Object.keys(block)) {
+    if ((DRM_ALLOWED_KEYS as readonly string[]).includes(key)) continue;
+    throw new Error(
+      `refusing to store unknown field "${key}" for DRM configuration in the parameter store`
+    );
   }
   if (typeof block['keyServerUrl'] === 'string' && hasCredentials(block['keyServerUrl'])) {
     throw new Error(

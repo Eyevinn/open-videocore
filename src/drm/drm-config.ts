@@ -43,6 +43,20 @@
 // credential as input either — the only credential source is `process.env`,
 // read at CALL time.
 //
+// That guarantee rests on an ALLOWLIST, not on a list of forbidden names:
+// `validateDrmStackConfig` rejects every key outside
+// `DRM_STACK_CONFIG_FIELD_NAMES`, and `projectDrmStackConfig` drops them on the
+// way to the store and to the response. A credential under a name nobody
+// anticipated (`clientSecret`, `authToken`, `pwd`) is therefore refused because
+// it is not a DRM coordinate, which is also why a typo'd field is a `400`
+// rather than a silently ignored one. `DRM_CREDENTIAL_FIELD_NAMES` survives as
+// the diagnostic layer that turns the common mistakes into a specific message.
+//
+// The read view adds exactly one derived field, `credentials`
+// (`DrmConfigView`), and the write path accepts it as a status value and strips
+// it — so GET `/api/v1/drm/config` → PUT the same body back is valid, which it
+// must be for any client that edits a config it just read.
+//
 // NAMING (CLAUDE.md rule 1 / ADR-008 §5.3): no vendor or product name appears
 // in any identifier, enum value, env var or configuration key. ADR-008 §5.2's
 // JSON sketch keys `systems` / `licenceUrls` by short product names; §5.3
@@ -172,20 +186,74 @@ function isHttpsUrl(value: unknown): boolean {
   return parsed.protocol === 'https:';
 }
 
-// Field names that would carry a SECRET. ADR-008 §5.2 keeps every credential in
-// the environment, so any of these appearing in a config body is a rejected
-// field rather than a stored one (the `400 invalid_field` of §9).
+// The ALLOWLIST: every key `StackConfig.drm` may carry (ADR-008 §5.2's field
+// list, as adapted by §5.3 — see the header note on `certificateUrls`). This is
+// the authoritative gate on the write path: a key that is not here is not a DRM
+// coordinate, so it is never validated, never persisted and never returned,
+// whatever it is named. The name denylist below is only a DIAGNOSTIC layer on
+// top of it (a better error message for a recognisably credential-shaped key),
+// not the defence — a denylist alone cannot see a key it was not told about.
+export const DRM_STACK_CONFIG_FIELD_NAMES = Object.freeze([
+  'enabled',
+  'providerKind',
+  'providerId',
+  'label',
+  'keyServerUrl',
+  'spekeVersion',
+  'authMode',
+  'scheme',
+  'systems',
+  'licenceUrls',
+  'certificateUrls',
+  'trackGroups'
+] as const) satisfies readonly (keyof DrmStackConfig)[];
+
+// Compile-time drift guard in the OTHER direction: `satisfies` above proves
+// every listed name is a real member, and this proves every real member is
+// listed. Adding a field to `DrmStackConfig` without adding it here is a type
+// error rather than a silently un-persistable field.
+type UnlistedDrmStackConfigField = Exclude<
+  keyof DrmStackConfig,
+  (typeof DRM_STACK_CONFIG_FIELD_NAMES)[number]
+>;
+const _allDrmFieldsListed: UnlistedDrmStackConfigField extends never
+  ? true
+  : never = true;
+void _allDrmFieldsListed;
+
+// Keys that exist on the READ view only (`DrmConfigView`) and are DERIVED, not
+// stored. A client that GETs the config and PUTs it back unchanged sends these,
+// so the write path must accept them — and then DROP them (`projectDrmStackConfig`),
+// because the stored block has no such member. `credentials` is the credential
+// STATUS of ADR-008 §9 (`'configured' | 'missing'`), not a credential value;
+// conflating the two is what made the GET→PUT round trip impossible.
+export const DRM_CONFIG_VIEW_ONLY_FIELD_NAMES: readonly string[] = Object.freeze(
+  ['credentials']
+);
+
+// Field names that would carry a SECRET VALUE. ADR-008 §5.2 keeps every
+// credential in the environment, so any of these appearing in a config body is
+// a rejected field rather than a stored one (the `400 invalid_field` of §9).
+//
+// Diagnostic layer only — `DRM_STACK_CONFIG_FIELD_NAMES` is what actually keeps
+// an unlisted key out of the store. Deliberately NOT containing `credentials`:
+// that name belongs to the read view's status field (see
+// `DRM_CONFIG_VIEW_ONLY_FIELD_NAMES`), and a non-status value under it is
+// rejected by its own check in `validateDrmStackConfig` instead.
 export const DRM_CREDENTIAL_FIELD_NAMES: readonly string[] = Object.freeze([
   'username',
   'password',
+  'pwd',
+  'passphrase',
   'token',
+  'authToken',
   'secret',
+  'clientSecret',
   'clientCert',
   'clientKey',
   'certificate',
   'privateKey',
-  'apiKey',
-  'credentials'
+  'apiKey'
 ]);
 
 // Validate a candidate `StackConfig.drm` block (ADR-008 §5.2).
@@ -193,9 +261,10 @@ export const DRM_CREDENTIAL_FIELD_NAMES: readonly string[] = Object.freeze([
 // Returns EVERY problem rather than throwing on the first, so an operator fixes
 // one round-trip instead of N. An empty array means valid.
 //
-// Checks, in order: no credential-shaped field; required members present and
-// well-typed; each enum value in its shared membership list; every URL an
-// absolute credential-free `https:` URL; every system id a `cpix:UUIDType`.
+// Checks, in order: no credential-shaped field; no unknown field (allowlist);
+// required members present and well-typed; each enum value in its shared
+// membership list; every URL an absolute credential-free `https:` URL; every
+// system id a `cpix:UUIDType`.
 export function validateDrmStackConfig(
   candidate: unknown
 ): DrmConfigValidationError[] {
@@ -204,11 +273,16 @@ export function validateDrmStackConfig(
     return [{ field: 'drm', reason: 'must be an object' }];
   }
 
+  // The candidate's OWN keys. Enumerated (rather than probed name by name with
+  // `in`) so an unlisted key cannot hide from the checks below, and so a key
+  // inherited from a prototype is not mistaken for a submitted one.
+  const keys = Object.keys(candidate);
+
   // Credential-shaped fields first: refuse the whole body before validating the
   // rest, so a caller never gets a "looks nearly valid" response for a body
   // that tried to store a secret.
-  for (const name of DRM_CREDENTIAL_FIELD_NAMES) {
-    if (name in candidate) {
+  for (const name of keys) {
+    if (DRM_CREDENTIAL_FIELD_NAMES.includes(name)) {
       errors.push({
         field: name,
         reason:
@@ -216,7 +290,40 @@ export function validateDrmStackConfig(
       });
     }
   }
+  // `credentials` is the read view's derived STATUS field (ADR-008 §9), so it
+  // round-trips from a GET; anything else under that name is an attempt to
+  // write a credential and is refused with the same diagnostic.
+  const credentials = candidate['credentials'];
+  if (
+    credentials !== undefined &&
+    !DRM_CREDENTIAL_STATUSES.includes(credentials as DrmCredentialStatus)
+  ) {
+    errors.push({
+      field: 'credentials',
+      reason: `is read-only and must be one of ${DRM_CREDENTIAL_STATUSES.join(
+        ', '
+      )}; credentials are operator environment variables and are never stored in the parameter store`
+    });
+  }
   if (errors.length > 0) return errors;
+
+  // ALLOWLIST: anything that is neither a stored coordinate nor a derived
+  // read-view field is rejected rather than stored. This is what closes the
+  // name-denylist bypass (a key called `clientSecret2` or `sessionKey` is not a
+  // DRM coordinate whether or not the denylist happens to name it) and what
+  // turns a typo (`scheem`) into a `400` instead of a silently ignored field.
+  for (const name of keys) {
+    if ((DRM_STACK_CONFIG_FIELD_NAMES as readonly string[]).includes(name)) {
+      continue;
+    }
+    if (DRM_CONFIG_VIEW_ONLY_FIELD_NAMES.includes(name)) continue;
+    errors.push({
+      field: name,
+      reason: `is not a DRM configuration field; allowed fields are ${DRM_STACK_CONFIG_FIELD_NAMES.join(
+        ', '
+      )}`
+    });
+  }
 
   if (typeof candidate['enabled'] !== 'boolean') {
     errors.push({ field: 'enabled', reason: 'must be a boolean' });
@@ -375,6 +482,28 @@ export function assertValidDrmStackConfig(
   if (errors.length > 0) throw new DrmConfigValidationFailure(errors);
 }
 
+// Project a (validated) candidate down to the allowlisted coordinates, dropping
+// derived read-view fields (`credentials`) and anything else not in
+// `DRM_STACK_CONFIG_FIELD_NAMES`.
+//
+// Validation REJECTS an unknown field, so in the normal flow there is nothing
+// left to drop; this is the structural guarantee behind that promise — the only
+// value that can reach `storeStackConfig` or a response body is one of the
+// twelve known coordinates, even on a path that skipped validation or that
+// re-reads a block written by an older build. `undefined` members are preserved
+// as absent rather than as explicit `undefined`, so a projected block
+// `JSON.stringify`s to the same bytes as the block it came from.
+export function projectDrmStackConfig(config: DrmStackConfig): DrmStackConfig {
+  const source = config as unknown as Record<string, unknown>;
+  const projected: Record<string, unknown> = {};
+  for (const name of DRM_STACK_CONFIG_FIELD_NAMES) {
+    if (!Object.prototype.hasOwnProperty.call(source, name)) continue;
+    if (source[name] === undefined) continue;
+    projected[name] = source[name];
+  }
+  return projected as unknown as DrmStackConfig;
+}
+
 // ---------------------------------------------------------------------------
 // The shared DRM_ENABLED gate (ADR-008 D9, §9)
 // ---------------------------------------------------------------------------
@@ -471,12 +600,18 @@ export type DrmConfigView = DrmStackConfig & {
 // Build the response view for a stored config. `authMode` defaults to `basic`
 // (ADR-008 §5.2's example value) when a config omits it, so the reported status
 // always refers to a concrete mode.
+//
+// The stored block is PROJECTED rather than spread: only the allowlisted
+// coordinates are serialised, so a block that somehow acquired an extra key
+// (an older build, a hand-edited parameter-store value) cannot echo it back
+// into a response — the view carries the twelve coordinates and the status
+// string, and nothing else.
 export function toDrmConfigView(
   config: DrmStackConfig,
   env: NodeJS.ProcessEnv = process.env
 ): DrmConfigView {
   return {
-    ...config,
+    ...projectDrmStackConfig(config),
     credentials: readDrmCredentialStatus(config.authMode ?? 'basic', env)
   };
 }
@@ -531,12 +666,18 @@ export async function storeDrmStackConfig(
     );
   }
   assertValidDrmStackConfig(drm);
+  // Validation already rejected any unlisted key, so this projection normally
+  // changes nothing — except for the derived read-view fields a GET→PUT
+  // round trip legitimately carries (`credentials`), which are dropped here
+  // because they are not stored state. What reaches `storeStackConfig` is
+  // therefore exactly the allowlisted coordinates.
+  const sanitised = projectDrmStackConfig(drm);
   const existing = await paramStore.loadStackConfig(workspaceId, stackName);
   if (!existing) {
     throw new Error(
       `refusing to store DRM configuration: no stack config for stack "${stackName}"`
     );
   }
-  const updated: StackConfig = { ...existing, drm };
+  const updated: StackConfig = { ...existing, drm: sanitised };
   await paramStore.storeStackConfig(workspaceId, stackName, updated);
 }
