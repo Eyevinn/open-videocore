@@ -21,6 +21,21 @@
 //   docs/osc-feedback/incoming-epic226-ondemand-packager-schema.md. When the MCP
 //   is reachable again, re-verify this body against get-service-schema.
 //
+//   RE-VERIFICATION ATTEMPT (issue #1263 part 4): still unreachable — the OSC
+//   MCP get-service-schema tool was not available in the authoring context (no
+//   MCP tool, no OSC token), so NOTHING below was changed on a guess. What WAS
+//   done instead is a static reconciliation, now pinned as a test:
+//   test/packager-create-body-field-reconciliation.test.ts cross-checks this
+//   field set against the only other in-repo code path that names this
+//   service's fields (`packagerCredentialMapping`,
+//   src/services/external-storage-credentials.ts:122, field names verified
+//   under #212) and asserts the exact key set, so a future live-schema diff is
+//   a one-assertion change. The blocker is logged as OSC friction in
+//   docs/osc-feedback/incoming-1263-packager-schema-reverification.md.
+//   Reconciliation result: no drift between the two paths, and no encryption
+//   field on any of them — which is what the packaging capability probe
+//   (`clearPackagingRunner`, src/pipeline/packaging.ts) reports.
+//
 //   Fields (eyevinn-encore-packager create body):
 //     RedisUrl             — Valkey connection string (the shared stack queue)
 //     RedisQueue           — 'encore-packager:jobs' (MUST match packagerQueueKey()
