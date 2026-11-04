@@ -213,6 +213,7 @@ import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registr
 import { valkeyConnectionId } from './encore-scaler/valkey-connection-id.js';
 import { resolveJobThroughputCap } from './encore-scaler/job-throughput-cap.js';
 import { resolveUploadPartSizeBytes } from './encore-scaler/upload-part-size.js';
+import { resolveMaxConcurrentSpawns } from './encore-scaler/spawn-admission.js';
 import { decideRetry, clearRetryState, makePriorAttemptCanceler } from './encore-scaler/retry-store.js';
 // #1218: the drop/failure signal shape the stall detector reuses, so a silently
 // hung transcode converges on the same handler as a reconcile-detected drop.
@@ -1198,6 +1199,34 @@ const encoreSpawnGatewayBackoffMs =
   Number.isFinite(encoreSpawnGatewayBackoffMsRaw) && encoreSpawnGatewayBackoffMsRaw >= 0
     ? encoreSpawnGatewayBackoffMsRaw
     : undefined;
+// Issue #1322. Two bounds on how HARD this deployment pushes the platform when
+// it scales up, both optional and both defaulted in the scaler itself
+// (DEFAULT_MAX_CONCURRENT_SPAWNS / DEFAULT_SPAWN_BACKOFF_MAX_MS):
+//   ENCORE_MAX_CONCURRENT_SPAWNS — how many spawns may be in flight at once
+//     ACROSS ALL WORKSPACES. Each spawn creates two instances, so two ingresses
+//     through the cluster's admission webhook; the per-workspace gates could not
+//     see each other, so independently ticking loops burst together.
+//   ENCORE_SPAWN_BACKOFF_MAX_MS — the ceiling the hold-off grows to. The window
+//     doubles per consecutive failed spawn and resets on the first success; the
+//     cap stops a bad afternoon from parking scale-up for hours.
+// Invalid/absent => the built-in default. Below the minimum is NOT honoured for
+// the spawn cap (a cap of 0 would stop the deployment scaling up at all).
+const encoreMaxConcurrentSpawns = resolveMaxConcurrentSpawns(
+  process.env['ENCORE_MAX_CONCURRENT_SPAWNS'],
+  (reason) =>
+    app.log.warn(
+      { reason },
+      'ENCORE_MAX_CONCURRENT_SPAWNS ignored — transcoder scale-up uses the built-in spawn cap'
+    )
+);
+const encoreSpawnBackoffMaxMsRaw = parseInt(
+  process.env['ENCORE_SPAWN_BACKOFF_MAX_MS'] || '',
+  10
+);
+const encoreSpawnBackoffMaxMs =
+  Number.isFinite(encoreSpawnBackoffMaxMsRaw) && encoreSpawnBackoffMaxMsRaw > 0
+    ? encoreSpawnBackoffMaxMsRaw
+    : undefined;
 // Bounded timeout (issue #273) for the failed-transcode reconciliation sweep: a
 // transcode still non-terminal after this long whose Encore record has been
 // garbage-collected (getJobStatus -> 404/undefined) is declared failed rather
@@ -1719,6 +1748,11 @@ function activateScaler(redisUrl: string): void {
     // next tick, and hold the next create off while the platform is slow.
     spawnAdoptProbeTimeoutMs: encoreSpawnAdoptProbeTimeoutMs,
     spawnGatewayBackoffMs: encoreSpawnGatewayBackoffMs,
+    // Bound the load scale-up itself puts on the platform (issue #1322): at most
+    // this many spawns in flight across every workspace this process serves, and
+    // a hold-off that lengthens per consecutive failure up to this ceiling.
+    maxConcurrentSpawns: encoreMaxConcurrentSpawns,
+    spawnBackoffMaxMs: encoreSpawnBackoffMaxMs,
     // Point each spawned Encore instance at our own public profile index so it
     // loads the operator-managed profiles from CouchDB (issue #84).
     profilesUrl: encoreScalerProfilesUrl,

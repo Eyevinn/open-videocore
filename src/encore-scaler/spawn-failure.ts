@@ -589,10 +589,94 @@ export function isGatewayTimeoutStatus(httpCode: number | undefined): boolean {
 // 12 ticks, then tries again.
 export const DEFAULT_SPAWN_GATEWAY_BACKOFF_MS = 120_000;
 
+// #1322: the ceiling the hold-off grows to, however many spawns in a row have
+// failed.
+//
+// The hold-off doubles per consecutive failure (see below) because a platform
+// that has refused the same create five times running is not going to be ready
+// 2 minutes later, and the burst of creates is what keeps it busy. It is capped
+// because an UNBOUNDED doubling parks scale-up for hours: at a 2-minute base,
+// failure 10 would be a 17-hour hold, so a deployment that had a bad afternoon
+// would still be refusing to grow the next morning. 30 minutes is the cap —
+// roughly twice the readiness budget for a spawn that is waiting on a new worker
+// node (DEFAULT_SPAWN_READY_TIMEOUT_MS, 15 min, instance-pool.ts), i.e. long
+// enough that the platform has demonstrably had time to finish whatever it was
+// doing, short enough that an operator who fixes the cause does not have to
+// restart the API to get scale-up back.
+export const DEFAULT_SPAWN_BACKOFF_MAX_MS = 30 * 60_000;
+
+// #1322: message markers for a spawn failure that carried NO HTTP status but
+// still means "the platform did not answer" — the `fetch failed` the issue names
+// (Node's undici wrapper around a connection that was reset, refused or timed
+// out, re-wrapped by @osaas/client-core as a FetchError with no httpCode; see
+// oscHttpCode in osc-error.ts).
+//
+// These are treated exactly like a gateway timeout by the hold-off: in the
+// incident they arrived interleaved with the 504s, from the same overloaded
+// ingress, and they say the same thing — the create may be running behind a
+// connection nobody is listening on any more. Only consulted when the record has
+// no httpCode, so a 403 whose body happens to quote "fetch failed" is still
+// retried at once.
+//
+// Matched on the record's REDACTED message, which is sound for these specific
+// strings: redactSpawnFailureMessage strips URLs, hosts and credentials, not
+// bare error text, so `fetch failed` survives it intact. Nothing weaker is
+// available — the record has no field for "transport failure" and adding one
+// would change the GET /api/v1/scaler/status response, which #1322 rules out.
+const TRANSPORT_FAILURE_MESSAGE_MARKERS = ['fetch failed'];
+
+// Does this recorded failure mean the scaler should wait before spawning again?
+//
+// True for a gateway timeout (the platform may still be creating the instance)
+// and for a status-less transport failure (nobody answered at all). False for
+// everything else: a 403, a rejected body or an exhausted quota says nothing
+// about platform load, and delaying that retry only delays the real error.
+export function isSpawnHoldOffFailure(
+  record: Pick<SpawnFailureRecord, 'httpCode' | 'message'> | undefined
+): boolean {
+  if (!record) return false;
+  if (record.httpCode !== undefined) return isGatewayTimeoutStatus(record.httpCode);
+  const message = (record.message ?? '').toLowerCase();
+  return TRANSPORT_FAILURE_MESSAGE_MARKERS.some((marker) => message.includes(marker));
+}
+
+// The length (ms) of the hold-off window for a failure with this many
+// consecutive failures behind it: `backoffMs` doubled once per failure after the
+// first, clamped to `maxMs` (#1322).
+//
+// failure 1 -> base, 2 -> 2x, 3 -> 4x, ... so the FIRST failure still waits
+// exactly the configured base (unchanged #1286 behaviour) and only a repeating
+// failure lengthens. The clamp is max(backoffMs, maxMs) so a cap configured
+// below the base can never shorten the base window.
+export function spawnBackoffWindowMs(
+  consecutiveFailures: number,
+  backoffMs: number = DEFAULT_SPAWN_GATEWAY_BACKOFF_MS,
+  maxMs: number = DEFAULT_SPAWN_BACKOFF_MAX_MS
+): number {
+  if (backoffMs <= 0) return 0;
+  const ceiling = Math.max(backoffMs, Number.isFinite(maxMs) ? maxMs : backoffMs);
+  // A record written before the counter existed, or one that has been tampered
+  // with, is read as a single failure rather than as "no hold-off".
+  const failures = Number.isFinite(consecutiveFailures)
+    ? Math.max(1, Math.trunc(consecutiveFailures))
+    : 1;
+  // Doubling is computed with a bounded exponent so a corrupt counter cannot
+  // produce Infinity before the clamp sees it.
+  const doublings = Math.min(failures - 1, 40);
+  return Math.min(ceiling, backoffMs * 2 ** doublings);
+}
+
 // Remaining back-off (ms) before this workspace may start another spawn, given
 // its last recorded spawn failure. 0 means "spawn now", which is the answer for
-// every failure that is not a gateway timeout — a 403 or a rejected body says
-// nothing about platform load and the record should not slow down the retry.
+// every failure that is neither a gateway timeout nor a transport failure — a
+// 403 or a rejected body says nothing about platform load and the record should
+// not slow down the retry.
+//
+// #1322: the window GROWS with record.consecutiveFailures (spawnBackoffWindowMs
+// above) instead of being the same two minutes every time. It resets implicitly
+// on the first success, because a successful spawn deletes the record
+// (clearSpawnFailure, called by spawnInstance) and this function answers 0 for
+// an absent record — there is no separate counter to forget to reset.
 //
 // Pure function of (record, now): the gate is computed from pool state rather
 // than held in process memory, so it survives an API restart and cannot differ
@@ -600,15 +684,17 @@ export const DEFAULT_SPAWN_GATEWAY_BACKOFF_MS = 120_000;
 export function spawnGatewayBackoffRemainingMs(
   record: SpawnFailureRecord | undefined,
   now: number,
-  backoffMs: number = DEFAULT_SPAWN_GATEWAY_BACKOFF_MS
+  backoffMs: number = DEFAULT_SPAWN_GATEWAY_BACKOFF_MS,
+  maxBackoffMs: number = DEFAULT_SPAWN_BACKOFF_MAX_MS
 ): number {
   if (!record || backoffMs <= 0) return 0;
-  if (!isGatewayTimeoutStatus(record.httpCode)) return 0;
+  if (!isSpawnHoldOffFailure(record)) return 0;
+  const window = spawnBackoffWindowMs(record.consecutiveFailures, backoffMs, maxBackoffMs);
   // A record with a future or nonsense timestamp (clock skew between the writer
   // and the reader) must not park scale-up indefinitely: the elapsed time is
   // clamped at 0, so the worst case is exactly one back-off window.
   const elapsed = Math.max(0, now - record.at);
-  return Math.max(0, backoffMs - elapsed);
+  return Math.max(0, window - elapsed);
 }
 
 // Drop the workspace's spawn-failure record. Called on a successful spawn so a

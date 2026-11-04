@@ -183,6 +183,26 @@ export type EncoreScalerConfig = {
   // risks a second instance nobody asked for. Unset uses
   // DEFAULT_SPAWN_GATEWAY_BACKOFF_MS; set to 0 to disable.
   spawnGatewayBackoffMs?: number;
+  // #1322: ceiling (ms) on that hold-off once it has been lengthened by repeated
+  // failures. The window doubles per consecutive failed spawn
+  // (spawnBackoffWindowMs, spawn-failure.ts) so a platform that keeps refusing
+  // the create is asked less and less often, and the cap stops an afternoon of
+  // failures from parking scale-up for hours. Unset uses
+  // DEFAULT_SPAWN_BACKOFF_MAX_MS. A value below spawnGatewayBackoffMs is ignored
+  // in favour of the base window; it can never SHORTEN the first hold-off.
+  spawnBackoffMaxMs?: number;
+  // #1322: the deployment-wide spawn concurrency limiter, SHARED by every
+  // per-workspace loop in this process (workspace-registry.ts creates one and
+  // passes the same object to each loop's config). A loop that cannot take a slot
+  // skips the spawn for this tick, logs why, and carries on with scale-down, the
+  // orphan sweep and dispatch.
+  //
+  // Unset => no cross-workspace cap, which is the pre-#1322 behaviour and what
+  // every single-loop unit test gets. Production is wired by the registry, so
+  // "unset" never happens for a real deployment. See
+  // src/encore-scaler/spawn-admission.ts for why the counter is in-process while
+  // the hold-off above is in Valkey.
+  spawnSlots?: import('./spawn-admission.js').SpawnConcurrencyLimiter;
   // #778: how long (ms) an instance must have been continuously observed as
   // orphaned before the reaper destroys it. Guards a spawn in progress, which
   // holds a live OSC instance with no pool record for as long as

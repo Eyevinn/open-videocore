@@ -25,6 +25,10 @@ import { makeScalingEncoreClient } from './index.js';
 import { destroyInstance, listInstances, reconcilePoolFromOsc } from './instance-pool.js';
 import { keys } from './types.js';
 import { valkeyConnectionId } from './valkey-connection-id.js';
+import {
+  DEFAULT_MAX_CONCURRENT_SPAWNS,
+  SpawnConcurrencyLimiter
+} from './spawn-admission.js';
 import type { DroppedJob, EncoreScalerConfig } from './types.js';
 import type { ScalerLogSink } from './scaler-log.js';
 
@@ -75,6 +79,18 @@ export type WorkspaceEncoreScalerConfig = {
   // DEFAULT_SPAWN_GATEWAY_BACKOFF_MS.
   spawnAdoptProbeTimeoutMs?: number;
   spawnGatewayBackoffMs?: number;
+  // #1322: ceiling (ms) on the hold-off once repeated failures have lengthened
+  // it, forwarded to every loop. Undefined uses DEFAULT_SPAWN_BACKOFF_MAX_MS.
+  spawnBackoffMaxMs?: number;
+  // #1322: how many Encore spawns this API instance may have in flight at once
+  // ACROSS ALL WORKSPACES. The registry owns the counter (one per registry,
+  // shared by every loop it creates) because it is the only thing here that sees
+  // every workspace: the loops tick independently and each previously decided to
+  // spawn with no knowledge of the others, so two queued workspaces started
+  // their creates — four ingresses through the cluster's admission webhook —
+  // within the same few hundred milliseconds. Undefined uses
+  // DEFAULT_MAX_CONCURRENT_SPAWNS (1); see src/encore-scaler/spawn-admission.ts.
+  maxConcurrentSpawns?: number;
   // Redis connection string forwarded to each spawned callback listener.
   redisUrl: string;
   // Optional per-stack Valkey resolver (issue #615). When supplied, called once
@@ -224,7 +240,21 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
   // previously known stacks beats reporting none.
   private stackKeysCache?: { keys: string[]; at: number };
 
-  constructor(private readonly config: WorkspaceEncoreScalerConfig) {}
+  // #1322: the deployment-wide spawn concurrency counter, created ONCE here and
+  // handed to every loop this registry creates. Scoped to the registry rather
+  // than to a module-level singleton so two registries in one test file (or a
+  // future second deployment surface in one process) do not share a cap neither
+  // of them configured.
+  // Assigned in the constructor BODY, not as a field initializer: the value
+  // depends on `config`, and a field initializer must not rely on the emit order
+  // of a parameter property.
+  private readonly spawnSlots: SpawnConcurrencyLimiter;
+
+  constructor(private readonly config: WorkspaceEncoreScalerConfig) {
+    this.spawnSlots = new SpawnConcurrencyLimiter(
+      config.maxConcurrentSpawns ?? DEFAULT_MAX_CONCURRENT_SPAWNS
+    );
+  }
 
   // Resolve (and cache) the Valkey connection + URL for a stack key (issue #615).
   // Public: main.ts hands the per-stack connection to everything that reads
@@ -455,6 +485,11 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       // create off while the platform is slow.
       spawnAdoptProbeTimeoutMs: this.config.spawnAdoptProbeTimeoutMs,
       spawnGatewayBackoffMs: this.config.spawnGatewayBackoffMs,
+      // #1322: the hold-off's growth ceiling, and the ONE counter every loop in
+      // this process shares so spawns for different workspaces cannot overlap
+      // into a burst.
+      spawnBackoffMaxMs: this.config.spawnBackoffMaxMs,
+      spawnSlots: this.spawnSlots,
       oscContext: this.config.oscContext,
       redis,
       redisUrl,

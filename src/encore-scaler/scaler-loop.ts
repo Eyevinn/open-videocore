@@ -57,11 +57,18 @@ import {
   type ProbeOutcome
 } from './assignment-log.js';
 import {
+  DEFAULT_SPAWN_BACKOFF_MAX_MS,
   DEFAULT_SPAWN_GATEWAY_BACKOFF_MS,
   readSpawnFailure,
   spawnFailureSecrets,
   spawnGatewayBackoffRemainingMs
 } from './spawn-failure.js';
+import {
+  adoptionPendingInstance,
+  holdReasonMessage,
+  type SpawnHoldReason,
+  type SpawnSlot
+} from './spawn-admission.js';
 import { hasPendingPackaging } from './packaging-pin.js';
 import {
   instancesHoldingStuckCancelledJobs,
@@ -72,6 +79,14 @@ import {
   fetchEncoreActiveState,
   type EncoreActiveState
 } from './encore-active-state.js';
+
+// #1322: the slot a loop uses when no deployment-wide spawn limiter is wired
+// (EncoreScalerConfig.spawnSlots unset — single-loop unit tests and any caller
+// that has not opted in). Releasing it is a no-op, so the spawn path is written
+// once: "take a slot, spawn, release it in a finally", with the UNCAPPED case
+// expressed as a slot that is always available rather than as a second branch
+// that could drift out of step with the capped one.
+const NO_SPAWN_SLOT: SpawnSlot = { workspaceId: '', release: () => {} };
 
 // Default bounded wait for the outbound callback-listener TLS-trust probe
 // (issue #463) when EncoreScalerConfig.callbackTrustTimeoutMs is unset.
@@ -479,21 +494,77 @@ export class EncoreScalerLoop {
       // Read from pool state (keys.spawnFailure), not process memory, so it
       // survives a restart and is the same for every replica. readSpawnFailure
       // is total — it never throws — so this cannot be what breaks a tick.
+      //
+      // #1322: three admission gates now sit in front of the create, checked in
+      // this order because that is cheapest-and-most-local first:
+      //
+      //   1. ADOPTION PENDING — this workspace already has a half-born instance
+      //      (resolvePendingSpawns, step 1b above, has just had its go at it).
+      //      Starting a sibling for the node OSC is already provisioning is the
+      //      extra-instance failure #1223 reported, and the second create's load
+      //      is what makes the first one's adopt probe time out.
+      //   2. HOLD-OFF — as #1286, but the window now grows per consecutive
+      //      failure and also covers a status-less transport failure
+      //      (spawn-failure.ts isSpawnHoldOffFailure / spawnBackoffWindowMs).
+      //   3. CONCURRENCY CAP — at most N spawns in flight across ALL workspaces
+      //      in this process. The other two gates are per workspace and could
+      //      not damp the overlapping bursts that two independently ticking
+      //      loops produce (spawn-admission.ts).
+      //
+      // Each one logs a sentence that names itself and its numbers, so "why is
+      // this pool not growing?" is answerable from a pod tail alone.
+      const pendingAdoption = adoptionPendingInstance(instances);
+      const failureRecord = await readSpawnFailure(redis, workspaceId);
       const gatewayBackoffMs = spawnGatewayBackoffRemainingMs(
-        await readSpawnFailure(redis, workspaceId),
+        failureRecord,
         Date.now(),
-        this.config.spawnGatewayBackoffMs ?? DEFAULT_SPAWN_GATEWAY_BACKOFF_MS
+        this.config.spawnGatewayBackoffMs ?? DEFAULT_SPAWN_GATEWAY_BACKOFF_MS,
+        this.config.spawnBackoffMaxMs ?? DEFAULT_SPAWN_BACKOFF_MAX_MS
       );
-      if (gatewayBackoffMs > 0) {
+      // Taken only once the first two gates have passed, and ALWAYS released in
+      // the `finally` below — a spawn that throws must not leak the slot, or the
+      // deployment would stop scaling up until a restart.
+      //
+      // NOTE the explicit `limiter === undefined` branch: `?.tryAcquire() ??
+      // NO_SPAWN_SLOT` would be wrong, because it cannot tell "no limiter is
+      // wired" from "the limiter refused" — both are `undefined` — and would
+      // hand out a free slot at exactly the moment the cap was reached.
+      const limiter = this.config.spawnSlots;
+      const slot =
+        pendingAdoption === undefined && gatewayBackoffMs <= 0
+          ? limiter === undefined
+            ? NO_SPAWN_SLOT
+            : limiter.tryAcquire(workspaceId)
+          : undefined;
+      const holdReason: SpawnHoldReason | undefined =
+        pendingAdoption !== undefined
+          ? { kind: 'adoption-pending', instanceId: pendingAdoption.instanceId }
+          : gatewayBackoffMs > 0
+            ? {
+                kind: 'failure-backoff',
+                remainingMs: gatewayBackoffMs,
+                consecutiveFailures: failureRecord?.consecutiveFailures ?? 0,
+                ...(failureRecord?.httpCode === undefined
+                  ? {}
+                  : { httpCode: failureRecord.httpCode })
+              }
+            : slot === undefined
+              ? {
+                  kind: 'concurrency-cap',
+                  limit: this.config.spawnSlots?.limit ?? 0,
+                  inFlight: this.config.spawnSlots?.inFlight ?? 0,
+                  holders: this.config.spawnSlots?.holders() ?? []
+                }
+              : undefined;
+      if (holdReason !== undefined) {
         console.warn(
           '[encore-scaler] scale-up: holding off (workspace=%s pending=%d instances=%d ' +
-            'max=%d) — the last spawn timed out at the gateway and the platform may ' +
-            'still be creating that instance; next attempt in %dms (#1286)',
+            'max=%d) — %s (#1322)',
           workspaceId,
           pending,
           instances.length,
           maxInstances,
-          gatewayBackoffMs
+          holdReasonMessage(holdReason)
         );
         // Not logFailure: nothing has failed on this tick, and the failure that
         // caused the back-off is already recorded (keys.spawnFailure) and served
@@ -522,6 +593,12 @@ export class EncoreScalerLoop {
               `max=${maxInstances}); continuing the tick with the existing pool`,
             err
           );
+        } finally {
+          // #1322: release the deployment-wide slot however the spawn ended.
+          // In a `finally` and not after the try/catch so an unexpected throw
+          // from the bookkeeping above still gives the slot back — a leaked slot
+          // at the default cap of 1 would stop the WHOLE deployment scaling up.
+          slot?.release();
         }
       }
     }
