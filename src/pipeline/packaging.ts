@@ -375,6 +375,41 @@ export const DRM_UNSUPPORTED_REFUSAL: Readonly<DrmUnsupportedRefusal> =
       'DRM protection was requested but the packaging runner for this stack cannot encrypt output; re-run without drm, or deploy a packaging runner that reports encryption support'
   });
 
+// The other two ways a runner can be unable to do what was asked. A runner that
+// reports `encryption: true` still cannot apply a protection scheme it does not
+// implement, nor signal a DRM system it does not know, and BOTH are the same
+// class of failure as `encryption: false` — the capability answer does not
+// cover the request. They therefore refuse with the same `409 drm_unsupported`
+// shape (`DrmUnsupportedRefusal`) and differ only in `message`.
+//
+// WHY THEY EXIST: without them the gate reduced the requested systems to the
+// runner-supported intersection and proceeded even when that intersection was
+// EMPTY, enqueueing `protectionSystems: []` / `pssh: {}` alongside real content
+// keys — encrypted output carrying no DRM signalling at all, reported to the
+// caller as `{ ok: true, encrypted: true }`. Unplayable output is not a
+// success; an unsatisfiable request must fail loud, before any key is minted.
+//
+// The messages name no system id, scheme or key material: they are static
+// operator-facing text (ADR-008 §10 "Logging and error redaction"), exactly
+// like DRM_UNSUPPORTED_REFUSAL above.
+export const DRM_SYSTEMS_UNSUPPORTED_REFUSAL: Readonly<DrmUnsupportedRefusal> =
+  Object.freeze({
+    status: 409,
+    error: 'drm_unsupported',
+    errorCode: 'drm_unsupported',
+    message:
+      'DRM protection was requested but the packaging runner for this stack supports none of the requested DRM systems; request a system the runner reports, or deploy a packaging runner that supports one'
+  });
+
+export const DRM_SCHEME_UNSUPPORTED_REFUSAL: Readonly<DrmUnsupportedRefusal> =
+  Object.freeze({
+    status: 409,
+    error: 'drm_unsupported',
+    errorCode: 'drm_unsupported',
+    message:
+      'DRM protection was requested with a protection scheme the packaging runner for this stack does not support; request a scheme the runner reports, or deploy a packaging runner that supports it'
+  });
+
 // Outcome of the packaging step gate. Discriminated so a caller cannot read
 // `refusal` on the proceed path or forget to handle the refusal path.
 export type PackagingStepOutcome =
@@ -403,10 +438,15 @@ export type PackagingStepDeps = {
 
 // Fast-fail gate + enqueue for one `package` step (issue #1263 part 3).
 //
-// ORDER IS THE CONTRACT: the capability probe happens FIRST and a
+// ORDER IS THE CONTRACT: the capability probe happens FIRST and EVERY
 // `409 drm_unsupported` returns BEFORE `KeyProvider.acquire()` is called, so a
 // request that cannot possibly be fulfilled never mints a content key, never
 // contacts the key provider, and never leaves key material in a call stack.
+// "Cannot be fulfilled" is all three of: the runner cannot encrypt at all; it
+// cannot apply the requested protection scheme; it supports none of the
+// requested DRM systems. None of the three may degrade into a partial
+// success — encrypted output with missing or empty DRM signalling is unplayable
+// and must never be reported as `{ ok: true }`.
 // The clear path (no `drm`) does not probe for capability at all and enqueues
 // exactly the `{ jobId, url }` envelope it always did.
 export async function enqueuePackagingStep(
@@ -428,16 +468,36 @@ export async function enqueuePackagingStep(
   // NO_ENCRYPTION_CAPABILITY) and deliberately written against the real
   // `KeyProvider` contract rather than a placeholder, so the day a runner does
   // report encryption support there is no invented shape to unpick.
+  // STILL BEFORE ANY KEY IS MINTED: narrow `encryption: true` down to what this
+  // runner can actually apply to THIS request. Both checks refuse rather than
+  // silently degrade — see DRM_SCHEME_UNSUPPORTED_REFUSAL /
+  // DRM_SYSTEMS_UNSUPPORTED_REFUSAL for why an empty result must not proceed.
+  //
+  // Scheme: the per-execution override (`PipelineExecution['drm'].scheme`,
+  // src/data/pipeline-repo.ts:100) when given, else the runner's own first
+  // reported scheme. A runner that claims encryption but reports NO scheme
+  // (`caps.schemes` empty, `PackagingCapabilities` above) can apply none, so
+  // `scheme === undefined` refuses too instead of falling back to a guess.
+  const scheme: ProtectionScheme | undefined =
+    req.drm.scheme ?? caps.schemes[0];
+  if (scheme === undefined || !caps.schemes.includes(scheme)) {
+    return { ok: false, refusal: DRM_SCHEME_UNSUPPORTED_REFUSAL };
+  }
+  // Systems: `resolveDrmSystemIds` (src/drm/key-provider.ts:69-71) applies the
+  // configured-or-default list, then the intersection with `caps.systems` keeps
+  // only the ones this runner can signal. An EMPTY intersection means nothing
+  // the caller asked for can be protected — refuse.
+  const systems = resolveDrmSystemIds(req.drm.systems).filter((id) =>
+    caps.systems.includes(id)
+  );
+  if (systems.length === 0) {
+    return { ok: false, refusal: DRM_SYSTEMS_UNSUPPORTED_REFUSAL };
+  }
   if (!deps.keyProvider) {
     throw new Error(
       'packaging runner reports encryption support but no key provider is wired'
     );
   }
-  const scheme: ProtectionScheme =
-    req.drm.scheme ?? caps.schemes[0] ?? 'cbcs';
-  const systems = resolveDrmSystemIds(req.drm.systems).filter((id) =>
-    caps.systems.includes(id)
-  );
   const request: KeyRequest = {
     contentId: req.job.jobId,
     systems,
