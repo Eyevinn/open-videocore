@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<cpix:CPIX id="01K9ZP4V7R8HTQ2B6WMNXE3C5D" xmlns:cpix="urn:dashif:org:cpix" xmlns:pskc="urn:ietf:params:xml:ns:keyprov:pskc">
+  <cpix:ContentKeyList>
+    <cpix:ContentKey kid="6f1d0a7c-6d9e-4e7a-9a3c-1f2b4d5e6a70"/>
+    <cpix:ContentKey kid="7a2e1b8d-7eaf-4f8b-8b4d-2a3c5e6f7b81"/>
+    <cpix:ContentKey kid="8b3f2c9e-8fb0-4a9c-9c5e-3b4d6f708c92"/>
+  </cpix:ContentKeyList>
+  <cpix:DRMSystemList>
+    <cpix:DRMSystem kid="6f1d0a7c-6d9e-4e7a-9a3c-1f2b4d5e6a70" systemId="edef8ba9-79d6-4ace-a3c8-27dcd51d21ed">
+      <cpix:ContentProtectionData/>
+      <cpix:PSSH/>
+      <cpix:URIExtXKey/>
+    </cpix:DRMSystem>
+    <cpix:DRMSystem kid="6f1d0a7c-6d9e-4e7a-9a3c-1f2b4d5e6a70" systemId="9a04f079-9840-4286-ab92-e65be0885f95">
+      <cpix:ContentProtectionData/>
+      <cpix:PSSH/>
+      <cpix:URIExtXKey/>
+    </cpix:DRMSystem>
+    <cpix:DRMSystem kid="7a2e1b8d-7eaf-4f8b-8b4d-2a3c5e6f7b81" systemId="edef8ba9-79d6-4ace-a3c8-27dcd51d21ed">
+      <cpix:ContentProtectionData/>
+      <cpix:PSSH/>
+      <cpix:URIExtXKey/>
+    </cpix:DRMSystem>
+    <cpix:DRMSystem kid="7a2e1b8d-7eaf-4f8b-8b4d-2a3c5e6f7b81" systemId="9a04f079-9840-4286-ab92-e65be0885f95">
+      <cpix:ContentProtectionData/>
+      <cpix:PSSH/>
+      <cpix:URIExtXKey/>
+    </cpix:DRMSystem>
+    <cpix:DRMSystem kid="8b3f2c9e-8fb0-4a9c-9c5e-3b4d6f708c92" systemId="edef8ba9-79d6-4ace-a3c8-27dcd51d21ed">
+      <cpix:ContentProtectionData/>
+      <cpix:PSSH/>
+      <cpix:URIExtXKey/>
+    </cpix:DRMSystem>
+    <cpix:DRMSystem kid="8b3f2c9e-8fb0-4a9c-9c5e-3b4d6f708c92" systemId="9a04f079-9840-4286-ab92-e65be0885f95">
+      <cpix:ContentProtectionData/>
+      <cpix:PSSH/>
+      <cpix:URIExtXKey/>
+    </cpix:DRMSystem>
+  </cpix:DRMSystemList>
+  <cpix:ContentKeyUsageRuleList>
+    <cpix:ContentKeyUsageRule kid="6f1d0a7c-6d9e-4e7a-9a3c-1f2b4d5e6a70">
+      <cpix:AudioFilter/>
+    </cpix:ContentKeyUsageRule>
+    <cpix:ContentKeyUsageRule kid="7a2e1b8d-7eaf-4f8b-8b4d-2a3c5e6f7b81">
+      <cpix:VideoFilter maxPixels="414720"/>
+    </cpix:ContentKeyUsageRule>
+    <cpix:ContentKeyUsageRule kid="8b3f2c9e-8fb0-4a9c-9c5e-3b4d6f708c92">
+      <cpix:VideoFilter minPixels="414721" maxPixels="2073600"/>
+    </cpix:ContentKeyUsageRule>
+  </cpix:ContentKeyUsageRuleList>
+</cpix:CPIX>
