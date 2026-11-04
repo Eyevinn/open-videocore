@@ -43,6 +43,9 @@ import {
   watchFolderUnavailableText,
   WATCH_FOLDER_UNAVAILABLE_COPY,
   WATCH_FOLDER_UNAVAILABLE_FALLBACK,
+  watchFolderSuppressed,
+  WATCH_FOLDER_FATAL_REASONS,
+  resetWatchFolderAvailabilityCache,
 } from '../public/app.js';
 
 type IngestMethod = { available: boolean; reason?: string };
@@ -103,6 +106,13 @@ async function flush() {
 afterEach(() => {
   vi.unstubAllGlobals();
   document.body.innerHTML = '';
+});
+
+// The deployment-level /health read is memoised at module level, so every test
+// must start from an unread signal — otherwise the first deployment shape
+// rendered in this file would be reused by all the later ones.
+afterEach(() => {
+  resetWatchFolderAvailabilityCache();
 });
 
 // ─── The reason copy ─────────────────────────────────────────────────────────
@@ -309,5 +319,143 @@ describe('renderWatchFolderToggle with the service available (issue #871 regress
     expect(err.textContent).toContain('watch-folder service is not configured');
     // Re-enabled so the operator can retry once configuration is restored.
     expect(btn.disabled).toBe(false);
+  });
+});
+
+// ─── Only a stack-independent reason may hide the control ────────────────────
+//
+// `ingest.watchFolder.available` is derived from the presence of a single global
+// storage endpoint alone — src/main.ts:383-386 passes
+// `hasEnvMinio: Boolean(process.env['MINIO_URL'])` into the health router and
+// `watchFolderMethod` (src/services/ingest-availability.ts) reports
+// `missing-storage-endpoint` whenever the opt-in flag is on without it. The
+// watcher is nevertheless wired from each PROVISIONED STACK's own storage
+// connection (`wireWatchFolderFromStack`, src/main.ts:3178, reconciling via
+// src/services/watch-folder-wiring.ts, issue #1099) and rebinds the shared
+// `watchFolder` that `currentWatchFolder()` (src/routes/storage.ts:275) returns
+// to the status and toggle handlers (src/routes/storage.ts:651, 671). So
+// `available: false` is NOT sufficient grounds to disable the control;
+// `not-enabled` is, because both wiring paths check the same flag
+// (src/main.ts:3145 and the first line of wireWatchFolderFromStack).
+
+describe('watchFolderSuppressed (issue #871 suppression gate)', () => {
+  it('suppresses on the opt-in flag only, never on a stack-dependent reason', () => {
+    expect(WATCH_FOLDER_FATAL_REASONS).toEqual(['not-enabled']);
+
+    expect(watchFolderSuppressed({ available: false, reason: 'not-enabled' })).toBe(true);
+
+    // Functional on the parameter-store path — must stay offered.
+    expect(watchFolderSuppressed({ available: false, reason: 'missing-storage-endpoint' })).toBe(
+      false
+    );
+    expect(watchFolderSuppressed({ available: false, reason: 'no-storage-endpoint' })).toBe(false);
+    // Unavailable with no reason, or a reason added to the enum after this
+    // build: cannot be shown to be stack-independent, so fail open.
+    expect(watchFolderSuppressed({ available: false })).toBe(false);
+    expect(watchFolderSuppressed({ available: false, reason: 'some-future-reason' })).toBe(false);
+
+    expect(watchFolderSuppressed({ available: true })).toBe(false);
+    expect(watchFolderSuppressed(null)).toBe(false);
+  });
+
+  it('does not offer a remedy that is wrong on a stack-provisioned deployment', () => {
+    const missingEndpoint = watchFolderUnavailableText('missing-storage-endpoint');
+    // It must not tell the operator the feature is simply off here, because a
+    // provisioned stack runs a watcher without any global endpoint.
+    expect(missingEndpoint).toContain('still works');
+    expect(missingEndpoint).toContain('stack');
+  });
+});
+
+describe('renderWatchFolderToggle on a stack-provisioned deployment (issue #871)', () => {
+  it('offers a working toggle when the only gap is a deployment-wide endpoint', async () => {
+    const { calls } = stubFetch({
+      health: () =>
+        jsonResponse(healthBody({ available: false, reason: 'missing-storage-endpoint' })),
+      bucketStatus: () => jsonResponse({ enabled: false, running: false, bucket: 'ovc-source' }),
+      toggle: () => jsonResponse({ enabled: true, running: true, bucket: 'ovc-source' }),
+    });
+    const el = mount();
+
+    await renderWatchFolderToggle(el, 'ovc-source');
+
+    const btn = el.querySelector('button') as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    expect(btn.textContent).toContain('Enable watch folder');
+    expect(btn.textContent).not.toContain('unavailable');
+
+    // The reported reason is still surfaced — as an advisory tied to the live
+    // control, not as a dead end.
+    const note = el.querySelector('#storage-watch-folder-unavailable') as HTMLElement;
+    expect(note).toBeTruthy();
+    expect(note.textContent).toBe(watchFolderUnavailableText('missing-storage-endpoint'));
+    expect(btn.getAttribute('aria-describedby')).toBe('storage-watch-folder-unavailable');
+
+    // And pressing it actually reaches the toggle route.
+    btn.click();
+    await flush();
+    expect(calls).toContain(
+      'POST ' + window.location.origin + '/api/v1/storage/buckets/ovc-source/watch-folder/toggle'
+    );
+  });
+
+  it('offers the toggle for a reason this build does not recognise', async () => {
+    stubFetch({
+      health: () => jsonResponse(healthBody({ available: false, reason: 'some-future-reason' })),
+      bucketStatus: () => jsonResponse({ enabled: false, running: false, bucket: 'ovc-source' }),
+    });
+    const el = mount();
+
+    await renderWatchFolderToggle(el, 'ovc-source');
+
+    const btn = el.querySelector('button') as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    const note = el.querySelector('#storage-watch-folder-unavailable') as HTMLElement;
+    expect(note.textContent).toBe(WATCH_FOLDER_UNAVAILABLE_FALLBACK);
+  });
+});
+
+// ─── One read per page, not one per render ───────────────────────────────────
+
+describe('the deployment-level /health read (issue #871)', () => {
+  it('is read once across repeated renders', async () => {
+    const { calls } = stubFetch({
+      health: () => jsonResponse(healthBody({ available: true })),
+      bucketStatus: () => jsonResponse({ enabled: false, running: false, bucket: 'ovc-source' }),
+    });
+    const el = mount();
+
+    await renderWatchFolderToggle(el, 'ovc-source');
+    await renderWatchFolderToggle(el, 'ovc-source');
+    await renderWatchFolderToggle(el, 'ovc-source');
+
+    expect(calls.filter((c) => c.endsWith('/health'))).toHaveLength(1);
+    // The per-bucket status is still read on every render — it is the part that
+    // can change while the page is open.
+    expect(
+      calls.filter((c) => c.endsWith('/api/v1/storage/buckets/ovc-source/watch-folder'))
+    ).toHaveLength(3);
+  });
+
+  it('retries after an unreadable /health instead of caching "cannot tell"', async () => {
+    let attempts = 0;
+    stubFetch({
+      health: () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('health blip');
+        return jsonResponse(healthBody({ available: false, reason: 'not-enabled' }));
+      },
+      bucketStatus: () => jsonResponse({ enabled: false, running: false, bucket: 'ovc-source' }),
+    });
+    const el = mount();
+
+    // First render fails open.
+    await renderWatchFolderToggle(el, 'ovc-source');
+    expect((el.querySelector('button') as HTMLButtonElement).disabled).toBe(false);
+
+    // Second render reads again and now learns the flag is off.
+    await renderWatchFolderToggle(el, 'ovc-source');
+    expect((el.querySelector('button') as HTMLButtonElement).disabled).toBe(true);
+    expect(attempts).toBe(2);
   });
 });
