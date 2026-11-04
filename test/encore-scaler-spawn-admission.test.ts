@@ -525,3 +525,106 @@ describe('spawn admission helpers (#1322)', () => {
     ).toContain('inst-x');
   });
 });
+
+// #1322 review finding 3: the slot bounds CREATES, not the readiness wait.
+//
+// The cap exists to damp the ingress admission-webhook load of instance creates,
+// which is over in seconds. The readiness wait that follows a create polls
+// getInstanceHealth against an instance that already exists, for up to
+// DEFAULT_SPAWN_READY_TIMEOUT_MS (15 minutes, because the platform may be
+// provisioning a whole worker node). Holding the slot across that would park
+// every other workspace's scale-up for the node-provisioning wait at the default
+// cap of 1, so the slot is handed back from spawnInstance's onCreatesSettled
+// hook (instance-pool.ts) as soon as both halves of the spawn exist.
+describe('the spawn slot is released before the readiness wait (#1322)', () => {
+  beforeEach(() => {
+    createInstanceMock.mockReset();
+    getInstanceHealthMock.mockClear();
+    removeInstanceMock.mockClear();
+    oscListInstancesMock.mockClear();
+    oscListInstancesMock.mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    getInstanceHealthMock.mockImplementation(async () => 'running');
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('frees the slot once both halves are created, while readiness is still pending', async () => {
+    const redis = new FakeRedis();
+    const slots = new SpawnConcurrencyLimiter(1);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('{}', { status: 200 }))
+    );
+
+    createInstanceMock.mockImplementation(async (_ctx, serviceId: string, _t, body) => ({
+      name: (body as { name: string }).name,
+      url: `https://${(body as { name: string }).name}.${serviceId}.example`
+    }));
+    // Stand-in for node provisioning: both creates land, but neither instance
+    // reports `running` yet, so both readiness waits keep polling.
+    getInstanceHealthMock.mockImplementation(async () => 'starting');
+
+    const loopA = new EncoreScalerLoop(
+      makeConfig(redis, 'ws-provisioning', {
+        spawnSlots: slots,
+        // Short, so the test does not sit on the real 15-minute budget if the
+        // instances never come up. Long enough that the assertions below run
+        // while the waits are genuinely in flight.
+        spawnReadyTimeoutMs: 5_000,
+        spawnReadyPollIntervalMs: 10
+      })
+    );
+
+    const tickA = loopA.tick();
+    // Wait until BOTH halves are polling health: that is strictly after the
+    // second create resolved, which is where the hook fires.
+    for (let i = 0; i < 200 && getInstanceHealthMock.mock.calls.length < 2; i += 1) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(createInstanceMock).toHaveBeenCalledTimes(2);
+    expect(getInstanceHealthMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+
+    // The spawn is still waiting for readiness...
+    const pool = await redis.hgetall(keys.pool('ws-provisioning'));
+    expect(Object.keys(pool)).toHaveLength(0);
+    // ...and the deployment-wide slot is already back, so another workspace is
+    // not blocked behind this provisioning wait.
+    expect(slots.inFlight).toBe(0);
+    expect(slots.holders()).toEqual([]);
+    const other = slots.tryAcquire('ws-next');
+    expect(other).toBeDefined();
+    other?.release();
+
+    // Let the spawn finish, and confirm the release is not double-counted.
+    getInstanceHealthMock.mockImplementation(async () => 'running');
+    await tickA;
+    expect(slots.inFlight).toBe(0);
+    expect(Object.keys(await redis.hgetall(keys.pool('ws-provisioning')))).toHaveLength(1);
+  });
+
+  it('still releases the slot when the spawn fails before either half exists', async () => {
+    const redis = new FakeRedis();
+    const slots = new SpawnConcurrencyLimiter(1);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    // No create ever succeeds, so onCreatesSettled never runs and the backstop
+    // release in the scale-up `finally` is the only one.
+    createInstanceMock.mockImplementation(async () => {
+      throw new FakeFetchError('403 Forbidden', 403);
+    });
+
+    const loop = new EncoreScalerLoop(
+      makeConfig(redis, 'ws-refused', { spawnSlots: slots })
+    );
+    await loop.tick();
+
+    expect(createInstanceMock).toHaveBeenCalled();
+    expect(slots.inFlight).toBe(0);
+    expect(slots.holders()).toEqual([]);
+  });
+});

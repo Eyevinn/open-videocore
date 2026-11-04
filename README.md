@@ -521,10 +521,17 @@ reason — a `504` with a climbing count means the pause is the back-off doing i
 job, not a pool that has stopped growing for an unknown reason.
 
 Second, the spawn cap. At most `ENCORE_MAX_CONCURRENT_SPAWNS` spawns (default
-`1`) are in flight at any moment across **all** workspaces this deployment
-serves, because each one creates two ingresses through the cluster's admission
-webhook and simultaneous bursts are what overload the platform. A workspace that
-arrives second waits for the next tick instead. In both cases the scaler log says
+`1`) are *creating instances* at any moment across **all** workspaces this
+deployment serves, because each one creates two ingresses through the cluster's
+admission webhook and simultaneous bursts are what overload the platform. A
+workspace that arrives second retries on its next tick, and keeps the rest of
+that tick (scale-down, the orphan sweep, dispatch) meanwhile. The slot is held
+only for the creates and released before the spawn waits for its instances to
+report ready — so what the second workspace waits for is the first one's two
+creates (seconds normally; a few minutes at worst, if those creates are
+themselves timing out at the gateway and the adopt probe runs), **not** the up to
+15 minutes of node provisioning a readiness wait can cover. In both cases the
+scaler log says
 which gate held the spawn and what it is waiting for — `spawn cap reached`,
 `spawn hold-off active` or `adoption pending`, each with its numbers — so the
 reason is readable in a pod tail without a log-aggregation query.

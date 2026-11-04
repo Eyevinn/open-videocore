@@ -36,10 +36,18 @@ import type { EncoreInstanceRecord } from './types.js';
 
 // Default ceiling on concurrent spawns per API instance.
 //
-// ONE, deliberately. A spawn is minutes long end to end (node provisioning), and
-// the pool only ever grows by one instance per tick per workspace anyway, so
-// serialising creates across workspaces costs a queued workspace one extra
-// spawn's worth of latency and nothing else. Set against that: the failure this
+// ONE, deliberately. The slot covers only a spawn's CREATE phase — it is
+// released as soon as both halves of the spawn exist and before the readiness
+// wait is awaited (instance-pool.ts SpawnHooks.onCreatesSettled), because the
+// readiness wait is a health poll against an existing instance and puts no
+// create pressure on the admission webhook. So what a second workspace waits
+// for is the first workspace's creates, not its node provisioning: typically
+// the two creates back to back (seconds), and in the worst case a spawn whose
+// creates are all timing out — up to maxAttempts gateway timeouts per half plus
+// the adopt probe (DEFAULT_SPAWN_ADOPT_PROBE_TIMEOUT_MS, 90s), a few minutes —
+// rather than the 15-minute DEFAULT_SPAWN_READY_TIMEOUT_MS. The pool only ever
+// grows by one instance per tick per workspace anyway, and a workspace that
+// misses a slot keeps the rest of its tick. Set against that: the failure this
 // bounds took out the platform's controllers for every tenant, and the create
 // that is 504'd is usually still running behind the gateway, so a second
 // concurrent create is often a second instance nobody asked for. Operators who

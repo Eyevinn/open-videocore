@@ -525,6 +525,15 @@ export class EncoreScalerLoop {
       // the `finally` below — a spawn that throws must not leak the slot, or the
       // deployment would stop scaling up until a restart.
       //
+      // The slot covers the spawn's CREATE phase, not its readiness wait: it is
+      // released from spawnInstance's onCreatesSettled hook as soon as both
+      // halves exist (see below), and the `finally` is the backstop for a spawn
+      // that failed before reaching that point. The cap exists to serialise the
+      // ingress admission-webhook load of the creates, which lasts seconds;
+      // holding it across the readiness wait would stall every other
+      // workspace's scale-up for up to DEFAULT_SPAWN_READY_TIMEOUT_MS
+      // (15 minutes of node provisioning) at the default cap of 1.
+      //
       // NOTE the explicit `limiter === undefined` branch: `?.tryAcquire() ??
       // NO_SPAWN_SLOT` would be wrong, because it cannot tell "no limiter is
       // wired" from "the limiter refused" — both are `undefined` — and would
@@ -572,7 +581,14 @@ export class EncoreScalerLoop {
         // — scale-down, the orphan sweep, dispatch — runs exactly as usual.
       } else {
         try {
-          const spawned = await spawnInstance(this.config);
+          const spawned = await spawnInstance(this.config, undefined, {
+            // #1322 review finding 3: hand the slot back the moment the spawn
+            // stops creating instances, instead of at the end of the readiness
+            // wait. `release()` is idempotent, so the `finally` below is still
+            // safe (and still the only release on a spawn that failed during
+            // the create phase).
+            onCreatesSettled: () => slot?.release()
+          });
           instances = [...instances, spawned];
         } catch (err) {
           console.error(
@@ -594,10 +610,13 @@ export class EncoreScalerLoop {
             err
           );
         } finally {
-          // #1322: release the deployment-wide slot however the spawn ended.
-          // In a `finally` and not after the try/catch so an unexpected throw
-          // from the bookkeeping above still gives the slot back — a leaked slot
-          // at the default cap of 1 would stop the WHOLE deployment scaling up.
+          // #1322: backstop release. On the normal path onCreatesSettled has
+          // already released this slot and `release()` is idempotent, so this
+          // credits nothing twice; it is what covers a spawn that failed BEFORE
+          // both halves existed (so the hook never ran). In a `finally` and not
+          // after the try/catch so an unexpected throw from the bookkeeping
+          // above still gives the slot back — a leaked slot at the default cap
+          // of 1 would stop the WHOLE deployment scaling up.
           slot?.release();
         }
       }
