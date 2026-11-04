@@ -619,3 +619,135 @@ describe('the existence check never guesses (#1325)', () => {
     }
   });
 });
+
+// Review finding on PR #1327: 'absent' must come from a POSITIVE, enumerated
+// not-found and from nothing else.
+//
+// WHY THE FIRST CUT OF THIS WAS WRONG. It read the verdict off
+// getInstanceHealth's rejection, on the belief that rejecting meant the control
+// plane had answered about this one instance. It had not. In the pinned
+// @osaas/client-core@0.24.0 the call is getInstanceHealth -> getInstanceLink ->
+// getInstance, and `getInstance` (lib/core.js:119-150) returns `undefined` for
+// EVERY failure but 401 — it rethrows UnauthorizedError, maps a 404 to
+// `undefined`, and falls through to `return undefined` for a 500, a 504 or a
+// dropped socket alike. `getInstanceLink` (lib/core.js:24-28) then throws a
+// plain `Error("Instance {name} of service {serviceId} not found")` with no
+// httpCode, which isInstanceAlreadyGoneError matches on its 'not found' marker.
+// So a TRANSIENT control-plane fault — the very condition behind the three
+// consecutive gateway timeouts in #1325 — was indistinguishable from "does not
+// exist". Two more routes reached 'absent' with nothing having answered: a
+// failed listInstances cross-check, and a list body that is not an array.
+//
+// THE COST OF GETTING IT WRONG IN THAT DIRECTION is the opposite of #1325 and
+// worse than it: an instance that DID land behind the 504 is declared absent, so
+// it is never adopted (instanceAdopted stays false) and never removed (the
+// create's error is rethrown before the cleanup block) — a live instance,
+// billing, that nothing in the system owns.
+describe('an indeterminate control-plane fault is not an absence (#1327)', () => {
+  // The exact error the SDK produces when the control plane faults on the way to
+  // the health route: a plain Error, no httpCode, 'not found' in the message.
+  const instanceLinkNotFound = (name: string): Error =>
+    new Error(`Instance ${name} of service ${ENCORE_SERVICE_ID} not found`);
+
+  it('reports unknown, not absent, when nothing authoritative has answered', async () => {
+    const config = makeConfig(new FakeRedis());
+
+    // 1. The not-found-SHAPED rejection a transient fault produces, with the
+    //    instance list unreadable as well: nothing has answered at all.
+    getInstanceHealthMock.mockRejectedValue(instanceLinkNotFound('scalerfault'));
+    oscListInstancesMock.mockRejectedValue(new FakeFetchError('internal error', 500));
+    expect(await encoreInstanceExistence(config, 'scalerfault', SERVICE_ACCESS_TOKEN)).toBe(
+      'unknown'
+    );
+
+    // 2. Even a real 404 on the health route is only ONE source. With the
+    //    enumeration unreadable it cannot be promoted to a verdict — this is the
+    //    case that used to let "the single-instance answer stand on its own".
+    getInstanceHealthMock.mockRejectedValue(doesNotExist('scalerfault'));
+    oscListInstancesMock.mockRejectedValue(gatewayTimeout());
+    expect(await encoreInstanceExistence(config, 'scalerfault', SERVICE_ACCESS_TOKEN)).toBe(
+      'unknown'
+    );
+
+    // 3. A list that came back OK but is not an array. createFetch hands back
+    //    whatever an ok response carried, parsed as JSON when the content type
+    //    says so and as TEXT otherwise, so a gateway interstitial page or an
+    //    empty body arrives here as a string or an object. Neither enumerates
+    //    anything, and neither may fall through to 'absent'.
+    for (const body of [GATEWAY_TIMEOUT_HTML, '', {}, null]) {
+      oscListInstancesMock.mockResolvedValue(body as unknown as unknown[]);
+      expect(
+        await encoreInstanceExistence(config, 'scalerfault', SERVICE_ACCESS_TOKEN)
+      ).toBe('unknown');
+    }
+
+    // The positive case still resolves, so this has not simply disabled the
+    // check: OSC enumerated the service and the name is not among them.
+    oscListInstancesMock.mockResolvedValue([{ name: HEALTHY_ID, url: HEALTHY_URL }]);
+    expect(await encoreInstanceExistence(config, 'scalerfault', SERVICE_ACCESS_TOKEN)).toBe(
+      'absent'
+    );
+  });
+
+  // The orphan the finding is about, end to end: the create landed behind the
+  // 504 and the control plane is faulting. The watch must NOT write the instance
+  // off on the first fault — it must keep looking within its budget and adopt it
+  // once OSC can answer, because walking away leaves it live with no owner.
+  it('keeps the watch alive through a fault and adopts the instance that did land', async () => {
+    vi.useFakeTimers();
+    const redis = new FakeRedis();
+    createInstanceMock.mockImplementation(gatewayTimingOutCreate());
+    // The create DID complete on the platform side, so OSC reports a perfectly
+    // well-formed instance under the name the creates used.
+    getInstanceMock.mockImplementation(async (...args: unknown[]) => {
+      const serviceId = args[1] as string;
+      const name = args[2] as string;
+      if (serviceId !== ENCORE_SERVICE_ID) return undefined;
+      return { name, url: `https://${name}.osc.example` };
+    });
+    // The control plane faults for the first two probes and recovers on the
+    // third. Before this fix the first probe ended the watch with 'absent'.
+    let healthCalls = 0;
+    getInstanceHealthMock.mockImplementation(async (...args: unknown[]) => {
+      const name = args[2] as string;
+      healthCalls += 1;
+      if (healthCalls <= 2) throw instanceLinkNotFound(name);
+      return 'running';
+    });
+    // And the cross-check cannot be read either, so nothing can prove absence.
+    oscListInstancesMock.mockRejectedValue(new FakeFetchError('internal error', 500));
+    stubFetchForTick();
+
+    const spawn = spawnInstance(
+      makeConfig(redis, {
+        spawnAdoptProbeTimeoutMs: 90_000,
+        spawnAdoptProbeIntervalMs: 5_000
+      })
+    );
+    await vi.advanceTimersByTimeAsync(3 * INGRESS_LIMIT_MS + 15_000 + 90_000 + 10_000);
+    const record = await spawn;
+
+    // ADOPTED, not orphaned. The spawn resolved with the instance the 504s left
+    // behind, under the one name they were sent.
+    const encoreCreateNames = new Set(
+      createInstanceMock.mock.calls
+        .filter((call) => call[1] === ENCORE_SERVICE_ID)
+        .map((call) => (call[3] as { name: string }).name)
+    );
+    expect(encoreCreateNames.size).toBe(1);
+    const name = [...encoreCreateNames][0] as string;
+    expect(record.instanceId).toBe(name);
+    expect(record.url).toBe(`https://${name}.osc.example`);
+    // It is in the pool, so it is tracked, counted against maxInstances and
+    // dispatched to — the opposite of the live-with-no-owner outcome.
+    expect(Object.keys(await redis.hgetall(keys.pool(WORKSPACE)))).toContain(name);
+    // The watch really did keep going through the faults rather than settling on
+    // the first one: adoption got more than a single probe.
+    expect(healthCalls).toBeGreaterThanOrEqual(3);
+    // Nothing was destroyed on the way: an adopted instance is never torn down
+    // by the cleanup rule (#1071, #417/#736).
+    expect(
+      removeInstanceMock.mock.calls.filter((call) => call[1] === ENCORE_SERVICE_ID)
+    ).toHaveLength(0);
+  });
+});

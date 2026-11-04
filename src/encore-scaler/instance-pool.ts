@@ -462,10 +462,13 @@ export const SPAWN_ADOPT_PROBE_MIN_CREATE_DURATION_MS = 20_000;
 // What OSC says about an instance the takeover is about to adopt (#1325).
 //
 //   'exists'  — OSC answered FOR THIS INSTANCE. It is there and may be adopted.
-//   'absent'  — OSC says it does not exist. There is nothing to take over.
-//   'unknown' — OSC could not be asked (an outage, a 5xx, a dropped socket).
-//               Neither proof of presence nor of absence, so it is never read as
-//               either: the caller keeps looking within its budget.
+//   'absent'  — OSC's own instance list for the service was READ SUCCESSFULLY and
+//               does not carry the name. A positive, enumerated not-found: there
+//               is nothing to take over and nothing to clean up.
+//   'unknown' — nothing answered definitively (an outage, a 5xx, a dropped
+//               socket, an unreadable or non-array instance list, or two sources
+//               disagreeing). Neither proof of presence nor of absence, so it is
+//               never read as either: the caller keeps looking within its budget.
 export type OscInstanceExistence = 'exists' | 'absent' | 'unknown';
 
 // Does the Encore instance `name` ACTUALLY exist on OSC? (#1325)
@@ -482,31 +485,54 @@ export type OscInstanceExistence = 'exists' | 'absent' | 'unknown';
 // waited on it for minutes with a callback listener created against it, and
 // dispatched nothing to the instance that was running fine in the meantime.
 //
-// The question is asked with getInstanceHealth, which is the instance-specific
-// query OSC exposes and the exact one the readiness wait that follows an
-// adoption would run anyway (waitForSpawnedInstanceReady ->
-// waitForInstanceReadyBounded, src/services/instance-readiness.ts). Contract
-// (verified, @osaas/client-core@0.24.0):
-//   - getInstanceHealth(context, serviceId, name, token): Promise<string>
-//     (lib/core.d.ts:86, lib/core.js:211-220). It resolves the `status` field of
-//     GET https://{serviceApiHost}/health/{name} — the CONTROL PLANE's own
-//     answer about that one instance, not the instance's own port — so a
-//     resolution is OSC speaking for the instance, and a 404/410 there is the
-//     control plane saying it does not know it. The readiness wait treats a
-//     REJECTION as "not ready yet" and retries to its deadline, which is why a
-//     phantom instance stalls it for the whole budget instead of failing.
-//   - A non-ok response arrives as `FetchError { message, httpCode }`
-//     (lib/fetch.js defaultErrorFactory), classified here by
-//     isInstanceAlreadyGoneError (osc-error.ts) — status first, message markers
-//     ('does not exist', 'not found') only when there is no status.
+// The question is asked in two steps, and ONLY THE SECOND ONE CAN PROVE ABSENCE.
 //
-// A health answer of 'does not exist' is CROSS-CHECKED against OSC's own
-// instance list for the service — the authoritative existence answer this module
-// already relies on for eviction (evictVanishedInstances below). If the list
-// still carries the name the two sources disagree, which is not proof of
-// absence, so the verdict is 'unknown' and the caller keeps looking. A list that
-// cannot be read leaves the health answer standing: that single-instance 404 is
-// precisely the report in #1325.
+// Step 1, getInstanceHealth — a positive signal for PRESENCE only. It is the
+// instance-specific query OSC exposes and the exact one the readiness wait that
+// follows an adoption would run anyway (waitForSpawnedInstanceReady ->
+// waitForInstanceReadyBounded, src/services/instance-readiness.ts). Contract
+// (verified against the pinned @osaas/client-core@0.24.0 tarball):
+//   - getInstanceHealth(context, serviceId, name, token): Promise<string>
+//     (lib/core.d.ts:86, lib/core.js:211-220) first resolves the health URL via
+//     `getInstanceLink(context, token, serviceId, name, 'health')` and only then
+//     GETs https://{serviceApiHost}/health/{name}. So a RESOLUTION means the
+//     control plane served both the instance record and the health route: good
+//     evidence of presence.
+//   - Its REJECTION, however, is NOT the control plane answering about this
+//     instance, and must never be read as one (#1327 review finding). The chain
+//     is getInstanceHealth -> getInstanceLink (lib/core.js:24-28) -> getInstance
+//     (lib/core.js:119-150), and `getInstance` returns `undefined` for EVERY
+//     failure but 401 — it rethrows only UnauthorizedError, maps 404 to
+//     `undefined`, and falls through to `return undefined` for a 500, a 504 or a
+//     dropped socket alike. `getInstanceLink` then throws a PLAIN
+//     `Error("Instance {name} of service {serviceId} not found")` with NO
+//     httpCode, so isInstanceAlreadyGoneError (osc-error.ts) matches it on its
+//     'not found' message marker. A transient control-plane fault — the very
+//     condition that produced the three consecutive gateway timeouts in #1325 —
+//     is therefore INDISTINGUISHABLE here from a real 404. `getService`'s own
+//     failures propagate the same way (it is awaited outside getInstance's try),
+//     so even an httpCode of 404 on this path can be the catalog's answer about
+//     /mysubscriptions rather than about this instance.
+//   - A non-ok response otherwise arrives as `FetchError { message, httpCode }`
+//     (lib/fetch.js defaultErrorFactory), with httpCode OPTIONAL — a
+//     transport-level failure is re-wrapped with none at all.
+//
+// Step 2, listInstances — the ARBITER, and the only thing that can return
+// 'absent'. It is the authoritative enumeration this module already relies on
+// for eviction (evictVanishedInstances below). A not-found-shaped rejection in
+// step 1 is only a reason to ASK it, never an answer:
+//   - list read, is an array, does NOT carry the name  => 'absent'. OSC
+//     enumerated its instances for this service and this one is not among them.
+//   - list read, is an array, DOES carry the name      => 'unknown' (the two
+//     sources disagree, which is not proof of absence).
+//   - list could not be read, or the body is not an array => 'unknown'. NOTHING
+//     has answered, so nothing may be concluded. Letting the single-instance
+//     rejection "stand on its own" here was the #1327 finding: an instance that
+//     DID land behind the 504 would be reported absent, never adopted and never
+//     removed — a live, billing orphan, because the create's error is rethrown
+//     before the cleanup block below.
+// An indeterminate verdict never ends the watch, so adoption keeps its full
+// budget; only a positively enumerated absence stops it early.
 export async function encoreInstanceExistence(
   config: EncoreScalerConfig,
   name: string,
@@ -530,36 +556,55 @@ export async function encoreInstanceExistence(
       );
       return 'unknown';
     }
-    // OSC says it does not exist. Cross-check against the service's instance
-    // list before acting on it.
+    // The rejection is not-found-SHAPED, which (see above) a transient fault
+    // produces just as readily as a real 404. It is only a reason to ask the
+    // authoritative question, so the instance list decides from here on and a
+    // non-answer from it resolves to 'unknown', never to 'absent' (#1327).
+    let listed: unknown;
     try {
-      const listed = (await oscListInstances(
-        config.oscContext,
-        ENCORE_SERVICE_ID,
-        sat
-      )) as OscInstance[];
-      if (
-        Array.isArray(listed) &&
-        listed.some((inst) => typeof inst.name === 'string' && inst.name === name)
-      ) {
-        console.warn(
-          '[encore-scaler] spawn: OSC reports Encore instance %s as not existing but ' +
-            'still lists it (workspace=%s) — not taking it over on this probe (#1325)',
-          name,
-          config.workspaceId
-        );
-        return 'unknown';
-      }
+      listed = await oscListInstances(config.oscContext, ENCORE_SERVICE_ID, sat);
     } catch (listErr) {
-      // The list is unavailable; the single-instance answer stands on its own.
       console.warn(
-        '[encore-scaler] spawn: Encore instance %s does not exist and the instance ' +
-          'list could not be read to cross-check (workspace=%s) (#1325):',
+        '[encore-scaler] spawn: Encore instance %s looks not-found but the instance ' +
+          'list could not be read to confirm it (workspace=%s) — INDETERMINATE, not ' +
+          'absent; an instance that did land must stay adoptable (#1325, #1327):',
         name,
         config.workspaceId,
         listErr
       );
+      return 'unknown';
     }
+    if (!Array.isArray(listed)) {
+      // createFetch hands back whatever an ok response carried, so a gateway's
+      // interstitial page or an empty body arrives here as a non-array. That is
+      // not an enumeration of anything.
+      console.warn(
+        '[encore-scaler] spawn: Encore instance %s looks not-found and OSC answered ' +
+          'the instance list with a %s rather than an array (workspace=%s) — ' +
+          'INDETERMINATE, not absent (#1327)',
+        name,
+        typeof listed,
+        config.workspaceId
+      );
+      return 'unknown';
+    }
+    // Elements are typed as possibly absent on purpose: this body is whatever an
+    // ok response carried, so a null or a bare string inside the array must not
+    // throw on the way to a verdict.
+    const instances = listed as Array<OscInstance | null | undefined>;
+    if (
+      instances.some((inst) => typeof inst?.name === 'string' && inst.name === name)
+    ) {
+      console.warn(
+        '[encore-scaler] spawn: OSC reports Encore instance %s as not existing but ' +
+          'still lists it (workspace=%s) — not taking it over on this probe (#1325)',
+        name,
+        config.workspaceId
+      );
+      return 'unknown';
+    }
+    // The only route to 'absent': OSC enumerated this service's instances and
+    // the name is not among them.
     return 'absent';
   }
 }
@@ -593,10 +638,19 @@ function takeoverCandidate(
 // the CREATE's error, so the spawn counts as FAILED, no callback listener is
 // created, the #1322 back-off applies and the tick carries on dispatching queued
 // jobs to the instances that are running (#1325).
+//
+// The two are NOT equivalent operationally, which is what `sawCandidate`
+// records (#1327). 'absent' means OSC enumerated the service and the name was
+// not there, so there is provably nothing to clean up. 'gone-quiet' means the
+// budget ran out with nothing proven either way — and if a takeover candidate
+// was seen during the watch, an instance under that name may well be LIVE on
+// OSC while this spawn walks away from it. Nothing here can safely remove it
+// (it may be another spawn's, or still coming up), so it is handed to the
+// orphan reaper, loudly, instead of being written off as absent.
 type GatewayTimeoutTakeover =
   | { kind: 'adopt'; instance: OscInstance }
   | { kind: 'absent' }
-  | { kind: 'gone-quiet' };
+  | { kind: 'gone-quiet'; sawCandidate: boolean };
 
 // Watch one instance name for a bounded time and return the instance if OSC
 // starts reporting it — and CONFIRMS that it exists (#1286, #1325).
@@ -623,8 +677,12 @@ async function probeForGatewayTimedOutInstance(
     config.spawnAdoptProbeTimeoutMs ?? DEFAULT_SPAWN_ADOPT_PROBE_TIMEOUT_MS;
   const intervalMs =
     config.spawnAdoptProbeIntervalMs ?? DEFAULT_SPAWN_ADOPT_PROBE_INTERVAL_MS;
-  if (budgetMs <= 0) return { kind: 'gone-quiet' };
+  if (budgetMs <= 0) return { kind: 'gone-quiet', sawCandidate: false };
   const deadline = Date.now() + budgetMs;
+  // Did any probe ever see something shaped like the instance we asked for? Only
+  // used to describe an indeterminate outcome accurately (#1327) — it is never
+  // evidence of existence on its own, which is the whole point of #1325.
+  let sawCandidate = false;
   // One probe: ask for the instance, and only if the answer looks like it, ask
   // OSC whether it really is there. Returns undefined for "nothing usable this
   // time round", which keeps the watch going.
@@ -636,6 +694,7 @@ async function probeForGatewayTimedOutInstance(
       await tryGetInstance(config, ENCORE_SERVICE_ID, name, sat)
     );
     if (candidate === undefined) return undefined;
+    sawCandidate = true;
     const existence = await encoreInstanceExistence(config, name, sat);
     if (existence === 'exists') {
       console.warn(
@@ -667,12 +726,12 @@ async function probeForGatewayTimedOutInstance(
     // The sleep is clamped to what is left of the budget, so a budget shorter
     // than one interval still ends on time and never overshoots it.
     const remaining = deadline - Date.now();
-    if (remaining <= 0) return { kind: 'gone-quiet' };
+    if (remaining <= 0) return { kind: 'gone-quiet', sawCandidate };
     await new Promise((r) => setTimeout(r, Math.min(intervalMs, remaining)));
     if (Date.now() >= deadline) {
       // One last look at the deadline itself: the instance may have appeared
       // during the final sleep, and the whole point is not to abandon it.
-      return (await lookOnce(probe + 1)) ?? { kind: 'gone-quiet' };
+      return (await lookOnce(probe + 1)) ?? { kind: 'gone-quiet', sawCandidate };
     }
   }
 }
@@ -983,8 +1042,14 @@ async function spawnPooledInstance(
       if (isNameAlreadyTakenError(err)) {
         // tryGetInstance, not getInstance: a probe that itself fails must not
         // replace the create's error or abandon the retry loop (#1071 review
-        // finding 4).
-        const existing = await tryGetInstance(config, ENCORE_SERVICE_ID, name, sat);
+        // finding 4). Guarded by takeoverCandidate for the same reason the
+        // post-exhaustion watch is (#1325, #1327 review minor): an ok response
+        // that is not this instance — an interstitial page, an empty body, a
+        // record under another name — must never be adopted here either.
+        const existing = takeoverCandidate(
+          name,
+          await tryGetInstance(config, ENCORE_SERVICE_ID, name, sat)
+        );
         if (existing) {
           instance = existing;
           instanceAdopted = true;
@@ -998,9 +1063,10 @@ async function spawnPooledInstance(
           );
           break;
         }
-        // getInstance returned undefined, which means "could not confirm" and
-        // not "does not exist" — lib/core.js:140-150 swallows EVERY error but
-        // 401, so a 404, a 500 and a dropped socket are indistinguishable here.
+        // getInstance returned undefined (or a body that is not this instance),
+        // which means "could not confirm" and not "does not exist" —
+        // lib/core.js:119-150 swallows EVERY error but 401, so a 404, a 500 and
+        // a dropped socket are indistinguishable here.
         // The name being taken is itself strong evidence the instance exists, so
         // this is retry-worthy: back off and try the create again, which will
         // collide again and give adoption a second chance. Safe because the name
@@ -1061,24 +1127,41 @@ async function spawnPooledInstance(
             instanceAdopted = true;
             break;
           }
-          // #1325: either OSC says the instance does not exist, or the watch
-          // ended without OSC ever confirming that it does. Both FAIL the spawn
-          // on the create's error, which is the pre-#1286 outcome for a create
-          // that really did not land: nothing is adopted, no callback listener
-          // is created against a name that is not there (an orphaned listener
-          // had to be deleted by hand in the incident), the failure is recorded
-          // so the #1322 back-off holds the next create off, and the tick
-          // continues straight to dispatch — so queued jobs keep going to the
-          // instances that are running instead of waiting on a missing one.
+          // #1325: either OSC enumerated the service and the instance is not
+          // there, or the watch ended without OSC ever confirming that it is.
+          // Both FAIL the spawn on the create's error, which is the pre-#1286
+          // outcome for a create that really did not land: nothing is adopted,
+          // no callback listener is created against a name that is not there
+          // (an orphaned listener had to be deleted by hand in the incident),
+          // the failure is recorded so the #1322 back-off holds the next create
+          // off, and the tick continues straight to dispatch — so queued jobs
+          // keep going to the instances that are running instead of waiting on
+          // a missing one.
+          //
+          // #1327: the indeterminate case is logged as what it is. 'absent' is
+          // proven (the instance list did not carry the name) and leaves nothing
+          // behind. A watch that merely went quiet having SEEN a candidate may
+          // be walking away from a live instance; this spawn cannot safely
+          // remove it — it never confirmed it created it, and destroying a name
+          // another spawn owns or that is still coming up is the worse error —
+          // so the orphan reaper is the backstop and the line says so.
           console.warn(
             takeover.kind === 'absent'
-              ? '[encore-scaler] spawn: OSC says Encore instance %s does not exist ' +
-                  'after the gateway timeouts (workspace=%s) — failing the spawn with ' +
-                  'the create error instead of taking over a missing instance; the ' +
-                  'next spawn for this workspace is backed off (#1325)'
-              : '[encore-scaler] spawn: Encore instance %s never appeared after the ' +
-                  'gateway timeouts (workspace=%s) — failing the spawn with the create ' +
-                  'error; the next spawn for this workspace is backed off (#1286)',
+              ? '[encore-scaler] spawn: OSC enumerated its instances and Encore ' +
+                  'instance %s is not among them after the gateway timeouts ' +
+                  '(workspace=%s) — failing the spawn with the create error instead of ' +
+                  'taking over a missing instance; nothing to clean up; the next spawn ' +
+                  'for this workspace is backed off (#1325)'
+              : takeover.sawCandidate
+                ? '[encore-scaler] spawn: Encore instance %s was reported by OSC during ' +
+                    'the watch but its existence was NEVER CONFIRMED before the budget ' +
+                    'ran out (workspace=%s) — failing the spawn with the create error. ' +
+                    'This is INDETERMINATE, not absent: an instance under this name may ' +
+                    'be live on OSC and this spawn cannot prove it owns it, so the ' +
+                    'orphan reaper is what must reclaim it (#1286, #1327)'
+                : '[encore-scaler] spawn: Encore instance %s never appeared after the ' +
+                    'gateway timeouts (workspace=%s) — failing the spawn with the create ' +
+                    'error; the next spawn for this workspace is backed off (#1286)',
             name,
             config.workspaceId
           );
