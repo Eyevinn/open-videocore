@@ -132,9 +132,28 @@ export const MAX_ENCODE_ATTEMPTS = 3;
 // scaler loop does not block. 15s, then 60s.
 export const BACKOFF_MS: readonly number[] = [15_000, 60_000];
 
+// The signature our OWN stall detector puts at the front of the failure text it
+// synthesizes for a silently hung encode (#1218). Unlike every other needle in
+// the two lists below this one is not Encore wording: a silent hang produces NO
+// Encore message at all (that IS the defect — Encore keeps the job IN_PROGRESS
+// and says nothing), so the detector has to supply the text. It is exported so
+// the single producer (src/pipeline/transcode-stall-detector.ts
+// buildStallFailureMessage) and this classifier cannot drift apart.
+//
+// Classified 'transport' because a progress freeze is a plumbing failure — the
+// observed cause is a source connection dropped mid-encode, the same population
+// as #292/#293 — and because 'transport' already carries exactly the right
+// semantics: bounded by MAX_ENCODE_ATTEMPTS with 15s/60s backoff. Reusing it also
+// keeps MessageFailureClass unwidened, which matters because that union IS the
+// caller-facing `encodeAttemptLog[].classification` enum (asserted in sync with
+// FAILURE_CLASSES at src/routes/jobs.ts:30-38 by a compile-time guard).
+export const TRANSCODE_STALL_SIGNATURE = 'transcode progress stalled';
+
 // Case-insensitive substring signatures. Kept as lowercase needles matched
 // against a lowercased haystack so the match is robust to Encore casing changes.
 const TRANSPORT_SIGNATURES: readonly string[] = [
+  // #1218 — our own synthesized stall text (see TRANSCODE_STALL_SIGNATURE).
+  TRANSCODE_STALL_SIGNATURE,
   'sdkclientexception',
   'acquire operation took longer than the configured maximum time',
   'unable to execute http request',

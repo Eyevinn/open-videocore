@@ -214,6 +214,10 @@ import { valkeyConnectionId } from './encore-scaler/valkey-connection-id.js';
 import { resolveJobThroughputCap } from './encore-scaler/job-throughput-cap.js';
 import { resolveUploadPartSizeBytes } from './encore-scaler/upload-part-size.js';
 import { decideRetry, clearRetryState, makePriorAttemptCanceler } from './encore-scaler/retry-store.js';
+// #1218: the drop/failure signal shape the stall detector reuses, so a silently
+// hung transcode converges on the same handler as a reconcile-detected drop.
+import type { DroppedJob } from './encore-scaler/types.js';
+import { DEFAULT_TRANSCODE_STALL_TIMEOUT_MS } from './pipeline/transcode-stall-detector.js';
 import { decodeEncoreJobId } from './data/job-repo.js';
 import { DEPLOYMENT_CONTEXT } from './auth/workspace.js';
 import {
@@ -1627,6 +1631,16 @@ function activateScaler(redisUrl: string): void {
     return instance !== undefined && instance !== null;
   };
 
+  // #1218: stall bound for a silently hung encode, in milliseconds. A
+  // non-numeric or non-positive value is ignored in favour of the detector's
+  // default (DEFAULT_TRANSCODE_STALL_TIMEOUT_MS) — a misconfigured bound must
+  // never shorten to zero and start failing healthy encodes.
+  const parsedStallTimeout = Number(process.env['ENCORE_TRANSCODE_STALL_TIMEOUT_MS']);
+  const encoreTranscodeStallTimeoutMs =
+    Number.isFinite(parsedStallTimeout) && parsedStallTimeout > 0
+      ? parsedStallTimeout
+      : DEFAULT_TRANSCODE_STALL_TIMEOUT_MS;
+
   scalerRegistry = new WorkspaceEncoreScalerRegistry({
     // Process-global fallback connection (env-override single-stack / tests):
     // used only when resolveRedisUrl below cannot resolve a per-stack URL.
@@ -1965,7 +1979,31 @@ function activateScaler(redisUrl: string): void {
       append: (input, context) =>
         inScalerStack(context?.workspaceId, async () => logStore.append(input))
     },
-    onJobsDropped: async (drops) => {
+    // #1218: hoisted below so the stall path can converge on this EXACT
+    // handler (see settleOrRetryEncoreJobDrops).
+    onJobsDropped: (drops) => settleOrRetryEncoreJobDrops(drops)
+  });
+  encore = scalerRegistry;
+
+  // The ONE handler every detected transcode failure signal converges on.
+  //
+  // Extracted from the inline `onJobsDropped` hook above (unchanged body) by
+  // issue #1218 so the stall detector can reach the SAME path rather than grow a
+  // parallel settle/retry: a silently hung encode is raised here as a drop whose
+  // `reason` carries the synthesized stall text, and from this point on it is
+  // handled identically to the fast "Stream ends prematurely" failure (#727) —
+  // decideRetry() classifies it, re-dispatches it with backoff after cancelling
+  // the still-active prior attempt (#745, which is exactly what a frozen ffmpeg
+  // needs), or settles it terminal through settleFailedTranscode once the bound
+  // is exhausted.
+  //
+  // A function DECLARATION (hoisted within activateScaler) so the registry config
+  // above can name it without reordering that config.
+  //
+  // CONTRACT: `DroppedJob = { encoreJobId: string; reason?: string }` and
+  // `ScalerConfig.onJobsDropped?: (drops: DroppedJob[]) => Promise<void>` —
+  // src/encore-scaler/types.ts:45 / :259.
+  async function settleOrRetryEncoreJobDrops(drops: DroppedJob[]): Promise<void> {
       for (const { encoreJobId, reason } of drops) {
         await inEncoreJobStack(encoreJobId, async () => {
           try {
@@ -2140,9 +2178,7 @@ function activateScaler(redisUrl: string): void {
           }
         });
       }
-    }
-  });
-  encore = scalerRegistry;
+  }
 
   // HLS/DASH packaging (issue #9). The eyevinn-encore-packager consumes a Valkey
   // queue and writes CMAF output to the packaged MinIO bucket; we enqueue jobs
@@ -2407,6 +2443,20 @@ function activateScaler(redisUrl: string): void {
     progressWriteIntervalMs: process.env['ENCORE_PROGRESS_WRITE_INTERVAL_MS']
       ? parseInt(process.env['ENCORE_PROGRESS_WRITE_INTERVAL_MS'], 10)
       : undefined,
+    // #1218: how long an Encore job may sit on the SAME progress value before the
+    // sweep declares it stalled. A source connection dropped mid-encode can freeze
+    // ffmpeg silently — no error, Encore stays IN_PROGRESS, the job stays `running`
+    // forever and no retry fires. Unset => the detector's own 60-minute default
+    // (DEFAULT_TRANSCODE_STALL_TIMEOUT_MS), which is also what an unparseable value
+    // falls back to so a typo cannot start failing healthy encodes immediately.
+    transcodeStallTimeoutMs: encoreTranscodeStallTimeoutMs,
+    // #1218: raise a detected stall through the SAME handler the scaler's
+    // onJobsDropped uses, so it reaches decideRetry -> settleFailedTranscode
+    // exactly like the fast "Stream ends prematurely" failure (#727). The stall
+    // reason is carried on `reason` and classifies as the retryable 'transport'
+    // class (retry-policy.ts TRANSCODE_STALL_SIGNATURE), so the existing bounded
+    // retry re-dispatches the attempt instead of the job hanging forever.
+    onTranscodeStalled: (stalls) => settleOrRetryEncoreJobDrops([...stalls]),
     // #708: grace window the poller uses for the keys.jobCompletionSeen PX TTL so
     // reconcile's dropped-job diff can skip a just-completed job. Uses the SAME
     // value forwarded to the scaler loop (ENCORE_RECONCILE_GRACE_MS) so the write
