@@ -247,6 +247,7 @@ import {
   drmGateClosed
 } from '../drm/drm-config.js';
 import {
+  DRM_DIRECT_ENQUEUE_UNSUPPORTED_REFUSAL,
   DRM_SCHEME_UNSUPPORTED_REFUSAL,
   DRM_SYSTEMS_UNSUPPORTED_REFUSAL,
   DRM_UNSUPPORTED_REFUSAL,
@@ -3321,6 +3322,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // long before any key could be minted, and every message is the shared
   // operator-facing constant — no system id, scheme or key material in a
   // response body (ADR-008 §10).
+  //
+  // SCOPE: this gate answers "could the deployment's runner do this?" ONLY.
+  // Passing it does NOT mean the calling path can carry the request — the
+  // direct `encoreJobId` enqueue on POST /:id/package cannot, and refuses
+  // separately (`DRM_DIRECT_ENQUEUE_UNSUPPORTED_REFUSAL`) right after this gate.
   async function drmRequestRefused(
     drm: z.infer<typeof drmRequestSchema> | undefined,
     reply: import('fastify').FastifyReply
@@ -6481,7 +6487,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //         (pipeline mode, issue #1059) `source_unreadable` — the source object
   //         is missing from the bucket the transcode step would read. The #1058
   //         stack-routing gate runs FIRST (is this the right stack at all?), then
-  //         the #1059 readiness gate (are the bytes actually there?).
+  //         the #1059 readiness gate (are the bytes actually there?),
+  //         (issue #1266) `drm_unsupported` — the deployment's packaging runner
+  //         cannot satisfy the `drm` request, OR `drm` was combined with
+  //         `encoreJobId`, whose direct enqueue cannot carry encryption
+  //         parameters and would otherwise produce CLEAR output
   //   422 — (pipeline mode, issue #1280) `destination_unreachable` — the named
   //         `destination` is registered at an object-storage endpoint this stack
   //         cannot write job output to, so the job is refused rather than
@@ -6508,7 +6518,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // Optional DRM request (ADR-008 §9, issue #1266). Refused with
           // `409 drm_unsupported` when the packaging runner cannot encrypt, and
           // with `501 not_configured` while `DRM_ENABLED` is off — see
-          // `drmRequestRefused`. Omitted => the clear path, unchanged.
+          // `drmRequestRefused`. Also refused `409 drm_unsupported` when
+          // combined with `encoreJobId`: that enqueue path cannot carry
+          // encryption parameters (`DRM_DIRECT_ENQUEUE_UNSUPPORTED_REFUSAL`).
+          // Omitted => the clear path, unchanged.
           drm: drmRequestSchema.optional()
         }),
         response: {
@@ -6538,11 +6551,38 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // existence is still not leaked, and before either packaging mode below,
       // so a request that cannot be honoured never enqueues a job or creates an
       // execution that would quietly produce CLEAR output under a protected
-      // request. Applies to BOTH modes: the direct `encoreJobId` enqueue has no
-      // execution record to carry the request either.
+      // request. Applies to BOTH modes: the capability answer and the
+      // `DRM_ENABLED` flag are properties of the deployment, not of the mode.
       if (await drmRequestRefused(request.body.drm, reply)) return reply;
 
       const { encoreJobId } = request.body;
+
+      // ...but passing that gate is NOT sufficient on the direct `encoreJobId`
+      // path, which is refused outright for a `drm` request. The gate above only
+      // establishes that the RUNNER could encrypt; this path cannot hand it the
+      // parameters to do so. `PackagingTrigger.triggerPackaging(assetId,
+      // encoreJobUrl)` (src/pipeline/packaging.ts) enqueues the fixed
+      // `PackagingJob = { jobId, url }` envelope with no `encryption` member,
+      // and unlike pipeline mode there is no execution record to persist
+      // `request.body.drm` on and no `asset.drm` written — so an accepted
+      // request would return `202 { ok: true }` for protection that is never
+      // applied and nowhere recorded (`GET /:id/drm` would still 404). That is
+      // the false protection claim `correlatesWithRun` already guards the
+      // callbacks against, precisely because `triggerPackaging` is CLEAR.
+      // Refused the same way `clearPackagingRunner.enqueue` refuses to run an
+      // encrypted job clear (src/pipeline/packaging.ts), with the same
+      // `409 drm_unsupported` class the capability refusals use. Runs BEFORE the
+      // job lookup / instance resolution, so a refused request does no I/O.
+      if (request.body.drm && encoreJobId !== undefined) {
+        request.log.warn(
+          { assetId: asset.id, reason: 'drm-on-direct-enqueue' },
+          'refusing a DRM-requesting package: the direct encoreJobId enqueue cannot carry encryption parameters, so accepting it would publish clear output under a protected request (issue #1266)'
+        );
+        return reply.code(DRM_DIRECT_ENQUEUE_UNSUPPORTED_REFUSAL.status).send({
+          error: DRM_DIRECT_ENQUEUE_UNSUPPORTED_REFUSAL.error,
+          message: DRM_DIRECT_ENQUEUE_UNSUPPORTED_REFUSAL.message
+        });
+      }
 
       // Pipeline mode: auto-transcode then package. Tracked as a first-class
       // PipelineExecution (abr-vod = [transcode, package]) rather than ad-hoc

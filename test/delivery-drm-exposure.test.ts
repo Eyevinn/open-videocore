@@ -46,12 +46,15 @@ vi.mock('../src/auth/workspace.js', async () => {
 import { registerAuth } from '../src/auth/middleware.js';
 import { assetsRouter } from '../src/routes/assets.js';
 import { InMemoryAssetRepository, type AssetDrm } from '../src/data/asset-repo.js';
+import { InMemoryJobRepository, encodeEncoreJobId } from '../src/data/job-repo.js';
+import { keys } from '../src/encore-scaler/types.js';
 import { InMemoryPipelineRepository } from '../src/data/pipeline-repo.js';
 import {
   DRM_NOT_CONFIGURED_PAYLOAD,
   DRM_NOT_CONFIGURED_STATUS
 } from '../src/drm/drm-config.js';
 import {
+  DRM_DIRECT_ENQUEUE_UNSUPPORTED_REFUSAL,
   NO_ENCRYPTION_CAPABILITY,
   type EncryptingPackagingRunner,
   type PackagingService
@@ -482,5 +485,259 @@ describe('POST /:id/package and /:id/execute — drm member (issue #1266)', () =
     // gate's, which is what distinguishes them.)
     expect(res.statusCode).not.toBe(409);
     expect(res.json().message).not.toBe(DRM_NOT_CONFIGURED_PAYLOAD.message);
+  });
+
+  // ---------------------------------------------------------------------------
+  // The DIRECT `encoreJobId` enqueue must REFUSE a `drm` request, never drop it.
+  //
+  // Passing the capability gate is not sufficient on that path: it hands the job
+  // to `PackagingTrigger.triggerPackaging(assetId, encoreJobUrl)`, whose envelope
+  // is the fixed `PackagingJob = { jobId, url }` with no `encryption` member, and
+  // unlike pipeline mode it persists NEITHER an execution record carrying the
+  // request NOR `asset.drm`. Accepting it would answer `202 { ok: true }` for
+  // protection that is never applied and nowhere recorded.
+  //
+  // CONTRACT SOURCES (CLAUDE.md rule 7), verified before writing these cases:
+  //   - `DRM_DIRECT_ENQUEUE_UNSUPPORTED_REFUSAL` — `{ status: 409, error:
+  //     'drm_unsupported', errorCode: 'drm_unsupported', message }`, the
+  //     `DrmUnsupportedRefusal` shape — src/pipeline/packaging.ts.
+  //   - `PackagingTrigger.triggerPackaging(assetId: string, encoreJobUrl: string)
+  //     : Promise<string | undefined>` and `PackagingJob = { jobId, url }` —
+  //     src/pipeline/packaging.ts.
+  //   - `JobRepository.findByEncoreJobId(encoreJobId): Promise<{ job: Job } |
+  //     undefined>` — src/data/job-repo.ts:392, the first I/O the direct branch
+  //     would reach. Asserted NOT called, so the refusal precedes every lookup.
+  //   - The `409` response body on POST /:id/package is `{ error, message }`
+  //     (route schema; openapi.json `/api/v1/assets/{id}/package` -> 409).
+  // ---------------------------------------------------------------------------
+
+  // A runner that CAN encrypt with the requested scheme, so `drmRequestRefused`
+  // passes and the only thing left that can refuse is the direct-path check.
+  const encryptingRunner: EncryptingPackagingRunner = {
+    capabilities: async () => ({
+      encryption: true,
+      schemes: ['cenc', 'cbcs'],
+      systems: [SYSTEM_ID_A]
+    }),
+    enqueue: async () => {}
+  };
+
+  // Like `buildApp`, plus the two things the direct branch would touch: a job
+  // repository (whose lookup is spied on) and a `triggerPackaging` spy standing
+  // in for the packaging service.
+  async function buildAppWithTrigger(): Promise<{
+    app: FastifyInstance;
+    assets: InMemoryAssetRepository;
+    pipelines: InMemoryPipelineRepository;
+    jobs: InMemoryJobRepository;
+    triggerPackaging: ReturnType<typeof vi.fn>;
+  }> {
+    const app = Fastify();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    registerAuth(app);
+    const assets = new InMemoryAssetRepository();
+    const pipelines = new InMemoryPipelineRepository();
+    const jobs = new InMemoryJobRepository();
+    const triggerPackaging = vi.fn(async () => undefined);
+    await app.register(assetsRouter, {
+      prefix: '/api/v1/assets',
+      repository: assets,
+      pipelineRepository: pipelines,
+      jobRepository: jobs,
+      storageFor: () => fakeStorage(),
+      outputBucket: 'openvideocore-packaged',
+      packaging: { triggerPackaging } as unknown as PackagingService,
+      packagingRunner: encryptingRunner
+    });
+    await app.ready();
+    return { app, assets, pipelines, jobs, triggerPackaging };
+  }
+
+  it('refuses 409 drm_unsupported for drm + encoreJobId, instead of enqueueing a clear job', async () => {
+    process.env['DRM_ENABLED'] = 'true';
+    const h = await buildAppWithTrigger();
+    const asset = await h.assets.create({ name: 'clip' });
+    const lookup = vi.spyOn(h.jobs, 'findByEncoreJobId');
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${asset.id}/package`,
+      headers: A,
+      payload: { encoreJobId: 'ctx__job-1', drm: drmRequest }
+    });
+
+    // NOT 202: a protection request on this path is answered, not swallowed.
+    expect(res.statusCode).toBe(DRM_DIRECT_ENQUEUE_UNSUPPORTED_REFUSAL.status);
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toEqual({
+      error: DRM_DIRECT_ENQUEUE_UNSUPPORTED_REFUSAL.error,
+      message: DRM_DIRECT_ENQUEUE_UNSUPPORTED_REFUSAL.message
+    });
+    expect(res.json().error).toBe('drm_unsupported');
+    // The runner CAN encrypt, so the capability gate passed: the refusal is the
+    // direct path's own, not `DRM_UNSUPPORTED_REFUSAL`'s.
+    expect((await encryptingRunner.capabilities()).encryption).toBe(true);
+    // No clear job was enqueued for a protected request, and the refusal landed
+    // before any I/O on the job repository.
+    expect(h.triggerPackaging).not.toHaveBeenCalled();
+    expect(lookup).not.toHaveBeenCalled();
+    // The message names the member/mode, never a system id or key material
+    // (ADR-008 §10).
+    expect(res.json().message).not.toContain(SYSTEM_ID_A);
+    expect(res.payload).not.toMatch(/"key"\s*:/);
+    lookup.mockRestore();
+  });
+
+  it('writes no drm state when the direct enqueue is refused, so GET /:id/drm still 404s', async () => {
+    process.env['DRM_ENABLED'] = 'true';
+    const h = await buildAppWithTrigger();
+    const asset = await h.assets.create({ name: 'clip' });
+
+    await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${asset.id}/package`,
+      headers: A,
+      payload: { encoreJobId: 'ctx__job-1', drm: drmRequest }
+    });
+
+    // Refused means refused: no half-written protection claim anywhere.
+    expect((await h.assets.get(asset.id))?.drm).toBeUndefined();
+    expect(await h.pipelines.listByAsset(asset.id)).toHaveLength(0);
+    const drm = await h.app.inject({
+      method: 'GET',
+      url: `/api/v1/assets/${asset.id}/drm`,
+      headers: A
+    });
+    expect(drm.statusCode).toBe(404);
+  });
+
+  it('leaves the clear direct enqueue untouched (encoreJobId, no drm member)', async () => {
+    process.env['DRM_ENABLED'] = 'true';
+    const h = await buildAppWithTrigger();
+    const asset = await h.assets.create({ name: 'clip' });
+    const lookup = vi.spyOn(h.jobs, 'findByEncoreJobId');
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${asset.id}/package`,
+      headers: A,
+      payload: { encoreJobId: 'ctx__job-1' }
+    });
+
+    // Without a `drm` member the direct branch behaves exactly as before: it
+    // reaches its own job lookup (and answers that unknown job 409
+    // `job_not_found` for this fixture) rather than any DRM refusal.
+    expect(lookup).toHaveBeenCalledWith('ctx__job-1');
+    expect(res.json().error).not.toBe('drm_unsupported');
+    lookup.mockRestore();
+  });
+
+  it('still answers 501 for drm + encoreJobId while DRM_ENABLED is off', async () => {
+    const h = await buildAppWithTrigger();
+    const asset = await h.assets.create({ name: 'clip' });
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${asset.id}/package`,
+      headers: A,
+      payload: { encoreJobId: 'ctx__job-1', drm: drmRequest }
+    });
+
+    // Flag gate FIRST and unchanged: which feature is off is reported before the
+    // path-specific refusal, exactly as for pipeline mode.
+    expect(res.statusCode).toBe(DRM_NOT_CONFIGURED_STATUS);
+    expect(res.json().error).toBe(DRM_NOT_CONFIGURED_PAYLOAD.error);
+    expect(h.triggerPackaging).not.toHaveBeenCalled();
+  });
+
+  // The same refusal against a FULLY ENQUEUEABLE direct request: a matching
+  // transcode job AND a resolvable packaging target, so every precondition the
+  // direct branch checks is satisfied and the pre-fix answer was
+  // `202 { ok: true }` with a CLEAR `triggerPackaging` call. This is the exact
+  // silent-drop this case exists to keep closed.
+  //
+  // CONTRACT SOURCES for the fixture (CLAUDE.md rule 7):
+  //   - `encodeEncoreJobId(contextId, jobLocalId)` =>
+  //     `<workspace>__<job local id>`, and `decodeEncoreJobId` reads it back —
+  //     src/data/job-repo.ts:422-439.
+  //   - `resolvePackagingTarget(redis, encoreJobId)` reads, in order,
+  //     `keys.jobTerminalInstance(encoreJobId)` (GET), `keys.pool(workspaceId)`
+  //     (HGET -> a JSON `EncoreInstanceRecord`), then
+  //     `keys.jobEncoreUrl(encoreJobId)` (GET) — src/encore-scaler/
+  //     packaging-target.ts, keys at src/encore-scaler/types.ts:475/490/501.
+  //     Only `get` and `hget` are used (`ReadRedis`), which is all this fake has.
+  it('refuses even when the direct enqueue would otherwise have succeeded (was 202 + clear enqueue)', async () => {
+    process.env['DRM_ENABLED'] = 'true';
+    const app = Fastify();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    registerAuth(app);
+    const assets = new InMemoryAssetRepository();
+    const jobs = new InMemoryJobRepository();
+    const triggerPackaging = vi.fn(async () => undefined);
+
+    const asset = await assets.create({ name: 'clip' });
+    const job = await jobs.create({ type: 'transcode', assetId: asset.id });
+    const encoreJobId = encodeEncoreJobId('workspace-a', job.id);
+    await jobs.update(job.id, { encoreJobId, status: 'running' });
+
+    const instanceId = 'instance-1';
+    const store: Record<string, string> = {
+      [keys.jobTerminalInstance(encoreJobId)]: instanceId,
+      [keys.jobEncoreUrl(encoreJobId)]: 'https://encore-1.example/encoreJobs/uuid-1'
+    };
+    const pool: Record<string, string> = {
+      [instanceId]: JSON.stringify({ url: 'https://encore-1.example' })
+    };
+    const packagingRedis = {
+      get: async (key: string) => store[key] ?? null,
+      hget: async (key: string, field: string) =>
+        key === keys.pool('workspace-a') ? (pool[field] ?? null) : null
+    } as unknown as import('ioredis').Redis;
+
+    await app.register(assetsRouter, {
+      prefix: '/api/v1/assets',
+      repository: assets,
+      pipelineRepository: new InMemoryPipelineRepository(),
+      jobRepository: jobs,
+      storageFor: () => fakeStorage(),
+      outputBucket: 'openvideocore-packaged',
+      packaging: { triggerPackaging } as unknown as PackagingService,
+      packagingRunner: encryptingRunner,
+      packagingRedis
+    });
+    await app.ready();
+
+    // The fixture really is enqueueable: the same request WITHOUT `drm` is
+    // accepted and enqueued clear, which is the behaviour that must not change.
+    const clear = await app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${asset.id}/package`,
+      headers: A,
+      payload: { encoreJobId }
+    });
+    expect(clear.statusCode).toBe(202);
+    expect(clear.json()).toEqual({ ok: true });
+    expect(triggerPackaging).toHaveBeenCalledWith(
+      asset.id,
+      'https://encore-1.example/encoreJobs/uuid-1'
+    );
+    triggerPackaging.mockClear();
+
+    // Same request WITH `drm`: refused, and nothing enqueued.
+    const protectedReq = await app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${asset.id}/package`,
+      headers: A,
+      payload: { encoreJobId, drm: drmRequest }
+    });
+    expect(protectedReq.statusCode).toBe(409);
+    expect(protectedReq.json()).toEqual({
+      error: DRM_DIRECT_ENQUEUE_UNSUPPORTED_REFUSAL.error,
+      message: DRM_DIRECT_ENQUEUE_UNSUPPORTED_REFUSAL.message
+    });
+    expect(triggerPackaging).not.toHaveBeenCalled();
+    expect((await assets.get(asset.id))?.drm).toBeUndefined();
   });
 });
