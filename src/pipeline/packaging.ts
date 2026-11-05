@@ -17,7 +17,11 @@
 //      POST /api/v1/internal/packager-callback route when the packager signals
 //      completion. On success it writes `manifestUrls` (HLS + DASH) onto the
 //      asset; on failure it records `packagingError`. Packaging NEVER changes
-//      the asset's lifecycle status — it only annotates the record.
+//      the asset's lifecycle status — it only annotates the record. Since
+//      #1265 the same two callbacks also SETTLE protection when the enqueued
+//      job carried encryption: a pending `asset.drm` becomes `protected` (with
+//      `protectedAt`) on success and `failed` on failure, in the same write —
+//      see `settleDrmOnPackagerSuccess` / `settleDrmOnPackagerFailure`.
 //   3. Both of the above keep an observable `package` Job in step (issue #976):
 //      created at enqueue time and settled from the completion callbacks, so the
 //      step that produces the customer-facing output is listed by
@@ -1138,6 +1142,114 @@ export type PackagerFailurePayload = {
   message: string;
 };
 
+// ---------------------------------------------------------------------------
+// Callback-side DRM settlement (issue #1265; ADR-008 §8, §12, C7).
+//
+// The key-acquisition step above leaves the asset at `drm.status = 'pending'`
+// once content keys were acquired and the encrypted job was enqueued (STEP 4/5).
+// Nothing then moved that state: the packager's own callbacks are the ONLY
+// events that know whether the protected package actually landed, so the two
+// transitions out of `pending` belong here, beside the callbacks that observe
+// them:
+//   - packager success -> `protected` + `protectedAt`
+//   - packager failure -> `failed`   (ADR-008 §12 "Packager fails after
+//     encryption started": `failPackageJob` + `drm.status='failed'`)
+//
+// BOTH are written as PURE functions over the persisted block, returning the
+// `AssetDrm` to patch or `undefined` for "nothing to settle". That keeps the
+// whole state machine in one readable place (no transition logic inlined in a
+// callback handler), and it is what makes the idempotency guarantee checkable:
+// `undefined` means the caller omits `drm` from its patch entirely, so an
+// at-least-once duplicate callback cannot overwrite `protectedAt` with a later
+// timestamp — `UpdateAssetInput.drm` replaces the block WHOLESALE (applyPatch,
+// src/data/asset-repo.ts:2011 and src/data/couch-asset-repo.ts:468), so
+// omitting the field is the only way to leave the stored block untouched.
+//
+// `pending` is the ONLY status either function acts on. A block that is already
+// `protected`, `failed` or `unsupported` is terminal for this package run, and a
+// clear asset (no `drm` block at all — the overwhelmingly common case, and every
+// asset while `DRM_ENABLED` is off) returns `undefined` from both, which is what
+// keeps the clear packaging path byte-for-byte unchanged.
+//
+// NO new `Asset.status` value and no lifecycle change: a DRM failure leaves the
+// asset `ready` with `drm.status = 'failed'` (ADR-008 §8, the `packagingError`
+// convention, C7).
+//
+// CONTRACT SOURCES VERIFIED BEFORE WRITING (CLAUDE.md rule 7)
+//   - `AssetDrm` (`status`, `providerId`, `scheme`, `systems`, `keyIds[]`,
+//     `licenceUrls?`, `certificateUrl?`, `requestedAt`, `protectedAt?`,
+//     `error?`, `errorCode?`) — src/data/asset-repo.ts:494-511.
+//   - `UpdateAssetInput.drm` (wholesale replacement, never changes `status`) —
+//     src/data/asset-repo.ts:976, applied at :2011 (in-memory) / :468
+//     (src/data/couch-asset-repo.ts).
+//   - `DrmStatus` / `DRM_STATUSES`, `DrmErrorCode` / `DRM_ERROR_CODES` (which
+//     already contains `packaging_failed`) — src/types/drm.ts:87-101.
+//   - `PackagerSuccessPayload = { url, jobId, outputPath? }` (jobId = assetId) —
+//     this file, and the handlers `PackagingService.handleSuccess` /
+//     `handleFailure` that the packager callback routes drive
+//     (src/routes/internal.ts POST /packagerCallback/success).
+//   - `completePackageJob` / `failPackageJob` idempotency (both early-return on
+//     an inactive job) — src/pipeline/package-job.ts:188-236.
+// ---------------------------------------------------------------------------
+
+// The FIXED `AssetDrm.error` text for a packager-reported failure. The
+// packager's own message is recorded verbatim on `asset.packagingError` (that is
+// the existing settlement and it is unchanged); the DRM block carries a static,
+// operator-facing sentence instead, exactly like `DRM_STEP_ERROR_MESSAGES`
+// above, so no received text can ever reach `structural.drm` (ADR-008 §10
+// "Logging and error redaction").
+export const DRM_PACKAGER_FAILED_MESSAGE =
+  'the packager reported a failure for this asset, so no protected package was produced';
+
+// Packager SUCCESS: settle a pending protection to `protected`.
+//
+// Returns `undefined` — "do not write `drm`" — for every non-pending block,
+// which is precisely the idempotency requirement: a second success callback for
+// the same asset finds `protected` and leaves the stored `protectedAt` alone.
+// `error` / `errorCode` are dropped on the way through: a protected package must
+// not keep advertising a failure from an earlier attempt.
+export function settleDrmOnPackagerSuccess(
+  drm: AssetDrm | undefined,
+  protectedAt: string
+): AssetDrm | undefined {
+  if (!drm || drm.status !== 'pending') return undefined;
+  // Rebuilt field by field (rather than spread-and-override) so the dropped
+  // `error` / `errorCode` are dropped by CONSTRUCTION — a future field added to
+  // `AssetDrm` then has to be considered here instead of silently riding along.
+  return {
+    status: 'protected',
+    providerId: drm.providerId,
+    scheme: drm.scheme,
+    systems: [...drm.systems],
+    keyIds: drm.keyIds.map((k) => ({ trackGroup: k.trackGroup, keyId: k.keyId })),
+    ...(drm.licenceUrls !== undefined ? { licenceUrls: { ...drm.licenceUrls } } : {}),
+    ...(drm.certificateUrl !== undefined ? { certificateUrl: drm.certificateUrl } : {}),
+    requestedAt: drm.requestedAt,
+    protectedAt
+  };
+}
+
+// Packager FAILURE: settle a pending protection to `failed`.
+//
+// Classified as `packaging_failed` — the same `DrmErrorCode` the key step's
+// "keys acquired, enqueue fails" path uses (ADR-008 §12), because it is the same
+// class of failure (keys were minted, no protected package landed). No new error
+// code and no new error path: the caller's `packagingError` write is what records
+// the packager's own message.
+export function settleDrmOnPackagerFailure(
+  drm: AssetDrm | undefined
+): AssetDrm | undefined {
+  if (!drm || drm.status !== 'pending') return undefined;
+  return {
+    ...drm,
+    systems: [...drm.systems],
+    keyIds: drm.keyIds.map((k) => ({ trackGroup: k.trackGroup, keyId: k.keyId })),
+    status: 'failed',
+    errorCode: 'packaging_failed',
+    error: DRM_PACKAGER_FAILED_MESSAGE
+  };
+}
+
 export type PackagingDeps = {
   assets: AssetRepository;
   queue: PackageQueue;
@@ -1165,6 +1277,11 @@ export type PackagingDeps = {
   // (src/main.ts, `logStore`), so the `package` stage of a run is visible in the
   // Logs tab.
   pipelineLog?: PipelineLogSink;
+  // Clock seam for `drm.protectedAt` (issue #1265). Optional and defaulted to
+  // the wall clock, so no existing caller changes; a test injects it to assert
+  // that a DUPLICATE success callback does not re-stamp `protectedAt` even when
+  // the clock has moved on. Same convention as `PackagingStepDeps.now`.
+  now?: () => string;
 };
 
 // The base the packaging pipeline WRITES manifest URLs against. Stays
@@ -1523,9 +1640,23 @@ export class PackagingService implements PackagingTrigger {
     // derived flat path. Omitted (undefined) when the packager reported no
     // `outputPath`, so the record only ever holds a verified location.
     const packagedOutput = packagedOutputFromCallback(payload.outputPath, packagedBucket());
+    // Settle protection in the SAME write that records the packaged output
+    // (issue #1265, ADR-008 §8/§12): the package that just landed IS the
+    // protected package, so `drm.status: 'pending' -> 'protected'` and
+    // `protectedAt` belong to this one patch rather than a second round-trip
+    // that could land without the manifests. `undefined` for a clear asset (no
+    // `drm` block) and for an already-settled one, in which case `drm` is left
+    // out of the patch entirely and the stored block — including its original
+    // `protectedAt` — is untouched: that is what makes a duplicate, at-least-once
+    // success callback idempotent (see `settleDrmOnPackagerSuccess`).
+    const settledDrm = settleDrmOnPackagerSuccess(
+      asset.drm,
+      (this.deps.now ?? (() => new Date().toISOString()))()
+    );
     await this.deps.assets.update(assetId, {
       manifestUrls,
       ...(packagedOutput ? { packagedOutput } : {}),
+      ...(settledDrm ? { drm: settledDrm } : {}),
       // Clear the packaged-output-stale marker (issue #1290) in the SAME write
       // that repoints the manifests: a re-encode without a package had recorded
       // that these manifests described an older generation of `renditions`
@@ -1593,7 +1724,18 @@ export class PackagingService implements PackagingTrigger {
   async handleFailure(assetId: string, message: string): Promise<boolean> {
     const asset = await this.deps.assets.get(assetId);
     if (!asset) return false;
-    await this.deps.assets.update(assetId, { packagingError: message });
+    // Settle protection alongside the EXISTING `packagingError` write (issue
+    // #1265, ADR-008 §12 "Packager fails after encryption started"): one patch,
+    // no new error path, and no change to `asset.status` — a DRM failure leaves
+    // the asset `ready` with `drm.status = 'failed'` (ADR-008 §8, C7). `drm` is
+    // omitted from the patch for a clear asset and for an already-terminal
+    // protection state, so the clear path is unchanged and a repeated failure
+    // callback cannot rewrite a settled block.
+    const settledDrm = settleDrmOnPackagerFailure(asset.drm);
+    await this.deps.assets.update(assetId, {
+      packagingError: message,
+      ...(settledDrm ? { drm: settledDrm } : {})
+    });
     // Settle the observable `package` Job as failed WITH the reason (issue
     // #976), so the failure is readable from the Jobs tab without opening the
     // asset record. Idempotent, and a no-op when no job repository is wired.
