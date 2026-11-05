@@ -35,14 +35,20 @@
 // behaviour. The queue contract for the packager is not formally documented in
 // the OSC catalog — see docs/osc-feedback/incoming-issue9-packaging.md.
 
-import type { AssetRepository, ManifestUrls, PackagedOutput } from '../data/asset-repo.js';
+import type {
+  AssetDrm,
+  AssetRepository,
+  ManifestUrls,
+  PackagedOutput
+} from '../data/asset-repo.js';
 import type { JobRepository } from '../data/job-repo.js';
 import type { PipelineExecution, PipelineRepository } from '../data/pipeline-repo.js';
-import type { StorageBackendConfig } from '../services/param-store.js';
+import type { ParamStore, StorageBackendConfig } from '../services/param-store.js';
 import type {
   DrmErrorCode,
   DrmSystemId,
-  ProtectionScheme
+  ProtectionScheme,
+  TrackTypeGroup
 } from '../types/drm.js';
 import type {
   ContentKey,
@@ -51,6 +57,14 @@ import type {
   KeyRequest
 } from '../drm/key-provider.js';
 import { resolveDrmSystemIds } from '../drm/key-provider.js';
+import type { DrmStackConfig } from '../drm/drm-config.js';
+import {
+  DRM_NOT_CONFIGURED_PAYLOAD,
+  DRM_NOT_CONFIGURED_STATUS,
+  loadDrmStackConfig,
+  readDrmCredentialStatus
+} from '../drm/drm-config.js';
+import { isKeyProviderError } from '../drm/key-provider-error.js';
 import { emitAudit, originActor, type AuditEmitter, type AuditErrorLog } from '../data/audit-emit.js';
 import { logPipelineEvent, type PipelineLogSink } from '../services/pipeline-log.js';
 import {
@@ -283,9 +297,22 @@ export type EncryptionParams = {
 // every job `PackageQueue.enqueue` accepts, plus an optional `encryption`
 // block, so an `EncryptingPackagingRunner` is usable anywhere a `PackageQueue`
 // is — but not the reverse.
+//
+// `options.signal` (issue #1264) carries the key-acquisition step's WHOLE-STEP
+// deadline into the enqueue, so a runner that can honour cancellation does not
+// hold key material past the 60 s budget (ADR-008 §12). It is a second OPTIONAL
+// parameter on purpose: a runner implemented with a single `job` parameter —
+// `clearPackagingRunner` below, and every fake in the test tree — still
+// satisfies this interface, and `EncryptingPackagingRunner` stays assignable to
+// `PackageQueue`. A runner that ignores the signal is not trusted to bound the
+// step either: `enqueuePackagingStep` ALSO races the returned promise against
+// the same signal (see `withAbortDeadline`).
 export interface EncryptingPackagingRunner {
   capabilities(): Promise<PackagingCapabilities>;
-  enqueue(job: PackagingJob & { encryption?: EncryptionParams }): Promise<void>;
+  enqueue(
+    job: PackagingJob & { encryption?: EncryptionParams },
+    options?: { signal?: AbortSignal }
+  ): Promise<void>;
 }
 
 // The capability answer of the runner this deployment actually has.
@@ -410,11 +437,39 @@ export const DRM_SCHEME_UNSUPPORTED_REFUSAL: Readonly<DrmUnsupportedRefusal> =
       'DRM protection was requested with a protection scheme the packaging runner for this stack does not support; request a scheme the runner reports, or deploy a packaging runner that supports it'
   });
 
+// The refusal a DRM-requesting step gets when the stack has no usable DRM
+// configuration (issue #1264): the deployment kill switch is off, the stack has
+// no stored DRM block, the stored block is `enabled: false`, or the configured
+// `cpix` provider has no credential in the environment. All four are the same
+// class — "DRM is not configured here" — and reuse the EXISTING constants every
+// DRM route already answers with (`DRM_NOT_CONFIGURED_STATUS` /
+// `DRM_NOT_CONFIGURED_PAYLOAD`, src/drm/drm-config.ts, ADR-008 §9) rather than
+// a new status or a new error string.
+//
+// `errorCode` is the `DrmErrorCode` class of this failure
+// (`'drm_not_configured'`, already in `DRM_ERROR_CODES`), carried so a caller
+// maps ANY refusal to a machine-readable class without special-casing which
+// refusal it got. The HTTP body a route sends stays `DRM_NOT_CONFIGURED_PAYLOAD`.
+export type DrmNotConfiguredRefusal = {
+  status: typeof DRM_NOT_CONFIGURED_STATUS;
+  error: (typeof DRM_NOT_CONFIGURED_PAYLOAD)['error'];
+  errorCode: Extract<DrmErrorCode, 'drm_not_configured'>;
+  message: string;
+};
+
+export const DRM_NOT_CONFIGURED_REFUSAL: Readonly<DrmNotConfiguredRefusal> =
+  Object.freeze({
+    status: DRM_NOT_CONFIGURED_STATUS,
+    error: DRM_NOT_CONFIGURED_PAYLOAD.error,
+    errorCode: 'drm_not_configured',
+    message: DRM_NOT_CONFIGURED_PAYLOAD.message
+  });
+
 // Outcome of the packaging step gate. Discriminated so a caller cannot read
 // `refusal` on the proceed path or forget to handle the refusal path.
 export type PackagingStepOutcome =
   | { ok: true; encrypted: boolean }
-  | { ok: false; refusal: DrmUnsupportedRefusal };
+  | { ok: false; refusal: DrmUnsupportedRefusal | DrmNotConfiguredRefusal };
 
 export type PackagingStepRequest = {
   job: PackagingJob;
@@ -424,6 +479,36 @@ export type PackagingStepRequest = {
   drm?: NonNullable<PipelineExecution['drm']>;
 };
 
+// Where the step reads the stack's NON-SECRET DRM coordinates from (issue
+// #1264, ADR-008 §6 step 1, D5/D6). The read goes through #1262's
+// `loadDrmStackConfig`, so the `DRM_ENABLED` short-circuit (no parameter-store
+// I/O at all while the flag is off) is reused verbatim instead of re-derived.
+//
+// OPTIONAL on the deps: a caller that supplies no locator gets the pre-#1264
+// behaviour (defaults from the execution request and the runner's capability
+// answer) and is NOT refused — the locator is how a deployment opts into
+// per-stack coordinates, not a new mandatory dependency.
+export type DrmConfigLocator = {
+  paramStore: ParamStore;
+  workspaceId: string;
+  stackName: string;
+};
+
+// The persistence seam for `asset.drm` (ADR-008 §6 step 6, D4/D7).
+//
+// Deliberately NARROW: the step needs to read the asset's persisted key
+// identifiers and write the DRM block, nothing else. `AssetRepository`
+// satisfies it structurally (`get(id): Promise<Asset | undefined>` and
+// `update(id, patch: UpdateAssetInput)` with `UpdateAssetInput.drm`), so the
+// real repository is passed directly and a test can pass a two-method fake.
+//
+// NO KEY MATERIAL CROSSES THIS SEAM: the patch type is `{ drm?: AssetDrm }`,
+// and `AssetDrm` has no `key` member (src/data/asset-repo.ts:494-511).
+export interface AssetDrmStore {
+  get(id: string): Promise<{ drm?: AssetDrm } | undefined>;
+  update(id: string, patch: { drm?: AssetDrm }): Promise<unknown>;
+}
+
 export type PackagingStepDeps = {
   runner: EncryptingPackagingRunner;
   // Only consulted on the supported path. Optional because today's runner never
@@ -432,8 +517,26 @@ export type PackagingStepDeps = {
   keyProvider?: KeyProvider;
   // Bounds the key acquisition (ADR-008 §12 gives the key step a whole-step
   // deadline); `KeyProvider.acquire` takes a MANDATORY signal
-  // (src/drm/key-provider.ts:149-165).
+  // (src/drm/key-provider.ts:149-165). When absent the step creates its own
+  // `AbortSignal.timeout(DRM_STEP_DEADLINE_MS)` — the 60 s whole-step budget.
   signal?: AbortSignal;
+  // Per-stack DRM coordinates (step 1). See `DrmConfigLocator`.
+  drmConfig?: DrmConfigLocator;
+  // Read at CALL time for the credential STATUS of step 1 (never a value —
+  // `readDrmCredentialStatus`, src/drm/drm-config.ts:577). Defaults to
+  // `process.env`, injectable so a test needs no global mutation.
+  env?: NodeJS.ProcessEnv;
+  // `asset.drm` read (persisted `keyIds`) + write (`pending` / `failed`).
+  // Optional: with no store wired nothing is persisted and no `keyIds` are
+  // re-used, which is exactly the pre-#1264 behaviour.
+  assets?: AssetDrmStore;
+  // Best-effort audit emission (ADR-008 §10 "Audit"), same optional-dependency
+  // convention as `PackagingDeps`. Details carry `keyIds` (identifiers) and
+  // never key material.
+  audit?: AuditEmitter;
+  auditLog?: AuditErrorLog;
+  // Clock seam, so `requestedAt` is assertable. Defaults to the wall clock.
+  now?: () => string;
 };
 
 // Fast-fail gate + enqueue for one `package` step (issue #1263 part 3).
@@ -449,6 +552,24 @@ export type PackagingStepDeps = {
 // and must never be reported as `{ ok: true }`.
 // The clear path (no `drm`) does not probe for capability at all and enqueues
 // exactly the `{ jobId, url }` envelope it always did.
+//
+// KEY ACQUISITION (issue #1264, ADR-008 §6 / §12 / D2 / D4). Everything from the
+// capability probe down to the enqueue is ONE step with ONE 60 s deadline, in
+// the order §6 draws it:
+//   1. resolve the stack's DRM coordinates (parameter store, via #1262's gated
+//      `loadDrmStackConfig`) and the credential STATUS from the environment;
+//   2. re-use the asset's persisted `keyIds` when it already has some, so a
+//      re-package re-requests the SAME keys instead of minting new ones
+//      (§6 "Idempotency", §12 "Re-package of an already-protected asset");
+//   3. `KeyProvider.acquire(req, signal)` under the whole-step signal;
+//   4. persist `asset.drm = { status: 'pending', ... }` — identifiers only,
+//      never key material (D4);
+//   5. enqueue the package job with the derived `EncryptionParams`;
+//   6. ZERO every `ContentKey.key` the moment `enqueue()` settles, success or
+//      failure (`finally`), so the raw bytes do not outlive the step.
+// An `enqueue()` rejection records `drm.status = 'failed'` and RETHROWS, so the
+// caller's existing `packagingError` path (`triggerPackaging`, C7) attributes
+// the failure exactly as it does for a clear package.
 export async function enqueuePackagingStep(
   deps: PackagingStepDeps,
   req: PackagingStepRequest
@@ -464,6 +585,15 @@ export async function enqueuePackagingStep(
     return { ok: false, refusal: DRM_UNSUPPORTED_REFUSAL };
   }
 
+  // STEP 1 (ADR-008 §6 step 1, issue #1264): the stack's non-secret DRM
+  // coordinates + the credential STATUS. `undefined` means "no locator was
+  // supplied", which is NOT a refusal — see `resolveDrmStepConfig`.
+  const resolvedConfig = await resolveDrmStepConfig(deps);
+  if (!resolvedConfig.ok) {
+    return { ok: false, refusal: DRM_NOT_CONFIGURED_REFUSAL };
+  }
+  const config = resolvedConfig.config;
+
   // Supported path. Unreachable with today's runner (see
   // NO_ENCRYPTION_CAPABILITY) and deliberately written against the real
   // `KeyProvider` contract rather than a placeholder, so the day a runner does
@@ -478,8 +608,11 @@ export async function enqueuePackagingStep(
   // reported scheme. A runner that claims encryption but reports NO scheme
   // (`caps.schemes` empty, `PackagingCapabilities` above) can apply none, so
   // `scheme === undefined` refuses too instead of falling back to a guess.
+  // The per-stack `scheme` (ADR-008 §5.2, default `cbcs` per D3) sits between
+  // the per-execution override and the runner's first reported scheme, so an
+  // operator-configured scheme is honoured without the request naming it.
   const scheme: ProtectionScheme | undefined =
-    req.drm.scheme ?? caps.schemes[0];
+    req.drm.scheme ?? config?.scheme ?? caps.schemes[0];
   if (scheme === undefined || !caps.schemes.includes(scheme)) {
     return { ok: false, refusal: DRM_SCHEME_UNSUPPORTED_REFUSAL };
   }
@@ -487,8 +620,8 @@ export async function enqueuePackagingStep(
   // configured-or-default list, then the intersection with `caps.systems` keeps
   // only the ones this runner can signal. An EMPTY intersection means nothing
   // the caller asked for can be protected — refuse.
-  const systems = resolveDrmSystemIds(req.drm.systems).filter((id) =>
-    caps.systems.includes(id)
+  const systems = resolveDrmSystemIds(req.drm.systems ?? config?.systems).filter(
+    (id) => caps.systems.includes(id)
   );
   if (systems.length === 0) {
     return { ok: false, refusal: DRM_SYSTEMS_UNSUPPORTED_REFUSAL };
@@ -498,22 +631,430 @@ export async function enqueuePackagingStep(
       'packaging runner reports encryption support but no key provider is wired'
     );
   }
+
+  // `packagingId = assetId` is the idempotency key for the whole packaging flow
+  // (C7) and `KeyRequest.contentId` is "= asset id" (src/drm/key-provider.ts:74-77),
+  // so the two are the same value and no second correlation id is introduced
+  // (ADR-008 §12 closing note).
+  const assetId = req.job.jobId;
+  const now = deps.now ?? (() => new Date().toISOString());
+  const providerId =
+    req.drm.providerId ?? config?.providerId ?? deps.keyProvider.id;
+
+  // STEP 2: the asset's ALREADY PERSISTED protection state. Its `keyIds` are
+  // what makes a re-package idempotent — they are handed back to the provider so
+  // the same keys are re-requested and an already-published manifest is never
+  // orphaned (ADR-008 §6 "Idempotency", §12 last two rows).
+  const persisted = deps.assets ? (await deps.assets.get(assetId))?.drm : undefined;
+  const trackGroups = resolveTrackGroups(config?.trackGroups, persisted?.keyIds);
+  const reusedKeyIds = persistedKeyIdMap(persisted?.keyIds, trackGroups);
   const request: KeyRequest = {
-    contentId: req.job.jobId,
+    contentId: assetId,
     systems,
     scheme,
-    trackGroups: ['SD']
+    trackGroups,
+    // Omitted rather than sent empty: an empty map would read as "re-request
+    // these zero keys" instead of "mint".
+    ...(reusedKeyIds ? { keyIds: reusedKeyIds } : {})
   };
-  const { keys, signalling } = await deps.keyProvider.acquire(
-    request,
-    deps.signal ?? AbortSignal.timeout(60_000)
-  );
-  await deps.runner.enqueue({
-    jobId: req.job.jobId,
-    url: req.job.url,
-    encryption: toEncryptionParams(scheme, systems, keys, signalling)
-  });
+
+  // ONE signal for the WHOLE step (ADR-008 §12 "whole-step deadline 60 s"):
+  // created here, before the first external call, and shared by the acquire and
+  // the enqueue so the budget covers both rather than restarting per call.
+  const signal = deps.signal ?? AbortSignal.timeout(DRM_STEP_DEADLINE_MS);
+  // `requestedAt` is "when protection was FIRST requested for this asset"
+  // (src/data/asset-repo.ts:484), so a re-package keeps the original stamp.
+  const requestedAt = persisted?.requestedAt ?? now();
+
+  // STEP 3: acquire. Also raced against the step signal — `acquire` is
+  // contractually bound to honour it, and racing means a provider that does not
+  // still cannot hold the step past its deadline.
+  let acquired: { keys: ContentKey[]; signalling: DrmSignalling };
+  try {
+    acquired = await withAbortDeadline(
+      deps.keyProvider.acquire(request, signal),
+      signal
+    );
+  } catch (err) {
+    // No keys were returned, so there is nothing to zero. Record the classified
+    // failure (§12: `key_provider_unreachable` / `key_provider_rejected` /
+    // `key_provider_invalid_response`) with a FIXED message — never the thrown
+    // text — and rethrow so the caller's existing failure path owns the step.
+    await persistDrmState(deps, assetId, {
+      status: 'failed',
+      providerId,
+      scheme,
+      systems,
+      keyIds: persisted?.keyIds ?? [],
+      requestedAt,
+      errorCode: classifyKeyAcquisitionError(err)
+    });
+    emitDrmAudit(deps, 'drm.failed', {
+      assetId,
+      providerId,
+      systems,
+      keyIds: (persisted?.keyIds ?? []).map((k) => k.keyId),
+      errorCode: classifyKeyAcquisitionError(err)
+    });
+    throw err;
+  }
+
+  const { keys, signalling } = acquired;
+  try {
+    // STEP 4: persist the pending protection state. IDENTIFIERS ONLY — the
+    // mapped `AssetDrm` has no `key` member and nothing here reads `key.key`.
+    await persistDrmState(deps, assetId, {
+      status: 'pending',
+      providerId,
+      scheme,
+      systems,
+      keyIds: keys.map((k) => ({ trackGroup: k.trackGroup, keyId: k.keyId })),
+      requestedAt,
+      licenceUrls: resolveLicenceUrls(systems, signalling, config),
+      certificateUrl: resolveCertificateUrl(systems, signalling, config)
+    });
+    emitDrmAudit(deps, 'drm.keys.requested', {
+      assetId,
+      providerId,
+      systems,
+      keyIds: keys.map((k) => k.keyId)
+    });
+
+    // STEP 5: enqueue, carrying the key material for this ONE job (D2).
+    try {
+      await withAbortDeadline(
+        deps.runner.enqueue(
+          {
+            jobId: req.job.jobId,
+            url: req.job.url,
+            encryption: toEncryptionParams(scheme, systems, keys, signalling)
+          },
+          { signal }
+        ),
+        signal
+      );
+    } catch (err) {
+      // §12 "Keys acquired, enqueue fails": the keys are discarded (the
+      // `finally` below zeroes them), `drm.status` becomes `failed`, and the
+      // error is rethrown into the EXISTING `packagingError` path (C7) rather
+      // than swallowed here — this step does not own the asset's packaging
+      // error field.
+      await persistDrmState(deps, assetId, {
+        status: 'failed',
+        providerId,
+        scheme,
+        systems,
+        keyIds: keys.map((k) => ({ trackGroup: k.trackGroup, keyId: k.keyId })),
+        requestedAt,
+        errorCode: 'packaging_failed'
+      });
+      emitDrmAudit(deps, 'drm.failed', {
+        assetId,
+        providerId,
+        systems,
+        keyIds: keys.map((k) => k.keyId),
+        errorCode: 'packaging_failed'
+      });
+      throw err;
+    }
+  } finally {
+    // STEP 6: zero the raw key bytes the moment the enqueue settles — resolved
+    // OR rejected — and on any other throw out of this block (a failed
+    // `asset.drm` write included). The `EncryptionParams` handed to the runner
+    // carries its own base64 COPY, which is the runner's to hold for the job;
+    // what this guarantees is that no `ContentKey.key` buffer still holds key
+    // bytes once the step returns (ADR-008 §5.1 "zeroed after use", D4).
+    zeroContentKeys(keys);
+  }
   return { ok: true, encrypted: true };
+}
+
+// ---------------------------------------------------------------------------
+// Key-acquisition step helpers (issue #1264)
+//
+// CONTRACT SOURCES VERIFIED BEFORE WRITING (CLAUDE.md rule 7)
+//   - `KeyProvider.acquire(req, signal)`, `KeyRequest` (incl.
+//     `keyIds?: Partial<Record<TrackTypeGroup, string>>`), `ContentKey`
+//     (`{ trackGroup, keyId, key: Uint8Array, iv? }`), `DrmSignalling`
+//     (`pssh`, `licenceUrls`, `certificateUrl`, `hlsKeyUri`) —
+//     src/drm/key-provider.ts:74-162.
+//   - `KeyProviderError.errorCode` / `isKeyProviderError` —
+//     src/drm/key-provider-error.ts:28-45.
+//   - `AssetDrm` (`status, providerId, scheme, systems, keyIds[], licenceUrls?,
+//     certificateUrl?, requestedAt, protectedAt?, error?, errorCode?`) and
+//     `UpdateAssetInput.drm` — src/data/asset-repo.ts:494-511, :958.
+//   - `DRM_ERROR_CODES` / `DrmStatus` — src/types/drm.ts:87-101.
+//   - `loadDrmStackConfig`, `readDrmCredentialStatus`, `DrmStackConfig`
+//     (`enabled, providerKind, providerId, scheme, systems, licenceUrls,
+//     certificateUrls, trackGroups, authMode`), `DRM_NOT_CONFIGURED_STATUS`,
+//     `DRM_NOT_CONFIGURED_PAYLOAD` — src/drm/drm-config.ts:120-160, :515-519,
+//     :577-590, :634-642.
+//   - `ParamStore.loadStackConfig` — src/services/param-store.ts:221-224.
+//   - `emitAudit` / `originActor` — src/data/audit-emit.ts:44-75.
+// ---------------------------------------------------------------------------
+
+// The whole-step deadline of ADR-008 §12 ("whole-step deadline 60 s"). Same
+// value as `DEFAULT_DEADLINE_MS` in the CPIX adapter (src/drm/cpix-provider.ts:89),
+// which bounds the provider's own retry series INSIDE this budget.
+export const DRM_STEP_DEADLINE_MS = 60_000;
+
+// Fixed, operator-facing text per failure class. The persisted `AssetDrm.error`
+// is ALWAYS one of these strings — never a thrown message, never a provider
+// body (ADR-008 §10 "Provider error bodies are not echoed verbatim"), so no
+// repository write can carry key material or a credential even if an adapter
+// one day throws something careless.
+export const DRM_STEP_ERROR_MESSAGES: Readonly<Partial<Record<DrmErrorCode, string>>> =
+  Object.freeze({
+    key_provider_unreachable:
+      'the key provider could not be reached within the key-acquisition deadline',
+    key_provider_rejected: 'the key provider rejected the key request',
+    key_provider_invalid_response:
+      'the key provider returned a response that could not be parsed',
+    drm_not_configured: 'DRM is not configured on this deployment',
+    packaging_failed:
+      'content keys were acquired but the package job could not be enqueued'
+  });
+
+// Step 1: resolve the stack's DRM coordinates and the credential STATUS.
+//
+// `{ ok: true, config: undefined }` is the NO-LOCATOR case and is deliberately
+// not a refusal: a caller that wires no parameter store keeps the pre-#1264
+// behaviour (defaults from the execution request and the capability answer).
+//
+// It refuses (`ok: false`) only when a locator WAS supplied and the stack has no
+// usable DRM configuration:
+//   - `loadDrmStackConfig` returns undefined — either `DRM_ENABLED` is off (it
+//     short-circuits before any parameter-store I/O, src/drm/drm-config.ts:639)
+//     or the stack has no stored `drm` block;
+//   - the stored block is `enabled: false` (the per-stack switch of §5.2: "both
+//     must be true for DRM to act");
+//   - the block selects the `cpix` provider but its credential is absent from
+//     the environment, so the request could only ever come back rejected. Only
+//     the STATUS is read (`readDrmCredentialStatus`) — never a value.
+async function resolveDrmStepConfig(
+  deps: PackagingStepDeps
+): Promise<{ ok: true; config: DrmStackConfig | undefined } | { ok: false }> {
+  const locator = deps.drmConfig;
+  if (!locator) return { ok: true, config: undefined };
+  const config = await loadDrmStackConfig(
+    locator.paramStore,
+    locator.workspaceId,
+    locator.stackName
+  );
+  if (!config || !config.enabled) return { ok: false };
+  if (
+    config.providerKind === 'cpix' &&
+    readDrmCredentialStatus(config.authMode ?? 'basic', deps.env ?? process.env) ===
+      'missing'
+  ) {
+    return { ok: false };
+  }
+  return { ok: true, config };
+}
+
+// Which track type groups this request binds a key to. The configured set
+// (`DrmStackConfig.trackGroups`) or the single-key profile default (D3), UNIONED
+// with the groups the asset already holds keys for: a group that was protected
+// by an earlier package must keep its key even if the configuration no longer
+// lists it, otherwise a re-package would silently orphan a published manifest.
+function resolveTrackGroups(
+  configured: readonly TrackTypeGroup[] | undefined,
+  persisted: readonly { trackGroup: TrackTypeGroup }[] | undefined
+): TrackTypeGroup[] {
+  const groups: TrackTypeGroup[] =
+    configured && configured.length > 0 ? [...configured] : [DEFAULT_TRACK_GROUP];
+  for (const entry of persisted ?? []) {
+    if (!groups.includes(entry.trackGroup)) {
+      groups.push(entry.trackGroup);
+    }
+  }
+  return groups;
+}
+
+// The single-key profile's group (ADR-008 D3 "a single-key profile as the
+// default"). Same value the pre-#1264 request hardcoded.
+const DEFAULT_TRACK_GROUP: TrackTypeGroup = 'SD';
+
+// Step 2: the persisted key identifiers, as `KeyRequest.keyIds`. Returns
+// undefined when the asset holds none for the requested groups, which is the
+// MINT case; any entry present means "re-request THIS key id" (ADR-008 §6
+// "Idempotency"). Never invents an id and never maps a group twice.
+function persistedKeyIdMap(
+  persisted: readonly { trackGroup: TrackTypeGroup; keyId: string }[] | undefined,
+  trackGroups: readonly TrackTypeGroup[]
+): Partial<Record<TrackTypeGroup, string>> | undefined {
+  if (!persisted || persisted.length === 0) return undefined;
+  const map: Partial<Record<TrackTypeGroup, string>> = {};
+  for (const entry of persisted) {
+    if (!trackGroups.includes(entry.trackGroup)) continue;
+    if (map[entry.trackGroup] !== undefined) continue;
+    map[entry.trackGroup] = entry.keyId;
+  }
+  return Object.keys(map).length > 0 ? map : undefined;
+}
+
+// Per-system licence URLs for the persisted block: the provider's answer wins
+// (it is authoritative for the keys it just issued), with the configured
+// `licenceUrls` as the fallback for a system the provider said nothing about.
+// Narrowed to the systems this package is actually signalled for, so the record
+// never advertises a licence URL for a system the output cannot be played with.
+function resolveLicenceUrls(
+  systems: readonly DrmSystemId[],
+  signalling: DrmSignalling,
+  config: DrmStackConfig | undefined
+): Record<DrmSystemId, string> | undefined {
+  const urls: Record<DrmSystemId, string> = {};
+  for (const system of systems) {
+    const url = signalling.licenceUrls[system] ?? config?.licenceUrls?.[system];
+    if (url !== undefined) {
+      urls[system] = url;
+    }
+  }
+  return Object.keys(urls).length > 0 ? urls : undefined;
+}
+
+// The application certificate URL for the persisted block. `AssetDrm` carries
+// ONE (src/data/asset-repo.ts:506) while the config keys them by system id
+// (`certificateUrls`, src/drm/drm-config.ts:156), so the provider's own value
+// wins and the fallback is the first configured entry among the signalled
+// systems — in `systems` order, so the choice is deterministic.
+function resolveCertificateUrl(
+  systems: readonly DrmSystemId[],
+  signalling: DrmSignalling,
+  config: DrmStackConfig | undefined
+): string | undefined {
+  if (signalling.certificateUrl !== undefined) return signalling.certificateUrl;
+  for (const system of systems) {
+    const url = config?.certificateUrls?.[system];
+    if (url !== undefined) return url;
+  }
+  return undefined;
+}
+
+// Map a key-acquisition failure onto the `DrmErrorCode` of ADR-008 §12.
+// `KeyProviderError` already classified it at the boundary that observed it
+// (src/drm/key-provider-error.ts), so this reads the carried code rather than
+// matching on prose. Anything else — an aborted step, a programming error in an
+// adapter — is reported as `key_provider_unreachable`, the §12 row that covers
+// "unreachable / 5xx / timeout".
+function classifyKeyAcquisitionError(err: unknown): DrmErrorCode {
+  return isKeyProviderError(err) ? err.errorCode : 'key_provider_unreachable';
+}
+
+// Write the asset's DRM block (steps 4 and the two failure paths).
+//
+// NO KEY MATERIAL: the input shape is `AssetDrm`-minus-`error`, so there is no
+// member a key could travel in, and `error` is filled from the FIXED
+// `DRM_STEP_ERROR_MESSAGES` table rather than from any thrown or received text.
+// Best-effort by design on the FAILURE paths: a repository that cannot record
+// the failure must not mask the failure itself, so a write error is swallowed
+// after the fact exactly like the `packagingError` write in `triggerPackaging`.
+async function persistDrmState(
+  deps: PackagingStepDeps,
+  assetId: string,
+  state: Omit<AssetDrm, 'error'>
+): Promise<void> {
+  if (!deps.assets) return;
+  const drm: AssetDrm = {
+    ...state,
+    keyIds: state.keyIds.map((k) => ({ trackGroup: k.trackGroup, keyId: k.keyId })),
+    systems: [...state.systems],
+    ...(state.errorCode !== undefined &&
+    DRM_STEP_ERROR_MESSAGES[state.errorCode] !== undefined
+      ? { error: DRM_STEP_ERROR_MESSAGES[state.errorCode] }
+      : {})
+  };
+  if (state.status === 'failed') {
+    try {
+      await deps.assets.update(assetId, { drm });
+    } catch (err) {
+      deps.auditLog?.error(
+        { err, assetId },
+        'failed to record DRM failure state on asset (non-fatal)'
+      );
+    }
+    return;
+  }
+  // The `pending` write is NOT best-effort: it is the record that keys were
+  // requested for this asset, and `keyIds` is what makes the next attempt
+  // idempotent. Letting it throw stops the step before the enqueue, which is
+  // the safe side — an unrecorded key id is a key that can never be re-requested.
+  await deps.assets.update(assetId, { drm });
+}
+
+// Zero the raw key bytes in place, then drop the buffer references (step 6).
+// `fill(0)` overwrites the ONE allocation every holder shares, so a caller still
+// holding the `ContentKey` sees zeroes too — which is the point. `length = 0` is
+// not used: the typed array is fixed-length, and replacing the reference would
+// leave the original bytes resident.
+export function zeroContentKeys(keys: readonly ContentKey[]): void {
+  for (const key of keys) {
+    key.key.fill(0);
+  }
+}
+
+// Race `work` against the step's abort signal so the whole step is bounded even
+// when the awaited call cannot (or does not) honour the signal itself — the
+// packaging runner's `enqueue` is the case that matters: `options.signal` is
+// advisory for a runner implemented with a single parameter.
+//
+// The rejection message names the deadline only; it carries no key material, no
+// provider text and no credential (ADR-008 §10). Handlers are attached to `work`
+// unconditionally, so a late rejection after the race was already lost is
+// observed rather than surfacing as an unhandled rejection.
+function withAbortDeadline<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const fail = (): void =>
+      reject(
+        new Error(
+          `DRM key-acquisition step exceeded its ${DRM_STEP_DEADLINE_MS} ms deadline`
+        )
+      );
+    if (signal.aborted) {
+      fail();
+    }
+    const onAbort = (): void => fail();
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort);
+    });
+  });
+}
+
+// Best-effort DRM audit entry (ADR-008 §10 "Audit"): `drm.keys.requested` when
+// keys were acquired and recorded, `drm.failed` on either failure path. The
+// detail carries `keyIds` — IDENTIFIERS, which §10 states are non-secret — and
+// never a key, a licence credential or a provider body. Uses the SAME
+// fire-and-forget `emitAudit` helper as the rest of this module, so a failed
+// audit write can never fail the packaging step (issue #564).
+function emitDrmAudit(
+  deps: PackagingStepDeps,
+  action: 'drm.keys.requested' | 'drm.failed',
+  detail: {
+    assetId: string;
+    providerId: string;
+    systems: DrmSystemId[];
+    keyIds: string[];
+    errorCode?: DrmErrorCode;
+  }
+): void {
+  emitAudit(
+    deps.audit,
+    {
+      actor: originActor('system'),
+      action,
+      targetType: 'asset',
+      targetId: detail.assetId,
+      detail: {
+        assetId: detail.assetId,
+        providerId: detail.providerId,
+        systems: [...detail.systems],
+        keyIds: [...detail.keyIds],
+        ...(detail.errorCode !== undefined ? { errorCode: detail.errorCode } : {})
+      }
+    },
+    deps.auditLog
+  );
 }
 
 // Map the key provider's answer onto the runner's encryption block.

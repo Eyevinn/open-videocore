@@ -462,6 +462,12 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.sceneDetectionError !== undefined) {
       next.sceneDetectionError = patch.sceneDetectionError;
     }
+    // DRM protection state (issue #1264). Replaced wholesale, same as the
+    // in-memory repo (data/asset-repo.ts); `toDoc` is what gates it on
+    // `DRM_ENABLED` and maps it to `structural.drm` (data/asset-document.ts).
+    if (patch.drm !== undefined) {
+      next.drm = patch.drm;
+    }
     if (patch.versionGroupId !== undefined) {
       next.versionGroupId = patch.versionGroupId;
     }
