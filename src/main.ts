@@ -56,6 +56,7 @@ import { collectionsRouter } from './routes/collections.js';
 import { auditRouter } from './routes/audit.js';
 import { storageRouter } from './routes/storage.js';
 import { exportDestinationsRouter } from './routes/export-destinations.js';
+import { drmConfigRouter } from './routes/drm-config.js';
 import { UPLOAD_CONTENT_TYPES } from './data/media-types.js';
 import { WorkspaceStorage } from './data/storage.js';
 import { couchServer, StackCouch } from './data/couchdb.js';
@@ -3685,6 +3686,23 @@ await app.register(storageRouter, {
 await app.register(exportDestinationsRouter, {
   prefix: '/api/v1/export-destinations',
   storageBackendRegistry
+});
+
+// DRM configuration admin surface (issue #1296, ADR-008 §9). GET/PUT the
+// stack's NON-SECRET DRM coordinates; credentials stay operator env vars and are
+// reported only as `credentials: 'configured' | 'missing'` (ADR-008 §5.2, D5).
+//
+// Registered UNCONDITIONALLY — the routes exist on every deployment so the
+// published contract (openapi.json, and therefore the spec/route parity check,
+// issue #480) does not depend on runtime wiring. Behaviour degrades instead:
+// `DRM_ENABLED` off is 501 before any I/O (ADR-008 D9), no parameter store is
+// 501, no provisioned stack or no stored config is 404. The resolver supplies
+// WHICH stack the request addresses (ADR-008 D6: per stack, the same scoping
+// StackConfig already has).
+await app.register(drmConfigRouter, {
+  prefix: '/api/v1/drm',
+  ...(paramStore ? { paramStore } : {}),
+  stackResolver
 });
 
 // Static file serving for the web UI (issue #frontend). Files are served from

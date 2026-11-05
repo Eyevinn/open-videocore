@@ -3,7 +3,7 @@
   "info": {
     "title": "open-videocore API",
     "description": "OSC-native media asset management \u2014 ingest, transcode, package, search, and deliver video assets.",
-    "version": "1.6.0"
+    "version": "1.7.0"
   },
   "components": {
     "securitySchemes": {
@@ -26827,6 +26827,417 @@
                   },
                   "required": [
                     "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/drm/config": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "description": "Read this stack's non-secret DRM configuration. Credential presence is reported as `credentials: \"configured\" | \"missing\"`; a credential VALUE is never returned (ADR-008 \u00a79).",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "providerKind": {
+                      "type": "string",
+                      "enum": [
+                        "cpix",
+                        "clearkey-dev"
+                      ]
+                    },
+                    "providerId": {
+                      "type": "string"
+                    },
+                    "label": {
+                      "type": "string"
+                    },
+                    "keyServerUrl": {
+                      "type": "string"
+                    },
+                    "spekeVersion": {
+                      "type": "string",
+                      "enum": [
+                        "1.0",
+                        "2.0"
+                      ]
+                    },
+                    "authMode": {
+                      "type": "string",
+                      "enum": [
+                        "basic",
+                        "bearer",
+                        "mtls"
+                      ]
+                    },
+                    "scheme": {
+                      "type": "string",
+                      "enum": [
+                        "cenc",
+                        "cbcs"
+                      ]
+                    },
+                    "systems": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "licenceUrls": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "string"
+                      }
+                    },
+                    "certificateUrls": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "string"
+                      }
+                    },
+                    "trackGroups": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "AUDIO",
+                          "SD",
+                          "HD",
+                          "UHD1"
+                        ]
+                      }
+                    },
+                    "credentials": {
+                      "type": "string",
+                      "enum": [
+                        "configured",
+                        "missing"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "enabled",
+                    "providerKind",
+                    "providerId",
+                    "credentials"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "admin"
+        ],
+        "description": "Set this stack's non-secret DRM configuration. Fields are validated against an allow-list: any other field \u2014 in particular a credential-shaped one \u2014 and a non-https `keyServerUrl` are rejected with `400 invalid_field`. Credentials are operator environment variables and are never accepted, stored or returned here (ADR-008 \u00a75.2, D5).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "providerKind": {
+                    "type": "string"
+                  },
+                  "providerId": {
+                    "type": "string"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "keyServerUrl": {
+                    "type": "string"
+                  },
+                  "spekeVersion": {
+                    "type": "string"
+                  },
+                  "authMode": {
+                    "type": "string"
+                  },
+                  "scheme": {
+                    "type": "string"
+                  },
+                  "systems": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "licenceUrls": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "certificateUrls": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "trackGroups": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "credentials": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": true,
+                "description": "Non-secret DRM coordinates (ADR-008 \u00a75.2). Allowed fields: enabled, providerKind, providerId, label, keyServerUrl, spekeVersion, authMode, scheme, systems, licenceUrls, certificateUrls, trackGroups. 'enabled', 'providerKind' and 'providerId' are required, and 'keyServerUrl' is required when providerKind is 'cpix'. Any other field \u2014 in particular a credential-shaped one \u2014 is rejected with 400 invalid_field; credentials are operator environment variables and are never stored here."
+              }
+            }
+          },
+          "description": "Non-secret DRM coordinates (ADR-008 \u00a75.2). Allowed fields: enabled, providerKind, providerId, label, keyServerUrl, spekeVersion, authMode, scheme, systems, licenceUrls, certificateUrls, trackGroups. 'enabled', 'providerKind' and 'providerId' are required, and 'keyServerUrl' is required when providerKind is 'cpix'. Any other field \u2014 in particular a credential-shaped one \u2014 is rejected with 400 invalid_field; credentials are operator environment variables and are never stored here."
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "providerKind": {
+                      "type": "string",
+                      "enum": [
+                        "cpix",
+                        "clearkey-dev"
+                      ]
+                    },
+                    "providerId": {
+                      "type": "string"
+                    },
+                    "label": {
+                      "type": "string"
+                    },
+                    "keyServerUrl": {
+                      "type": "string"
+                    },
+                    "spekeVersion": {
+                      "type": "string",
+                      "enum": [
+                        "1.0",
+                        "2.0"
+                      ]
+                    },
+                    "authMode": {
+                      "type": "string",
+                      "enum": [
+                        "basic",
+                        "bearer",
+                        "mtls"
+                      ]
+                    },
+                    "scheme": {
+                      "type": "string",
+                      "enum": [
+                        "cenc",
+                        "cbcs"
+                      ]
+                    },
+                    "systems": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "licenceUrls": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "string"
+                      }
+                    },
+                    "certificateUrls": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "string"
+                      }
+                    },
+                    "trackGroups": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "AUDIO",
+                          "SD",
+                          "HD",
+                          "UHD1"
+                        ]
+                      }
+                    },
+                    "credentials": {
+                      "type": "string",
+                      "enum": [
+                        "configured",
+                        "missing"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "enabled",
+                    "providerKind",
+                    "providerId",
+                    "credentials"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "fields": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "field": {
+                            "type": "string"
+                          },
+                          "reason": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "field",
+                          "reason"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "message"
                   ],
                   "additionalProperties": false
                 }
