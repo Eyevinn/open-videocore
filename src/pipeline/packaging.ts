@@ -1021,6 +1021,71 @@ function withAbortDeadline<T>(work: Promise<T>, signal: AbortSignal): Promise<T>
   });
 }
 
+// The closed set of DRM audit actions (ADR-008 §10 "Audit"; issue #1267).
+//
+// Exported as a frozen tuple so the leak test (test/drm-no-key-leak.test.ts) and
+// any future reader enumerate the SAME list the emitter can produce, instead of
+// matching on literals copied by hand.
+//   - `drm.keys.requested` — a successful `KeyProvider.acquire()`.
+//   - `drm.protected`      — `asset.drm.status` became `'protected'`.
+//   - `drm.failed`         — `asset.drm.status` became `'failed'`.
+// No detail object carries key material, raw bytes or provider text: the detail
+// is built in `emitDrmAudit` from identifiers and the `errorCode` enum only.
+export const DRM_AUDIT_ACTIONS = Object.freeze([
+  'drm.keys.requested',
+  'drm.protected',
+  'drm.failed'
+] as const);
+export type DrmAuditAction = (typeof DRM_AUDIT_ACTIONS)[number];
+
+// The `pending` -> `protected` transition (ADR-008 §8; issue #1267).
+//
+// The ONE place `asset.drm.status` becomes `'protected'`, so the audit action
+// cannot drift from the state change: both happen here or neither does. Called
+// once the encrypted package for `assetId` is confirmed to have landed.
+//
+// Idempotent and narrow:
+//   - no persisted `drm` block (DRM was never requested for this asset) or an
+//     already-`protected` one -> no write, no audit entry, returns `false`;
+//   - `protectedAt` is "when the encrypted package landed"
+//     (src/data/asset-repo.ts:485) and is stamped only on the first transition,
+//     so a replayed confirmation keeps the original time;
+//   - `error` / `errorCode` from an earlier failed attempt are dropped, because
+//     the asset is no longer in a failed state;
+//   - IDENTIFIERS ONLY (ADR-008 D4): the rebuilt `AssetDrm` is copied field by
+//     field from the persisted one and `AssetDrm` has no `key` member.
+export async function markDrmProtected(
+  deps: PackagingStepDeps,
+  assetId: string
+): Promise<boolean> {
+  if (!deps.assets) return false;
+  const existing = (await deps.assets.get(assetId))?.drm;
+  if (!existing || existing.status === 'protected') return false;
+  const now = deps.now ?? (() => new Date().toISOString());
+  const drm: AssetDrm = {
+    status: 'protected',
+    providerId: existing.providerId,
+    scheme: existing.scheme,
+    systems: [...existing.systems],
+    keyIds: existing.keyIds.map((k) => ({ trackGroup: k.trackGroup, keyId: k.keyId })),
+    ...(existing.licenceUrls !== undefined
+      ? { licenceUrls: { ...existing.licenceUrls } }
+      : {}),
+    ...(existing.certificateUrl !== undefined
+      ? { certificateUrl: existing.certificateUrl }
+      : {}),
+    requestedAt: existing.requestedAt,
+    protectedAt: existing.protectedAt ?? now()
+  };
+  await deps.assets.update(assetId, { drm });
+  emitDrmAudit(deps, 'drm.protected', {
+    assetId,
+    providerId: drm.providerId,
+    keyIds: drm.keyIds.map((k) => k.keyId)
+  });
+  return true;
+}
+
 // Best-effort DRM audit entry (ADR-008 §10 "Audit"): `drm.keys.requested` when
 // keys were acquired and recorded, `drm.failed` on either failure path. The
 // detail carries `keyIds` — IDENTIFIERS, which §10 states are non-secret — and
@@ -1029,11 +1094,11 @@ function withAbortDeadline<T>(work: Promise<T>, signal: AbortSignal): Promise<T>
 // audit write can never fail the packaging step (issue #564).
 function emitDrmAudit(
   deps: PackagingStepDeps,
-  action: 'drm.keys.requested' | 'drm.failed',
+  action: DrmAuditAction,
   detail: {
     assetId: string;
     providerId: string;
-    systems: DrmSystemId[];
+    systems?: DrmSystemId[];
     keyIds: string[];
     errorCode?: DrmErrorCode;
   }
@@ -1048,7 +1113,7 @@ function emitDrmAudit(
       detail: {
         assetId: detail.assetId,
         providerId: detail.providerId,
-        systems: [...detail.systems],
+        ...(detail.systems !== undefined ? { systems: [...detail.systems] } : {}),
         keyIds: [...detail.keyIds],
         ...(detail.errorCode !== undefined ? { errorCode: detail.errorCode } : {})
       }
