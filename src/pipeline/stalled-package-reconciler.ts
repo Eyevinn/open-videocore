@@ -34,7 +34,11 @@
 
 import type { JobRepository } from '../data/job-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
-import { failPackageJob } from './package-job.js';
+import {
+  failPackageJob,
+  PACKAGE_STALL_DIAGNOSTIC_MARKER,
+  PACKAGE_STALL_FAILURE_REASON
+} from './package-job.js';
 
 // Default bound: a `package` step still `running` after this long is declared
 // failed. Generous by default so a genuinely slow packaging job is never cut off
@@ -125,6 +129,14 @@ export async function reconcileStalledPackages(
         ...steps[idx],
         status: 'failed',
         error: message,
+        // The machine-readable half of the verdict, and the ONLY thing the
+        // run-identity guard reads (#1044 review, finding 7): the `error` text
+        // above shares its field with the unauthenticated packager failure
+        // callback's caller-supplied message, so it cannot carry a control
+        // signal. This line is the single writer of `failureReason` in the
+        // codebase (CONTRACT: `StepExecution.failureReason?: StepFailureReason`,
+        // `STEP_FAILURE_REASONS = ['package-stall']` — src/data/pipeline-repo.ts).
+        failureReason: PACKAGE_STALL_FAILURE_REASON,
         completedAt: new Date().toISOString()
       };
       await deps.pipeline.update(execution.id, { steps, status: 'failed' });
@@ -176,7 +188,15 @@ async function probePackagerPresent(
   }
 }
 
-// Build the timeout diagnostic. It always states the bound and the probed
+// Build the timeout diagnostic. The invariant opening is
+// PACKAGE_STALL_DIAGNOSTIC_MARKER (src/pipeline/package-job.ts), so a failure
+// this sweep declared READS as "we gave up waiting", not as "the run failed".
+// This is prose for a human only: what lets a genuine late success callback
+// still be applied is the structured `failureReason: 'package-stall'` written
+// alongside it (#1044 review, BLOCKING 5 and finding 7,
+// packagingAbandonedByStallSweep). Nothing branches on this text.
+//
+// It always states the bound and the probed
 // presence, and distinguishes the two common causes (issue #336 acceptance):
 //   - present=false -> no packager instance to consume the job; a callback can
 //     never arrive.
@@ -185,7 +205,7 @@ async function probePackagerPresent(
 //   - present=unknown -> presence could not be determined; we still fail the
 //     step within the bound but name the ambiguity.
 function buildDiagnostic(minutes: number, present: boolean | undefined): string {
-  const base = `packager never signalled completion within ${minutes} minutes`;
+  const base = `${PACKAGE_STALL_DIAGNOSTIC_MARKER} ${minutes} minutes`;
   if (present === false) {
     return (
       `${base}; packager instance present=false — no packager instance to ` +

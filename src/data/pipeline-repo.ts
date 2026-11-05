@@ -46,6 +46,19 @@ export function isStepTerminal(step: StepExecution): boolean {
   return step.status === 'done' || step.status === 'skipped' || step.status === 'failed';
 }
 
+// The closed set of step-failure declarers (see `StepExecution.failureReason`).
+//
+// `package-stall` — the stalled-package sweep gave up waiting for the packager's
+// completion callback after its bound (DEFAULT_PACKAGE_STALL_TIMEOUT_MS,
+// src/pipeline/stalled-package-reconciler.ts). NOT a verdict that the run
+// failed: the run may still complete and report success afterwards, which is why
+// this has to be recognisable from a real packager failure.
+//
+// A `const` tuple so a new value cannot be introduced without this union
+// following it.
+export const STEP_FAILURE_REASONS = ['package-stall'] as const;
+export type StepFailureReason = (typeof STEP_FAILURE_REASONS)[number];
+
 export type StepExecution = {
   name: PipelineStepName;
   status: StepStatus;
@@ -63,6 +76,25 @@ export type StepExecution = {
   // transcoder job and then the bucket to find out the key is missing. Built by
   // buildSourceReadErrorDetail (src/pipeline/encore-source-read-failure.ts).
   errorDetail?: StepErrorDetail;
+  // WHO declared this step failed, as a closed set of values that only our own
+  // sweeps write (#1044 review, finding 7). Distinct from `error`/`errorDetail`:
+  // both of those carry text that originates OUTSIDE the API (the packager's
+  // failure callback writes its caller-supplied `message` verbatim into `error`
+  // — src/routes/internal.ts POST /packagerCallback/failure, which is
+  // unauthenticated by design), so neither can carry a control signal. This
+  // field is never populated from request input anywhere; the only writer is the
+  // stalled-package sweep (src/pipeline/stalled-package-reconciler.ts), and the
+  // only reader is the run-identity guard that has to tell "we stopped waiting
+  // for this callback" apart from "the run failed"
+  // (packagingAbandonedByStallSweep, src/pipeline/package-job.ts).
+  //
+  // ADDITIVE and OPTIONAL exactly like `skipReason` and `errorDetail`: the
+  // status enum is untouched, `error` keeps its free text, and a failure with no
+  // recognised declarer simply leaves this absent. Deliberately NOT part of
+  // `stepExecutionSchema` (src/routes/pipelines.ts, src/routes/assets.ts): it is
+  // internal orchestration state, so the serialised response contract — and
+  // openapi.json with it — is unchanged.
+  failureReason?: StepFailureReason;
   // Why a `skipped` step did not run (issue #789), e.g. the optional service
   // instance for this stack is unconfigured. Only set when status is `skipped`;
   // `error` stays reserved for genuine failures.
