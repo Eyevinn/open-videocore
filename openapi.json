@@ -3,7 +3,7 @@
   "info": {
     "title": "open-videocore API",
     "description": "OSC-native media asset management \u2014 ingest, transcode, package, search, and deliver video assets.",
-    "version": "1.8.0"
+    "version": "1.9.0"
   },
   "components": {
     "securitySchemes": {
@@ -27469,6 +27469,104 @@
                     "error"
                   ],
                   "additionalProperties": true
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/drm/config/test": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "description": "Dry-run a key request against this stack's stored DRM coordinates, using a throwaway content id that belongs to no asset. Reports whether the provider answered, which common-encryption system ids it signalled, and how long it took. On failure `error` carries a machine-readable error code only; no key material, provider message or credential is ever returned (ADR-008 \u00a79, \u00a710).",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "systems": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "latencyMs": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "drm_unsupported",
+                        "key_provider_unreachable",
+                        "key_provider_rejected",
+                        "key_provider_invalid_response",
+                        "drm_not_configured",
+                        "packaging_failed"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "systems",
+                    "latencyMs"
+                  ],
+                  "additionalProperties": false
                 }
               }
             }
