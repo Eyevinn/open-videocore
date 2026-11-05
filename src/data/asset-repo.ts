@@ -508,6 +508,17 @@ export type AssetDrm = {
   protectedAt?: string;
   error?: string;
   errorCode?: DrmErrorCode;
+  // The `package` Job id (issue #976) this protection run was ENQUEUED under —
+  // the run that carried `EncryptionParams` to the packager. Written at
+  // `enqueuePackagingStep` STEP 4 (src/pipeline/packaging.ts) and read by the
+  // callback settlement to prove the completing package run is the ENCRYPTED
+  // one: without it, a clear re-package of an asset left `pending` by an
+  // earlier protected run would settle `status: 'protected'` for unencrypted
+  // output (issue #1265 review). NOT a new correlation id (ADR-008 §12 closing
+  // note): it is the existing package Job id, recorded here so the two ends of
+  // one run can be matched. Absent on a deployment with no job repository
+  // wired, where no run identity exists on either end.
+  packageJobId?: string;
 };
 
 // One ABR rendition produced by a transcode job (issue #8, redesigned #79).

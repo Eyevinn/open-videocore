@@ -223,7 +223,13 @@ export const AssetDrmSchema = z.object({
   // Already redacted/truncated upstream (ADR-008 §10) — provider error bodies
   // are never echoed verbatim.
   error: z.string().optional(),
-  errorCode: z.enum(DRM_ERROR_CODES).optional()
+  errorCode: z.enum(DRM_ERROR_CODES).optional(),
+  // The `package` Job id the protection run was enqueued under (issue #1265
+  // review): the correlation that lets the packager callbacks settle ONLY the
+  // run that carried encryption. An identifier of ours, not provider data, and
+  // optional like every other member added after #1259 — a block persisted
+  // before it stays valid.
+  packageJobId: z.string().optional()
 });
 export type DocAssetDrm = z.infer<typeof AssetDrmSchema>;
 
@@ -817,7 +823,8 @@ function drmToDoc(drm: AssetDrm): DocAssetDrm {
     ...(drm.certificateUrl !== undefined ? { certificateUrl: drm.certificateUrl } : {}),
     ...(drm.protectedAt !== undefined ? { protectedAt: drm.protectedAt } : {}),
     ...(drm.error !== undefined ? { error: drm.error } : {}),
-    ...(drm.errorCode !== undefined ? { errorCode: drm.errorCode } : {})
+    ...(drm.errorCode !== undefined ? { errorCode: drm.errorCode } : {}),
+    ...(drm.packageJobId !== undefined ? { packageJobId: drm.packageJobId } : {})
   };
 }
 
@@ -841,7 +848,8 @@ function drmFromDoc(block: DocAssetDrm | undefined): AssetDrm | undefined {
     ...(block.certificateUrl !== undefined ? { certificateUrl: block.certificateUrl } : {}),
     ...(block.protectedAt !== undefined ? { protectedAt: block.protectedAt } : {}),
     ...(block.error !== undefined ? { error: block.error } : {}),
-    ...(block.errorCode !== undefined ? { errorCode: block.errorCode } : {})
+    ...(block.errorCode !== undefined ? { errorCode: block.errorCode } : {}),
+    ...(block.packageJobId !== undefined ? { packageJobId: block.packageJobId } : {})
   };
 }
 

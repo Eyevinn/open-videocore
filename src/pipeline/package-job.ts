@@ -180,6 +180,33 @@ async function resolvePackageJob(
   return findActivePackageJob(jobs, target.assetId);
 }
 
+// READ-ONLY: the id of the package job a settle WOULD apply to, without
+// settling it (issue #1265 review). The DRM callback settlement needs the
+// completing run's job id in the SAME write that records the packaged output —
+// i.e. BEFORE `completePackageJob` runs — so it can prove the run that is
+// completing is the run that carried encryption (`correlatesWithRun`,
+// src/pipeline/packaging.ts). Resolution is identical to the settle helpers
+// (explicit id, else the asset's in-flight package job), and it is best-effort
+// in the same way: `undefined` for no repository, no match, or a repository
+// error, never a throw.
+export async function resolvePackageJobId(
+  deps: PackageJobDeps,
+  target: { jobId?: string; assetId: string }
+): Promise<string | undefined> {
+  if (!deps.jobs) return undefined;
+  try {
+    return (await resolvePackageJob(deps.jobs, target))?.id;
+  } catch (err) {
+    logWarn(
+      deps.logger,
+      '[package-job] failed to resolve package job for asset %s: %o',
+      target.assetId,
+      err
+    );
+    return undefined;
+  }
+}
+
 // Settle the asset's package job as `done`. Idempotent: an already-terminal job
 // is left untouched, so an at-least-once packager success callback never
 // re-settles (mirrors completeTranscode's first-terminal-write-wins guard).
