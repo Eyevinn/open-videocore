@@ -955,6 +955,25 @@ export type UpdateAssetInput = {
   // technicalMetadata/technicalMetadataError semantics. Does not change `status`.
   sceneMetadata?: SceneMetadata | null;
   sceneDetectionError?: string;
+  // Set by the packaging pipeline's key-acquisition step (issue #1264, ADR-008
+  // §6 steps 6/8) and by the packager callbacks that settle protection. Replaces
+  // the asset's DRM block wholesale — the step always writes a COMPLETE
+  // `AssetDrm` (it holds every field it needs: status, providerId, scheme,
+  // systems, keyIds, requestedAt), so there is no partial-merge semantics to get
+  // wrong. Does NOT change `status`: an asset whose DRM step failed is still
+  // `ready` with `drm.status = 'failed'` (ADR-008 §8), exactly like
+  // `packagingError`.
+  //
+  // NO KEY MATERIAL (ADR-008 D4): `AssetDrm` carries key IDENTIFIERS and has no
+  // `key` member, so this write path cannot persist a content key.
+  //
+  // NOT reachable from `PATCH /api/v1/assets/:id`: that route validates its body
+  // with its own Zod schema (src/routes/assets.ts) which has no `drm` member, so
+  // protection state stays pipeline-derived and system-written. Persistence is
+  // additionally gated by `DRM_ENABLED` at the document mapper
+  // (`toAssetDocument`, src/data/asset-document.ts:719), which is what keeps the
+  // flag-off deployment byte-for-byte unchanged (D9).
+  drm?: AssetDrm;
 };
 
 // Input to the dedicated attach-external-id write path (issue #577). The
@@ -1986,6 +2005,11 @@ export class InMemoryAssetRepository implements AssetRepository {
     }
     if (patch.sceneDetectionError !== undefined) {
       next.sceneDetectionError = patch.sceneDetectionError;
+    }
+    // DRM protection state (issue #1264). Replaced wholesale — the writer always
+    // supplies a complete `AssetDrm` — and never touches `status`.
+    if (patch.drm !== undefined) {
+      next.drm = patch.drm;
     }
     if (patch.versionGroupId !== undefined) {
       next.versionGroupId = patch.versionGroupId;
