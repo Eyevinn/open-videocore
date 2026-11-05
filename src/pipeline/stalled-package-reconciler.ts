@@ -66,6 +66,20 @@ export type ReconcileStalledPackagesDeps = {
   // the likely cause. Optional and never trusted for control flow: when absent
   // or it throws, the message degrades to "unknown". Never blocks the timeout.
   packagerPresent?: () => Promise<boolean>;
+  // Settle a pending DRM protection as `failed` for a run this sweep just
+  // declared failed (issue #1265; ADR-008 §12 "Packager fails after encryption
+  // started"). Wired to `PackagingService.settleProtectionFailure`
+  // (src/pipeline/packaging.ts) in src/main.ts; the argument is the `package`
+  // Job id the failure was recorded on, which is what correlates the settlement
+  // with the run that carried the encryption. A sweep-failed run is one of the
+  // only two places a packager failure is attributed at all (the other is POST
+  // /packagerCallback/failure), so without it an encrypted run whose completion
+  // signal never arrives stays `drm.status='pending'` forever. Optional and
+  // best-effort exactly like `jobs`: absent -> the sweep behaves as before.
+  settleProtectionFailure?: (
+    assetId: string,
+    failingPackageJobId?: string
+  ) => Promise<unknown>;
   // Injectable clock + bound so the timeout path is unit-testable.
   now?: () => number;
   stallTimeoutMs?: number;
@@ -134,11 +148,18 @@ export async function reconcileStalledPackages(
       // (stamped at enqueue), falling back to the asset's in-flight package job
       // for runs started before the job record existed. Best-effort: never
       // throws, so the sweep's per-execution guarantees are unchanged.
-      await failPackageJob(
+      const failedPackageJobId = await failPackageJob(
         { jobs: deps.jobs, logger: deps.logger },
         { jobId: step.jobId, assetId: execution.assetId },
         message
       );
+      // Settle a pending DRM protection for the SAME run (issue #1265): this
+      // sweep is one of the two places a packaging failure is actually
+      // attributed, so it is where `drm.status='pending'` gets its exit when no
+      // completion signal ever arrives. Correlated by the package Job id the
+      // failure was just recorded on; a no-op for every clear asset and when the
+      // seam is not wired.
+      await deps.settleProtectionFailure?.(execution.assetId, failedPackageJobId);
       failed += 1;
       deps.logger?.info?.(
         '[stalled-package-reconciler] failed stalled package step for execution %s (asset %s): %s',

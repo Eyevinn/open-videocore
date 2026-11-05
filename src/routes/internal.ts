@@ -725,10 +725,24 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
                 // step's own jobId (stamped at enqueue), falling back to the
                 // asset's in-flight package job. Best-effort — never throws, so
                 // attribution stays as resilient as it was.
-                await failPackageJob(
+                const failedPackageJobId = await failPackageJob(
                   { jobs: opts.jobRepository, pipeline: opts.pipelineRepository, logger: fastify.log },
                   { jobId: runningPackageStep?.jobId, assetId: execution.assetId },
                   reason
+                );
+                // Settle a pending PROTECTION here too (issue #1265, ADR-008 §12
+                // "Packager fails after encryption started"). This is where a
+                // packager failure is actually attributed — the callback carries
+                // no jobId of ours and never reaches
+                // `PackagingService.handleFailure` — so without this the DRM
+                // block of an encrypted run would stay `pending` forever. Keyed
+                // to the SAME package Job this failure was just recorded on, so
+                // a clear re-package failing cannot mark an earlier protected
+                // run failed. Best-effort and never throws (see
+                // `settleProtectionFailure`); a no-op for every clear asset.
+                await opts.packaging?.settleProtectionFailure(
+                  execution.assetId,
+                  failedPackageJobId
                 );
                 if (opts.webhookDispatcher) {
                   void opts.webhookDispatcher.dispatch({

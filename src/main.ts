@@ -1936,6 +1936,15 @@ function activateScaler(redisUrl: string): void {
           // the message degrades to present=unknown rather than mis-attributing a
           // cause. Never gates the timeout.
           packagerPresent: probePackagerPresent,
+          // #1265: a swept run is one of the two places a packaging failure is
+          // attributed, so settle a pending DRM protection for it too —
+          // otherwise an encrypted run whose completion signal never arrives
+          // stays `drm.status='pending'` forever (ADR-008 §12). Read through the
+          // module-scoped service at CALL time: the sweep closure is built
+          // before `packaging` is constructed below. Best-effort and a no-op for
+          // every clear asset.
+          settleProtectionFailure: async (assetId, failingPackageJobId) =>
+            packaging?.settleProtectionFailure(assetId, failingPackageJobId),
           stallTimeoutMs: packageStallTimeoutMs,
           logger: {
             info: (...a: unknown[]) => app.log.info(a),
