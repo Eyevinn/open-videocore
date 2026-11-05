@@ -1283,9 +1283,9 @@ export const DRM_PACKAGER_FAILED_MESSAGE =
 // re-enqueue that lands on the very same job id while the protected run is still
 // in flight is indistinguishable from that protected run by job id alone. That
 // window needs a per-enqueue identity the packager echoes back, which today's
-// queue contract does not carry (ADR-008 C3: `QueueMessage = { jobId, url }`);
-// it is called out in `docs/osc-feedback/incoming-packager-no-encryption-support.md`
-// as part of the same missing-per-job-contract gap.
+// queue contract does not carry (ADR-008 C3: `QueueMessage = { jobId, url }`,
+// and the callbacks echo only our `jobId` = assetId). Logged as OSC friction in
+// `docs/osc-feedback/incoming-issue1265-packager-callback-no-run-identity.md`.
 function correlatesWithRun(
   drm: AssetDrm,
   completingPackageJobId: string | undefined
