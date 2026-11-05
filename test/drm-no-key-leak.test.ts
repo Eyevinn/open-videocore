@@ -343,7 +343,18 @@ const DRM_MEMBER_FILES = [
   'src/services/param-store.ts',
   // `DrmStackConfig` / `DrmConfigView` — operator configuration, no key
   // material; credentials are read from the environment at call time.
-  'src/drm/drm-config.ts'
+  'src/drm/drm-config.ts',
+  // The delivery `drm` block, `GET /:id/drm` and the `drm` request member on
+  // POST /:id/package / POST /:id/execute (issue #1266). REVIEWED: all four are
+  // closed `z.object` schemas with no `key`, `keys` or `iv` member, so the
+  // serialiser cannot emit one. The response shapes are PROJECTIONS of the
+  // persisted `AssetDrm` (sink 1) — `deliveryDrmFor` copies `scheme`, the
+  // system ids, the licence/certificate URLs and the key IDENTIFIERS only, and
+  // `GET /:id/drm` sends the stored block itself. The request member is the
+  // intent shape of `PipelineExecution['drm']` (sink 3), which carries no key
+  // identifier at all. No key material exists anywhere in this module: it never
+  // constructs a `ContentKey`, an `EncryptionParams` or a `DrmSignalling`.
+  'src/routes/assets.ts'
 ];
 
 async function sourceFilesDeclaringDrmMember(): Promise<string[]> {

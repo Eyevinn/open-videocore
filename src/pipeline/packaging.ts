@@ -447,6 +447,37 @@ export const DRM_SCHEME_UNSUPPORTED_REFUSAL: Readonly<DrmUnsupportedRefusal> =
       'DRM protection was requested with a protection scheme the packaging runner for this stack does not support; request a scheme the runner reports, or deploy a packaging runner that supports it'
   });
 
+// A FOURTH way the request cannot be honoured, and the only one that is about
+// the CALL PATH rather than the runner's capability answer: the caller asked for
+// protection on the DIRECT enqueue path (`POST /:id/package` with an explicit
+// `encoreJobId`, src/routes/assets.ts).
+//
+// That path hands the job to `PackagingTrigger.triggerPackaging(assetId,
+// encoreJobUrl)` (this file), whose whole envelope is `PackagingJob =
+// { jobId, url }` — there is NO slot for `EncryptionParams`, no `packageJobId`
+// to stamp on `asset.drm` and no execution record to persist the request on. So
+// the request cannot be carried, and a capability-only gate would let an
+// encrypting runner through into a CLEAR enqueue: `202 { ok: true }` for
+// protection that is never applied, with nothing recorded anywhere that says so
+// (`correlatesWithRun` below already relies on `triggerPackaging` being clear).
+//
+// Dropping it is therefore not an option, for the same reason
+// `clearPackagingRunner.enqueue` THROWS when handed `encryption` rather than
+// running the job clear: silently publishing unprotected output under a
+// protected request is the one outcome that must never happen. This is the
+// route-level form of that refusal — the same `409 drm_unsupported` class, so a
+// client's error handling does not have to learn a new code, differing only in
+// `message`, which names the member to drop or the mode to use instead and (like
+// the three above) no system id, scheme or key material (ADR-008 §10).
+export const DRM_DIRECT_ENQUEUE_UNSUPPORTED_REFUSAL: Readonly<DrmUnsupportedRefusal> =
+  Object.freeze({
+    status: 409,
+    error: 'drm_unsupported',
+    errorCode: 'drm_unsupported',
+    message:
+      'DRM protection was requested together with an explicit encoreJobId, but the direct packaging enqueue carries no encryption parameters, so the output would be clear; re-send without encoreJobId to package through a pipeline execution that records the protection request, or without drm to package clear'
+  });
+
 // The refusal a DRM-requesting step gets when the stack has no usable DRM
 // configuration (issue #1264): the deployment kill switch is off, the stack has
 // no stored DRM block, the stored block is `enabled: false`, or the configured
