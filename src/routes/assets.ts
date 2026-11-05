@@ -228,6 +228,33 @@ import {
   resolvePackagedOutput,
   type PackagedObjectLister
 } from '../pipeline/packaging.js';
+// DRM exposure on the delivery and asset surfaces (ADR-008 §9/§10, issue
+// #1266). Every DRM symbol below is IMPORTED from the module that owns it —
+// the shared vocabulary (src/types/drm.ts), the flag gate (src/drm/drm-config.ts)
+// and the packaging runner's capability answer (src/pipeline/packaging.ts) — so
+// this router restates no enum, no status code and no refusal message.
+import {
+  DRM_ERROR_CODES,
+  DRM_STATUSES,
+  DRM_SYSTEM_ID_PATTERN,
+  PROTECTION_SCHEMES,
+  TRACK_TYPE_GROUPS,
+  drmEnabled
+} from '../types/drm.js';
+import type { AssetDrm } from '../data/asset-repo.js';
+import {
+  DRM_NOT_CONFIGURED_STATUS,
+  drmGateClosed
+} from '../drm/drm-config.js';
+import {
+  DRM_SCHEME_UNSUPPORTED_REFUSAL,
+  DRM_SYSTEMS_UNSUPPORTED_REFUSAL,
+  DRM_UNSUPPORTED_REFUSAL,
+  NO_ENCRYPTION_CAPABILITY,
+  probeEncryptionCapability,
+  type EncryptingPackagingRunner,
+  type PackagingCapabilities
+} from '../pipeline/packaging.js';
 import {
   isManifestPath,
   rewriteManifest,
@@ -727,12 +754,108 @@ const deliveryResolutionSchema = z.object({
 //                        caller can fetch the raw source to diagnose or
 //                        re-ingest. NEVER `ready`: a consumer that keys off
 //                        `status` must not read a failed asset as playable.
+// Protection signalling for a packaged, PROTECTED asset (ADR-008 §9 "Delivery
+// `drm` block", issue #1266). Purely additive: the block appears only for an
+// asset whose `drm.status` is `protected` on a deployment with `DRM_ENABLED=true`,
+// and `urls.hls` / `urls.dash` are unchanged — the encrypted manifests sit at
+// the same keys and carry their own in-manifest signalling. The block exists so
+// a client can configure its key systems without parsing the manifest first.
+//
+// NO KEY MATERIAL (ADR-008 D4/§10, src/drm/key-provider.ts:107-109 "no HTTP
+// response schema contains key material, including ... the delivery `drm`
+// block"): `keyIds` are key IDENTIFIERS, there is no `key` member, and the
+// schema is a closed `z.object` so the serialiser strips anything else.
+//
+// `system` is a registered common-encryption system id (`DrmSystemId`,
+// src/types/drm.ts) — a UUID, not a product name (CLAUDE.md rule 1 /
+// ADR-008 §5.3, which overrides the short names sketched in §9). Validation is
+// on the shape CPIX fixes (`cpix:UUIDType`) for the same reason
+// `DrmSystemIdSchema` (src/data/asset-document.ts:192) is.
+const deliveryDrmSystemSchema = z.object({
+  system: z.string().regex(DRM_SYSTEM_ID_PATTERN),
+  // Licence service URL for this system, when one is known. Licence requests
+  // never pass through this API — the player talks to the provider directly
+  // (ADR-008 §9 N4), so this is an opaque pass-through value.
+  licenceUrl: z.string().optional(),
+  // Application certificate URL, where the system needs one. `AssetDrm` persists
+  // exactly ONE, unbound to a system (src/data/asset-repo.ts:506), so it is
+  // offered on each signalled entry rather than guessing a binding the asset
+  // does not record; a client uses it for the system whose licence exchange
+  // requires a certificate.
+  certificateUrl: z.string().optional()
+});
+
+const deliveryDrmSchema = z.object({
+  scheme: z.enum(PROTECTION_SCHEMES),
+  systems: z.array(deliveryDrmSystemSchema),
+  // Identifiers only — useful for player diagnostics (ADR-008 §9).
+  keyIds: z.array(z.string())
+});
+
 const deliverySchema = z.object({
   assetId: z.string(),
   status: z.enum(['ready', 'not_configured', 'failed']),
   urls: deliveryUrlsSchema,
   resolution: deliveryResolutionSchema.optional(),
+  // ADDITIVE (issue #1266). Absent — not `null`, not `{}` — whenever DRM is off
+  // on this deployment or the asset is not `protected`, so a pre-#1266 client
+  // and the whole clear path see a byte-identical body.
+  drm: deliveryDrmSchema.optional(),
   expiresAt: z.string()
+});
+
+// `GET /api/v1/assets/:id/drm` (ADR-008 §9 "The `AssetDrm` shape of §8"): the
+// persisted protection state of one asset, field for field as
+// `AssetDrm` (src/data/asset-repo.ts:494-522) declares it. Enum members are the
+// SHARED membership lists (src/types/drm.ts), never retyped strings, so the
+// published contract cannot drift from what is persisted
+// (`AssetDrmSchema`, src/data/asset-document.ts:211-233).
+//
+// Closed `z.object` — the same read-boundary closure routes/drm-config.ts
+// applies to its config view, and the reason the no-key-material guarantee
+// (ADR-008 D4) holds structurally here: there is no `key` member to populate
+// and the serialiser drops anything not listed.
+const assetDrmSchema = z.object({
+  status: z.enum(DRM_STATUSES),
+  providerId: z.string(),
+  scheme: z.enum(PROTECTION_SCHEMES),
+  systems: z.array(z.string()),
+  keyIds: z.array(
+    z.object({ trackGroup: z.enum(TRACK_TYPE_GROUPS), keyId: z.string() })
+  ),
+  licenceUrls: z.record(z.string(), z.string()).optional(),
+  certificateUrl: z.string().optional(),
+  requestedAt: z.string(),
+  protectedAt: z.string().optional(),
+  // Already redacted/truncated upstream (ADR-008 §10) — a provider error body
+  // is never echoed verbatim.
+  error: z.string().optional(),
+  errorCode: z.enum(DRM_ERROR_CODES).optional(),
+  packageJobId: z.string().optional()
+});
+
+// The optional per-request DRM member on POST /:id/package and POST /:id/execute
+// (ADR-008 §9, issue #1266). Field for field `PipelineExecution['drm']`
+// (src/data/pipeline-repo.ts:100), which is what the execution record persists
+// and what the packaging step reads back (`PackagingStepRequest.drm`,
+// src/pipeline/packaging.ts:500).
+//
+// `requested: true` is the only permitted value: absence IS "no protection
+// requested", so there is exactly one representation of the clear path. The
+// three optional members override the stack-level defaults (ADR-008 §5.2).
+//
+// REQUEST INTENT ONLY — no key material and no key identifiers (ADR-008 D4).
+const drmRequestSchema = z.object({
+  requested: z.literal(true),
+  providerId: z.string().min(1).optional(),
+  systems: z
+    .array(
+      z
+        .string()
+        .regex(DRM_SYSTEM_ID_PATTERN, 'must be a registered DRM system id (UUID)')
+    )
+    .optional(),
+  scheme: z.enum(PROTECTION_SCHEMES).optional()
 });
 
 // Unified files view (issue #119). A DERIVED / projection read model over the
@@ -1492,6 +1615,17 @@ type AssetsRouterOptions = {
   clipDeps?: Partial<ClipDeps>;
   // HLS/DASH packaging (issue #9). When present, POST /:id/package is enabled.
   packaging?: import('../pipeline/packaging.js').PackagingService;
+  // The packaging runner whose CAPABILITY answer decides whether a DRM-requesting
+  // package/execute can be accepted at all (ADR-008 §7.1/D8, issue #1263; the
+  // route gate is issue #1266). OPTIONAL: the runner this deployment actually
+  // has is the clear Valkey queue (`makeOscPackagerQueue`, src/main.ts), whose
+  // honest answer is `NO_ENCRYPTION_CAPABILITY` (src/pipeline/packaging.ts:344,
+  // verified against the packaging library's own argv/config/queue surfaces), so
+  // an unwired router behaves exactly as that runner would — `409 drm_unsupported`
+  // for a DRM request, and completely unchanged for every clear one. A deployment
+  // that gains an encrypting runner wires it here and is answered by its own
+  // probe, never by a cached or assumed value.
+  packagingRunner?: EncryptingPackagingRunner;
   // Redis for resolving Encore instance URL at packaging time.
   packagingRedis?: import('ioredis').Redis;
   // Per-stack replacements for `packagingRedis` (every scaler key lives on the
@@ -2168,6 +2302,51 @@ function notConfiguredDelivery(
     urls: {},
     ...(resolution ? { resolution } : {}),
     expiresAt
+  };
+}
+
+// The delivery response's optional `drm` block (ADR-008 §9, issue #1266).
+//
+// A pure PROJECTION of the persisted `AssetDrm` (src/data/asset-repo.ts:494-522)
+// — no parameter-store read, no provider call, no I/O of any kind, so an
+// unprotected or flag-off delivery response costs exactly what it did before.
+//
+// Returns undefined (so the caller omits the key entirely rather than sending
+// `null` or `{}`) unless BOTH hold:
+//   - `DRM_ENABLED` is on. Checked at CALL time via the shared `drmEnabled()`
+//     gate, never cached. With the flag off `fromAssetDocument` does not even
+//     read the persisted block onto the domain object (src/data/asset-document.ts:963),
+//     so this is the second independent gate, not the only one.
+//   - `drm.status === 'protected'`. A `pending` / `failed` / `unsupported`
+//     protection has no encrypted package to signal, and advertising key
+//     systems for clear output would make a player fail where it would
+//     otherwise play. The lifecycle detail of those states is what
+//     `GET /:id/drm` is for.
+//
+// NO KEY MATERIAL (ADR-008 D4): `keyIds` carries the key IDENTIFIERS persisted
+// on the asset, deduplicated (one key may bind several track groups) and in
+// first-seen order so the value is deterministic. `AssetDrm` has no `key`
+// member, so there is nothing else here to leak.
+function deliveryDrmFor(
+  asset: { drm?: AssetDrm }
+): z.infer<typeof deliveryDrmSchema> | undefined {
+  if (!drmEnabled()) return undefined;
+  const drm = asset.drm;
+  if (!drm || drm.status !== 'protected') return undefined;
+  const keyIds = [...new Set(drm.keyIds.map((k) => k.keyId))];
+  return {
+    scheme: drm.scheme,
+    systems: drm.systems.map((system) => {
+      const licenceUrl = drm.licenceUrls?.[system];
+      return {
+        system,
+        ...(licenceUrl !== undefined ? { licenceUrl } : {}),
+        ...(drm.certificateUrl !== undefined
+          ? { certificateUrl: drm.certificateUrl }
+          : {})
+      };
+    }),
+    keyIds
   };
 }
 
@@ -3120,6 +3299,64 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   }
 
+  // Gate for the optional `drm` member on POST /:id/package and POST /:id/execute
+  // (ADR-008 §9, issue #1266). Returns true when the request was REFUSED (a
+  // response has been sent and the caller must return immediately), false when
+  // there is nothing to refuse — including the clear path, which never reaches
+  // the probe at all and is therefore byte-identical to its pre-#1266 behaviour.
+  //
+  // ORDER IS THE CONTRACT, and it is the SAME order `enqueuePackagingStep`
+  // (src/pipeline/packaging.ts:594-612) applies later for the same reasons:
+  //   1. `DRM_ENABLED` off -> the uniform `501 not_configured` every DRM route
+  //      answers (`drmGateClosed`), with no capability probe and no I/O. The
+  //      member is still ACCEPTED by the body schema so the refusal is an
+  //      explicit 501 rather than a validation error that hides which feature
+  //      is off.
+  //   2. The runner cannot encrypt at all -> `409 drm_unsupported`.
+  //   3. The runner can encrypt but not with the requested scheme, or for none
+  //      of the requested systems -> the same `409 drm_unsupported`, differing
+  //      only in message. Both are the same class of failure: the capability
+  //      answer does not cover the request.
+  // Every refusal therefore happens BEFORE an execution record is created and
+  // long before any key could be minted, and every message is the shared
+  // operator-facing constant — no system id, scheme or key material in a
+  // response body (ADR-008 §10).
+  async function drmRequestRefused(
+    drm: z.infer<typeof drmRequestSchema> | undefined,
+    reply: import('fastify').FastifyReply
+  ): Promise<boolean> {
+    if (!drm) return false;
+    if (drmGateClosed(reply)) return true;
+    // Probed fresh on every request (`probeEncryptionCapability` exists so the
+    // "never cached" constraint of #1263 has one place it can be read); the
+    // unwired case is the clear queue's own answer, not an assumption.
+    const caps: PackagingCapabilities = opts.packagingRunner
+      ? await probeEncryptionCapability(opts.packagingRunner)
+      : {
+          encryption: NO_ENCRYPTION_CAPABILITY.encryption,
+          schemes: [...NO_ENCRYPTION_CAPABILITY.schemes],
+          systems: [...NO_ENCRYPTION_CAPABILITY.systems]
+        };
+    const refuse = (refusal: typeof DRM_UNSUPPORTED_REFUSAL): true => {
+      reply
+        .code(refusal.status)
+        .send({ error: refusal.error, message: refusal.message });
+      return true;
+    };
+    if (!caps.encryption) return refuse(DRM_UNSUPPORTED_REFUSAL);
+    if (drm.scheme !== undefined && !caps.schemes.includes(drm.scheme)) {
+      return refuse(DRM_SCHEME_UNSUPPORTED_REFUSAL);
+    }
+    if (
+      drm.systems !== undefined &&
+      drm.systems.length > 0 &&
+      !drm.systems.some((system) => caps.systems.includes(system))
+    ) {
+      return refuse(DRM_SYSTEMS_UNSUPPORTED_REFUSAL);
+    }
+    return false;
+  }
+
   // Start a named built-in pipeline against an asset, executing the first step
   // immediately. Returns the created PipelineExecution, or undefined after
   // having sent an error response via `reply`. Callers must not send again when
@@ -3137,7 +3374,16 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     // execution record so #208 (packager relocation) and #210 (delivery) can
     // resolve the destination actually used. When undefined, later stages fall
     // back to the provisioned instance-level default (backwards compatible).
-    destinationBucket?: string
+    destinationBucket?: string,
+    // Optional per-execution DRM request (ADR-008 §8/§9, issue #1266), mirroring
+    // `destinationBucket` above in every respect: validated at the edge, already
+    // gated by `drmRequestRefused`, and persisted on the execution record so the
+    // later `package` step resolves what the caller actually asked for
+    // (`PackagingStepRequest.drm`, src/pipeline/packaging.ts:500) instead of
+    // re-deriving it. `PipelineRepository.create` drops it unless `DRM_ENABLED`
+    // is on (src/data/pipeline-repo.ts:126-130), so a flag-off execution record
+    // is identical to a pre-#1259 one.
+    drm?: import('../data/pipeline-repo.js').PipelineExecution['drm']
   ): Promise<import('../data/pipeline-repo.js').PipelineExecution | undefined> {
     const pipelineRepo = opts.pipelineRepository;
     if (!pipelineRepo) {
@@ -3536,7 +3782,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       assetId: asset.id,
       pipelineName,
       steps,
-      ...(destinationBucket !== undefined ? { destinationBucket } : {})
+      ...(destinationBucket !== undefined ? { destinationBucket } : {}),
+      ...(drm !== undefined ? { drm } : {})
     });
     const now = () => new Date().toISOString();
     const stepsCopy: StepExecution[] = execution.steps.map((s) => ({ ...s }));
@@ -4898,6 +5145,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const ttl = deliveryUrlTtlSeconds();
       const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
 
+      // Protection signalling for a protected asset (ADR-008 §9, issue #1266).
+      // Resolved ONCE and spread into every PACKAGED-output response below, so
+      // the block travels with the manifests it describes. Deliberately NOT
+      // added to the source-object fallback further down: that path advertises
+      // the stored, UNENCRYPTED source object, and signalling key systems for
+      // clear bytes would make a player fail where it would otherwise play.
+      // `{}` when DRM is off or the asset is not protected, so `...drmBlock`
+      // adds no key at all (never `drm: null`, never `drm: {}`).
+      const drm = deliveryDrmFor(asset);
+      const drmBlock = drm ? { drm } : {};
+
       // Resolve the per-role storage backend metadata for this asset's stack
       // (issue #211/#213), carried on the resolved connections so no extra
       // parameter-store read is needed here. When absent (stack predates #211,
@@ -4956,6 +5214,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               ...(asset.manifestUrls.hls ? { hls: urls.hls } : {}),
               ...(asset.manifestUrls.dash ? { dash: urls.dash } : {})
             },
+            ...drmBlock,
             expiresAt
           });
         }
@@ -4975,6 +5234,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             assetId: asset.id,
             status: 'ready',
             urls: { hls: rehost(asset.manifestUrls.hls), dash: rehost(asset.manifestUrls.dash) },
+            ...drmBlock,
             expiresAt
           });
         }
@@ -5008,9 +5268,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // unambiguous `not_configured` response (no playback URL) plus the
           // packaged-location metadata for deterministic client-side resolution.
           if (!isAbsoluteUrl(proxyBase)) {
-            return reply.code(200).send(
-              notConfiguredDelivery(asset, expiresAt, MISSING_API_ORIGIN)
-            );
+            return reply.code(200).send({
+              ...notConfiguredDelivery(asset, expiresAt, MISSING_API_ORIGIN),
+              ...drmBlock
+            });
           }
           const proxied = proxyManifestUrlsFor(asset.id, proxyBase);
           return reply.code(200).send({
@@ -5021,6 +5282,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               hls: asset.manifestUrls.hls ? proxied.hls : undefined,
               dash: asset.manifestUrls.dash ? proxied.dash : undefined
             },
+            ...drmBlock,
             expiresAt
           });
         }
@@ -5059,14 +5321,16 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // resolution metadata, and the name of the setting that is missing
           // (issue #860) so the operator can fix it instead of debugging a 401.
           if (!hls && !dash) {
-            return reply
-              .code(200)
-              .send(notConfiguredDelivery(asset, expiresAt, MISSING_PUBLIC_ORIGIN));
+            return reply.code(200).send({
+              ...notConfiguredDelivery(asset, expiresAt, MISSING_PUBLIC_ORIGIN),
+              ...drmBlock
+            });
           }
           return reply.code(200).send({
             assetId: asset.id,
             status: 'ready',
             urls: { hls, dash },
+            ...drmBlock,
             expiresAt
           });
         } catch (err) {
@@ -5121,6 +5385,54 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         error: 'no_delivery',
         message: 'asset has no packaged output or stored source object to deliver'
       });
+    }
+  );
+
+  // DRM state of one asset (ADR-008 §9 `GET /api/v1/assets/{id}/drm`, issue
+  // #1266). The full persisted `AssetDrm` block of §8 — the lifecycle view the
+  // delivery route deliberately does NOT carry (it signals only a `protected`
+  // package, see `deliveryDrmFor`), so a client that needs to know a protection
+  // is `pending` or why it `failed` reads it here.
+  //
+  // NO KEY MATERIAL (ADR-008 D4/§10, src/drm/key-provider.ts:107-109): the
+  // response is the persisted block, which has no `key` member, sent through
+  // the closed `assetDrmSchema`.
+  //   200 — the asset's DRM block
+  //   404 — unknown/foreign asset (existence is not leaked), or the asset has
+  //         no DRM record (it was never requested for protection)
+  //   501 — `not_configured`: DRM is off on this deployment (ADR-008 D9)
+  app.get(
+    '/:id/drm',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: {
+          200: assetDrmSchema,
+          404: errorSchema,
+          [DRM_NOT_CONFIGURED_STATUS]: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      // Flag gate FIRST and with NO I/O (`drmGateClosed`, src/drm/drm-config.ts):
+      // a flag-off deployment answers the uniform 501 every DRM route answers
+      // without reading the asset at all, so the kill switch is total rather
+      // than cosmetic.
+      if (drmGateClosed(reply)) return;
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      // No protection was ever requested for this asset, so there is no state
+      // to report. A 404 rather than an empty 200: "no DRM record" is not a DRM
+      // record with empty fields.
+      if (!asset.drm) {
+        return reply.code(404).send({
+          error: 'not_found',
+          message: 'asset has no DRM record'
+        });
+      }
+      return reply.code(200).send(asset.drm);
     }
   );
 
@@ -6192,7 +6504,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // name of a registered output-role destination. Resolved server-side
           // to the SAME `destinationBucket` the relocation consumes. Mutually
           // exclusive with the inline `destinationBucket` override.
-          destination: z.string().min(1).max(256).optional()
+          destination: z.string().min(1).max(256).optional(),
+          // Optional DRM request (ADR-008 §9, issue #1266). Refused with
+          // `409 drm_unsupported` when the packaging runner cannot encrypt, and
+          // with `501 not_configured` while `DRM_ENABLED` is off — see
+          // `drmRequestRefused`. Omitted => the clear path, unchanged.
+          drm: drmRequestSchema.optional()
         }),
         response: {
           202: z.object({ ok: z.literal(true), jobId: z.string().optional(), pipelineMode: z.boolean().optional() }),
@@ -6216,6 +6533,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
+
+      // Optional DRM request (issue #1266). Gated here — after the 404, so
+      // existence is still not leaked, and before either packaging mode below,
+      // so a request that cannot be honoured never enqueues a job or creates an
+      // execution that would quietly produce CLEAR output under a protected
+      // request. Applies to BOTH modes: the direct `encoreJobId` enqueue has no
+      // execution record to carry the request either.
+      if (await drmRequestRefused(request.body.drm, reply)) return reply;
 
       const { encoreJobId } = request.body;
 
@@ -6250,7 +6575,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           request,
           reply,
           undefined,
-          resolvedDestination.destinationBucket
+          resolvedDestination.destinationBucket,
+          request.body.drm
         );
         if (!started) return reply; // startPipelineExecution already sent the error
         return reply.code(202).send({ ok: true, jobId: started.steps.find((s) => s.name === 'transcode')?.jobId, pipelineMode: true });
@@ -6347,7 +6673,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // coordinates at job time (credentials stay in OSC secrets). Mutually
           // exclusive with `destination` and the inline `destinationBucket`
           // override (all name an output destination).
-          externalBackend: z.string().trim().min(1).max(256).optional()
+          externalBackend: z.string().trim().min(1).max(256).optional(),
+          // Optional per-execution DRM request (ADR-008 §9, issue #1266),
+          // persisted on the execution record exactly like `destinationBucket`.
+          // Refused with `409 drm_unsupported` when the packaging runner cannot
+          // encrypt and with `501 not_configured` while `DRM_ENABLED` is off
+          // (`drmRequestRefused`). Omitted => the clear path, unchanged.
+          drm: drmRequestSchema.optional()
         }),
         response: {
           202: pipelineExecutionSchema,
@@ -6368,6 +6700,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // Optional per-execution DRM request (issue #1266). Gated before the
+      // destination resolution and before the execution record is created, so a
+      // request the runner cannot satisfy never leaves a running execution
+      // behind — the same placement the #1058/#1059 pre-flight gates use.
+      if (await drmRequestRefused(request.body.drm, reply)) return reply;
       // Resolve the requested output destination (at most one of the named
       // export-destination reference #573, the external-backend reference #549,
       // or the inline override) into the single `destinationBucket` string the
@@ -6397,7 +6734,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           profile: request.body.profile,
           profileParams: request.body.profileParams
         },
-        resolvedDestination.destinationBucket
+        resolvedDestination.destinationBucket,
+        request.body.drm
       );
       if (!started) return reply; // error already sent
       return reply.code(202).send(started);
