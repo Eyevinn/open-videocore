@@ -322,3 +322,81 @@ test('the transcode budget is 900 s by default and is overridable per instance f
   assert.deepEqual(timeoutsFromEnv({ E2E_TIMEOUT_PACKAGE_MS: '60000', E2E_TIMEOUT_READY_MS: '1000' }), { readyMs: 1000, packageMs: 60_000 });
   for (const bad of ['abc', '0', '-5']) assert.throws(() => timeoutsFromEnv({ E2E_TIMEOUT_TRANSCODE_MS: bad }), /positive number of milliseconds/, bad);
 });
+
+// ---------------------------------------------------------------------------
+// DRM flag-off case and the v2 gate list (issue #1268; ADR-008 §13 / D9).
+//
+// `GATE_CASES` is the list the gate's entry points run (suite/cli.mjs, runner/wire.mjs): the v1 list
+// with `drm-flag-off` directly after `package`. The v1 `cases` list and its expectations above are
+// untouched on purpose — those tests pin v1 behaviour exactly — so the v2 addition is pinned here,
+// against the list the gate actually runs.
+//
+// There is no DRM-POSITIVE case to test: the OSC catalog packager cannot encrypt, so such a case would
+// be permanently red. See the long comment in suite/cases.mjs and the friction log it names,
+// `docs/osc-feedback/incoming-packager-no-encryption-support.md`. The positive path is proven locally
+// by test/drm-local-clearkey-chain.test.ts behind the docker-compose `local-drm` profile.
+// ---------------------------------------------------------------------------
+import { GATE_CASES, SUITE_VERSION, drmFlagOffCase } from '../suite/cases.mjs';
+
+async function runGate(faults = {}, cfg = {}) {
+  const mock = await startMock({ faults });
+  try {
+    const result = await runSuite({
+      cases: GATE_CASES,
+      client: createClient({ baseUrl: mock.baseUrl, token: mock.token }),
+      anon: createClient({ baseUrl: mock.baseUrl }),
+      ingress: createClient({ baseUrl: mock.baseUrl, token: mock.token, appToken: '' }),
+      config: { ...fastCfg, ...cfg },
+    });
+    return { result, mock };
+  } finally { await mock.close(); }
+}
+
+test('the gate list is the v1 list plus drm-flag-off after package, and the suite reports v2', async () => {
+  assert.equal(SUITE_VERSION, 'v2');
+  const ids = GATE_CASES.map((c) => c.id);
+  assert.equal(ids.length, 13);
+  assert.equal(ids[ids.indexOf('package') + 1], 'drm-flag-off');
+  assert.equal(ids.indexOf('drm-flag-off') < ids.indexOf('delete'), true, 'it runs while the asset still exists');
+  assert.equal(drmFlagOffCase.chain, true, 'a broken chain skips it instead of failing it');
+});
+
+test('drm-flag-off passes against an instance with DRM off, and the suite stays green', async () => {
+  const { result } = await runGate();
+  assert.equal(result.status, 'green', JSON.stringify(result.cases.filter((c) => c.status !== 'pass')));
+  assert.equal(result.suiteVersion, 'v2');
+  assert.equal(result.cases.length, 13);
+  assert.equal(byId(result)['drm-flag-off'].status, 'pass');
+});
+
+test('a drm block on the delivery response fails drm-flag-off and turns the suite red', async () => {
+  const { result } = await runGate({ deliveryDrm: true });
+  const c = byId(result)['drm-flag-off'];
+  assert.equal(c.status, 'fail');
+  assert.equal(c.failureClass, undefined, 'a leaked drm block is the image\'s own failure, never infra');
+  assert.match(c.detail, /delivery response carries a drm property/);
+  assert.equal(result.status, 'red');
+  assert.equal(byId(result).delete.status, 'skipped');
+});
+
+test('a drm key on the asset read and the asset list fails drm-flag-off', async () => {
+  const { result } = await runGate({ assetDrm: true });
+  const c = byId(result)['drm-flag-off'];
+  assert.equal(c.status, 'fail');
+  assert.match(c.detail, /asset response carries a drm property/);
+  assert.equal(result.status, 'red');
+});
+
+test('drm-flag-off is skipped, not failed, when an earlier chain case broke', async () => {
+  const { result } = await runGate({ packagingError: true });
+  assert.equal(byId(result).package.status, 'fail');
+  assert.equal(byId(result)['drm-flag-off'].status, 'skipped');
+});
+
+test('drm-flag-off needs no credential or configuration beyond the suite\'s own client', async () => {
+  // The case only ever uses `ctx.client` and `ctx.state.assetId` — no new token, no new env var, so the
+  // runner environment is unchanged (ADR-007 §5).
+  const src = drmFlagOffCase.run.toString();
+  assert.equal(/ctx\.(anon|ingress)/.test(src), false, 'it does not reach for another client');
+  assert.equal(/process\.env/.test(src), false, 'it reads no environment variable');
+});
