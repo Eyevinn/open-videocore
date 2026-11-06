@@ -33,7 +33,10 @@ vi.mock('@osaas/client-core', () => ({
 }));
 
 import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE } from './workspace-stack.js';
-import { resolveEncoreS3Config } from './encore-s3-config.js';
+import {
+  resolveEncoreS3Config,
+  resolveEncoreS3ConfigWithSecretRef
+} from './encore-s3-config.js';
 import {
   LEGACY_OBJECT_STORE_ACCESS_KEY_ID,
   deriveObjectStoreCredential
@@ -259,5 +262,38 @@ describe('spawned transcoders get the stack\'s own credential (issue #1094)', ()
     const logged = JSON.stringify(log.error.mock.calls);
     expect(logged).not.toContain(CRED_A.secretAccessKey);
     expect(logged).not.toContain(SEED);
+  });
+
+  // #1287 review: the spawn-path view also names the OSC secret the
+  // PROVISIONING path already minted for the per-stack credential, so the
+  // scaler references it instead of re-POSTing a write-once name
+  // (docs/architecture/ADR-002-credential-storage.md:46,48,155,174).
+  it('names the pre-minted OSC secret for a per-stack credential, and none for a legacy one', async () => {
+    const store = makeStore({
+      stacka: configFor('stacka', CRED_A.accessKeyId),
+      oldstack: configFor('oldstack')
+    });
+
+    const perStack = await resolveEncoreS3ConfigWithSecretRef(
+      s3ConfigDeps(store),
+      'stacka'
+    );
+    // Exactly the name provision.ts mints: `${stackName}.${rolePurpose}` with
+    // rolePurpose `objectstore` and the `.s3secretaccesskey` suffix from
+    // encoreCredentialMapping.
+    expect(perStack?.secretAccessKeyRef).toBe('stacka.objectstore.s3secretaccesskey');
+
+    // A pre-#1094 stack on the legacy deployment-wide password has no minted
+    // secret, so no reference — the scaler writes its own.
+    const legacy = await resolveEncoreS3ConfigWithSecretRef(
+      s3ConfigDeps(store),
+      'oldstack'
+    );
+    expect(legacy?.accessKeyId).toBe(LEGACY_OBJECT_STORE_ACCESS_KEY_ID);
+    expect(legacy?.secretAccessKeyRef).toBeUndefined();
+
+    // The narrow view stays credential-only.
+    const narrow = await resolveEncoreS3Config(s3ConfigDeps(store), 'stacka');
+    expect('secretAccessKeyRef' in (narrow ?? {})).toBe(false);
   });
 });
