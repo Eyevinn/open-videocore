@@ -1,4 +1,4 @@
-import { cases, CaseFailure, InfraFailure, SUITE_VERSION } from './cases.mjs';
+import { cases, GATE_CASES, CaseFailure, InfraFailure, SUITE_VERSION } from './cases.mjs';
 import { createClient } from '../lib/http.mjs';
 import { redact, redactValue } from '../lib/redact.mjs';
 import { sweepLeftovers } from './sweep.mjs';
@@ -43,16 +43,20 @@ export function timeoutsFromEnv(env = {}) {
  *
  * Status: `green` with no failures; `infra-error` when every failure was a platform failure (an InfraFailure, see
  * cases.mjs) — not final, so the runner retries the same commit; `red` otherwise.
- * @param {{ client: any, anon: any, config: any, sleep?: Function, now?: Function }} deps
+ * `cases` selects the case list (issue #1268). It defaults to the v1 list so every existing caller is
+ * unchanged; the OSC gate's two entry points — `suite/cli.mjs` and `runner/wire.mjs` — pass
+ * `GATE_CASES`, the list that includes the DRM flag-off case. Any new entry point that is meant to
+ * produce a gate verdict must pass `GATE_CASES` too.
+ * @param {{ client: any, anon: any, config: any, cases?: any[], sleep?: Function, now?: Function }} deps
  */
-export async function runSuite({ client, anon, ingress, config, sleep, now = Date.now }) {
+export async function runSuite({ client, anon, ingress, config, cases: selected = cases, sleep, now = Date.now }) {
   const cfg = { pollMs: 2_000, ...config, timeouts: { ...DEFAULT_TIMEOUTS, ...config.timeouts } };
   const ctx = { client, anon, ingress: ingress ?? anon, config: cfg, sleep, now, state: {} };
   let swept = 0;
   if (cfg.sweep !== false) { try { swept = await sweepLeftovers({ client, now }); } catch { /* best effort */ } }
   const results = [];
   let chainBroken = false;
-  for (const c of cases) {
+  for (const c of selected) {
     if (c.chain && chainBroken) { results.push({ id: c.id, status: 'skipped', ms: 0 }); continue; }
     const t0 = now();
     try {
@@ -82,4 +86,4 @@ export async function runSuite({ client, anon, ingress, config, sleep, now = Dat
   return { suiteVersion: SUITE_VERSION, status, build: ctx.state.build, swept, cases: results };
 }
 
-export { createClient };
+export { createClient, GATE_CASES };

@@ -26,6 +26,84 @@ services:
     ports:
       - "6379:6379"
 
+  # Encryption-capable packager — LOCAL DEVELOPMENT ONLY (profile `local-drm`).
+  #
+  # WHY IT IS HERE. The OSC catalog packager cannot encrypt: no encryption option exists in
+  # the packaging library, in the service's instance config, or in the queue envelope it
+  # consumes, so the product's capability probe answers `encryption: false`
+  # (`NO_ENCRYPTION_CAPABILITY`, src/pipeline/packaging.ts) and a protected package request is
+  # refused with `409 drm_unsupported`. The upstream change is requested in the engagement's
+  # friction log `docs/osc-feedback/incoming-packager-no-encryption-support.md` (ADR-008 §7.2).
+  # Until it ships, the only way to prove the key-acquisition -> encrypt -> callback ->
+  # delivery chain is a packager image you build yourself from the branch that adds encryption
+  # support, which is what this service runs.
+  #
+  # It is behind a PROFILE, so `docker compose up` never starts it, and `pull_policy: never`,
+  # so compose never tries to fetch a tag that exists only on your machine. Nothing in the OSC
+  # cloud e2e environment uses it.
+  #
+  #   docker compose --profile local-drm up -d
+  #   LOCAL_DRM_PACKAGER_IMAGE=<your tag> pnpm test test/drm-local-clearkey-chain.test.ts
+  #
+  # The test SKIPS (it does not fail) when the image is not present locally.
+  #
+  # The environment below is the packager IMAGE's own container env surface, not the catalog
+  # service's instance-config field list. Those two are spelled differently for the same image
+  # — the instance config exposes `OutputFolder`, the container reads `PACKAGE_OUTPUT_FOLDER` —
+  # so running the image locally has to follow the source, not the service form. Verified in
+  # Eyevinn/encore-packager `src/config.ts` (`readPackagingConfig()`):
+  #   - `PACKAGE_OUTPUT_FOLDER`   src/config.ts:159 `normalizeOutputFolder(process.env.PACKAGE_OUTPUT_FOLDER)`;
+  #                              unset falls back to `DEFAULT_OUTPUT_FOLDER = 'packaged'` (:51),
+  #                              resolved as a LOCAL directory (:89-96) — i.e. with the wrong
+  #                              name set, nothing reaches the bucket at all.
+  #   - `OUTPUT_SUBFOLDER_TEMPLATE` src/config.ts:161, default `$INPUTNAME$/$JOBID$` (:50), so the
+  #                              objects land job-nested UNDER the output folder; `$INPUTNAME$`
+  #                              / `$JOBID$` / `$EXTERNALID$` are resolved from the ENCORE job
+  #                              (`resolveTemplate`, src/encorePackager.ts:198-207), not from the
+  #                              queue envelope's `jobId`.
+  #   - `REDIS_URL`, `REDIS_QUEUE` src/config.ts:100-101
+  #   - `S3_ENDPOINT_URL`          src/config.ts:172
+  #   - `CALLBACK_URL`             src/config.ts:108
+  #   - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` — read by the S3 client, documented in the
+  #                              packager README env table ("Optional AWS access key id when
+  #                              `PACKAGE_OUTPUT_FOLDER` is an AWS S3 bucket").
+  # The queue key and bucket are the product's own defaults: `encore-packager:jobs`
+  # (`packagerQueueKey()`, src/pipeline/osc-packager-queue.ts:33) and `openvideocore-packaged`
+  # (`DEFAULT_PACKAGED_BUCKET`, src/pipeline/packaging.ts:89). Every credential and endpoint is
+  # an override carrying the same dev default the `minio` service above already uses — no
+  # credential is baked in.
+  packager-encrypting:
+    profiles: ["local-drm"]
+    image: ${LOCAL_DRM_PACKAGER_IMAGE:-open-videocore-local/encore-packager-encryption:dev}
+    pull_policy: never
+    depends_on:
+      - minio
+      - valkey
+    environment:
+      REDIS_URL: ${LOCAL_DRM_REDIS_URL:-redis://valkey:6379}
+      REDIS_QUEUE: ${PACKAGER_QUEUE_KEY:-encore-packager:jobs}
+      # Base output folder. The trailing slash is required by the packager's URI concatenation
+      # (`new URL(outputFolder + subfolder)`, src/encorePackager.ts:167-177); `normalizeOutputFolder`
+      # (src/config.ts:89-96) adds it when missing.
+      PACKAGE_OUTPUT_FOLDER: s3://${LOCAL_DRM_PACKAGED_BUCKET:-openvideocore-packaged}/
+      # Pinned, not inherited: the packaged objects land under
+      # `<PACKAGE_OUTPUT_FOLDER>/<INPUTNAME>/<ENCORE_JOB_ID>/`, so the local layout stays the
+      # same even if a future image changes its own default. This is the image's default value
+      # today (`DEFAULT_OUTPUT_SUBFOLDER_TEMPLATE`, src/config.ts:50). NOTE: the tokens are
+      # resolved from the ENCORE job (`resolveTemplate`, src/encorePackager.ts:198-207) — the
+      # product's `jobId`/asset id is not among them, so the packaged prefix is NOT
+      # `packaged/<assetId>/` and has to be resolved from the callback's `outputPath` or by
+      # listing the bucket (see `packagedOutputFromCallback`, src/pipeline/packaging.ts:2033-2061).
+      # `$$` is compose's escape for a literal `$`, so the container receives
+      # `$INPUTNAME$/$JOBID$` and compose does not try to interpolate shell variables here.
+      OUTPUT_SUBFOLDER_TEMPLATE: $$INPUTNAME$$/$$JOBID$$
+      AWS_ACCESS_KEY_ID: ${LOCAL_DRM_S3_ACCESS_KEY:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${LOCAL_DRM_S3_SECRET_KEY:-minioadmin}
+      S3_ENDPOINT_URL: ${LOCAL_DRM_S3_ENDPOINT:-http://minio:9000}
+      # Where the packager reports completion. Empty by default: the local chain test polls the
+      # packaged bucket and only asserts the callback when it is given a listener URL.
+      CALLBACK_URL: ${LOCAL_DRM_CALLBACK_URL:-}
+
 volumes:
   couchdb-data:
   minio-data:
