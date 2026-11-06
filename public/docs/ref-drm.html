@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DRM · open-videocore docs</title>
+<meta name="description" content="Per-stack content-encryption configuration: the key server coordinates packaging and delivery use, and a dry-run that checks them without touching an asset. Credential values live in the environment and are never returned — only their presence is reported.">
+<link rel="canonical" href="https://videocore.pages.osaas.io/ref-drm.html">
+<link rel="icon" href="data:,">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="open-videocore documentation">
+<meta property="og:title" content="DRM">
+<meta property="og:description" content="Per-stack content-encryption configuration: the key server coordinates packaging and delivery use, and a dry-run that checks them without touching an asset. Credential values live in the environment and are never returned — only their presence is reported.">
+<meta property="og:url" content="https://videocore.pages.osaas.io/ref-drm.html">
+<meta property="og:image" content="https://videocore.pages.osaas.io/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="open-videocore — API-first media asset management on Open Source Cloud">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="DRM">
+<meta name="twitter:description" content="Per-stack content-encryption configuration: the key server coordinates packaging and delivery use, and a dry-run that checks them without touching an asset. Credential values live in the environment and are never returned — only their presence is reported.">
+<meta name="twitter:image" content="https://videocore.pages.osaas.io/og-image.png">
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage","name":"DRM","description":"Per-stack content-encryption configuration: the key server coordinates packaging and delivery use, and a dry-run that checks them without touching an asset. Credential values live in the environment and are never returned — only their presence is reported.","url":"https://videocore.pages.osaas.io/ref-drm.html","isPartOf":{"@type":"WebSite","name":"open-videocore documentation","url":"https://videocore.pages.osaas.io/"},"breadcrumb":{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Docs","item":"https://videocore.pages.osaas.io/docs.html"},{"@type":"ListItem","position":2,"name":"DRM","item":"https://videocore.pages.osaas.io/ref-drm.html"}]}}</script>
+<style>
+:root{
+  --bg:#ffffff; --bg-side:#f6f7f9; --bg-code:#1e2530; --text:#1c2128; --text-dim:#5b6572;
+  --border:#e3e6ea; --accent:#1e3a8a; --accent-soft:#eef1fb;
+  --get:#2563eb; --post:#16a34a; --put:#d97706; --patch:#7c3aed; --delete:#dc2626;
+  --code-text:#d6e0ff;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+  color:var(--text); background:var(--bg); font-size:15px; line-height:1.6;
+}
+a{color:var(--accent); text-decoration:none}
+a:hover{text-decoration:underline}
+code, pre{font-family:"SF Mono",Menlo,Consolas,monospace; font-size:13px}
+code{background:var(--accent-soft); padding:1px 5px; border-radius:4px; color:#1e3a8a}
+.layout{display:flex; min-height:100vh}
+.sidebar{
+  width:290px; flex:0 0 290px; background:var(--bg-side); border-right:1px solid var(--border);
+  height:100vh; position:sticky; top:0; overflow-y:auto; padding:0 0 40px;
+}
+.brand{padding:22px 20px 14px; border-bottom:1px solid var(--border); display:block}
+.brand .logo{font-size:19px; font-weight:700; letter-spacing:-0.01em; color:var(--text)}
+.brand .logo span{color:var(--accent)}
+.brand .version{font-size:12px; color:var(--text-dim); margin-top:2px}
+.search-box{padding:12px 16px}
+.search-box input{width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:6px; font-size:13px; background:#fff}
+.nav-top{padding:10px 8px 4px}
+.nav-top-link{display:block; padding:7px 12px; border-radius:6px; font-size:13.5px; color:var(--text); font-weight:600}
+.nav-top-link:hover{background:var(--accent-soft); text-decoration:none}
+.nav-top-link.active{background:var(--accent); color:#fff}
+.nav-section-label{padding:16px 16px 4px; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.06em; color:var(--text-dim); border-top:1px solid var(--border); margin-top:8px}
+.nav-guides{padding:2px 8px 6px}
+.nav-guide-link{display:block; padding:6px 12px; border-radius:6px; font-size:13px; color:var(--text)}
+.nav-guide-link:hover{background:var(--accent-soft); text-decoration:none}
+.nav-guide-link.active{background:var(--accent-soft); font-weight:700; color:var(--accent)}
+.nav-group{}
+.nav-group-title{width:100%; display:flex; justify-content:space-between; align-items:center; text-align:left; background:none; border:none; padding:8px 16px; font-size:12.5px; font-weight:700; color:var(--text)}
+.nav-group-title:hover{background:var(--accent-soft); text-decoration:none}
+.nav-group-title.active{color:var(--accent)}
+.group-title-right{display:flex; align-items:center; gap:6px}
+.nav-group-title .count{font-weight:500; background:var(--border); color:var(--text-dim); border-radius:10px; font-size:11px; padding:0 7px}
+.chevron{background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:11px;padding:2px 4px}
+.nav-group-items{display:flex; flex-direction:column; padding:0 8px 6px}
+.nav-group-items.collapsed{display:none}
+.nav-endpoint{display:flex; align-items:center; gap:8px; padding:4px 8px; border-radius:5px; font-size:12px; color:var(--text); white-space:nowrap; overflow:hidden}
+.nav-endpoint:hover{background:var(--accent-soft); text-decoration:none}
+.nav-endpoint.hl{background:var(--accent-soft); font-weight:600}
+.nav-path{overflow:hidden; text-overflow:ellipsis; font-family:"SF Mono",Menlo,Consolas,monospace; font-size:11px; color:var(--text-dim)}
+.badge{display:inline-block; font-size:10px; font-weight:700; padding:2px 6px; border-radius:4px; color:#fff; min-width:42px; text-align:center; letter-spacing:.02em; flex:0 0 auto}
+.badge-GET{background:var(--get)} .badge-POST{background:var(--post)} .badge-PUT{background:var(--put)} .badge-PATCH{background:var(--patch)} .badge-DELETE{background:var(--delete)}
+.main{flex:1; min-width:0; padding:48px 56px 120px; max-width:860px}
+.main h1{font-size:30px; margin:0 0 6px}
+.main h2{font-size:21px; margin-top:38px; padding-bottom:8px; border-bottom:1px solid var(--border); scroll-margin-top:20px}
+.main h3{font-size:16px}
+.lede{color:var(--text-dim); font-size:16.5px; margin-top:0}
+.hero-links{margin:18px 0 40px; display:flex; gap:10px; flex-wrap:wrap}
+.hero-links a{border:1px solid var(--border); padding:7px 14px; border-radius:7px; font-size:13.5px; font-weight:600; color:var(--text)}
+.hero-links a:hover{background:var(--accent-soft); text-decoration:none; border-color:var(--accent)}
+.crumb{font-size:12.5px; color:var(--text-dim); margin-bottom:6px}
+.crumb a{color:var(--text-dim)}
+.group-blurb{color:var(--text-dim); margin-top:-6px}
+.card-grid{display:grid; grid-template-columns:repeat(auto-fill, minmax(230px,1fr)); gap:14px; margin:20px 0}
+.card{border:1px solid var(--border); border-radius:10px; padding:16px 18px; display:block; color:var(--text)}
+.card:hover{border-color:var(--accent); background:var(--accent-soft); text-decoration:none}
+.card .card-title{font-weight:700; font-size:14.5px; display:flex; align-items:center; justify-content:space-between}
+.card .card-count{font-size:11px; color:var(--text-dim); background:var(--border); border-radius:10px; padding:0 7px}
+.card .card-desc{color:var(--text-dim); font-size:13px; margin-top:6px}
+.steps{counter-reset:step; list-style:none; padding:0; margin:0}
+.steps > li{counter-increment:step; position:relative; padding:0 0 28px 40px; border-left:2px solid var(--border); margin-left:14px}
+.steps > li:last-child{border-color:transparent; padding-bottom:0}
+.steps > li::before{content:counter(step); position:absolute; left:-15px; top:0; width:28px; height:28px; background:var(--accent); color:#fff; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:700}
+.steps h3{margin:0 0 6px}
+.steps p{margin:6px 0}
+.code-block{margin:12px 0; border-radius:8px; overflow:hidden; border:1px solid #2a3242}
+.code-label{background:#161b24; color:#8b96a8; font-size:11px; padding:6px 12px; font-family:"SF Mono",Menlo,Consolas,monospace; letter-spacing:.02em; text-transform:uppercase}
+.code-block pre{margin:0; background:var(--bg-code); color:var(--code-text); padding:14px; overflow-x:auto}
+.code-block code{background:none; color:inherit; padding:0}
+table.params, table.env, table.model{width:100%; border-collapse:collapse; margin:10px 0 18px; font-size:13.5px}
+table.params th, table.params td, table.env th, table.env td, table.model th, table.model td{text-align:left; padding:7px 10px; border-bottom:1px solid var(--border); vertical-align:top}
+table.params th, table.env th, table.model th{color:var(--text-dim); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.03em}
+.tag-path{color:#7c3aed; font-weight:600} .tag-query{color:#2563eb; font-weight:600} .tag-header{color:#d97706; font-weight:600}
+.endpoint{border:1px solid var(--border); border-radius:10px; padding:20px 22px; margin-bottom:22px; scroll-margin-top:24px}
+.endpoint h3{margin:0 0 8px; font-size:16px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; border:none; padding:0}
+.endpoint h3 .path{background:none; padding:0; color:var(--text); font-size:14.5px}
+.endpoint-desc{color:var(--text-dim); margin:0 0 4px}
+.endpoint h4{font-size:12.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--text-dim); margin:18px 0 6px; border:none}
+.endpoint-detail{margin:8px 0 4px; font-size:14px}
+.endpoint-detail p{margin:0 0 8px}
+.prose-steps{margin:0 0 8px; padding-left:20px; font-size:14px}
+.prose-steps li{margin-bottom:4px}
+.field-notes{background:var(--bg-side); border-radius:8px; padding:10px 14px; margin:8px 0 4px; font-size:13px}
+.field-notes ul{margin:6px 0 0; padding-left:18px}
+.field-notes li{margin-bottom:4px}
+.callout{background:var(--accent-soft); border-left:3px solid var(--accent); padding:12px 16px; border-radius:0 8px 8px 0; margin:14px 0; font-size:14px}
+.callout.warn{background:#fff7ed; border-left-color:#d97706}
+.entity-card{border:1px solid var(--border); border-radius:10px; padding:18px 20px; margin-bottom:24px; scroll-margin-top:24px}
+.entity-card h3{margin-top:0}
+.rel-diagram{font-family:"SF Mono",Menlo,Consolas,monospace; font-size:12.5px; background:var(--bg-side); border:1px solid var(--border); border-radius:10px; padding:18px; overflow-x:auto; white-space:pre; line-height:1.5; margin:16px 0 28px}
+footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-top:20px; color:var(--text-dim); font-size:13px}
+.pager{display:flex; justify-content:space-between; margin-top:50px; padding-top:20px; border-top:1px solid var(--border)}
+.pager a{border:1px solid var(--border); border-radius:8px; padding:10px 16px; font-size:13.5px; font-weight:600; color:var(--text)}
+.pager a:hover{border-color:var(--accent); background:var(--accent-soft); text-decoration:none}
+.pager .dir{display:block; font-size:11px; color:var(--text-dim); font-weight:500; text-transform:uppercase; letter-spacing:.04em}
+@media (max-width: 900px){ .sidebar{position:static; width:100%; height:auto; flex:none} .layout{flex-direction:column} .main{padding:32px 20px} }
+</style>
+<script defer src="https://umami-eyevinn.users.osaas.io/script.js" data-website-id="41cc05c2-445c-4fd2-a89c-4ec1b183089f"></script>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar">
+    <a class="brand" href="index.html">
+      <div class="logo">open<span>videocore</span></div>
+      <div class="version">Documentation &middot; v1.9.0</div>
+    </a>
+    <div class="search-box"><input type="search" id="nav-search" placeholder="Filter endpoints&hellip;" autocomplete="off"></div>
+    
+    <div class="nav-top"><a href="introduction.html" class="nav-top-link">Introduction</a><a href="data-model.html" class="nav-top-link">Data model</a><a href="installation.html" class="nav-top-link">Installation</a><a href="authentication.html" class="nav-top-link">Authentication &amp; errors</a></div>
+    <div class="nav-section-label">Guides</div>
+    <div class="nav-guides"><a href="guide-ingest.html" class="nav-guide-link">Ingesting media</a><a href="guide-transcode-package.html" class="nav-guide-link">Transcoding &amp; packaging</a><a href="guide-metadata-search.html" class="nav-guide-link">Metadata, tags &amp; search</a><a href="guide-thumbnails-clips-export.html" class="nav-guide-link">Thumbnails, clips &amp; export</a><a href="guide-delivery.html" class="nav-guide-link">Delivery &amp; playback</a><a href="guide-organizing.html" class="nav-guide-link">Organizing: collections &amp; webhooks</a><a href="guide-operating.html" class="nav-guide-link">Operating a workspace</a></div>
+    <div class="nav-section-label">Agentic examples</div>
+    <div class="nav-guides"><a href="agentic-examples.html" class="nav-guide-link">Agentic examples</a></div>
+    <div class="nav-section-label">API reference</div>
+    
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-health.html">
+    <span>Health</span>
+    <span class="group-title-right"><span class="count">2</span><button class="chevron" type="button" data-toggle="group-health" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-health"><a href="ref-health.html#get-health" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/health</span></a><a href="ref-health.html#get-healthz" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/healthz</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-provisioning.html">
+    <span>Provisioning</span>
+    <span class="group-title-right"><span class="count">7</span><button class="chevron" type="button" data-toggle="group-provisioning" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-provisioning"><a href="ref-provisioning.html#get-api-v1-provision" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/provision/</span></a><a href="ref-provisioning.html#post-api-v1-provision" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/provision/</span></a><a href="ref-provisioning.html#get-api-v1-provision-operations" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/provision/operations</span></a><a href="ref-provisioning.html#get-api-v1-provision-operations-id" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/provision/operations/{id}</span></a><a href="ref-provisioning.html#get-api-v1-provision-name" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/provision/{name}</span></a><a href="ref-provisioning.html#delete-api-v1-provision-name" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/provision/{name}</span></a><a href="ref-provisioning.html#get-api-v1-provision-name-reachability" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/provision/{name}/reachability</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-optional-services.html">
+    <span>Optional services</span>
+    <span class="group-title-right"><span class="count">4</span><button class="chevron" type="button" data-toggle="group-optional-services" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-optional-services"><a href="ref-optional-services.html#get-api-v1-optional-services" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/optional-services/</span></a><a href="ref-optional-services.html#get-api-v1-optional-services-key" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/optional-services/{key}</span></a><a href="ref-optional-services.html#delete-api-v1-optional-services-key" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/optional-services/{key}</span></a><a href="ref-optional-services.html#post-api-v1-optional-services-key-provision" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/optional-services/{key}/provision</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-profiles.html">
+    <span>Profiles</span>
+    <span class="group-title-right"><span class="count">10</span><button class="chevron" type="button" data-toggle="group-profiles" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-profiles"><a href="ref-profiles.html#get-api-v1-profiles" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/profiles/</span></a><a href="ref-profiles.html#post-api-v1-profiles" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/profiles/</span></a><a href="ref-profiles.html#post-api-v1-profiles-bootstrap" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/profiles/bootstrap</span></a><a href="ref-profiles.html#get-api-v1-profiles-index.yml" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/profiles/index.yml</span></a><a href="ref-profiles.html#get-api-v1-profiles-stacks-stack-index.yml" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/profiles/stacks/{stack}/index.yml</span></a><a href="ref-profiles.html#get-api-v1-profiles-stacks-stack-name-yaml" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/profiles/stacks/{stack}/{name}/yaml</span></a><a href="ref-profiles.html#get-api-v1-profiles-name" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/profiles/{name}</span></a><a href="ref-profiles.html#put-api-v1-profiles-name" class="nav-endpoint" data-method="PUT"><span class="badge badge-PUT">PUT</span><span class="nav-path">/api/v1/profiles/{name}</span></a><a href="ref-profiles.html#delete-api-v1-profiles-name" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/profiles/{name}</span></a><a href="ref-profiles.html#get-api-v1-profiles-name-yaml" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/profiles/{name}/yaml</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-assets.html">
+    <span>Assets</span>
+    <span class="group-title-right"><span class="count">55</span><button class="chevron" type="button" data-toggle="group-assets" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-assets"><a href="ref-assets.html#get-api-v1-assets" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/</span></a><a href="ref-assets.html#post-api-v1-assets" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/</span></a><a href="ref-assets.html#get-api-v1-assets-by-external-id-namespace-id" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/by-external-id/{namespace}/{id}</span></a><a href="ref-assets.html#get-api-v1-assets-by-tams-address" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/by-tams-address</span></a><a href="ref-assets.html#post-api-v1-assets-ingest-url" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/ingest-url</span></a><a href="ref-assets.html#get-api-v1-assets-search" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/search</span></a><a href="ref-assets.html#get-api-v1-assets-id" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}</span></a><a href="ref-assets.html#patch-api-v1-assets-id" class="nav-endpoint" data-method="PATCH"><span class="badge badge-PATCH">PATCH</span><span class="nav-path">/api/v1/assets/{id}</span></a><a href="ref-assets.html#delete-api-v1-assets-id" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}</span></a><a href="ref-assets.html#post-api-v1-assets-id-audio-tracks" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/audio-tracks</span></a><a href="ref-assets.html#delete-api-v1-assets-id-audio-tracks-trackId" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/audio-tracks/{trackId}</span></a><a href="ref-assets.html#post-api-v1-assets-id-clip" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/clip</span></a><a href="ref-assets.html#get-api-v1-assets-id-comments" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/comments</span></a><a href="ref-assets.html#post-api-v1-assets-id-comments" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/comments</span></a><a href="ref-assets.html#post-api-v1-assets-id-deliver" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/deliver</span></a><a href="ref-assets.html#get-api-v1-assets-id-delivery" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/delivery</span></a><a href="ref-assets.html#get-api-v1-assets-id-drm" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/drm</span></a><a href="ref-assets.html#post-api-v1-assets-id-execute" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/execute</span></a><a href="ref-assets.html#get-api-v1-assets-id-executions" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/executions</span></a><a href="ref-assets.html#get-api-v1-assets-id-executions-execId" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/executions/{execId}</span></a><a href="ref-assets.html#post-api-v1-assets-id-export" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/export</span></a><a href="ref-assets.html#get-api-v1-assets-id-external-ids" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/external-ids</span></a><a href="ref-assets.html#post-api-v1-assets-id-external-ids" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/external-ids</span></a><a href="ref-assets.html#delete-api-v1-assets-id-external-ids-namespace-externalId" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/external-ids/{namespace}/{externalId}</span></a><a href="ref-assets.html#post-api-v1-assets-id-extract-metadata" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/extract-metadata</span></a><a href="ref-assets.html#get-api-v1-assets-id-files" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/files</span></a><a href="ref-assets.html#put-api-v1-assets-id-lock" class="nav-endpoint" data-method="PUT"><span class="badge badge-PUT">PUT</span><span class="nav-path">/api/v1/assets/{id}/lock</span></a><a href="ref-assets.html#delete-api-v1-assets-id-lock" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/lock</span></a><a href="ref-assets.html#put-api-v1-assets-id-metadata" class="nav-endpoint" data-method="PUT"><span class="badge badge-PUT">PUT</span><span class="nav-path">/api/v1/assets/{id}/metadata</span></a><a href="ref-assets.html#post-api-v1-assets-id-multipart-initiate" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/multipart/initiate</span></a><a href="ref-assets.html#delete-api-v1-assets-id-multipart-uploadId" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/multipart/{uploadId}</span></a><a href="ref-assets.html#post-api-v1-assets-id-multipart-uploadId-complete" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/multipart/{uploadId}/complete</span></a><a href="ref-assets.html#get-api-v1-assets-id-multipart-uploadId-part-url" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/multipart/{uploadId}/part-url</span></a><a href="ref-assets.html#post-api-v1-assets-id-package" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/package</span></a><a href="ref-assets.html#get-api-v1-assets-id-pipelines" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/pipelines</span></a><a href="ref-assets.html#delete-api-v1-assets-id-purge" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/purge</span></a><a href="ref-assets.html#post-api-v1-assets-id-restore" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/restore</span></a><a href="ref-assets.html#get-api-v1-assets-id-review-state" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/review-state</span></a><a href="ref-assets.html#post-api-v1-assets-id-review-state" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/review-state</span></a><a href="ref-assets.html#get-api-v1-assets-id-storage-usage" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/storage-usage</span></a><a href="ref-assets.html#get-api-v1-assets-id-stream" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/stream/{*}</span></a><a href="ref-assets.html#post-api-v1-assets-id-subtitle-tracks" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/subtitle-tracks</span></a><a href="ref-assets.html#delete-api-v1-assets-id-subtitle-tracks-trackId" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/subtitle-tracks/{trackId}</span></a><a href="ref-assets.html#post-api-v1-assets-id-tags" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/tags</span></a><a href="ref-assets.html#delete-api-v1-assets-id-tags-tag" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/tags/{tag}</span></a><a href="ref-assets.html#get-api-v1-assets-id-thumbnails" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/thumbnails</span></a><a href="ref-assets.html#post-api-v1-assets-id-thumbnails" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/thumbnails</span></a><a href="ref-assets.html#get-api-v1-assets-id-thumbnails-index" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/thumbnails/{index}</span></a><a href="ref-assets.html#get-api-v1-assets-id-thumbnails-index-url" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/thumbnails/{index}/url</span></a><a href="ref-assets.html#get-api-v1-assets-id-tracks" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/tracks</span></a><a href="ref-assets.html#post-api-v1-assets-id-transcode" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/transcode</span></a><a href="ref-assets.html#put-api-v1-assets-id-upload" class="nav-endpoint" data-method="PUT"><span class="badge badge-PUT">PUT</span><span class="nav-path">/api/v1/assets/{id}/upload</span></a><a href="ref-assets.html#post-api-v1-assets-id-upload-complete" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/upload-complete</span></a><a href="ref-assets.html#post-api-v1-assets-id-upload-url" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/upload-url</span></a><a href="ref-assets.html#get-api-v1-assets-id-versions" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/versions</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-jobs.html">
+    <span>Jobs</span>
+    <span class="group-title-right"><span class="count">3</span><button class="chevron" type="button" data-toggle="group-jobs" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-jobs"><a href="ref-jobs.html#get-api-v1-jobs" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/jobs/</span></a><a href="ref-jobs.html#get-api-v1-jobs-id" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/jobs/{id}</span></a><a href="ref-jobs.html#delete-api-v1-jobs-id" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/jobs/{id}</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-pipelines.html">
+    <span>Pipelines</span>
+    <span class="group-title-right"><span class="count">3</span><button class="chevron" type="button" data-toggle="group-pipelines" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-pipelines"><a href="ref-pipelines.html#get-api-v1-pipelines" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/pipelines/</span></a><a href="ref-pipelines.html#get-api-v1-pipelines-executionId" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/pipelines/{executionId}</span></a><a href="ref-pipelines.html#delete-api-v1-pipelines-executionId" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/pipelines/{executionId}</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-encore.html">
+    <span>Transcoder jobs</span>
+    <span class="group-title-right"><span class="count">2</span><button class="chevron" type="button" data-toggle="group-encore" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-encore"><a href="ref-encore.html#post-api-v1-encore-encoreJobs" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/encore/encoreJobs</span></a><a href="ref-encore.html#get-api-v1-encore-encoreJobs-id" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/encore/encoreJobs/{id}</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-scaler.html">
+    <span>Auto-scaler</span>
+    <span class="group-title-right"><span class="count">3</span><button class="chevron" type="button" data-toggle="group-scaler" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-scaler"><a href="ref-scaler.html#get-api-v1-scaler-config" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/scaler/config</span></a><a href="ref-scaler.html#patch-api-v1-scaler-config" class="nav-endpoint" data-method="PATCH"><span class="badge badge-PATCH">PATCH</span><span class="nav-path">/api/v1/scaler/config</span></a><a href="ref-scaler.html#get-api-v1-scaler-status" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/scaler/status</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-retention.html">
+    <span>Retention</span>
+    <span class="group-title-right"><span class="count">2</span><button class="chevron" type="button" data-toggle="group-retention" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-retention"><a href="ref-retention.html#get-api-v1-retention-config" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/retention/config</span></a><a href="ref-retention.html#patch-api-v1-retention-config" class="nav-endpoint" data-method="PATCH"><span class="badge badge-PATCH">PATCH</span><span class="nav-path">/api/v1/retention/config</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-logs.html">
+    <span>Logs</span>
+    <span class="group-title-right"><span class="count">1</span><button class="chevron" type="button" data-toggle="group-logs" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-logs"><a href="ref-logs.html#get-api-v1-logs" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/logs/</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-search.html">
+    <span>Search</span>
+    <span class="group-title-right"><span class="count">1</span><button class="chevron" type="button" data-toggle="group-search" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-search"><a href="ref-search.html#get-api-v1-search" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/search/</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-webhooks.html">
+    <span>Webhooks</span>
+    <span class="group-title-right"><span class="count">3</span><button class="chevron" type="button" data-toggle="group-webhooks" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-webhooks"><a href="ref-webhooks.html#get-api-v1-webhooks" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/webhooks/</span></a><a href="ref-webhooks.html#post-api-v1-webhooks" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/webhooks/</span></a><a href="ref-webhooks.html#delete-api-v1-webhooks-id" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/webhooks/{id}</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-collections.html">
+    <span>Collections</span>
+    <span class="group-title-right"><span class="count">9</span><button class="chevron" type="button" data-toggle="group-collections" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-collections"><a href="ref-collections.html#get-api-v1-collections" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/collections/</span></a><a href="ref-collections.html#post-api-v1-collections" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/collections/</span></a><a href="ref-collections.html#get-api-v1-collections-id" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/collections/{id}</span></a><a href="ref-collections.html#patch-api-v1-collections-id" class="nav-endpoint" data-method="PATCH"><span class="badge badge-PATCH">PATCH</span><span class="nav-path">/api/v1/collections/{id}</span></a><a href="ref-collections.html#delete-api-v1-collections-id" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/collections/{id}</span></a><a href="ref-collections.html#put-api-v1-collections-id-assets-assetId" class="nav-endpoint" data-method="PUT"><span class="badge badge-PUT">PUT</span><span class="nav-path">/api/v1/collections/{id}/assets/{assetId}</span></a><a href="ref-collections.html#delete-api-v1-collections-id-assets-assetId" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/collections/{id}/assets/{assetId}</span></a><a href="ref-collections.html#put-api-v1-collections-id-lock" class="nav-endpoint" data-method="PUT"><span class="badge badge-PUT">PUT</span><span class="nav-path">/api/v1/collections/{id}/lock</span></a><a href="ref-collections.html#delete-api-v1-collections-id-lock" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/collections/{id}/lock</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-storage.html">
+    <span>Storage</span>
+    <span class="group-title-right"><span class="count">12</span><button class="chevron" type="button" data-toggle="group-storage" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-storage"><a href="ref-storage.html#get-api-v1-storage-backends" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/storage/backends</span></a><a href="ref-storage.html#post-api-v1-storage-backends" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/storage/backends</span></a><a href="ref-storage.html#get-api-v1-storage-backends-id" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/storage/backends/{id}</span></a><a href="ref-storage.html#patch-api-v1-storage-backends-id" class="nav-endpoint" data-method="PATCH"><span class="badge badge-PATCH">PATCH</span><span class="nav-path">/api/v1/storage/backends/{id}</span></a><a href="ref-storage.html#delete-api-v1-storage-backends-id" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/storage/backends/{id}</span></a><a href="ref-storage.html#post-api-v1-storage-backends-id-test-connection" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/storage/backends/{id}/test-connection</span></a><a href="ref-storage.html#get-api-v1-storage-buckets" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/storage/buckets</span></a><a href="ref-storage.html#post-api-v1-storage-buckets" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/storage/buckets</span></a><a href="ref-storage.html#get-api-v1-storage-buckets-bucket-objects" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/storage/buckets/{bucket}/objects</span></a><a href="ref-storage.html#delete-api-v1-storage-buckets-bucket-objects" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/storage/buckets/{bucket}/objects/{*}</span></a><a href="ref-storage.html#get-api-v1-storage-buckets-bucket-watch-folder" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/storage/buckets/{bucket}/watch-folder</span></a><a href="ref-storage.html#post-api-v1-storage-buckets-bucket-watch-folder-toggle" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/storage/buckets/{bucket}/watch-folder/toggle</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title active" href="ref-drm.html">
+    <span>DRM</span>
+    <span class="group-title-right"><span class="count">3</span><button class="chevron" type="button" data-toggle="group-drm" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items" id="group-drm"><a href="ref-drm.html#get-api-v1-drm-config" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/drm/config</span></a><a href="ref-drm.html#put-api-v1-drm-config" class="nav-endpoint" data-method="PUT"><span class="badge badge-PUT">PUT</span><span class="nav-path">/api/v1/drm/config</span></a><a href="ref-drm.html#post-api-v1-drm-config-test" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/drm/config/test</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-admin.html">
+    <span>Admin</span>
+    <span class="group-title-right"><span class="count">3</span><button class="chevron" type="button" data-toggle="group-admin" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-admin"><a href="ref-admin.html#post-api-v1-admin-watch-folder-start" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/admin/watch-folder/start</span></a><a href="ref-admin.html#get-api-v1-admin-watch-folder-status" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/admin/watch-folder/status</span></a><a href="ref-admin.html#post-api-v1-admin-watch-folder-stop" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/admin/watch-folder/stop</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-internal.html">
+    <span>Internal callbacks</span>
+    <span class="group-title-right"><span class="count">3</span><button class="chevron" type="button" data-toggle="group-internal" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-internal"><a href="ref-internal.html#post-api-v1-internal-encore-callback" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/internal/encore-callback</span></a><a href="ref-internal.html#post-api-v1-internal-packagerCallback-failure" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/internal/packagerCallback/failure</span></a><a href="ref-internal.html#post-api-v1-internal-packagerCallback-success" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/internal/packagerCallback/success</span></a></div>
+</div>
+
+<div class="nav-group">
+  <a class="nav-group-title" href="ref-ui.html">
+    <span>Ops UI</span>
+    <span class="group-title-right"><span class="count">1</span><button class="chevron" type="button" data-toggle="group-ui" aria-label="toggle">&#9662;</button></span>
+  </a>
+  <div class="nav-group-items collapsed" id="group-ui"><a href="ref-ui.html#get-ui" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/ui</span></a></div>
+</div>
+
+
+  </nav>
+  <main class="main">
+    
+    <div class="crumb"><a href="api-reference.html">API reference</a> / DRM</div>
+    <h1>DRM</h1>
+    <p class="lede">Per-stack content-encryption configuration: the key server coordinates packaging and delivery use, and a dry-run that checks them without touching an asset. Credential values live in the environment and are never returned — only their presence is reported.</p>
+    
+<article class="endpoint" id="get-api-v1-drm-config">
+  <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/drm/config</code></h3>
+  <p class="endpoint-desc">Read this stack's non-secret DRM configuration. Credential presence is reported as `configured` / `missing`; a credential value is never returned.</p>
+  <div class="endpoint-detail"><p>Read this stack's non-secret DRM configuration. Credential presence is reported as <code>credentials: &quot;configured&quot; | &quot;missing&quot;</code>; a credential VALUE is never returned (ADR-008 §9).</p></div>
+  
+  
+  <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
+  &quot;enabled&quot;: true,
+  &quot;providerKind&quot;: &quot;cpix&quot;,
+  &quot;providerId&quot;: &quot;string&quot;,
+  &quot;credentials&quot;: &quot;configured&quot;,
+  &quot;label&quot;: &quot;string&quot;,
+  &quot;keyServerUrl&quot;: &quot;string&quot;,
+  &quot;spekeVersion&quot;: &quot;1.0&quot;,
+  &quot;authMode&quot;: &quot;basic&quot;,
+  &quot;scheme&quot;: &quot;cenc&quot;,
+  &quot;systems&quot;: [
+    &quot;string&quot;
+  ],
+  &quot;licenceUrls&quot;: {},
+  &quot;certificateUrls&quot;: {}
+}</code></pre></div>
+  
+</article>
+
+<article class="endpoint" id="put-api-v1-drm-config">
+  <h3><span class="badge badge-PUT">PUT</span> <code class="path">/api/v1/drm/config</code></h3>
+  <p class="endpoint-desc">Set this stack's non-secret DRM configuration. Fields are checked against an allow-list, so a credential-shaped field or a non-`https` key server URL is rejected.</p>
+  <div class="endpoint-detail"><p>Set this stack's non-secret DRM configuration. Fields are validated against an allow-list: any other field — in particular a credential-shaped one — and a non-https <code>keyServerUrl</code> are rejected with <code>400 invalid_field</code>. Credentials are operator environment variables and are never accepted, stored or returned here (ADR-008 §5.2, D5).</p></div>
+  
+  <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
+  &quot;enabled&quot;: true,
+  &quot;providerKind&quot;: &quot;string&quot;,
+  &quot;providerId&quot;: &quot;string&quot;,
+  &quot;label&quot;: &quot;string&quot;,
+  &quot;keyServerUrl&quot;: &quot;string&quot;,
+  &quot;spekeVersion&quot;: &quot;string&quot;,
+  &quot;authMode&quot;: &quot;string&quot;,
+  &quot;scheme&quot;: &quot;string&quot;,
+  &quot;systems&quot;: [
+    &quot;string&quot;
+  ],
+  &quot;licenceUrls&quot;: {},
+  &quot;certificateUrls&quot;: {},
+  &quot;trackGroups&quot;: [
+    &quot;string&quot;
+  ]
+}</code></pre></div>
+  <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
+  &quot;enabled&quot;: true,
+  &quot;providerKind&quot;: &quot;cpix&quot;,
+  &quot;providerId&quot;: &quot;string&quot;,
+  &quot;credentials&quot;: &quot;configured&quot;,
+  &quot;label&quot;: &quot;string&quot;,
+  &quot;keyServerUrl&quot;: &quot;string&quot;,
+  &quot;spekeVersion&quot;: &quot;1.0&quot;,
+  &quot;authMode&quot;: &quot;basic&quot;,
+  &quot;scheme&quot;: &quot;cenc&quot;,
+  &quot;systems&quot;: [
+    &quot;string&quot;
+  ],
+  &quot;licenceUrls&quot;: {},
+  &quot;certificateUrls&quot;: {}
+}</code></pre></div>
+  
+</article>
+
+<article class="endpoint" id="post-api-v1-drm-config-test">
+  <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/drm/config/test</code></h3>
+  <p class="endpoint-desc">Dry-run a key request against the stored DRM coordinates using a throwaway content id that belongs to no asset — reports whether the provider answered and which encryption system ids it supports, without returning key material.</p>
+  <div class="endpoint-detail"><p>Dry-run a key request against this stack's stored DRM coordinates, using a throwaway content id that belongs to no asset. Reports whether the provider answered, which common-encryption system ids it signalled, and how long it took. On failure <code>error</code> carries a machine-readable error code only; no key material, provider message or credential is ever returned (ADR-008 §9, §10).</p></div>
+  
+  
+  <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
+  &quot;ok&quot;: true,
+  &quot;systems&quot;: [
+    &quot;string&quot;
+  ],
+  &quot;latencyMs&quot;: 0,
+  &quot;error&quot;: &quot;drm_unsupported&quot;
+}</code></pre></div>
+  
+</article>
+
+    
+    <div class="pager"><a href="ref-storage.html"><span class="dir">&larr; Previous</span>Storage</a><a href="ref-admin.html" style="text-align:right"><span class="dir">Next &rarr;</span>Admin</a></div>
+    <footer class="doc-footer">The API reference is generated from <code>openapi.json</code>, committed in the open-videocore repository. Interactive, always-current reference docs are also served at <code>/api-docs</code> on any running instance.</footer>
+  </main>
+</div>
+<script>
+document.querySelectorAll('.chevron').forEach(function(btn){
+  btn.addEventListener('click', function(e){
+    e.preventDefault();
+    var target = document.getElementById(btn.dataset.toggle);
+    target.classList.toggle('collapsed');
+  });
+});
+var searchInput = document.getElementById('nav-search');
+if (searchInput) {
+  searchInput.addEventListener('input', function(){
+    var q = searchInput.value.trim().toLowerCase();
+    document.querySelectorAll('.nav-group').forEach(function(group){
+      var anyVisible = false;
+      group.querySelectorAll('.nav-endpoint').forEach(function(a){
+        var match = !q || a.textContent.toLowerCase().indexOf(q) !== -1;
+        a.style.display = match ? '' : 'none';
+        if (match) anyVisible = true;
+      });
+      var items = group.querySelector('.nav-group-items');
+      if (q) items.classList.remove('collapsed');
+      group.style.display = (q && !anyVisible) ? 'none' : '';
+    });
+  });
+}
+var navLinks = document.querySelectorAll('.nav-endpoint');
+var sections = Array.prototype.slice.call(document.querySelectorAll('.endpoint'));
+if (sections.length) {
+  window.addEventListener('scroll', function(){
+    var y = window.scrollY + 80;
+    var current = null;
+    sections.forEach(function(s){ if (s.offsetTop <= y) current = s; });
+    navLinks.forEach(function(a){ a.classList.remove('hl'); });
+    if (current) {
+      var link = document.querySelector('.nav-endpoint[href$="#' + current.id + '"]');
+      if (link) link.classList.add('hl');
+    }
+  }, {passive:true});
+}
+</script>
+</body>
+</html>
