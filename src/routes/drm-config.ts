@@ -89,7 +89,7 @@ import {
   type DrmStackConfig
 } from '../drm/drm-config.js';
 import { CpixProvider } from '../drm/cpix-provider.js';
-import { ClearKeyDevProvider } from '../drm/clearkey-dev-provider.js';
+import { ClearKeyDevProvider, ClearKeyDevNotAllowedError } from '../drm/clearkey-dev-provider.js';
 import { isKeyProviderError } from '../drm/key-provider-error.js';
 import { resolveDrmSystemIds } from '../drm/key-provider.js';
 import type {
@@ -317,8 +317,17 @@ export function defaultKeyProviderFactory(config: DrmStackConfig): KeyProvider {
 // classified it (src/drm/key-provider-error.ts), else the unreachable class.
 // The thrown MESSAGE is never read, so no provider text, credential or key byte
 // can reach the response or a log line (ADR-008 §10).
+//
+// `ClearKeyDevNotAllowedError` is the one case that needs naming: it extends
+// `Error`, not `KeyProviderError` (clearkey-dev-provider.ts), so the fallback
+// would report it as `key_provider_unreachable` — while nothing was ever
+// reached. A stack configured for the development-only provider in a
+// production process is a CONFIGURATION fault, which is what the dry-run
+// should tell the operator.
 function testErrorCode(err: unknown): DrmErrorCode {
-  return isKeyProviderError(err) ? err.errorCode : 'key_provider_unreachable';
+  if (isKeyProviderError(err)) return err.errorCode;
+  if (err instanceof ClearKeyDevNotAllowedError) return 'drm_not_configured';
+  return 'key_provider_unreachable';
 }
 
 export const drmConfigRouter: FastifyPluginAsync<DrmConfigRouterOptions> = async (

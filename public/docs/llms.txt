@@ -41,9 +41,10 @@
 - [Webhooks](https://videocore.pages.osaas.io/ref-webhooks.html): HTTP event notification registrations.
 - [Collections](https://videocore.pages.osaas.io/ref-collections.html): Named groups for organising assets.
 - [Storage](https://videocore.pages.osaas.io/ref-storage.html): Object storage bucket and watch-folder management.
+- [DRM](https://videocore.pages.osaas.io/ref-drm.html): Per-stack content-encryption configuration: the key server coordinates packaging and delivery use, and a dry-run that checks them without touching an asset. Credential values live in the environment and are never returned — only their presence is reported.
 - [Admin](https://videocore.pages.osaas.io/ref-admin.html): Watch-folder poller control.
 - [Internal callbacks](https://videocore.pages.osaas.io/ref-internal.html): Called by the transcoder and packager services — not for direct client use.
 - [Ops UI](https://videocore.pages.osaas.io/ref-ui.html): Built-in browser dashboard.
-- [API reference](https://videocore.pages.osaas.io/api-reference.html): Every open-videocore REST API endpoint (124 across 18 resource groups), generated straight from the committed openapi.json.
+- [API reference](https://videocore.pages.osaas.io/api-reference.html): Every open-videocore REST API endpoint (127 across 19 resource groups), generated straight from the committed openapi.json.
 
 [Full text of every page](https://videocore.pages.osaas.io/llms-full.txt)

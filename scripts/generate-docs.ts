@@ -102,6 +102,7 @@ const GROUP_RULES: [string, string[]][] = [
   ['webhooks', ['/api/v1/webhooks']],
   ['collections', ['/api/v1/collections']],
   ['storage', ['/api/v1/storage']],
+  ['drm', ['/api/v1/drm']],
   ['admin', ['/api/v1/admin']],
   ['internal', ['/api/v1/internal']],
   ['ui', ['/ui']]
@@ -132,6 +133,10 @@ const GROUP_META: Record<string, [string, string]> = {
   webhooks: ['Webhooks', 'HTTP event notification registrations.'],
   collections: ['Collections', 'Named groups for organising assets.'],
   storage: ['Storage', 'Object storage bucket and watch-folder management.'],
+  drm: [
+    'DRM',
+    "Per-stack content-encryption configuration: the key server coordinates packaging and delivery use, and a dry-run that checks them without touching an asset. Credential values live in the environment and are never returned — only their presence is reported."
+  ],
   admin: ['Admin', 'Watch-folder poller control.'],
   internal: [
     'Internal callbacks',
@@ -267,6 +272,12 @@ const DESCRIPTIONS: Record<string, string> = {
   'POST /api/v1/storage/buckets/{bucket}/watch-folder/toggle': 'Toggle watch-folder ingest for a bucket.',
   'GET /api/v1/storage/buckets/{bucket}/objects': 'List objects in a bucket.',
   'DELETE /api/v1/storage/buckets/{bucket}/objects/{*}': 'Delete an object from a bucket.',
+  'GET /api/v1/drm/config':
+    "Read this stack's non-secret DRM configuration. Credential presence is reported as `configured` / `missing`; a credential value is never returned.",
+  'PUT /api/v1/drm/config':
+    "Set this stack's non-secret DRM configuration. Fields are checked against an allow-list, so a credential-shaped field or a non-`https` key server URL is rejected.",
+  'POST /api/v1/drm/config/test':
+    'Dry-run a key request against the stored DRM coordinates using a throwaway content id that belongs to no asset — reports whether the provider answered and which encryption system ids it supports, without returning key material.',
   'GET /ui': 'Built-in ops dashboard for managing assets, jobs, profiles, and buckets.'
 };
 
@@ -354,6 +365,24 @@ for (const eps of groups.values()) {
     if (a[1] !== b[1]) return a[1] < b[1] ? -1 : 1;
     return (METHOD_ORDER[a[0]] ?? 9) - (METHOD_ORDER[b[0]] ?? 9);
   });
+}
+
+// An operation whose path matches no GROUP_RULES prefix lands in `other`, and
+// `other` is not in `groupOrder` — so it is silently dropped from the site even
+// though it IS in openapi.json. Shout about it on stderr: a missing group rule
+// is a docs bug, not a spec bug. Deliberately NOT a hard failure — some known
+// groups are still unrouted here, and the docs build must stay runnable while
+// they are addressed one at a time.
+const ungrouped = groups.get('other') ?? [];
+if (ungrouped.length > 0) {
+  console.warn(
+    `\n!! WARNING: ${ungrouped.length} operation(s) in openapi.json match no GROUP_RULES prefix,\n` +
+      `!! so they are NOT rendered on any page of the generated docs site:`
+  );
+  for (const [method, path] of ungrouped) console.warn(`!!   ${method} ${path}`);
+  console.warn(
+    `!! Fix by adding a GROUP_RULES prefix + GROUP_META entry for each (scripts/generate-docs.ts).\n`
+  );
 }
 
 // True when a JSON Schema accepts no value at all (`{ "not": {} }` — what a

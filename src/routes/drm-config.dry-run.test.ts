@@ -42,6 +42,7 @@ import {
   type KeyRequest
 } from '../drm/key-provider.js';
 import { ENV_PASSWORD, ENV_USERNAME } from '../drm/cpix-provider.js';
+import { ClearKeyDevNotAllowedError } from '../drm/clearkey-dev-provider.js';
 import { DRM_ERROR_CODES } from '../types/drm.js';
 import type { ParamStore, StackConfig } from '../services/param-store.js';
 
@@ -300,6 +301,27 @@ describe('POST /api/v1/drm/config/test', () => {
       error: 'drm_not_configured'
     });
     expect(factory).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a development-only provider refusing to start as 'drm_not_configured'", async () => {
+    // `ClearKeyDevNotAllowedError` (src/drm/clearkey-dev-provider.ts) extends
+    // `Error`, not `KeyProviderError`, so the unreachable fallback would claim
+    // the key server could not be reached — when no request was ever sent. The
+    // stack is simply configured for a provider this process refuses to run.
+    const factory = vi.fn(() => {
+      throw new ClearKeyDevNotAllowedError();
+    });
+    const { app } = await wire(factory as unknown as DrmKeyProviderFactory);
+
+    const res = await app.inject({ method: 'POST', url: URL_UNDER_TEST });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({
+      ok: false,
+      systems: [],
+      error: 'drm_not_configured'
+    });
+    // The thrown message is never echoed (ADR-008 §10).
+    expect(res.payload).not.toContain('NODE_ENV');
   });
 
   it('reports ok for a provider that signals only the system it speaks for', async () => {
