@@ -220,7 +220,12 @@ const DESCRIPTIONS: Record<string, string> = {
   'POST /api/v1/assets/{id}/review-state':
     "Transition an asset's editorial review state (draft / in-review / approved / rejected).",
   'POST /api/v1/assets/{id}/restore': "Restore a soft-deleted asset within its retention window.",
-  'GET /api/v1/jobs/': 'List background jobs.',
+  'GET /api/v1/jobs/':
+    'List background jobs, newest first. `limit` and `offset` cut each page out ' +
+    'of that one creation-time order, so page 2 is strictly older than page 1 ' +
+    'and walking the pages of an unchanging list visits every job exactly once. ' +
+    '`total` is a count of matching jobs, counted up to 10,000 — a deployment ' +
+    'holding more jobs than that reports `10000`, not the true number.',
   'DELETE /api/v1/jobs/{id}': 'Cancel or delete a job.',
   'GET /api/v1/jobs/{id}': 'Get a job.',
   'GET /api/v1/pipelines/': 'List pipeline executions across all assets.',

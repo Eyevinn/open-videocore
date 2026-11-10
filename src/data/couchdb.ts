@@ -43,10 +43,28 @@ export type MangoIndexDef = {
 // on the instance or every request would re-POST `_index`.
 const ensuredIndexes = new Set<string>();
 
-// Test seam: forget the ensured-index memo so each test starts from a cold
-// process. Not used by production code.
+// Per-process memo of index declarations that FAILED, keyed the same way, with
+// the failure and when it happened.
+//
+// Why memoise a failure at all (#1346 review finding 1): the index declaration
+// can be attempted from a read path, and on a database whose runtime credential
+// may not write design documents it fails every time. Without a memo that is a
+// fresh `POST _index` on EVERY request, which is a write attempt per read that
+// can never succeed. Why memoise it only for a COOLDOWN rather than for the
+// process lifetime: the failure may be transient (CouchDB still starting, a
+// node briefly unavailable), and a permanently-disabled declaration would leave
+// such a deployment on the degraded read path until it is restarted. One
+// attempt per cooldown is bounded and still self-healing.
+const failedIndexAttempts = new Map<string, { err: unknown; at: number }>();
+
+// How long a failed index declaration suppresses the next attempt.
+const INDEX_RETRY_COOLDOWN_MS = 10 * 60_000;
+
+// Test seam: forget the ensured-index memos (successes and failures) so each
+// test starts from a cold process. Not used by production code.
 export function resetEnsuredIndexesForTest(): void {
   ensuredIndexes.clear();
+  failedIndexAttempts.clear();
 }
 
 // CouchDB access for a single stack's database. OSC provisions a dedicated
@@ -135,20 +153,41 @@ export class StackCouch {
   //
   // POST `_index` is idempotent for a given ddoc + name + fields: CouchDB
   // answers `{ result: 'exists' }` instead of rebuilding (nano.d.ts:1824
-  // `interface CreateIndexResponse { result: string }`, "created" or "exists"),
-  // so calling this on a read path is safe. The memo keeps it to one request per
-  // process per index; a failure is NOT memoised, so the next call retries.
+  // `interface CreateIndexResponse { result: string }`, "created" or "exists").
+  //
+  // The index for a provisioned stack is created at PROVISION time with the
+  // admin credential (src/routes/provision.ts, step 2c), so on a stack
+  // provisioned by this version this call finds the index already there. It
+  // remains available as a best-effort declaration for a stack provisioned
+  // before that step existed.
+  //
+  // Attempt bounding (#1346 review finding 1): a success is memoised for the
+  // process, and so is a FAILURE — for INDEX_RETRY_COOLDOWN_MS — so a database
+  // this credential cannot write design documents to costs at most one `POST
+  // _index` per cooldown instead of one per caller. Inside the cooldown the
+  // remembered error is re-thrown without a request, so the caller's own
+  // error handling is unchanged.
   async ensureIndex(def: MangoIndexDef): Promise<void> {
     const key = `${this.dbName}|${def.ddoc}|${def.name}`;
     if (ensuredIndexes.has(key)) {
       return;
     }
-    await this.db.createIndex({
-      index: { fields: def.fields },
-      ddoc: def.ddoc,
-      name: def.name,
-      type: 'json'
-    });
+    const failed = failedIndexAttempts.get(key);
+    if (failed && Date.now() - failed.at < INDEX_RETRY_COOLDOWN_MS) {
+      throw failed.err;
+    }
+    try {
+      await this.db.createIndex({
+        index: { fields: def.fields },
+        ddoc: def.ddoc,
+        name: def.name,
+        type: 'json'
+      });
+    } catch (err) {
+      failedIndexAttempts.set(key, { err, at: Date.now() });
+      throw err;
+    }
+    failedIndexAttempts.delete(key);
     ensuredIndexes.add(key);
   }
 
@@ -170,7 +209,10 @@ export class StackCouch {
   }
 }
 
-const COUNT_CAP = 10_000;
+// Most documents `count` will match. A selector matching more than this reports
+// COUNT_CAP, not the true total — `count` is a CAPPED count, not an exact one.
+// Exported so callers can describe their own `total` honestly (#1346).
+export const COUNT_CAP = 10_000;
 
 function isNotFound(err: unknown): boolean {
   return (
@@ -207,6 +249,53 @@ export function isUpdateConflict(err: unknown): boolean {
     e.status === 409 ||
     e.error === 'conflict' ||
     e.reason === 'Document update conflict.'
+  );
+}
+
+// "This sorted query has no usable index" — the ONLY `_find` failure a caller
+// may answer by reading the documents itself instead (#1346 review finding 1).
+//
+// Contract (apache/couchdb `src/mango/src/mango_error.erl`, fetched
+// 2026-11-10):
+//   - `info(mango_idx, {no_usable_index, missing_sort_index*})` -> HTTP 400,
+//     error `no_usable_index`, reason "No index exists for this sort, try
+//     indexing by the sort fields." (lines 21-44) — a `sort` with no covering
+//     index.
+//   - `info(mango_cursor, {invalid_index, [DDocName(, ViewName)]})` -> HTTP 400,
+//     error `invalid_index`, reason "_design/<ddoc>(, <name>) specified by
+//     `use_index` could not be found or it is not suitable." (lines 51-72) — the
+//     named index is absent or cannot serve this sort.
+//
+// Both mean exactly "the index this query needs is not in place", which a
+// bounded client-side scan CAN answer in the same order. Every other failure —
+// 401/403 (credential), 409, a 5xx, a transport error — means the query itself
+// did not get an answer, so it must propagate instead of being disguised as a
+// successful, silently degraded page.
+export function isMissingUsableIndex(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) {
+    return false;
+  }
+  const e = err as {
+    statusCode?: number;
+    status?: number;
+    error?: string;
+    reason?: string;
+  };
+  const status = e.statusCode ?? e.status;
+  // Keyed on the stable error identifier (as isUpdateConflict keys on 409 /
+  // 'conflict'); when a status IS present it must be the documented 400, so a
+  // 500 that happens to carry the same identifier is not treated as benign.
+  const identified = e.error === 'no_usable_index' || e.error === 'invalid_index';
+  if (identified) {
+    return status === undefined || status === 400;
+  }
+  // nano surfaces some errors with only the reason string filled in; match the
+  // two documented reasons above rather than any 400.
+  const reason = e.reason ?? '';
+  return (
+    status === 400 &&
+    (reason.startsWith('No index exists for this sort') ||
+      reason.includes('specified by `use_index` could not be found'))
   );
 }
 

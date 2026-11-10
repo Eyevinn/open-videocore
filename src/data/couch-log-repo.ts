@@ -114,6 +114,15 @@ const LIST_MAX_PAGES = 5;
 // per-stack index-bootstrap path — neither of which exists. The forward walk
 // above removes the cap from the correctness path without either. Logged as a
 // follow-up rather than smuggled in here.
+//
+// Update (#1337 / #1346 review): the two capabilities named above now exist —
+// `StackCouch.find` takes `{ sort, useIndex }`, `StackCouch.ensureIndex`
+// declares a Mango index, and a stack's provisioner creates one up front
+// (src/data/couchdb.ts find/ensureIndex; src/routes/provision.ts step 2c). So
+// sorting HERE is still a deliberate choice, not a missing capability: it would
+// need its own covering index on `[resourceType, _id]` created at provision
+// time, plus a decision for stacks provisioned without it. The forward walk
+// keeps this read correct meanwhile, so that remains a separate change.
 
 // Page size and page bound for the one-time high-water-mark scan. 20 pages of
 // 1000 covers four times the retained cap, which bounds the scan even against a
