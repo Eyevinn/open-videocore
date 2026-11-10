@@ -297,6 +297,48 @@ function buildConnectionsFromStack(
     legacySecretAccessKey: minioPassword
   });
 
+  // CREDENTIAL/INSTANCE AGREEMENT CHECK (issue #1342). The stored
+  // `objectStoreAccessKeyId` is the ground truth of what THIS stack's object
+  // store was created with (routes/provision.ts passes it as the instance's
+  // `RootUser`), so a resolved credential that is not that id — or one whose
+  // secret came back empty — cannot produce a signature the store will accept.
+  // Every signed call then fails, and the first one a client makes on an upload
+  // is the multipart initiate, which surfaces as an unexplained 500 naming
+  // neither the stack nor the credential (the symptom reported in #1342).
+  //
+  // The reachable cause is a seed this process does not have: with an empty
+  // MINIO_ROOT_PASSWORD, resolveObjectStoreCredential cannot re-derive the
+  // secret and returns the LEGACY deployment-wide pair (`admin` + the empty
+  // password) for a stack that was provisioned with its own credential. That
+  // substitution is correct for a pre-#1094 stack — which records no id — and
+  // wrong for this one, and the stored id is exactly what tells the two apart.
+  //
+  // Reported, not refused: the live instances and buckets are fine, so taking
+  // the stack's storage offline here would turn a credential misconfiguration
+  // into a total outage of reads that a fixed env var restores. The sibling
+  // transcoder path makes the same distinction for the same condition
+  // (services/encore-s3-config.ts refuses to SPAWN on an empty secret, because
+  // a spawned instance would fail minutes later and elsewhere). Logged at ERROR
+  // with the stack id and both NON-SECRET key ids — never the secret, and never
+  // its length.
+  if (
+    config.objectStoreAccessKeyId &&
+    (objectStoreCredential.accessKeyId !== config.objectStoreAccessKeyId ||
+      objectStoreCredential.secretAccessKey.length === 0)
+  ) {
+    log.error(
+      {
+        stackName,
+        namespace: STACK_CONFIG_NAMESPACE,
+        expectedAccessKeyId: config.objectStoreAccessKeyId,
+        resolvedAccessKeyId: objectStoreCredential.accessKeyId,
+        resolvedSecretPresent: objectStoreCredential.secretAccessKey.length > 0,
+        seedConfigured: minioPassword.length > 0
+      },
+      "stack resolver: the object-store credential resolved for this stack is NOT the one its object store was created with — every signed storage request (an upload's multipart initiate first) will be refused with a signature error. Check that MINIO_ROOT_PASSWORD on this deployment is the value the stack was provisioned with (issue #1342)"
+    );
+  }
+
   const url = new URL(config.minioEndpoint);
   const useSSL = url.protocol === 'https:';
   const minioClient = new MinioClient({
