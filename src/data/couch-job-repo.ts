@@ -23,9 +23,55 @@ import {
 } from './job-repo.js';
 import type { MessageFailureClass } from '../encore-scaler/retry-policy.js';
 import { currentDocumentStackName } from '../services/request-stack-context.js';
-import { updateWithRetry, type StoredDoc, type StackCouch } from './couchdb.js';
+import {
+  updateWithRetry,
+  type MangoIndexDef,
+  type MangoSort,
+  type StoredDoc,
+  type StackCouch
+} from './couchdb.js';
 
 const RESOURCE_TYPE = 'job';
+
+// The newest-first listing query (issue #1337).
+//
+// `createdAt: { $gt: null }` is in the selector because CouchDB will only sort
+// on a field the query also constrains; `$gt: null` is the range predicate that
+// matches every present, non-null value, so it narrows nothing a job document
+// written by `toDoc` below (which always writes `createdAt`) would match.
+const LIST_SELECTOR: Record<string, unknown> = {
+  resourceType: RESOURCE_TYPE,
+  createdAt: { $gt: null }
+};
+
+// Mango json index backing LIST_SORT. Field order matters and a sort may only
+// use a prefix of it in the same order, so `[resourceType, createdAt]` serves
+// "this resource type, newest first". Within one index key CouchDB orders equal
+// keys by document id, so jobs sharing a `createdAt` still have one stable
+// total order and the pages stay disjoint slices of it.
+const LIST_INDEX: MangoIndexDef = {
+  ddoc: 'jobs-by-created-at',
+  name: 'jobs-by-created-at',
+  fields: ['resourceType', 'createdAt']
+};
+
+// Every sort field must carry the SAME direction and must appear in the index
+// in index order, so `resourceType` leads even though the selector pins it to a
+// single value.
+const LIST_SORT: MangoSort = [{ resourceType: 'desc' }, { createdAt: 'desc' }];
+
+// Documents the degraded (sort-refused) listing path will scan. Mirrors the
+// COUNT_CAP that bounds `couch.count` (src/data/couchdb.ts), so that path
+// cannot turn one listing into an unbounded read either.
+const LIST_SCAN_CAP = 10_000;
+
+// Newest first, ties broken by ascending id — the same total order CouchDB
+// applies inside LIST_INDEX (equal index keys are ordered by document id), so
+// re-sorting a page here can never disagree with the order the pages were cut
+// in.
+function byCreatedAtDesc(a: Job, b: Job): number {
+  return b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id);
+}
 
 export type CouchFactory = () => StackCouch;
 
@@ -70,14 +116,67 @@ export class CouchJobRepository implements JobRepository {
     return fromDoc(doc);
   }
 
+  // One page of the newest-first job list (issue #1337).
+  //
+  // The page is cut by CouchDB from a `createdAt desc` ORDER, not from the
+  // index's own document-id order: job ids are `job-<random>`, so before this
+  // the database applied skip/limit to an effectively unordered sequence and the
+  // in-memory sort could only reorder whatever that page happened to contain —
+  // page 2 could start again with jobs newer than the end of page 1, and a job
+  // could appear on two pages or on none. `total` is now the exact count of
+  // matching documents (`couch.count`), the same primitive and the same
+  // concurrent read pair the asset repository uses
+  // (src/data/couch-asset-repo.ts:312-325), replacing the old
+  // `skip + items.length + 1` lower bound that read 101 after a full page.
   async list(opts?: { limit?: number; offset?: number }): Promise<{ items: Job[]; total: number }> {
     const couch = this.couchFor();
     const limit = opts?.limit ?? 50;
     const skip = opts?.offset ?? 0;
-    const docs = await couch.find({ resourceType: RESOURCE_TYPE }, { limit, skip });
+    const [docs, total] = await Promise.all([
+      this.findPageNewestFirst(couch, limit, skip),
+      couch.count(LIST_SELECTOR)
+    ]);
     const items = docs.filter((d) => d.resourceType === RESOURCE_TYPE).map(fromDoc);
-    items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    return { items, total: skip + items.length + (items.length === limit ? 1 : 0) };
+    // The page is already ordered by the query; re-applying the same comparator
+    // is a no-op that keeps the returned order explicit at this layer (and
+    // orders the degraded path below identically).
+    items.sort(byCreatedAtDesc);
+    return { items, total };
+  }
+
+  // Ask CouchDB for the page in `createdAt desc` order, declaring the covering
+  // index first.
+  //
+  // Degraded path: if the index cannot be declared or the sorted query is
+  // refused (e.g. a database this process may read but not add a design
+  // document to), fall back to a bounded scan of the matching documents sorted
+  // here. That is slower but returns the SAME ordering and the same page
+  // boundaries, so a listing never regresses to the unordered pages this issue
+  // is about, and never fails outright.
+  private async findPageNewestFirst(
+    couch: StackCouch,
+    limit: number,
+    skip: number
+  ): Promise<StoredDoc[]> {
+    try {
+      await couch.ensureIndex(LIST_INDEX);
+      return await couch.find(LIST_SELECTOR, {
+        limit,
+        skip,
+        sort: LIST_SORT,
+        useIndex: [LIST_INDEX.ddoc, LIST_INDEX.name]
+      });
+    } catch {
+      const all = await couch.find(LIST_SELECTOR, { limit: LIST_SCAN_CAP });
+      return all
+        .filter((d) => d.resourceType === RESOURCE_TYPE)
+        .sort(
+          (a, b) =>
+            String(b['createdAt'] ?? '').localeCompare(String(a['createdAt'] ?? '')) ||
+            a._id.localeCompare(b._id)
+        )
+        .slice(skip, skip + limit);
+    }
   }
 
   // Find every in-flight job referencing `assetId` as its source (issue #569).

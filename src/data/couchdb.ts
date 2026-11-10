@@ -16,14 +16,49 @@ export type StoredDoc = {
   [key: string]: unknown;
 };
 
+// One Mango sort term per entry, e.g. `[{ resourceType: 'desc' }, { createdAt:
+// 'desc' }]`. Mirrors nano's `SortOrder` object form (nano.d.ts:1694
+// `type SortOrder = string | string[] | { [key: string]: 'asc' | 'desc' }`),
+// narrowed to the object form because CouchDB requires an explicit direction
+// per field and the same direction for every field in one sort.
+export type MangoSort = Array<Record<string, 'asc' | 'desc'>>;
+
+// A Mango json index this process needs in place before it can ask CouchDB to
+// sort. `fields` follows the index's own sort syntax (nano.d.ts:1798
+// `interface CreateIndexRequest { index: { fields: SortOrder[] }, ddoc?, name?,
+// type? }`); the field ORDER matters, and a query may only sort on a prefix of
+// it, in the same order.
+export type MangoIndexDef = {
+  /** Design document the index lives in. */
+  ddoc: string;
+  /** Index name inside that design document. */
+  name: string;
+  /** Indexed fields, in index order. */
+  fields: string[];
+};
+
+// Per-process memo of indexes already ensured, keyed by database + ddoc + name.
+// StackCouch is constructed per call (`wc = () => new StackCouch(server,
+// dbName)` — src/services/workspace-stack.ts:280/:507), so the memo cannot live
+// on the instance or every request would re-POST `_index`.
+const ensuredIndexes = new Set<string>();
+
+// Test seam: forget the ensured-index memo so each test starts from a cold
+// process. Not used by production code.
+export function resetEnsuredIndexesForTest(): void {
+  ensuredIndexes.clear();
+}
+
 // CouchDB access for a single stack's database. OSC provisions a dedicated
 // CouchDB instance per stack, so there is no workspace partitioning: documents
 // are stored under their flat local id.
 export class StackCouch {
   private readonly db: DocumentScope<StoredDoc>;
+  private readonly dbName: string;
 
   constructor(server: ServerScope, dbName: string) {
     this.db = server.use<StoredDoc>(dbName);
+    this.dbName = dbName;
   }
 
   async put(localId: string, body: Record<string, unknown>): Promise<{ id: string; rev: string }> {
@@ -63,16 +98,58 @@ export class StackCouch {
     return docs;
   }
 
+  // Mango query. `sort` and `useIndex` are OPTIONAL additions (issue #1337):
+  // every pre-existing caller passes `{ limit, skip }` only and keeps exactly
+  // the previous behaviour, where CouchDB applies skip/limit in its own index
+  // order. A caller that needs database-side ordering passes `sort` — and must
+  // first put a covering index in place with `ensureIndex`, because CouchDB
+  // answers a sorted `_find` with 400 `no_usable_index` otherwise.
   async find(
     selector: Record<string, unknown>,
-    opts: { limit?: number; skip?: number } = {}
+    opts: {
+      limit?: number;
+      skip?: number;
+      sort?: MangoSort;
+      useIndex?: string | [string, string];
+    } = {}
   ): Promise<StoredDoc[]> {
-    const result = await this.db.find({
+    const query: nano.MangoQuery = {
       selector: selector as nano.MangoSelector,
       limit: opts.limit ?? 50,
       skip: opts.skip ?? 0
-    });
+    };
+    if (opts.sort && opts.sort.length > 0) {
+      // nano.d.ts:1709 `sort?: SortOrder[]`, whose object form is
+      // `{ [key: string]: 'asc' | 'desc' }` — what MangoSort already is.
+      query.sort = opts.sort;
+    }
+    if (opts.useIndex) {
+      // nano.d.ts:1721 `use_index?: string | [string, string]`.
+      query.use_index = opts.useIndex;
+    }
+    const result = await this.db.find(query);
     return result.docs;
+  }
+
+  // Declare a Mango json index, once per process (issue #1337).
+  //
+  // POST `_index` is idempotent for a given ddoc + name + fields: CouchDB
+  // answers `{ result: 'exists' }` instead of rebuilding (nano.d.ts:1824
+  // `interface CreateIndexResponse { result: string }`, "created" or "exists"),
+  // so calling this on a read path is safe. The memo keeps it to one request per
+  // process per index; a failure is NOT memoised, so the next call retries.
+  async ensureIndex(def: MangoIndexDef): Promise<void> {
+    const key = `${this.dbName}|${def.ddoc}|${def.name}`;
+    if (ensuredIndexes.has(key)) {
+      return;
+    }
+    await this.db.createIndex({
+      index: { fields: def.fields },
+      ddoc: def.ddoc,
+      name: def.name,
+      type: 'json'
+    });
+    ensuredIndexes.add(key);
   }
 
   async count(selector: Record<string, unknown>): Promise<number> {
