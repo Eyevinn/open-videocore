@@ -94,7 +94,7 @@ import {
   logScalerNotActivated,
   type StackRedisResolution
 } from './services/scaler-redis-url.js';
-import { resolveEncoreS3Config } from './services/encore-s3-config.js';
+import { resolveEncoreS3ConfigWithSecretRef } from './services/encore-s3-config.js';
 import { resolveObjectStoreCredential } from './services/object-store-credentials.js';
 import {
   makeInternalEndpointResolver,
@@ -1814,8 +1814,12 @@ function activateScaler(redisUrl: string): void {
     // undefined there is what turned a config miss into an Encore instance with
     // no s3Endpoint (instance-pool.ts:368-372), an `s3://` input resolved
     // against the wrong endpoint, and an unexplained 404.
+    // #1287 review: the spawn path takes the WithSecretRef view, so a per-stack
+    // credential whose OSC secret provisioning already minted is REFERENCED by
+    // name instead of re-POSTed (OSC secrets are write-once, no update path —
+    // ADR-002-credential-storage.md, @osaas/client-core lib/core.d.ts:154).
     resolveS3Config: (stackKey: string) =>
-      resolveEncoreS3Config(
+      resolveEncoreS3ConfigWithSecretRef(
         {
           paramStore,
           secretAccessKey: encoreS3SecretKey,
