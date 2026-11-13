@@ -45,9 +45,25 @@ import { z } from 'zod';
 // error, a lost worker) because the remedy is different and is entirely about
 // the input: the key is missing, or the credentials/permissions on it are wrong.
 //
+// The `packager_*` codes (#1338, broken out of #1336) classify a failed
+// `package` step. Until now such a step carried only free text — the packager's
+// own callback message, or the stall sweep's diagnostic — so a caller could not
+// tell a media the packager cannot parse (re-ingest a supported mezzanine) from
+// a rejected service credential (an operator fix) from a run that simply never
+// signalled completion (retry). They are built by
+// ./package-failure-detail.ts, which carries ONLY the code and a fixed
+// user-safe sentence: the raw packager text stays in `error` and the server
+// logs, never in the detail.
+//
 // Kept as a `const` tuple so the route schemas derive their enum from it and a
 // new code cannot be added without the response contract following.
-export const STEP_ERROR_CODES = ['source_read_failed'] as const;
+export const STEP_ERROR_CODES = [
+  'source_read_failed',
+  'packager_timeout',
+  'packager_unsupported_media',
+  'packager_auth',
+  'packager_failed'
+] as const;
 export type StepErrorCode = (typeof STEP_ERROR_CODES)[number];
 
 // Where the failing read was pointed. `url` is ALWAYS redacted before it lands
@@ -114,8 +130,14 @@ export const stepErrorDetailSchema = z.object({
       'Stable, machine-readable failure code. `source_read_failed`: the step ' +
         'could not READ its source object — the storage answered 404 (the key ' +
         'is absent) or 403 (a permissions/credentials verdict), or the ' +
-        'connection to the storage failed. Branch on this rather than on the ' +
-        'free-text `error`.'
+        'connection to the storage failed. `packager_timeout`: a `package` ' +
+        'step that never signalled completion inside the allowed window and ' +
+        'was declared failed by the completion watchdog. ' +
+        '`packager_unsupported_media`: the packager could not parse the media ' +
+        '(unsupported container/codec). `packager_auth`: the packaging ' +
+        'credential was rejected, so the run could not be authorised. ' +
+        '`packager_failed`: a packaging failure outside the three classes ' +
+        'above. Branch on this rather than on the free-text `error`.'
     ),
   message: z.string().describe('One human-readable sentence describing the failure.'),
   storageError: z

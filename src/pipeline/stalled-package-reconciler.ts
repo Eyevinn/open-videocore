@@ -35,6 +35,7 @@
 import type { JobRepository } from '../data/job-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { failPackageJob } from './package-job.js';
+import { buildPackageTimeoutErrorDetail } from './package-failure-detail.js';
 
 // Default bound: a `package` step still `running` after this long is declared
 // failed. Generous by default so a genuinely slow packaging job is never cut off
@@ -139,6 +140,12 @@ export async function reconcileStalledPackages(
         ...steps[idx],
         status: 'failed',
         error: message,
+        // #1338: the machine-readable companion to the diagnostic above. This
+        // sweep IS the completion watchdog, so every step it fails is a
+        // timeout by construction — the bound expired with no packager signal.
+        // Carries the code and a fixed user-safe sentence only; the probed
+        // presence and the bound stay in `error` and in the log line below.
+        errorDetail: buildPackageTimeoutErrorDetail(),
         completedAt: new Date().toISOString()
       };
       await deps.pipeline.update(execution.id, { steps, status: 'failed' });

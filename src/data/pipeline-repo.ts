@@ -62,6 +62,13 @@ export type StepExecution = {
   // transcoder job + asset ids so the caller does not have to open the
   // transcoder job and then the bucket to find out the key is missing. Built by
   // buildSourceReadErrorDetail (src/pipeline/encore-source-read-failure.ts).
+  // A failed `package` step carries one of the `packager_*` codes instead
+  // (issue #1338): `packager_timeout` from the completion watchdog,
+  // `packager_unsupported_media` / `packager_auth` / `packager_failed` from the
+  // packager's failure callback. Those details carry the code and a fixed
+  // user-safe sentence ONLY — no job URL, host or credential — because the
+  // packager's own text can contain all three and stays on `error` and in the
+  // server logs. Built by src/pipeline/package-failure-detail.ts.
   errorDetail?: StepErrorDetail;
   // Why a `skipped` step did not run (issue #789), e.g. the optional service
   // instance for this stack is unconfigured. Only set when status is `skipped`;

@@ -9515,9 +9515,13 @@
                               "code": {
                                 "type": "string",
                                 "enum": [
-                                  "source_read_failed"
+                                  "source_read_failed",
+                                  "packager_timeout",
+                                  "packager_unsupported_media",
+                                  "packager_auth",
+                                  "packager_failed"
                                 ],
-                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. Branch on this rather than on the free-text `error`."
+                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. Branch on this rather than on the free-text `error`."
                               },
                               "message": {
                                 "type": "string",
@@ -9825,9 +9829,13 @@
                                 "code": {
                                   "type": "string",
                                   "enum": [
-                                    "source_read_failed"
+                                    "source_read_failed",
+                                    "packager_timeout",
+                                    "packager_unsupported_media",
+                                    "packager_auth",
+                                    "packager_failed"
                                   ],
-                                  "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. Branch on this rather than on the free-text `error`."
+                                  "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. Branch on this rather than on the free-text `error`."
                                 },
                                 "message": {
                                   "type": "string",
@@ -10032,9 +10040,13 @@
                               "code": {
                                 "type": "string",
                                 "enum": [
-                                  "source_read_failed"
+                                  "source_read_failed",
+                                  "packager_timeout",
+                                  "packager_unsupported_media",
+                                  "packager_auth",
+                                  "packager_failed"
                                 ],
-                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. Branch on this rather than on the free-text `error`."
+                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. Branch on this rather than on the free-text `error`."
                               },
                               "message": {
                                 "type": "string",
@@ -10232,9 +10244,13 @@
                                 "code": {
                                   "type": "string",
                                   "enum": [
-                                    "source_read_failed"
+                                    "source_read_failed",
+                                    "packager_timeout",
+                                    "packager_unsupported_media",
+                                    "packager_auth",
+                                    "packager_failed"
                                   ],
-                                  "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. Branch on this rather than on the free-text `error`."
+                                  "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. Branch on this rather than on the free-text `error`."
                                 },
                                 "message": {
                                   "type": "string",
@@ -18016,9 +18032,13 @@
                                     "code": {
                                       "type": "string",
                                       "enum": [
-                                        "source_read_failed"
+                                        "source_read_failed",
+                                        "packager_timeout",
+                                        "packager_unsupported_media",
+                                        "packager_auth",
+                                        "packager_failed"
                                       ],
-                                      "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. Branch on this rather than on the free-text `error`."
+                                      "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. Branch on this rather than on the free-text `error`."
                                     },
                                     "message": {
                                       "type": "string",
@@ -18206,9 +18226,13 @@
                               "code": {
                                 "type": "string",
                                 "enum": [
-                                  "source_read_failed"
+                                  "source_read_failed",
+                                  "packager_timeout",
+                                  "packager_unsupported_media",
+                                  "packager_auth",
+                                  "packager_failed"
                                 ],
-                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. Branch on this rather than on the free-text `error`."
+                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. Branch on this rather than on the free-text `error`."
                               },
                               "message": {
                                 "type": "string",
@@ -18402,9 +18426,13 @@
                               "code": {
                                 "type": "string",
                                 "enum": [
-                                  "source_read_failed"
+                                  "source_read_failed",
+                                  "packager_timeout",
+                                  "packager_unsupported_media",
+                                  "packager_auth",
+                                  "packager_failed"
                                 ],
-                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. Branch on this rather than on the free-text `error`."
+                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. Branch on this rather than on the free-text `error`."
                               },
                               "message": {
                                 "type": "string",
