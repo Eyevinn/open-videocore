@@ -318,9 +318,16 @@ backend error, …) — see
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/v1/jobs` | List background jobs |
+| `GET` | `/api/v1/jobs` | List background jobs, newest first |
 | `GET` | `/api/v1/jobs/:id` | Get a job |
 | `DELETE` | `/api/v1/jobs/:id` | Cancel or delete a job |
+
+The listing is ordered by creation time, newest first, and `limit`/`offset` cut
+each page out of that one order — so page 2 is strictly older than page 1, and
+walking the pages of an unchanging list visits every job exactly once. (As with
+any offset paging, a job created while you are part-way through shifts the
+window by one.) `total` is a count of matching jobs, counted up to 10,000: a
+deployment holding more jobs than that reports `10000`, not the true number.
 
 **Profiles**
 
