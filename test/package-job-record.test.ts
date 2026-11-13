@@ -463,4 +463,55 @@ describe('package step Job record (issue #976)', () => {
       expect(res.statusCode).toBe(200);
     });
   });
+
+  // Issue #1338: the packager failure callback also stamps a machine-readable
+  // `errorDetail.code` on the failed `package` step, so a caller can branch
+  // without scraping the free text. Contract: the callback body is
+  // `{ message }` only (`packagerFailureSchema`, src/routes/internal.ts) and the
+  // step field is `StepExecution.errorDetail` (src/data/pipeline-repo.ts).
+  describe('a packaging failure carries a machine-readable errorDetail.code', () => {
+    async function failPackagingWith(message: string) {
+      const h = await buildApp();
+      const assetId = await seedPackageableAsset(h);
+      await runPackagePipeline(h.app, assetId);
+
+      const res = await h.app.inject({
+        method: 'POST',
+        url: '/api/v1/internal/packagerCallback/failure',
+        payload: { message }
+      });
+      expect(res.statusCode).toBe(200);
+
+      const execution = (await h.pipelines.listByAsset(assetId)).find(
+        (e) => e.steps.some((s) => s.name === 'package' && s.status === 'failed' && s.errorDetail)
+      );
+      return execution?.steps.find((s) => s.name === 'package');
+    }
+
+    it('maps a PARSER_FAILURE callback reason to packager_unsupported_media', async () => {
+      const step = await failPackagingWith('packaging failed: PARSER_FAILURE on the input');
+      expect(step?.errorDetail?.code).toBe('packager_unsupported_media');
+    });
+
+    it('maps a rejected credential to packager_auth', async () => {
+      const step = await failPackagingWith('could not fetch the job: 401 Unauthorized');
+      expect(step?.errorDetail?.code).toBe('packager_auth');
+    });
+
+    it('maps any other packager failure to packager_failed', async () => {
+      const step = await failPackagingWith('packager exited with code 1');
+      expect(step?.errorDetail?.code).toBe('packager_failed');
+    });
+
+    it('keeps the packager text out of errorDetail and on `error` instead', async () => {
+      const step = await failPackagingWith(
+        'failed fetching http://packager-a.internal:8080/encoreJobs/ab12?token=secret-value'
+      );
+      expect(Object.keys(step!.errorDetail!).sort()).toEqual(['code', 'message']);
+      expect(step?.errorDetail?.message).not.toContain('packager-a.internal');
+      expect(step?.errorDetail?.message).not.toContain('secret-value');
+      // The raw text is still attributable on the step's free-text field.
+      expect(step?.error).toContain('packager-a.internal');
+    });
+  });
 });

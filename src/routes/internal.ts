@@ -77,6 +77,11 @@ import { dispatchTranscodeCompletionEvents } from '../pipeline/transcode-complet
 // live failure path — it carries no jobId, so it settles the job the same way it
 // settles the execution: by correlating on a running `package` step.
 import { failPackageJob } from '../pipeline/package-job.js';
+// Machine-readable classification of a packager-reported failure (issue #1338).
+// The callback's `message` is the only signal this path has, so the classifier
+// matches against it; what lands on the step is a code plus a fixed user-safe
+// sentence, never the message itself.
+import { buildPackageFailureErrorDetail } from '../pipeline/package-failure-detail.js';
 import type { AuditEmitter } from '../data/audit-emit.js';
 import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
@@ -702,6 +707,14 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
                 );
                 if (!hasRunningPackage) continue;
                 const reason = `packager failure: ${message}`;
+                // #1338: classify the packager's message into a stable code so a
+                // caller can branch (unparseable media -> re-ingest; rejected
+                // credential -> operator fix; anything else -> retry) instead of
+                // scraping `reason`. The detail carries the code and a fixed
+                // user-safe sentence ONLY — `message` can contain the transcoder
+                // job URL the packager was pointed at, and it stays where it
+                // already was: on `error` and in the fastify.log.error above.
+                const errorDetail = buildPackageFailureErrorDetail(message);
                 const runningPackageStep = execution.steps.find(
                   (s) => s.name === 'package' && s.status === 'running'
                 );
@@ -711,6 +724,7 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
                         ...s,
                         status: 'failed' as const,
                         error: reason,
+                        errorDetail,
                         completedAt: now
                       }
                     : s
