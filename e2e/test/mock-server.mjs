@@ -35,6 +35,12 @@ export function startMock({ token = 'tok', commit = 'abc1234', sourceDigest = 's
     // its own; a real un-gated image would report both at once.
     // `healthNoFeatures` models an older image that predates the block entirely.
     if (p === '/health') return json(res, 200, { status: 'ok', service: 'open-videocore-api', build: { version: '1.5.0', commit, sourceDigest, builtAt: null, packageVersion: '1.5.0' }, ...(faults.healthNoFeatures ? {} : { features: { authGateRegistered: !faults.noAuthGate } }) });
+    // `assetDrm` (issue #1268) models an instance leaking a `drm` key onto the asset read AND every
+    // asset-list item. Neither schema has a `drm` member and both are `additionalProperties: false`
+    // (openapi.json v1.8.0 GET /api/v1/assets/{id} and GET /api/v1/assets/ `items[]`), so this is the
+    // contract violation the DRM flag-off case has to see. Applied here, before routing, so it reaches
+    // the single-asset and list branches alike without either of them changing.
+    if (faults.assetDrm) for (const seeded of assets.values()) seeded.drm = { status: 'protected' };
     const m = (re) => p.match(re);
     let x;
     if (req.method === 'GET' && p === '/api/v1/assets/') {
@@ -118,6 +124,26 @@ export function startMock({ token = 'tok', commit = 'abc1234', sourceDigest = 's
         if (faults.silentPackager) { /* the packager failed and never called back: no manifestUrls, no packagingError */ }
         else if (faults.packagingError) a.packagingError = 'packager failed'; else a.manifestUrls = { hls: 'http://x/master.m3u8' };
         return json(res, 202, { ok: true, jobId });
+      }
+      // GET /api/v1/assets/{id}/delivery (issue #1268). openapi.json v1.8.0: 200 with required
+      // {assetId, status, urls, expiresAt}; `status` is one of ready|not_configured|failed and `drm` is
+      // an OPTIONAL block that a `DRM_ENABLED=false` deployment omits entirely — `deliveryDrmFor`
+      // returns undefined when `drmEnabled()` is false, and the handler spreads `{}` (src/routes/assets.ts,
+      // "`{}` when DRM is off or the asset is not protected ... never `drm: null`, never `drm: {}`").
+      // `deliveryDrm` models the leak: a `drm` block on a flag-off deployment. Its member shapes follow
+      // `deliveryDrmSchema` (scheme, systems[{system}], keyIds[]) with registered system ids, never
+      // product names (CLAUDE.md rule 1).
+      if (req.method === 'GET' && sub === '/delivery') {
+        const out = {
+          assetId: a.id,
+          status: a.manifestUrls ? 'ready' : 'not_configured',
+          urls: a.manifestUrls ? { hls: a.manifestUrls.hls } : {},
+          expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+        };
+        if (faults.deliveryDrm) {
+          out.drm = { scheme: 'cbcs', systems: [{ system: 'edef8ba9-79d6-4ace-a3c8-27dcd51d21ed' }], keyIds: ['11111111-2222-3333-4444-555555555555'] };
+        }
+        return json(res, 200, out);
       }
     }
     if (req.method === 'GET' && p === '/api/v1/search/') {

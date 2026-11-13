@@ -9,9 +9,19 @@
 //   package           POST /api/v1/assets/{id}/package    202 {ok, jobId}
 //   search            GET /api/v1/search/                 {assets[], total, page, ...}
 //   patch/delete      PATCH /api/v1/assets/{id}; DELETE /api/v1/assets/{id}?force=true  204
+//
+// v2 adds the DRM flag-off case (issue #1268). Its paths and fields were re-read from
+// openapi.json v1.8.0 (the version in the repo today):
+//   delivery          GET /api/v1/assets/{id}/delivery    200 required {assetId, status, urls, expiresAt};
+//                     `drm` is OPTIONAL and present only on a DRM_ENABLED deployment for a protected asset
+//   asset list        GET /api/v1/assets/                 200 {items[], limit, offset, total}; the item schema
+//                     has no `drm` member at all and `additionalProperties: false`
 import { poll, PollTimeout } from '../lib/poll.mjs';
 
-export const SUITE_VERSION = 'v1';
+// v2 (issue #1268): adds `drm-flag-off`. The promote workflow compares this against the
+// repository variable `E2E_SUITE_VERSION` when one is set (ADR-007 §4.1), so a bump is the
+// mechanism by which a gate pinned to v1 stops accepting v1 results.
+export const SUITE_VERSION = 'v2';
 
 /**
  * A case failure. `observed` carries structured facts the verdict should keep (see `runSuite`, which copies it
@@ -386,5 +396,85 @@ export const cases = [
     },
   },
 ];
+
+/**
+ * DRM flag-off case (issue #1268; ADR-008 §13 "e2e gate (ADR-007)" and decision D9 "with the flag off,
+ * every DRM field is absent ... the clear path is byte-for-byte unchanged").
+ *
+ * `DRM_ENABLED` is OFF by default, which is what the e2e instance runs, so this case needs no new
+ * credential, no new environment variable and no change to the runner (ADR-007 §5 keeps the runner's
+ * credential set closed). It is `chain: true` because it reads the asset the chain packaged: a protected
+ * deployment would expose `drm` on the PACKAGED delivery responses, so the assertion is only meaningful
+ * once `package` has produced manifests.
+ *
+ * Contracts (openapi.json v1.8.0, read 2026-11-05):
+ *   - GET /api/v1/assets/{id}/delivery 200 → required `assetId`, `status`, `urls`, `expiresAt`; `drm` is an
+ *     optional block (src/routes/assets.ts `deliverySchema`), emitted only by `deliveryDrmFor`, which
+ *     returns `undefined` when `drmEnabled()` is false (src/routes/assets.ts, "`{}` when DRM is off").
+ *   - GET /api/v1/assets/{id} 200 and GET /api/v1/assets/ 200 `items[]` → neither schema has a `drm`
+ *     member and both are `additionalProperties: false`, so a `drm` key appearing on either is a
+ *     contract violation, not a new feature.
+ */
+export const drmFlagOffCase = {
+  id: 'drm-flag-off',
+  chain: true,
+  async run(ctx) {
+    const id = encodeURIComponent(ctx.state.assetId);
+    const delivery = await ctx.client.request('GET', `/api/v1/assets/${id}/delivery`);
+    expectStatus(delivery, 200);
+    const body = delivery.body ?? {};
+    // The clear delivery contract, unchanged by this feature: every required member still there.
+    for (const member of ['assetId', 'status', 'urls', 'expiresAt']) {
+      if (body[member] === undefined) fail(`delivery response lacks the required member ${member}`);
+    }
+    if ('drm' in body) fail(`delivery response carries a drm property with DRM off: ${JSON.stringify(body.drm).slice(0, 200)}`);
+
+    // The clear packaging path produces what it produced before the feature: the asset still advertises
+    // the manifests the `package` case waited for, and carries no `drm` key.
+    const asset = await getAsset(ctx);
+    if ('drm' in asset) fail(`asset response carries a drm property with DRM off: ${JSON.stringify(asset.drm).slice(0, 200)}`);
+    if (!asset.manifestUrls?.hls && !asset.manifestUrls?.dash) fail('clear packaging path advertises no manifestUrls after package');
+
+    const list = await ctx.client.request('GET', '/api/v1/assets/', { query: { limit: '50' } });
+    expectStatus(list, 200);
+    const items = list.body?.items ?? [];
+    if (!Array.isArray(list.body?.items)) fail(`asset list has no items array: ${JSON.stringify(list.body).slice(0, 200)}`);
+    const leaking = items.filter((a) => a && typeof a === 'object' && 'drm' in a).map((a) => a.id);
+    if (leaking.length > 0) {
+      fail(`asset list carries a drm property on ${leaking.length} asset(s) with DRM off: ${leaking.slice(0, 3).join(', ')}`);
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
+// WHY THIS SUITE HAS NO DRM-POSITIVE CASE (issue #1268 item 3, ADR-008 §13, ADR-007 §2).
+//
+// The OSC catalog packager cannot encrypt at all: there is no encryption option in the packaging
+// library, in the service's instance config, or in the queue envelope the packager consumes, so the
+// product's own capability probe answers `encryption: false` (src/pipeline/packaging.ts
+// `NO_ENCRYPTION_CAPABILITY`) and a protected package request is refused with `409 drm_unsupported`.
+// A positive DRM case aimed at the OSC environment would therefore be red on every single cycle. Red
+// is final per commit (ADR-007 §3) and blocks promotion until a human deletes the record, so a
+// permanently red case would teach the team to ignore the gate — exactly the failure mode the ADR-007
+// §2 design exists to avoid. It is not added until the packager can encrypt.
+//
+// The upstream change is tracked in the engagement's OSC friction log
+// `docs/osc-feedback/incoming-packager-no-encryption-support.md` (requested items 1-3: an `encryption`
+// member on `PackageOptions` in the packaging library, an optional PER-JOB `encryption` object in the
+// queue envelope, and a rebuilt catalog image). Until that lands, encryption is proven LOCALLY only:
+// the `local-drm` docker-compose profile plus `test/drm-local-clearkey-chain.test.ts`, which asserts
+// the manifests carry `#EXT-X-SESSION-KEY` / `ContentProtection` and skips when the locally built
+// encryption-capable packager image is absent.
+// ---------------------------------------------------------------------------
+
+/**
+ * The case list the OSC gate runs (`suite/cli.mjs`, `runner/wire.mjs`): the v1 list with the DRM
+ * flag-off case directly after `package`, because it reads that asset's packaged delivery.
+ *
+ * `cases` above stays exactly the v1 list, and stays the default in `runSuite`, so the v1 oracle in
+ * `test/suite.test.mjs` keeps pinning v1 behaviour line for line (test assertions here are
+ * additive-only by policy); the v2 addition is pinned by its own tests against `GATE_CASES`.
+ */
+export const GATE_CASES = cases.flatMap((c) => (c.id === 'package' ? [c, drmFlagOffCase] : [c]));
 
 export { CaseFailure, InfraFailure };
