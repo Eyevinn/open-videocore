@@ -5,6 +5,10 @@ import {
   removeInstance
 } from '@osaas/client-core';
 import {
+  isRouteNotFoundError,
+  oscHttpCode
+} from '../encore-scaler/osc-error.js';
+import {
   AUTO_SUBTITLES_SERVICE_ID,
   SCENE_DETECT_SERVICE_ID,
   STACK_SERVICES,
@@ -139,6 +143,69 @@ export async function confirmInstanceAbsentVia(
   );
 }
 
+// Run the absence confirmation, distinguishing "the probe says it is still
+// there / could not be checked" from "this service API has no probe to run".
+//
+// CONTRACT NOTE (issue #1211). `listInstances` reads the service's OWN instance
+// API at the `apiUrl` the catalog publishes for that serviceId — for the object
+// store (`OBJECT_STORE_SERVICE_ID = 'minio-minio'`, stack.ts) that is
+// `https://api-minio-minio.auto.prod-se.osaas.io/minioinstance`
+// (service OpenAPI `…/docs/json`, recorded in ADR-026 C5: the document defines
+// `POST /minioinstance` for create, and NO collection GET). So the path is
+// right and the serviceId is right — the collection READ simply is not part of
+// that service's contract, and the call comes back
+// `Route GET:/minioinstance not found` (404).
+//
+// Treating that as a probe failure made the storage teardown unconditionally
+// `failed`: the instance was never even asked to go away, so a stack delete
+// reported failures while its object store stayed up (#1166). A missing route
+// is NOT evidence about the instance, so it must not resolve `true` (that would
+// claim a confirmed absence and skip the removal — exactly the #1039 defect in
+// the other direction). We resolve `false`: nothing was confirmed, so fall
+// through to the removal and let the DELETE — the authoritative read — decide.
+// Every other failure still propagates and reports `failed`.
+//
+// The confirming read is passed in already BOUNDED (issue #1212): teardown runs
+// every OSC call through runBoundedOscCall, so this wrapper must sit OUTSIDE
+// that bound, not inside it. A missing route is permanent, so the bounded call
+// fails on attempt 1 without burning any of the service's budget before the
+// classification below gets to see it.
+async function absenceConfirmed(
+  confirm: () => Promise<boolean>
+): Promise<boolean> {
+  try {
+    return await confirm();
+  } catch (err) {
+    if (!isRouteNotFoundError(oscCause(err))) throw err;
+    return false;
+  }
+}
+
+// The OSC error underneath a bounded teardown call.
+//
+// runBoundedOscCall ALWAYS rejects with a TeardownCallError (issue #1212),
+// carrying the original rejection on `.cause` — so the status-based
+// classifications below have to read through the wrapper or they would see a
+// local Error with no httpCode and classify every 404 as a generic failure.
+// A deadline breach puts a TeardownTimeoutError here instead, which carries no
+// httpCode and is therefore correctly classified as neither of the 404 cases.
+function oscCause(err: unknown): unknown {
+  return isTeardownCallError(err) ? err.cause : err;
+}
+
+// Did the removal 404 because the instance is ALREADY GONE?
+//
+// A DELETE answered 404 by the instance route is the control plane stating
+// directly that there is nothing at that name — stronger evidence than either
+// probe above, so it converges to `not_found` rather than failing a retry
+// forever. A 404 that reports a missing ROUTE is excluded: that says the API
+// cannot perform the removal at all, which stays a failure so the stored config
+// is kept and the instance is surfaced as a leftover.
+function removedAlready(err: unknown): boolean {
+  const cause = oscCause(err);
+  return oscHttpCode(cause) === 404 && !isRouteNotFoundError(cause);
+}
+
 // Tear down a single OSC service instance, tolerating the already-removed case.
 // We probe with getInstance first; because that probe reports EVERY error as
 // `undefined` (see confirmInstanceAbsent), an empty probe result is re-checked
@@ -194,8 +261,10 @@ async function teardownService(
     );
     if (
       !existing &&
-      (await read('listInstances', () =>
-        confirmInstanceAbsent(osc, serviceId, name, sat)
+      (await absenceConfirmed(() =>
+        read('listInstances', () =>
+          confirmInstanceAbsent(osc, serviceId, name, sat)
+        )
       ))
     ) {
       // Already gone — nothing to retry for this service.
@@ -204,19 +273,32 @@ async function teardownService(
 
     // Either the probe returned the instance, or the probe came back empty but
     // the list says the instance is still there (the empty probe was a swallowed
-    // error). Both mean there is something to remove.
-    await runBoundedOscCall(
-      () => removeInstance(osc, serviceId, name, sat),
-      {
-        attempts: bounds.removeAttempts,
-        backoffMs: bounds.backoffMs,
-        deadlineAt,
-        label: `removeInstance ${target}`,
-        sleep: bounds.sleep,
-        now: bounds.now,
-        onAttempt: countAttempt
+    // error), or the service publishes no collection read to confirm with
+    // (#1211). All three mean there is something to remove — or, when the
+    // DELETE itself answers 404, nothing left to remove.
+    try {
+      await runBoundedOscCall(
+        () => removeInstance(osc, serviceId, name, sat),
+        {
+          attempts: bounds.removeAttempts,
+          backoffMs: bounds.backoffMs,
+          deadlineAt,
+          label: `removeInstance ${target}`,
+          sleep: bounds.sleep,
+          now: bounds.now,
+          onAttempt: countAttempt
+        }
+      );
+    } catch (err) {
+      // A 404 from the DELETE is the authoritative "nothing at that name", so
+      // it converges to not_found instead of failing every retry (#1211). It is
+      // never transient, so runBoundedOscCall has already given up on attempt 1
+      // and the attempt count reported here is honest.
+      if (removedAlready(err)) {
+        return { serviceId, role, status: 'not_found', attempts };
       }
-    );
+      throw err;
+    }
     return { serviceId, role, status: 'removed', attempts };
   } catch (err) {
     // runBoundedOscCall always throws a TeardownCallError whose message already
