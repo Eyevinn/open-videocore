@@ -2663,6 +2663,7 @@ Response 200 (application/json)
   "updatedAt": "string",
   "assetName": "string"
 }
+Field notes- status — Execution status. failed covers BOTH a run that broke and a run that was cancelled by hand — cancelling settles the run as failed because these three values are the whole enum. To tell them apart, look for errorDetail.code = "cancelled" on the steps the cancel settled; a cancelled run is a stop, not an error.
 
   DELETE /api/v1/pipelines/{executionId}
 
@@ -2708,6 +2709,7 @@ Response 200 (application/json)
   "updatedAt": "string",
   "assetName": "string"
 }
+Field notes- status — Execution status. failed covers BOTH a run that broke and a run that was cancelled by hand — cancelling settles the run as failed because these three values are the whole enum. To tell them apart, look for errorDetail.code = "cancelled" on the steps the cancel settled; a cancelled run is a stop, not an error.
 
 ---
 
