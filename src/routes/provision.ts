@@ -21,6 +21,9 @@ import {
 } from '../services/instance-readiness.js';
 import { Client as MinioClient } from 'minio';
 import nano from 'nano';
+// The jobs listing's covering index, created here with the admin credential
+// (#1346 review finding 2) from the single definition the reader uses.
+import { JOBS_LIST_INDEX } from '../data/couch-job-repo.js';
 import {
   deprovisionStack,
   deprovisionStackFromConfig,
@@ -2003,6 +2006,77 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               attempts++;
               if (attempts >= 20) throw err;
               await delay(5000);
+            }
+          }
+        }
+
+        // 2c. Declare the Mango index the jobs listing sorts on (#1337, #1346
+        // review finding 2).
+        //
+        // Here rather than from the read path: `GET /api/v1/jobs` sorts
+        // `createdAt desc`, which CouchDB refuses with 400 `no_usable_index`
+        // unless a covering index exists (apache/couchdb
+        // src/mango/src/mango_error.erl:21-44). Creating it lazily on the first
+        // listing made a read pay an index build, and left a stack whose RUNTIME
+        // credential may not write design documents on a bounded scan for good.
+        // This runs once per provision with the ADMIN credential already in hand
+        // above, so the index is in place before the first request and the
+        // runtime credential only ever reads it.
+        //
+        // The database is the one the runtime actually stores job documents in:
+        // every repository on a stack shares `COUCHDB_ASSETS_DB ?? 'assets'`
+        // (src/services/workspace-stack.ts:276-280 and :505-509), so the index
+        // must go there and NOT on the separate `jobs` database created above,
+        // which holds no job documents today.
+        //
+        // Definition imported from the reader (JOBS_LIST_INDEX,
+        // src/data/couch-job-repo.ts) so creator and reader cannot drift.
+        // `POST _index` is idempotent for the same ddoc/name/fields — CouchDB
+        // answers `{ result: 'exists' }` (nano.d.ts CreateIndexResponse) — so a
+        // re-provision converges. Best-effort with the same bounded retry as the
+        // policy steps above: the listing still returns correct, correctly
+        // ordered pages without the index (bounded scan), so a transient failure
+        // here must not fail the whole provision — it is warned about instead.
+        {
+          const jobsIndexDb = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
+          let attempts = 0;
+          while (true) {
+            try {
+              const scope = couchServer.use(jobsIndexDb);
+              await scope.createIndex({
+                index: { fields: JOBS_LIST_INDEX.fields },
+                ddoc: JOBS_LIST_INDEX.ddoc,
+                name: JOBS_LIST_INDEX.name,
+                type: 'json'
+              });
+              break;
+            } catch (err) {
+              attempts++;
+              // Retry only a REQUEST failure (CouchDB still coming up, a 5xx, a
+              // dropped connection), which nano reports with a `statusCode` or a
+              // transport `code`. Anything else is not going to come good by
+              // waiting, so report it once instead of sleeping five times.
+              const transient =
+                typeof err === 'object' &&
+                err !== null &&
+                ('statusCode' in err || 'status' in err || 'code' in err);
+              if (!transient || attempts >= 5) {
+                app.log.warn(
+                  {
+                    err,
+                    db: jobsIndexDb,
+                    ddoc: JOBS_LIST_INDEX.ddoc,
+                    index: JOBS_LIST_INDEX.name,
+                    stack: name
+                  },
+                  'could not create the jobs listing index; GET /api/v1/jobs ' +
+                    'still returns correctly ordered pages but each listing reads ' +
+                    'up to 10,000 documents until the index exists — re-provision ' +
+                    'this stack to create it'
+                );
+                break;
+              }
+              await delay(3000);
             }
           }
         }

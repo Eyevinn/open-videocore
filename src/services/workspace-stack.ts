@@ -318,7 +318,10 @@ function buildConnectionsFromStack(
   });
 
   const assets = new CouchAssetRepository(wc);
-  const jobs = new CouchJobRepository(wc);
+  // `log` so the jobs listing reports which read path served it (#1346 review
+  // finding 1) instead of degrading invisibly, the same seam the durable log
+  // store and the comment store already take.
+  const jobs = new CouchJobRepository(wc, { log });
   const collections = new CouchCollectionRepository(wc);
   // Search projects both assets and collections (issue #561). The collection
   // repo is passed so collection hits are reconstructed by the same
@@ -506,7 +509,7 @@ function buildEnvConnections(
     const server = couchServer(couchUrl);
     const wc = () => new StackCouch(server, dbName);
     assets = new CouchAssetRepository(wc);
-    jobs = new CouchJobRepository(wc);
+    jobs = new CouchJobRepository(wc, { log });
     collections = new CouchCollectionRepository(wc);
     // Search projects assets + collections (issue #561).
     search = new CouchSearchRepository(wc, collections);
