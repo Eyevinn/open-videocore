@@ -21,6 +21,10 @@ import { recomputeAssetStateAfterTerminalJob } from '../pipeline/asset-state-aft
 // router's copy of stepExecutionSchema and the assets router's copy
 // (src/routes/assets.ts) cannot drift on it.
 import { stepErrorDetailSchema } from '../pipeline/step-error-detail.js';
+// #1339: the one marker that tells a cancelled run apart from a failed one.
+// Shared with DELETE /api/v1/jobs/:id (src/routes/jobs.ts) so both cancel
+// paths stamp an identical detail.
+import { buildCancelledStepErrorDetail } from '../pipeline/cancelled-run-detail.js';
 
 const stepExecutionSchema = z.object({
   name: z.enum(['extract-metadata', 'thumbnail', 'subtitles', 'scene-detect', 'transcode', 'package']),
@@ -56,7 +60,21 @@ const pipelineExecutionSchema = z.object({
   assetId: z.string(),
   assetName: z.string().optional(),
   pipelineName: z.string(),
-  status: z.enum(['running', 'done', 'failed']),
+  // #1339: a run CANCELLED by hand (DELETE /:executionId, or DELETE
+  // /api/v1/jobs/:id on the job behind a running step) also reports `failed` —
+  // these three values are the whole enum and no new one is introduced — and is
+  // told apart by `steps[].errorDetail.code = 'cancelled'` on the steps the
+  // cancel settled. See buildCancelledStepErrorDetail
+  // (../pipeline/cancelled-run-detail.ts).
+  status: z
+    .enum(['running', 'done', 'failed'])
+    .describe(
+      'Execution status. `failed` covers BOTH a run that broke and a run that ' +
+        'was cancelled by hand — cancelling settles the run as `failed` ' +
+        'because these three values are the whole enum. To tell them apart, ' +
+        'look for `errorDetail.code = "cancelled"` on the steps the cancel ' +
+        'settled; a cancelled run is a stop, not an error.'
+    ),
   steps: z.array(stepExecutionSchema),
   createdAt: z.string(),
   updatedAt: z.string()
@@ -167,9 +185,25 @@ export const pipelinesRouter: FastifyPluginAsync<PipelinesRouterOptions> = async
       // already-settled step is left as-is: `done` for a completed one and
       // `skipped` for an optional step that never ran (issue #789) — cancelling
       // the execution must not retroactively turn either into a failure.
+      //
+      // #1339: each step this cancel settles also gets
+      // `errorDetail.code = 'cancelled'`, the distinct marker separating a run
+      // an operator stopped from one that broke. The statuses above are
+      // unchanged — `failed` is still the only terminal status the enums carry
+      // (StepStatus / PipelineExecution.status, ../data/pipeline-repo.ts) — so
+      // a client that does not read `errorDetail` sees exactly what it saw
+      // before. An already-terminal step keeps whatever detail it had: a step
+      // that genuinely failed earlier is not relabelled as cancelled.
       const now = new Date().toISOString();
       const updatedSteps = exec.steps.map((step) =>
-        isStepTerminal(step) ? step : { ...step, status: 'failed' as const, completedAt: now }
+        isStepTerminal(step)
+          ? step
+          : {
+              ...step,
+              status: 'failed' as const,
+              errorDetail: buildCancelledStepErrorDetail(),
+              completedAt: now
+            }
       );
       const updated = await pipelineRepository.update(exec.id, {
         status: 'failed',

@@ -17,6 +17,10 @@ import { decodeEncoreJobId } from '../data/job-repo.js';
 // #1227: recompute the asset's state from the job's FINAL state once the cancel
 // has made that state terminal.
 import { recomputeAssetStateAfterTerminalJob } from '../pipeline/asset-state-after-terminal-job.js';
+// #1339: the marker that tells a cancelled run apart from a failed one, stamped
+// on the `transcode` step this cancel settles. Shared with the run-level cancel
+// (DELETE /api/v1/pipelines/:executionId, src/routes/pipelines.ts).
+import { buildCancelledStepErrorDetail } from '../pipeline/cancelled-run-detail.js';
 import type { MessageFailureClass } from '../encore-scaler/retry-policy.js';
 import { authGate } from '../auth/middleware.js';
 
@@ -290,6 +294,13 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
       // Release the running pipeline lock: mark the running transcode step failed
       // so the asset's pipeline is no longer RUNNING. No-op when no running
       // execution is found (e.g. non-transcode/ingest jobs).
+      //
+      // #1339: that step also carries `errorDetail.code = 'cancelled'` — the
+      // machine-readable half of the free-text `error` right below it, and the
+      // same detail the run-level cancel stamps
+      // (src/routes/pipelines.ts). Without it the run reads exactly like a
+      // broken one: `failed` execution, `failed` step. The statuses are
+      // unchanged; only the optional detail is added.
       const pipelineRepo = opts.pipelineRepository;
       if (pipelineRepo) {
         const execution = await pipelineRepo.findRunningByAssetAndStep(job.assetId, 'transcode');
@@ -302,6 +313,7 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
               ...steps[tIdx],
               status: 'failed',
               error: 'cancelled by operator',
+              errorDetail: buildCancelledStepErrorDetail(),
               completedAt: now
             };
             await pipelineRepo.update(execution.id, { steps, status: 'failed' });
