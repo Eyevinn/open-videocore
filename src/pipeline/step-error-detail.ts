@@ -55,6 +55,20 @@ import { z } from 'zod';
 // user-safe sentence: the raw packager text stays in `error` and the server
 // logs, never in the detail.
 //
+// `cancelled` (#1339) is the one code here that does NOT describe something
+// going wrong. A run stopped by hand — DELETE /api/v1/pipelines/:executionId,
+// or DELETE /api/v1/jobs/:id on the job behind a running `transcode` step —
+// settles its unfinished steps as `failed` and the execution as `failed`,
+// because `running | done | failed` is the entire execution status enum
+// (PipelineExecution.status, ../data/pipeline-repo.ts) and `pending | running |
+// done | failed | skipped` the entire step one (StepStatus, same file). Until
+// now that left an operator's own cancel indistinguishable from a genuine
+// failure: a caller polling a run could not tell "someone stopped this" (do
+// nothing, or re-run when ready) from "this broke" (alert, retry,
+// investigate). The code is the distinct marker for that, carried in the place
+// the schema already has for machine-readable annotation, so the status values
+// existing clients branch on are untouched.
+//
 // Kept as a `const` tuple so the route schemas derive their enum from it and a
 // new code cannot be added without the response contract following.
 export const STEP_ERROR_CODES = [
@@ -62,7 +76,8 @@ export const STEP_ERROR_CODES = [
   'packager_timeout',
   'packager_unsupported_media',
   'packager_auth',
-  'packager_failed'
+  'packager_failed',
+  'cancelled'
 ] as const;
 export type StepErrorCode = (typeof STEP_ERROR_CODES)[number];
 
@@ -137,7 +152,12 @@ export const stepErrorDetailSchema = z.object({
         '(unsupported container/codec). `packager_auth`: the packaging ' +
         'credential was rejected, so the run could not be authorised. ' +
         '`packager_failed`: a packaging failure outside the three classes ' +
-        'above. Branch on this rather than on the free-text `error`.'
+        'above. `cancelled`: the step did not fail — the run was cancelled by ' +
+        'hand (DELETE /api/v1/pipelines/{executionId}, or DELETE ' +
+        '/api/v1/jobs/{id} on the job behind a running step), and the step and ' +
+        'its execution report `failed` only because that is the terminal ' +
+        'status the enums carry; treat it as a stop, not an error. Branch on ' +
+        'this rather than on the free-text `error`.'
     ),
   message: z.string().describe('One human-readable sentence describing the failure.'),
   storageError: z

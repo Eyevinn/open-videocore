@@ -69,6 +69,15 @@ export type StepExecution = {
   // user-safe sentence ONLY — no job URL, host or credential — because the
   // packager's own text can contain all three and stays on `error` and in the
   // server logs. Built by src/pipeline/package-failure-detail.ts.
+  //
+  // A step settled by a CANCEL carries `code: 'cancelled'` (issue #1339) —
+  // DELETE /api/v1/pipelines/:executionId, or DELETE /api/v1/jobs/:id on the
+  // job behind a running `transcode` step. That code is the only one here that
+  // does not mean something went wrong: a cancelled run has to report `failed`
+  // because `failed` is the only terminal status `StepStatus` and
+  // `PipelineExecution['status']` carry, and this is what tells a caller the
+  // run was stopped rather than broken. Built by
+  // src/pipeline/cancelled-run-detail.ts.
   errorDetail?: StepErrorDetail;
   // Why a `skipped` step did not run (issue #789), e.g. the optional service
   // instance for this stack is unconfigured. Only set when status is `skipped`;

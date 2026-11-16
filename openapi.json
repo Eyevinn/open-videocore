@@ -9519,9 +9519,10 @@
                                   "packager_timeout",
                                   "packager_unsupported_media",
                                   "packager_auth",
-                                  "packager_failed"
+                                  "packager_failed",
+                                  "cancelled"
                                 ],
-                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. Branch on this rather than on the free-text `error`."
+                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. `cancelled`: the step did not fail \u2014 the run was cancelled by hand (DELETE /api/v1/pipelines/{executionId}, or DELETE /api/v1/jobs/{id} on the job behind a running step), and the step and its execution report `failed` only because that is the terminal status the enums carry; treat it as a stop, not an error. Branch on this rather than on the free-text `error`."
                               },
                               "message": {
                                 "type": "string",
@@ -9833,9 +9834,10 @@
                                     "packager_timeout",
                                     "packager_unsupported_media",
                                     "packager_auth",
-                                    "packager_failed"
+                                    "packager_failed",
+                                    "cancelled"
                                   ],
-                                  "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. Branch on this rather than on the free-text `error`."
+                                  "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. `cancelled`: the step did not fail \u2014 the run was cancelled by hand (DELETE /api/v1/pipelines/{executionId}, or DELETE /api/v1/jobs/{id} on the job behind a running step), and the step and its execution report `failed` only because that is the terminal status the enums carry; treat it as a stop, not an error. Branch on this rather than on the free-text `error`."
                                 },
                                 "message": {
                                   "type": "string",
@@ -10044,9 +10046,10 @@
                                   "packager_timeout",
                                   "packager_unsupported_media",
                                   "packager_auth",
-                                  "packager_failed"
+                                  "packager_failed",
+                                  "cancelled"
                                 ],
-                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. Branch on this rather than on the free-text `error`."
+                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. `cancelled`: the step did not fail \u2014 the run was cancelled by hand (DELETE /api/v1/pipelines/{executionId}, or DELETE /api/v1/jobs/{id} on the job behind a running step), and the step and its execution report `failed` only because that is the terminal status the enums carry; treat it as a stop, not an error. Branch on this rather than on the free-text `error`."
                               },
                               "message": {
                                 "type": "string",
@@ -10248,9 +10251,10 @@
                                     "packager_timeout",
                                     "packager_unsupported_media",
                                     "packager_auth",
-                                    "packager_failed"
+                                    "packager_failed",
+                                    "cancelled"
                                   ],
-                                  "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. Branch on this rather than on the free-text `error`."
+                                  "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. `cancelled`: the step did not fail \u2014 the run was cancelled by hand (DELETE /api/v1/pipelines/{executionId}, or DELETE /api/v1/jobs/{id} on the job behind a running step), and the step and its execution report `failed` only because that is the terminal status the enums carry; treat it as a stop, not an error. Branch on this rather than on the free-text `error`."
                                 },
                                 "message": {
                                   "type": "string",
@@ -17989,7 +17993,8 @@
                               "running",
                               "done",
                               "failed"
-                            ]
+                            ],
+                            "description": "Execution status. `failed` covers BOTH a run that broke and a run that was cancelled by hand \u2014 cancelling settles the run as `failed` because these three values are the whole enum. To tell them apart, look for `errorDetail.code = \"cancelled\"` on the steps the cancel settled; a cancelled run is a stop, not an error."
                           },
                           "steps": {
                             "type": "array",
@@ -18036,9 +18041,10 @@
                                         "packager_timeout",
                                         "packager_unsupported_media",
                                         "packager_auth",
-                                        "packager_failed"
+                                        "packager_failed",
+                                        "cancelled"
                                       ],
-                                      "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. Branch on this rather than on the free-text `error`."
+                                      "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. `cancelled`: the step did not fail \u2014 the run was cancelled by hand (DELETE /api/v1/pipelines/{executionId}, or DELETE /api/v1/jobs/{id} on the job behind a running step), and the step and its execution report `failed` only because that is the terminal status the enums carry; treat it as a stop, not an error. Branch on this rather than on the free-text `error`."
                                     },
                                     "message": {
                                       "type": "string",
@@ -18183,7 +18189,8 @@
                         "running",
                         "done",
                         "failed"
-                      ]
+                      ],
+                      "description": "Execution status. `failed` covers BOTH a run that broke and a run that was cancelled by hand \u2014 cancelling settles the run as `failed` because these three values are the whole enum. To tell them apart, look for `errorDetail.code = \"cancelled\"` on the steps the cancel settled; a cancelled run is a stop, not an error."
                     },
                     "steps": {
                       "type": "array",
@@ -18230,9 +18237,10 @@
                                   "packager_timeout",
                                   "packager_unsupported_media",
                                   "packager_auth",
-                                  "packager_failed"
+                                  "packager_failed",
+                                  "cancelled"
                                 ],
-                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. Branch on this rather than on the free-text `error`."
+                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. `cancelled`: the step did not fail \u2014 the run was cancelled by hand (DELETE /api/v1/pipelines/{executionId}, or DELETE /api/v1/jobs/{id} on the job behind a running step), and the step and its execution report `failed` only because that is the terminal status the enums carry; treat it as a stop, not an error. Branch on this rather than on the free-text `error`."
                               },
                               "message": {
                                 "type": "string",
@@ -18383,7 +18391,8 @@
                         "running",
                         "done",
                         "failed"
-                      ]
+                      ],
+                      "description": "Execution status. `failed` covers BOTH a run that broke and a run that was cancelled by hand \u2014 cancelling settles the run as `failed` because these three values are the whole enum. To tell them apart, look for `errorDetail.code = \"cancelled\"` on the steps the cancel settled; a cancelled run is a stop, not an error."
                     },
                     "steps": {
                       "type": "array",
@@ -18430,9 +18439,10 @@
                                   "packager_timeout",
                                   "packager_unsupported_media",
                                   "packager_auth",
-                                  "packager_failed"
+                                  "packager_failed",
+                                  "cancelled"
                                 ],
-                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. Branch on this rather than on the free-text `error`."
+                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. `packager_timeout`: a `package` step that never signalled completion inside the allowed window and was declared failed by the completion watchdog. `packager_unsupported_media`: the packager could not parse the media (unsupported container/codec). `packager_auth`: the packaging credential was rejected, so the run could not be authorised. `packager_failed`: a packaging failure outside the three classes above. `cancelled`: the step did not fail \u2014 the run was cancelled by hand (DELETE /api/v1/pipelines/{executionId}, or DELETE /api/v1/jobs/{id} on the job behind a running step), and the step and its execution report `failed` only because that is the terminal status the enums carry; treat it as a stop, not an error. Branch on this rather than on the free-text `error`."
                               },
                               "message": {
                                 "type": "string",
