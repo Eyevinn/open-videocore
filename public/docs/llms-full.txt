@@ -3962,7 +3962,8 @@ Response 200 (application/json)
   Request
 Request body (application/json)
 {
-  "message": "string"
+  "message": "string",
+  "reason": "string"
 }
 
   Response
