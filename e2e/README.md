@@ -7,6 +7,7 @@ The end-to-end suite and the runner that tests the beta image on OSC (eng-open-v
 | Path | What |
 |---|---|
 | `suite/cases.mjs` | the 12 cases (health, auth-required, x-jwt-accepted, auth-accepted, ingest-url, metadata, thumbnails, transcode, package, search, tags-roundtrip, delete) |
+| `suite/cases.mjs` → `GATE_CASES` | suite **v2** (issue #1268): the 12 above plus `drm-flag-off` directly after `package`. This is the list the gate's entry points (`suite/cli.mjs`, `runner/wire.mjs`) run; `runSuite` still defaults to the v1 list, so a caller that wants a gate verdict passes `cases: GATE_CASES` |
 | `suite/run.mjs`, `suite/cli.mjs` | runs the cases in order; a failed chain case marks the rest `skipped`; deletes its asset on the way out. Status `infra-error` when every failure was a platform failure, `red` as soon as one failure is the image's own |
 | `runner/cycle.mjs` | one runner cycle: read the commit from the `:latest` image label; skip if that commit already has a green or red result, create-or-restart the instance, wait for `/health` `build.commit` to equal `main`'s head, run the suite (once more if the first run ends `infra-error`), record. Statuses: `green`, `red`, `stale`, `infra-error` |
 | `runner/stack.mjs` | makes sure the instance has a provisioned stack (`GET`/`POST /api/v1/provision/`): a fresh instance has no backing storage and ingest answers `500 object storage is not configured for this stack` |
@@ -125,3 +126,20 @@ Variables: `GHCR_USER`, `GHCR_TOKEN` (read:packages), `OSC_ACCESS_TOKEN`, `E2E_I
 - The instance's ingest may refuse the raw.githubusercontent.com URL (SSRF rules); then host the clip in the
   runner's bucket instead.
 - Everything under "Not verified, needs the first live run" above.
+
+## DRM in the gate (issue #1268, ADR-008 §13 / D9)
+
+Suite v2 adds exactly one DRM case, `drm-flag-off`. With `DRM_ENABLED=false` — the default, and what
+the e2e instance runs — it asserts that `GET /api/v1/assets/{id}/delivery` carries **no `drm`
+property**, that the packaged asset read carries none either and still advertises its `manifestUrls`
+(the clear path unchanged), and that no item in `GET /api/v1/assets/` carries one. It needs no new
+credential and no new environment variable, so the runner's credential set (ADR-007 §5) is unchanged.
+
+**There is no DRM-positive case here, on purpose.** The OSC catalog packager cannot encrypt, so such a
+case would be red on every cycle; red is final per commit and blocks promotion, so a permanently red
+case would train the team to ignore the gate. The upstream change is tracked in the engagement's
+friction log `docs/osc-feedback/incoming-packager-no-encryption-support.md`. The positive path is
+proven locally instead, by the product repo's `docker compose --profile local-drm` service plus
+`test/drm-local-clearkey-chain.test.ts`, which asserts the packaged manifests carry
+`#EXT-X-SESSION-KEY` (HLS) and `ContentProtection` (DASH) and **skips with a named reason** when the
+locally built encryption-capable packager image is absent.

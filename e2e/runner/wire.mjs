@@ -4,7 +4,7 @@ import { ensureStack } from './stack.mjs';
 import { slackNotifier } from '../lib/notify.mjs';
 import { fileStore } from './store-file.mjs';
 import { s3Store } from './store-s3.mjs';
-import { createClient, runSuite, timeoutsFromEnv } from '../suite/run.mjs';
+import { createClient, runSuite, timeoutsFromEnv, GATE_CASES } from '../suite/run.mjs';
 
 export class ConfigError extends Error {}
 
@@ -28,6 +28,7 @@ export async function buildDeps(env) {
     store,
     notify: slackNotifier({ token: env.E2E_SLACK_BOT_TOKEN, channel: env.E2E_SLACK_CHANNEL || undefined, secrets }),
     runSuite: (inst, expected) => runSuite({
+      cases: GATE_CASES, // the gate list: v1 plus the DRM flag-off case (issue #1268)
       client: createClient({ baseUrl: inst.baseUrl, token: inst.token }),
       anon: createClient({ baseUrl: inst.baseUrl }),
       ingress: createClient({ baseUrl: inst.baseUrl, token: inst.token, appToken: '' }),
