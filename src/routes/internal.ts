@@ -81,7 +81,12 @@ import { failPackageJob } from '../pipeline/package-job.js';
 // The callback's `message` is the only signal this path has, so the classifier
 // matches against it; what lands on the step is a code plus a fixed user-safe
 // sentence, never the message itself.
-import { buildPackageFailureErrorDetail } from '../pipeline/package-failure-detail.js';
+// #1340: the same callback may also carry a structured `reason` naming the
+// failure class. `normalisePackageFailureReason` is the known-set check.
+import {
+  buildPackageFailureErrorDetail,
+  normalisePackageFailureReason
+} from '../pipeline/package-failure-detail.js';
 import type { AuditEmitter } from '../data/audit-emit.js';
 import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
@@ -98,8 +103,24 @@ const packagerSuccessSchema = z.object({
   outputPath: z.string().optional()
 });
 
+// `reason` (issue #1340) is the packager naming the failure CLASS instead of
+// leaving us to infer it from prose. OPTIONAL and loosely typed ON PURPOSE:
+//   - optional, because the packager does not send it yet (verified against
+//     Eyevinn/encore-packager@main, src/callbackListener.ts:88-108, whose
+//     `onPackageFail` POSTs `{ message }` only). A body without it must keep
+//     behaving exactly as before.
+//   - `z.string()` rather than an enum of the known tokens, because the
+//     callback is best-effort and fire-and-forget: the packager never reads our
+//     response (same file — the failure path does not even check `response.ok`).
+//     Rejecting an unrecognised token with a 400 would therefore not correct
+//     anybody; it would DISCARD the failure signal, and the run would go back to
+//     surfacing only at the 15-minute watchdog — the precise outcome #1340
+//     exists to remove. So the known-set check lives one layer in
+//     (`normalisePackageFailureReason`), where an unknown token degrades to the
+//     text classification instead of to nothing.
 const packagerFailureSchema = z.object({
-  message: z.string()
+  message: z.string(),
+  reason: z.string().optional()
 });
 
 const ackSchema = z.object({ ok: z.boolean() });
@@ -657,9 +678,11 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
   // Packager failure callback (issue #9, attribution hardened by #209). No auth
   // — see file header.
   // Path: {CallbackUrl}/packagerCallback/failure
-  // CONTRACT: body: { message } ONLY — the packager does NOT echo the jobId on
-  //   the failure path (verified from encore-packager callbackListener.ts). So
-  //   we cannot correlate the failure by a packager-supplied id. Instead we
+  // CONTRACT: body: { message, reason? } — the packager does NOT echo the jobId
+  //   on the failure path (verified from encore-packager callbackListener.ts).
+  //   `reason` (#1340) is the optional failure class; it is additive and not yet
+  //   sent by the packager, so the handler must behave identically without it.
+  //   We cannot correlate the failure by a packager-supplied id. Instead we
   //   correlate by open-videocore-side EXECUTION STATE: any pipeline execution
   //   currently blocked on a running `package` step is awaiting exactly this
   //   packager callback, so we mark that step (and the execution) failed and
@@ -679,8 +702,30 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
     },
     async (request, reply) => {
       const message = request.body.message;
-      // Always log — this is the durable record when no execution matches.
-      fastify.log.error({ msg: 'packager reported failure', message });
+      // #1340: validate the optional structured reason against the known set
+      // HERE, so everything downstream deals in a canonical token or in
+      // nothing. A token we do not know is logged once and then treated as
+      // absent: the message classification still runs, so the failure is still
+      // attributed in seconds — only the sharper code is lost. Never a 4xx; see
+      // the schema comment for why rejecting the body would be the worse
+      // outcome.
+      const failureReason = normalisePackageFailureReason(request.body.reason);
+      if (request.body.reason !== undefined && failureReason === undefined) {
+        fastify.log.warn({
+          msg: 'packager failure reason not recognised; classifying from the message instead',
+          // Server-side only, like the `message` logged just below, and the one
+          // way an operator sees the packager drifting from the known set.
+          reason: request.body.reason
+        });
+      }
+      // Always log — this is the durable record when no execution matches. The
+      // `reason` member is spread in ONLY when a known one was sent, so a
+      // callback without one logs the identical record it logged before #1340.
+      fastify.log.error({
+        msg: 'packager reported failure',
+        message,
+        ...(failureReason !== undefined ? { reason: failureReason } : {})
+      });
 
       // This callback carries NO identifier of ours — not even an assetId — so
       // there is no stack identity to decode (issue #1058). Attribution is by
@@ -714,7 +759,11 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
                 // user-safe sentence ONLY — `message` can contain the transcoder
                 // job URL the packager was pointed at, and it stays where it
                 // already was: on `error` and in the fastify.log.error above.
-                const errorDetail = buildPackageFailureErrorDetail(message);
+                // #1340: a known `reason` asserts the class outright and wins
+                // over the message matching; without one (today's packager)
+                // this is the pre-#1340 call verbatim. The reason is mapped to
+                // a code only — never copied into the detail.
+                const errorDetail = buildPackageFailureErrorDetail(message, failureReason);
                 const runningPackageStep = execution.steps.find(
                   (s) => s.name === 'package' && s.status === 'running'
                 );
