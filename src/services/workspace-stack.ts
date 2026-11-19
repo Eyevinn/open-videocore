@@ -326,7 +326,10 @@ function buildConnectionsFromStack(
   const search = new CouchSearchRepository(wc, collections);
   const webhooks = new CouchWebhookRepository(wc);
   const profiles = new CouchProfileRepository(wc);
-  const pipelines = new CouchPipelineRepository(wc);
+  // `log` so a listing served by the degraded (no sort index) scan reports
+  // itself instead of silently costing a scan per request (#1350), the same
+  // seam the comment store and the durable log store already take.
+  const pipelines = new CouchPipelineRepository(wc, log);
   // Asset comments over the same per-stack CouchDB connection (issue #1046), so
   // a stack provisioned through POST /api/v1/provision gets the DURABLE comment
   // store without any COUCHDB_URL env var being set.
@@ -512,7 +515,7 @@ function buildEnvConnections(
     search = new CouchSearchRepository(wc, collections);
     webhooks = new CouchWebhookRepository(wc);
     profiles = new CouchProfileRepository(wc);
-    pipelines = new CouchPipelineRepository(wc);
+    pipelines = new CouchPipelineRepository(wc, log);
     comments = new CouchCommentRepository(wc, log);
     audit = new CouchAuditRepository(wc);
     // `log` so a failed overflow eviction or an over-cap read window is reported

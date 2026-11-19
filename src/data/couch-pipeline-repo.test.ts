@@ -102,6 +102,36 @@ function makeCouch(): {
     }
   } as unknown as StackCouch;
 
+  // Issue #1350 widened what the pipeline listing asks CouchDB for: `listAll`
+  // now sends a Mango presence condition (`createdAt: { $gt: null }`) so the
+  // query may be sorted, asks for that sort over a declared index, and reads
+  // `total` from `count`. This fake predates all three, so it is extended here
+  // — additively, leaving the get/put/find above untouched — with just enough
+  // of them that the #1060 round-trips keep exercising the same read paths.
+  // Order, paging and `total` are covered in
+  // ./couch-pipeline-list-pagination.test.ts against a fake that models them.
+  const findEqualityOnly = couch.find.bind(couch);
+  const extended = couch as unknown as {
+    find: (selector: Record<string, unknown>, opts?: unknown) => Promise<StoredDoc[]>;
+    count: (selector: Record<string, unknown>) => Promise<number>;
+    ensureIndex: () => Promise<void>;
+  };
+  // Drop operator conditions before handing the selector to the equality-only
+  // matcher above. The only operator the listing uses is `$gt: null`, which
+  // CouchDB matches for any present, non-null value — and every document
+  // `toDoc` writes carries `createdAt` — so dropping it selects the same set.
+  const stripOperators = (selector: Record<string, unknown>): Record<string, unknown> =>
+    Object.fromEntries(
+      Object.entries(selector).filter(
+        ([, condition]) => condition === null || typeof condition !== 'object'
+      )
+    );
+  extended.find = async (selector: Record<string, unknown>): Promise<StoredDoc[]> =>
+    findEqualityOnly(stripOperators(selector));
+  extended.count = async (selector: Record<string, unknown>): Promise<number> =>
+    (await extended.find(selector)).length;
+  extended.ensureIndex = async (): Promise<void> => {};
+
   return {
     couch,
     seed: (doc: StoredDoc) => {
