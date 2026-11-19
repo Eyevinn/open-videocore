@@ -61,6 +61,11 @@ const createInstanceMock = vi.fn();
 const getInstanceHealthMock = vi.fn(async () => 'running');
 const removeInstanceMock = vi.fn(async () => undefined);
 const oscListInstancesMock = vi.fn(async () => [] as unknown[]);
+// #1287: spawnInstance writes the object-store secret access key as an OSC
+// per-service secret before the create call (the body carries only a
+// `{{secrets.<name>}}` reference), so the SDK's saveSecret is now part of the
+// path under test and is stubbed rather than performing a real secret write.
+const saveSecretMock = vi.fn(async () => undefined);
 vi.mock('@osaas/client-core', async () => {
   const actual = await vi.importActual<typeof import('@osaas/client-core')>(
     '@osaas/client-core'
@@ -70,7 +75,8 @@ vi.mock('@osaas/client-core', async () => {
     createInstance: (...args: unknown[]) => createInstanceMock(...args),
     getInstanceHealth: (...args: unknown[]) => getInstanceHealthMock(...args),
     removeInstance: (...args: unknown[]) => removeInstanceMock(...args),
-    listInstances: (...args: unknown[]) => oscListInstancesMock(...args)
+    listInstances: (...args: unknown[]) => oscListInstancesMock(...args),
+    saveSecret: (...args: unknown[]) => saveSecretMock(...(args as []))
   };
 });
 
