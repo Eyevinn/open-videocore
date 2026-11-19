@@ -44,10 +44,11 @@
 //     stored values with `stepErrorDetailSchema`, so a code absent from the
 //     tuple would silently degrade to "no detail".
 //   - The failure callback whose `message` is classified here: POST
-//     /packagerCallback/failure, body `packagerFailureSchema` = `{ message }`
-//     ONLY (src/routes/internal.ts:101, handler at :673). The packager
-//     sends no id and no structured reason, so the message text — which is
-//     where it relays its own log line — is the only signal available.
+//     /packagerCallback/failure, body `packagerFailureSchema`
+//     (src/routes/internal.ts:101, handler at :673). The packager
+//     sends no id, so the message text — which is where it relays its own log
+//     line — was until #1340 the only signal available; since #1340 the body
+//     may also carry an OPTIONAL `reason`, see below.
 //   - The completion watchdog that produces the timeout:
 //     `reconcileStalledPackages` with `DEFAULT_PACKAGE_STALL_TIMEOUT_MS =
 //     15 * 60 * 1000` (src/pipeline/stalled-package-reconciler.ts:46, 98).
@@ -99,17 +100,102 @@ const PARSER_FAILURE_PATTERN = /parser[\s_-]?failure/i;
 const AUTH_FAILURE_PATTERN =
   /\b401\b|unauthori[sz]ed|invalid[\s_-]+(?:access[\s_-]+)?token|token[\s_-]+(?:is[\s_-]+)?(?:invalid|expired|rejected)|authentication[\s_-]+failed/i;
 
-// Classify a packager failure text into a code.
+// THE STRUCTURED REASON VOCABULARY (issue #1340, from #1336)
+// ----------------------------------------------------------
+// The failure callback may carry an optional `reason` alongside its `message`:
+// a short, stable token naming the failure CLASS, so the API no longer has to
+// infer the class by matching prose the packager happened to write. The tokens
+// are deliberately few and map one-to-one onto the `packager_*` codes a caller
+// can act on; `packager_timeout` is absent on purpose, because it is the
+// verdict for "no signal arrived at all" and no signal can assert it.
 //
-// Precedence follows issue #1338: an unparseable media first (the most
-// specific, and the one whose remedy sits with the caller), then a rejected
-// credential, then the catch-all. `packager_timeout` is NOT reachable from text
-// — it is a verdict only the completion watchdog can reach, since it is defined
-// by the ABSENCE of any packager signal — so it has its own builder below.
+// WHERE THE VOCABULARY COMES FROM. The packager's own failure path today is
+// `CallbackListener.onPackageFail(message, err)`, which POSTs `{ message }` and
+// drops `err` (Eyevinn/encore-packager@main, src/callbackListener.ts:88-108;
+// the `PackageListener` interface at src/packageListener.ts:3). `message` is
+// the text composed in `EncorePackager.package`, i.e.
+// `Packaging of job <id> failed: <underlying error>`
+// (src/encorePackager.ts:117-125). So `reason` does NOT exist packager-side
+// yet: this is the API half of the contract, specified here so the packager
+// change (a separate Eyevinn/encore-packager issue, NOT a blocking dependency)
+// has something exact to implement. Until it ships, no caller sends `reason`
+// and every failure keeps taking the text-matching path below, unchanged.
+//
+// The three classes are the three observed in #1336: media the underlying tool
+// cannot parse (it reports `PARSER_FAILURE`), a rejected service credential
+// (#1335: a stale OSC token on the packager, where the failure never reached us
+// at all and the step only failed at the 15-minute watchdog), and everything
+// else.
+export const PACKAGE_FAILURE_REASONS = [
+  // The media could not be parsed: unsupported container/codec. Caller remedy.
+  'unsupported_media',
+  // The credential the packager was given was rejected. Operator remedy.
+  'invalid_credentials',
+  // The packager's catch-all: it failed, with no class it can name.
+  'packaging_failed'
+] as const;
+export type PackageFailureReason = (typeof PACKAGE_FAILURE_REASONS)[number];
+
+// The code each reason asserts.
+const REASON_CODES: Readonly<Record<PackageFailureReason, PackageStepErrorCode>> = Object.freeze({
+  unsupported_media: 'packager_unsupported_media',
+  invalid_credentials: 'packager_auth',
+  packaging_failed: 'packager_failed'
+});
+
+// Validate a received `reason` against the known set, returning the canonical
+// token or `undefined` for anything else (including a non-string, which the
+// route schema already excludes, and `undefined` itself).
+//
+// Matching is case- and surrounding-whitespace-insensitive only. Nothing else
+// is coerced: a token we do not know is NOT guessed at, it is rejected here and
+// the caller falls back to the text classifier, which is strictly better than
+// mapping an unknown class onto a code a client would branch on.
+export function normalisePackageFailureReason(reason: unknown): PackageFailureReason | undefined {
+  if (typeof reason !== 'string') return undefined;
+  const token = reason.trim().toLowerCase();
+  return (PACKAGE_FAILURE_REASONS as readonly string[]).includes(token)
+    ? (token as PackageFailureReason)
+    : undefined;
+}
+
+// The code a known reason maps to. Exported so the mapping is testable and
+// citable on its own, rather than only observable through a built detail.
+export function codeForPackageFailureReason(reason: PackageFailureReason): PackageStepErrorCode {
+  return REASON_CODES[reason];
+}
+
+// Classify a packager failure into a code, from its optional structured
+// `reason` first and its free text second.
+//
+// `reason` (issue #1340) is the packager naming the class itself, so a KNOWN,
+// SPECIFIC reason wins outright: it is an assertion, not an inference, and no
+// amount of prose matching should override it.
+//
+// Two cases deliberately fall through to the text classifier instead:
+//   - `packaging_failed`, the packager's catch-all. It asserts only "it
+//     failed", which is exactly what the text classifier's own default says —
+//     so letting the text be matched can only SHARPEN the verdict (a
+//     `PARSER_FAILURE` in the message still yields `packager_unsupported_media`)
+//     and can never blunt it.
+//   - an unknown/absent reason, which carries no information at all.
+// Either way the fallback is the pre-#1340 behaviour verbatim.
+//
+// Precedence within the text path follows issue #1338: an unparseable media
+// first (the most specific, and the one whose remedy sits with the caller),
+// then a rejected credential, then the catch-all. `packager_timeout` is NOT
+// reachable from text — it is a verdict only the completion watchdog can reach,
+// since it is defined by the ABSENCE of any packager signal — so it has its own
+// builder below.
 //
 // `undefined`/empty text classifies as `packager_failed`: a failure we were
 // told about but cannot classify is still a packaging failure.
-export function classifyPackageFailure(failureText: string | undefined): PackageStepErrorCode {
+export function classifyPackageFailure(
+  failureText: string | undefined,
+  reason?: unknown
+): PackageStepErrorCode {
+  const known = normalisePackageFailureReason(reason);
+  if (known !== undefined && known !== 'packaging_failed') return codeForPackageFailureReason(known);
   const text = failureText ?? '';
   if (PARSER_FAILURE_PATTERN.test(text)) return 'packager_unsupported_media';
   if (AUTH_FAILURE_PATTERN.test(text)) return 'packager_auth';
@@ -135,8 +221,15 @@ export function buildPackageTimeoutErrorDetail(): StepErrorDetail {
 // the packager's log line was captured instead, that log. `failureText` may
 // carry anything the packager wrote, including URLs — it is only ever MATCHED
 // against here, never copied into the returned detail.
+//
+// `reason` (issue #1340) is the callback's optional structured token. It is
+// likewise never copied into the detail — only mapped to a code — so the
+// detail's "code + fixed sentence and nothing else" guarantee is unaffected by
+// whatever a caller puts in the field. Omitting it reproduces the pre-#1340
+// result exactly.
 export function buildPackageFailureErrorDetail(
-  failureText: string | undefined
+  failureText: string | undefined,
+  reason?: unknown
 ): StepErrorDetail {
-  return packageErrorDetail(classifyPackageFailure(failureText));
+  return packageErrorDetail(classifyPackageFailure(failureText, reason));
 }
