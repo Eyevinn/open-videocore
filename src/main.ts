@@ -194,6 +194,7 @@ import { reconcileInterruptedIngests } from './pipeline/interrupted-ingest-recon
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import {
   PackagerEnsureSingleFlight,
+  PackagerPatRollLedger,
   packagerOscApiFromContext,
   packagerQueueForStack,
   packagingStackName
@@ -2293,6 +2294,14 @@ function activateScaler(redisUrl: string): void {
     // guard per activation; cleared implicitly when the scaler deactivates and
     // the ensurePackaging closure is dropped.
     const packagerEnsureGuard = new PackagerEnsureSingleFlight();
+    // Stale-token guard (issue #1335). `packagerPat` below is read from this
+    // process's OSC context, so after a token rotation the only way the API
+    // itself sees the new value is a restart — which also gives it a fresh
+    // ledger. The first packaging execution of this process therefore refreshes
+    // an existing packager's `<stack>.pat` and rolls it onto the current token;
+    // every later execution finds the stack already claimed and leaves the
+    // running packager alone. One ledger per activation, like the guard above.
+    const packagerPatRollLedger = new PackagerPatRollLedger();
     ensurePackaging = async () => {
       // Resolve the stack (name + MinIO endpoint + packaged bucket) the packaging
       // work belongs to: the ambient stack (packagingStackName), which both
@@ -2399,6 +2408,11 @@ function activateScaler(redisUrl: string): void {
           oscPersonalAccessToken: packagerPat
         },
         log: app.log,
+        // Issue #1335: lets the ensure step roll an EXISTING packager once per
+        // process after refreshing its `<stack>.pat`, so a rotated/revoked token
+        // is not kept by a long-running packager (which used to show up as a
+        // 15-minute packaging timeout).
+        patRollLedger: packagerPatRollLedger,
         // Record the created packager in the stack's service inventory (issue
         // #335 acceptance). The packager shares the stack name and is NOT part of
         // STACK_SERVICES, so it was previously absent from services[]. We append

@@ -71,6 +71,7 @@ import {
   getInstance,
   listInstances,
   removeInstance,
+  restartInstance,
   saveSecret
 } from '@osaas/client-core';
 // The readiness wait goes through this bounded helper, NOT @osaas/client-core's
@@ -225,6 +226,22 @@ export interface PackagerOscApi {
     name: string,
     token: string
   ): Promise<void>;
+  // restartInstance(ctx, serviceId, name, token) -> Promise<void>
+  // (@osaas/client-core lib/core.d.ts:95, v0.24.0; POSTs the instance's
+  // `restart` _link, lib/core.js:230-238). Rolls a RUNNING packager so it
+  // re-reads its {{secrets.*}} values — the only way to get a refreshed
+  // `<stack>.pat` into an already-created instance (issue #1335), because OSC
+  // resolves secret references into the container environment at start.
+  //
+  // OPTIONAL on this interface on purpose: every pre-#1335 caller and test fake
+  // satisfies PackagerOscApi without it, and an adapter that cannot roll simply
+  // skips the roll (the refreshed secret then lands at the packager's next
+  // restart) instead of failing the ensure step.
+  restartInstance?(
+    serviceId: string,
+    name: string,
+    token: string
+  ): Promise<void>;
 }
 
 // Adapt an @osaas/client-core Context into the narrow PackagerOscApi. Keeps the
@@ -256,7 +273,9 @@ export function packagerOscApiFromContext(
     saveSecret: (serviceId, name, value) =>
       saveSecret(serviceId, name, value, osc),
     removeInstance: (serviceId, name, token) =>
-      removeInstance(osc, serviceId, name, token)
+      removeInstance(osc, serviceId, name, token),
+    restartInstance: (serviceId, name, token) =>
+      restartInstance(osc, serviceId, name, token)
   };
 }
 
@@ -290,6 +309,51 @@ export interface PackagerProvisionLogger {
   error(obj: Record<string, unknown>, msg: string): void;
 }
 
+// Per-process record of which stacks' packagers have already been rolled to
+// pick up a refreshed `<stack>.pat` (issue #1335).
+//
+// WHY A LEDGER AT ALL: the ensure step runs on EVERY packaging execution, and
+// OSC secrets are write-only (@osaas/client-core exports `saveSecret` only —
+// lib/index.d.ts:6 — there is no getSecret), so the ensure step cannot read the
+// value the running packager was started with and compare it with the current
+// token. Without that comparison the only way to guarantee a rotated token
+// reaches an existing packager would be to restart it on every execution, which
+// would interrupt whatever that packager is packaging. This ledger bounds it
+// instead: the packager for a given stack is rolled AT MOST ONCE per API
+// process.
+//
+// Once per process is exactly the rotation trigger: this API reads its own OSC
+// token from the environment (Context#getPersonalAccessToken), so a rotated
+// token only reaches this process by restarting it — which empties this ledger
+// and makes the next packaging execution roll the stale packager. A process that
+// keeps running with an unchanged token rolls its packager once, on the first
+// packaging execution, and never again.
+export class PackagerPatRollLedger {
+  private rolled = new Set<string>();
+
+  // Claim the single roll for `stackName`. Returns true for the first caller in
+  // this process (which should then perform the roll) and false afterwards.
+  claim(stackName: string): boolean {
+    if (this.rolled.has(stackName)) return false;
+    this.rolled.add(stackName);
+    return true;
+  }
+
+  // Give the claim back, so a LATER ensure call retries the roll. Used when the
+  // roll could not be completed (restart call failed, or the secret refresh that
+  // must precede it failed) — a failed roll must not consume the one chance this
+  // process had to get the current token into the packager.
+  release(stackName: string): void {
+    this.rolled.delete(stackName);
+  }
+
+  // Whether `stackName` has been rolled in this process. Read-only; exported for
+  // observability/tests.
+  hasRolled(stackName: string): boolean {
+    return this.rolled.has(stackName);
+  }
+}
+
 export type EnsurePackagerDeps = {
   osc: PackagerOscApi;
   coords: PackagerStackCoordinates;
@@ -313,7 +377,101 @@ export type EnsurePackagerDeps = {
   // not re-write the inventory. A failure to record is logged and rethrown so the
   // package step fails loudly rather than leaving an unrecorded packager.
   recordInInventory?: (instanceName: string) => Promise<void>;
+  // Per-process roll ledger for the stale-token fix (issue #1335). When present
+  // (and the osc adapter can restart), an ensure call that finds an EXISTING
+  // packager rolls it once per process so it re-reads the just-refreshed
+  // `<stack>.pat`. When absent the secret is still refreshed, but the running
+  // packager is left alone and only picks the new value up at its next restart.
+  patRollLedger?: PackagerPatRollLedger;
 };
+
+// Bring an ALREADY RUNNING packager's `<stack>.pat` up to the current OSC token
+// (issue #1335).
+//
+// Two steps, in this order:
+//   1. saveSecret — rewrite `<stack>.pat` with the token this process is holding
+//      now. saveSecret is an overwrite (POST /mysecrets/<serviceId>, the same
+//      call the create path makes), so this is safe to repeat and needs no
+//      delete-then-create. After it, the packager's existing
+//      `{{secrets.<stack>.pat}}` reference resolves to the current token.
+//   2. restartInstance — roll the instance so it RE-READS that reference. OSC
+//      resolves secret references into the container environment when the
+//      instance starts, so step 1 alone does not reach a running packager. The
+//      roll is claimed through the per-process ledger (see
+//      PackagerPatRollLedger) so repeat packaging executions do not keep
+//      restarting a healthy packager mid-job.
+//
+// The OSC-side limitations this works around — a rewritten secret never reaching
+// a running instance, no way to detect that an instance is holding a stale
+// secret (secrets are write-only), and restart not being supported by every
+// service — are logged as friction in the agent team's
+// docs/osc-feedback/incoming-1335-secret-rotation-does-not-reach-running-instances.md.
+//
+// Both steps are NON-FATAL by design. The ensure step cannot tell a rotated
+// token from an unchanged one (OSC secrets are write-only), so this runs on
+// every exists path — and turning a transient OSC refresh/restart fault into a
+// hard packaging failure would break executions whose token was never rotated
+// and would have worked. A failure is therefore logged loudly, the ledger claim
+// is released so a later execution retries, and the ensure call still reports
+// 'exists'. What the caller loses is the refresh, not the packaging run.
+async function refreshExistingPackagerPat(args: {
+  osc: PackagerOscApi;
+  sat: string;
+  name: string;
+  secrets: PackagerSecrets;
+  waitForReady: boolean;
+  ledger?: PackagerPatRollLedger;
+  log?: PackagerProvisionLogger;
+  logCtx: Record<string, unknown>;
+}): Promise<void> {
+  const { osc, sat, name, secrets, waitForReady, ledger, log, logCtx } = args;
+  const patSecretName = `${name}.${PACKAGER_PAT_PURPOSE}`;
+
+  try {
+    await osc.saveSecret(
+      PACKAGER_SERVICE_ID,
+      patSecretName,
+      secrets.oscPersonalAccessToken
+    );
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    // No roll after a failed refresh: restarting would only make the packager
+    // re-read the OLD value, costing a restart for nothing.
+    log?.error(
+      { ...logCtx, phase: 'refresh-pat', error },
+      'on-demand packager: failed to refresh access-token secret for existing instance'
+    );
+    return;
+  }
+
+  // Nothing more to do when this caller cannot roll (no ledger wired, or an osc
+  // adapter without restartInstance): the refreshed secret is in place and the
+  // packager will read it at its next restart.
+  if (!ledger || !osc.restartInstance) return;
+  if (!ledger.claim(name)) return;
+
+  try {
+    log?.info(
+      { ...logCtx, phase: 'refresh-pat' },
+      'on-demand packager: restarting existing instance to pick up refreshed access token'
+    );
+    await osc.restartInstance(PACKAGER_SERVICE_ID, name, sat);
+    if (waitForReady) {
+      await osc.waitForInstanceReady(PACKAGER_SERVICE_ID, name);
+    }
+    log?.info(
+      { ...logCtx, phase: 'refresh-pat' },
+      'on-demand packager: existing instance restarted with refreshed access token'
+    );
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    ledger.release(name);
+    log?.error(
+      { ...logCtx, phase: 'refresh-pat-roll', error },
+      'on-demand packager: failed to restart existing instance after refreshing its access token'
+    );
+  }
+}
 
 // Ensure the packager instance for this stack exists, reconciling against OSC
 // ground truth: it first introspects the live instance (getInstance) and only
@@ -326,6 +484,11 @@ export type EnsurePackagerDeps = {
 // The packager instance shares the stack name (like every STACK_SERVICES
 // instance), so getInstance(name = stackName) is the ground-truth existence
 // check.
+//
+// The 'exists' path is NOT a pure no-op any more (issue #1335): it refreshes the
+// packager's `<stack>.pat` secret to the token this process holds now and rolls
+// the instance once per process, so a rotated token reaches a packager that was
+// created with the old one. See refreshExistingPackagerPat above.
 export async function ensurePackagerProvisioned(
   deps: EnsurePackagerDeps
 ): Promise<EnsurePackagerResult> {
@@ -342,6 +505,23 @@ export async function ensurePackagerProvisioned(
   // Ground-truth reconciliation: is the packager already running for this stack?
   const existing = await osc.getInstance(PACKAGER_SERVICE_ID, name, sat);
   if (existing) {
+    // Issue #1335: an existing packager used to be returned untouched, so its
+    // `<stack>.pat` secret kept whatever value it was given at CREATE time. When
+    // this API's own OSC token was rotated (e.g. after a revocation) the running
+    // packager went on presenting the revoked one, every packaging job it picked
+    // up failed inside the packager, and the step only failed here 15 minutes
+    // later on the completion timeout. Refresh the secret to the current token,
+    // then roll the instance so it actually re-reads it.
+    await refreshExistingPackagerPat({
+      osc,
+      sat,
+      name,
+      secrets,
+      waitForReady,
+      ...(deps.patRollLedger ? { ledger: deps.patRollLedger } : {}),
+      ...(log ? { log } : {}),
+      logCtx
+    });
     return { status: 'exists', instanceName: name };
   }
 
