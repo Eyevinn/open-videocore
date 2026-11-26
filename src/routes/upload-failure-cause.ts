@@ -108,10 +108,26 @@ export type UploadFailureCause = z.infer<typeof uploadFailureCauseSchema>;
 // required machine-readable discriminator and `code` optionally carries the
 // non-secret underlying S3/errno code for diagnostics.
 export const uploadErrorSchema = z.object({
-  error: z.string(),
-  cause: uploadFailureCauseSchema,
-  message: z.string().optional(),
-  code: z.string().optional()
+  error: z
+    .string()
+    .describe(
+      'Error code. Stable per failure mode. An upstream object-storage rejection of this deployment\'s storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`.'
+    ),
+  cause: uploadFailureCauseSchema.describe(
+    'Machine-readable failure cause. Treat an unrecognised value as `unknown`.'
+  ),
+  message: z
+    .string()
+    .optional()
+    .describe(
+      "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
+    ),
+  code: z
+    .string()
+    .optional()
+    .describe(
+      "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
+    )
 });
 
 export type UploadErrorBody = z.infer<typeof uploadErrorSchema>;
@@ -153,6 +169,45 @@ export const UPLOAD_FAILURE_ERROR_CODE: Record<UploadFailureCause, string> = {
   unknown: 'upload_failed'
 };
 
+// The `error` code for the one storage-side refusal that needs to be told apart
+// from every other one: the store REJECTED OUR AUTHENTICATION (issue #1343).
+// It overrides the generic `storage_error` on the SAME cause
+// (`storage_backend_error`) and the SAME status (502) — the taxonomy of causes
+// is unchanged, so no client that branches on `cause` is affected, while a
+// client (or an operator reading the body) can now tell "the deployment's
+// storage credentials or clock are wrong, an operator must fix it" from
+// "this upload session is stale, restart it".
+export const STORAGE_AUTH_ERROR_CODE = 'storage_auth_failed';
+
+// S3 error codes that mean the request's credentials/signature were refused,
+// NOT that the object or session was wrong.
+//
+// CONTRACT SOURCE: the codes are the S3 error codes minio surfaces verbatim on
+// `S3Error.code` (node_modules/minio/dist/main/errors.d.ts — `class S3Error
+// extends ExtendableError { code?: string }`), populated either from the
+// response body's `<Code>` element (node_modules/minio/dist/main/internal/
+// xml-parser.js:53-67 `parseError`, which lowercases every XML key onto the
+// error) or synthesised from the HTTP status when the body is empty
+// (xml-parser.js:79-81: a bodiless 403 becomes code 'AccessDenied').
+// The set itself is the one already used against the same client for the same
+// purpose in src/services/external-backend-validation.ts:176-183 `AUTH_CODES`,
+// extended with the two 403 spellings that file's probes handle separately
+// ('AccessDenied' at :301/:320/:344/:382 and 'Forbidden' at :320).
+const STORAGE_AUTH_ERROR_CODES = new Set([
+  'SignatureDoesNotMatch',
+  'InvalidAccessKeyId',
+  'InvalidToken',
+  'ExpiredToken',
+  'TokenRefreshRequired',
+  'AuthorizationHeaderMalformed',
+  'AccessDenied',
+  'Forbidden'
+]);
+
+export function isStorageAuthErrorCode(code: string | undefined): boolean {
+  return code !== undefined && STORAGE_AUTH_ERROR_CODES.has(code);
+}
+
 // A classified upload failure, ready to be turned into an HTTP response by the
 // router's error handler. Mirrors DependencyUnreachableError's
 // `toResponseBody()` precedent (src/encore-scaler/dependency-timeout.ts): the
@@ -170,11 +225,21 @@ export class UploadFailureError extends Error {
   readonly detailCode?: string;
   // The storage operation that failed, for the server-side log only.
   readonly operation?: string;
+  // The storage backend's own request id for the failed call, when it sent one,
+  // so an operator can correlate this failure with the store's access log
+  // (issue #1343). Non-secret by construction — see `storageRequestId()`.
+  readonly storageRequestId?: string;
 
   constructor(
     failureCause: UploadFailureCause,
     message: string,
-    opts: { detailCode?: string; operation?: string; errorCode?: string; cause?: unknown } = {}
+    opts: {
+      detailCode?: string;
+      operation?: string;
+      errorCode?: string;
+      storageRequestId?: string;
+      cause?: unknown;
+    } = {}
   ) {
     super(message, opts.cause !== undefined ? { cause: opts.cause } : undefined);
     this.name = 'UploadFailureError';
@@ -183,6 +248,40 @@ export class UploadFailureError extends Error {
     this.errorCode = opts.errorCode ?? UPLOAD_FAILURE_ERROR_CODE[failureCause];
     this.detailCode = opts.detailCode;
     this.operation = opts.operation;
+    this.storageRequestId = opts.storageRequestId;
+  }
+
+  // The fields the server-side log may carry for this failure — and ONLY those
+  // (issue #1343: "never log credentials or signatures").
+  //
+  // WHY this exists instead of logging the error object. The default pino error
+  // serializer copies every enumerable property of a logged error onto the log
+  // record (node_modules/.pnpm/pino-std-serializers@7.1.0/node_modules/
+  // pino-std-serializers/lib/err.js:30-39, `for (const key in err)`) and
+  // appends the messages and stacks of its `cause` chain (:20-22,
+  // `messageWithCauses` / `stackWithCauses`). A minio S3Error carries one
+  // lowercased property per element of the store's XML error body
+  // (xml-parser.js:58-63), and the body of a SignatureDoesNotMatch response
+  // contains the signing material itself — `StringToSign`,
+  // `StringToSignBytes`, `CanonicalRequest`, `SignatureProvided` and the access
+  // key id. Logging the error (or any wrapper whose cause chain reaches it)
+  // would therefore write a request signature and an access key id into the
+  // application log. These fields are allow-listed instead: the store's error
+  // CODE and request id, our own message, and this process's stack.
+  toLogFields(): Record<string, unknown> {
+    return {
+      uploadFailureCause: this.failureCause,
+      uploadFailureErrorCode: this.errorCode,
+      uploadFailureOperation: this.operation,
+      // Named `storageErrorCode` (not `uploadFailureCode`) for the storage
+      // codes this field actually carries; kept under the old key too so the
+      // existing log consumers for #771 do not break.
+      uploadFailureCode: this.detailCode,
+      storageErrorCode: this.detailCode,
+      storageRequestId: this.storageRequestId,
+      message: this.message,
+      stack: this.stack
+    };
   }
 
   toResponseBody(): UploadErrorBody {
@@ -205,6 +304,26 @@ export function isUploadFailureError(err: unknown): err is UploadFailureError {
 function errorCode(err: unknown): string | undefined {
   const code = (err as { code?: unknown } | null)?.code;
   return typeof code === 'string' ? code : undefined;
+}
+
+// The storage backend's request id for a failed call, for the server-side log
+// (issue #1343). Two fields, one meaning, both verified in
+// node_modules/minio/dist/main/internal/xml-parser.js:
+//   - `amzRequestid` — copied verbatim from the `x-amz-request-id` response
+//     header onto the error (:101-103 `headerInfo.amzRequestid`, applied at
+//     :111 for a body-bearing error and :122-125 for a bodiless one);
+//   - `requestid` — the `<RequestId>` element of the error body, lowercased
+//     onto the error by `parseError` (:58-63).
+// Only these two are read, and only when they are strings: an id is an opaque
+// correlation token, never a credential. A transport failure has neither.
+export function storageRequestId(err: unknown): string | undefined {
+  const source = err as { amzRequestid?: unknown; requestid?: unknown } | null;
+  const fromHeader = source?.amzRequestid;
+  if (typeof fromHeader === 'string' && fromHeader.length > 0) {
+    return fromHeader;
+  }
+  const fromBody = source?.requestid;
+  return typeof fromBody === 'string' && fromBody.length > 0 ? fromBody : undefined;
 }
 
 // Codes that mean "the bytes never made it over the wire" rather than "the
@@ -348,12 +467,44 @@ export function classifyUploadFailure(err: unknown, operation?: string): UploadF
       { ...(code ? { detailCode: code } : {}), operation, cause: err }
     );
   }
+  const requestId = storageRequestId(err);
+  // The store answered, and what it refused was our AUTHENTICATION: a bad
+  // signature, a wrong/expired key, a skewed clock, or a flat 403 (issue #1343).
+  // Same cause and same 502 as any other storage refusal, but a distinct `error`
+  // code and a message that names the storage's own code — because the two need
+  // different responses: this one is a deployment/credential fault for an
+  // operator, not a stale session the client can restart.
+  //
+  // The message is assembled from OUR prose plus the storage error code ONLY.
+  // The store's own message is deliberately not echoed: the body of a
+  // SignatureDoesNotMatch response carries the string-to-sign and the signature
+  // that was presented, and none of that may leave this process.
+  if (isStorageAuthErrorCode(code)) {
+    return new UploadFailureError(
+      'storage_backend_error',
+      operation
+        ? `object storage rejected this deployment's storage credentials during ${operation} (storage error code: ${code})`
+        : `object storage rejected this deployment's storage credentials (storage error code: ${code})`,
+      {
+        errorCode: STORAGE_AUTH_ERROR_CODE,
+        detailCode: code,
+        ...(requestId ? { storageRequestId: requestId } : {}),
+        operation,
+        cause: err
+      }
+    );
+  }
   return new UploadFailureError(
     'storage_backend_error',
     operation
-      ? `the storage backend rejected or failed the upload during ${operation}`
-      : 'the storage backend rejected or failed the upload',
-    { ...(code ? { detailCode: code } : {}), operation, cause: err }
+      ? `the storage backend rejected or failed the upload during ${operation}${code ? ` (storage error code: ${code})` : ''}`
+      : `the storage backend rejected or failed the upload${code ? ` (storage error code: ${code})` : ''}`,
+    {
+      ...(code ? { detailCode: code } : {}),
+      ...(requestId ? { storageRequestId: requestId } : {}),
+      operation,
+      cause: err
+    }
   );
 }
 

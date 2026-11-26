@@ -19168,7 +19168,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19184,13 +19185,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19210,7 +19214,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19226,13 +19231,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19252,7 +19260,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19268,13 +19277,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19294,7 +19306,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19310,13 +19323,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19336,7 +19352,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19352,13 +19369,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19378,7 +19398,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19394,13 +19415,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19420,7 +19444,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19436,13 +19461,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19462,7 +19490,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19478,13 +19507,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19504,7 +19536,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19520,13 +19553,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19546,7 +19582,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19562,13 +19599,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19636,7 +19676,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19652,13 +19693,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19678,7 +19722,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19694,13 +19739,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19720,7 +19768,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19736,13 +19785,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19762,7 +19814,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19778,13 +19831,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19804,7 +19860,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19820,13 +19877,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19846,7 +19906,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19862,13 +19923,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19888,7 +19952,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19904,13 +19969,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -19930,7 +19998,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -19946,13 +20015,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20016,7 +20088,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20032,13 +20105,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20058,7 +20134,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20074,13 +20151,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20100,7 +20180,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20116,13 +20197,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20142,7 +20226,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20158,13 +20243,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20184,7 +20272,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20200,13 +20289,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20226,7 +20318,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20242,13 +20335,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20268,7 +20364,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20284,13 +20381,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20310,7 +20410,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20326,13 +20427,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20415,7 +20519,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20431,13 +20536,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20457,7 +20565,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20473,13 +20582,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20499,7 +20611,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20515,13 +20628,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20541,7 +20657,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20557,13 +20674,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20583,7 +20703,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20599,13 +20720,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20625,7 +20749,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20641,13 +20766,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20756,7 +20884,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20772,13 +20901,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20798,7 +20930,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20814,13 +20947,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20840,7 +20976,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20856,13 +20993,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20882,7 +21022,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20898,13 +21039,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20924,7 +21068,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20940,13 +21085,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -20966,7 +21114,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -20982,13 +21131,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21008,7 +21160,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21024,13 +21177,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21050,7 +21206,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21066,13 +21223,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21131,7 +21291,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21147,13 +21308,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21173,7 +21337,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21189,13 +21354,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21215,7 +21383,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21231,13 +21400,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21257,7 +21429,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21273,13 +21446,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21299,7 +21475,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21315,13 +21492,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21341,7 +21521,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21357,13 +21538,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21383,7 +21567,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21399,13 +21584,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21425,7 +21613,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21441,13 +21630,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21507,7 +21699,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21523,13 +21716,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21549,7 +21745,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21565,13 +21762,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21591,7 +21791,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21607,13 +21808,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21633,7 +21837,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21649,13 +21854,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21675,7 +21883,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21691,13 +21900,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21717,7 +21929,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21733,13 +21946,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21759,7 +21975,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21775,13 +21992,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21801,7 +22021,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21817,13 +22038,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21843,7 +22067,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21859,13 +22084,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
@@ -21885,7 +22113,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Error code. Stable per failure mode. An upstream object-storage rejection of this deployment's storage credentials or request signature returns `storage_auth_failed` (issue #1343); any other storage-side refusal returns `storage_error`."
                     },
                     "cause": {
                       "type": "string",
@@ -21901,13 +22130,16 @@
                         "invalid_request",
                         "unsupported_media_type",
                         "unknown"
-                      ]
+                      ],
+                      "description": "Machine-readable failure cause. Treat an unrecognised value as `unknown`."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable detail. Safe to surface: it never contains credentials, request signatures or the storage endpoint. For a storage-side refusal it names the storage's own error code (e.g. `SignatureDoesNotMatch`)."
                     },
                     "code": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "The non-secret underlying code when one was available: the storage backend's error code (e.g. `SignatureDoesNotMatch`, `AccessDenied`, `NoSuchBucket`) or a transport errno (e.g. `ECONNREFUSED`)."
                     }
                   },
                   "required": [
