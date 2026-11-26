@@ -149,8 +149,14 @@ async function finalizedSourceSizeBytes(
     const stat = await storage.statObject(objectKey);
     return stat && stat.size > 0 ? stat.size : 0;
   } catch (err) {
+    // Allow-listed fields only, not the raw storage error (issue #1343): this
+    // runs on the multipart-complete path, where a credential/signature
+    // rejection by the store would otherwise put the string-to-sign and the
+    // presented signature into the log via pino's error serializer. Reuses the
+    // same classification the handlers' failures get, so the stat failure is
+    // described by the same storage error code and request id.
     log.warn(
-      { err, objectKey },
+      { ...classifyUploadFailure(err, 'statObject').toLogFields(), objectKey },
       'could not stat the finalized source object to record its length (issue #1059) — clearing any recorded length so the pre-transcode check enforces presence only'
     );
     return 0;
@@ -259,13 +265,15 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
     // always gets a `cause` instead of a bare 500. The underlying error stays
     // server-side (log only) — it can carry endpoint detail we do not echo.
     if (isUploadFailureError(err)) {
+      // Allow-listed fields only (issue #1343): the storage error code, the
+      // storage's request id and this request's id, so an operator can correlate
+      // the failure with the store's access log. The error object itself is NOT
+      // logged — pino's error serializer would copy the storage error's own
+      // properties and cause-chain messages onto the record, and a
+      // SignatureDoesNotMatch body carries the string-to-sign, the presented
+      // signature and the access key id. See `UploadFailureError.toLogFields()`.
       request.log.warn(
-        {
-          err,
-          uploadFailureCause: err.failureCause,
-          uploadFailureOperation: err.operation,
-          uploadFailureCode: err.detailCode
-        },
+        { ...err.toLogFields(), requestId: request.id },
         'upload failed'
       );
       return reply.code(err.statusCode).send(err.toResponseBody());
