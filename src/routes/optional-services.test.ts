@@ -71,12 +71,10 @@ beforeEach(() => {
   saveSecret.mockReset();
   getServiceAccessToken.mockClear();
   delete process.env['AUTO_SUBTITLES_INSTANCE_NAME'];
-  delete process.env['SCENE_DETECT_INSTANCE_NAME'];
 });
 
 afterEach(() => {
   delete process.env['AUTO_SUBTITLES_INSTANCE_NAME'];
-  delete process.env['SCENE_DETECT_INSTANCE_NAME'];
 });
 
 describe('GET /api/v1/optional-services (issue #195)', () => {
@@ -89,7 +87,9 @@ describe('GET /api/v1/optional-services (issue #195)', () => {
     expect(res.statusCode).toBe(200);
     const body = res.json() as { key: string; state: string }[];
     const keys = body.map((s) => s.key).sort();
-    expect(keys).toEqual(['auto-subtitles', 'scene-detect']);
+    // Scene detection is NOT in the registry (issue #1193): it runs as an
+    // ephemeral eyevinn-ffmpeg-s3 job, so it has no instance to provision.
+    expect(keys).toEqual(['auto-subtitles']);
     // Env vars unset in beforeEach → every service is not-configured. Status
     // must NOT probe OSC in this case.
     for (const s of body) expect(s.state).toBe('not-configured');
@@ -134,17 +134,41 @@ describe('GET /api/v1/optional-services/:key', () => {
   });
 
   it('reports configured (not active) when the env var is set but no live instance exists', async () => {
-    process.env['SCENE_DETECT_INSTANCE_NAME'] = 'scenes1';
+    process.env['AUTO_SUBTITLES_INSTANCE_NAME'] = 'subs1';
     getInstance.mockResolvedValue(undefined);
     const { app } = await buildApp();
     const res = await app.inject({
       method: 'GET',
-      url: '/api/v1/optional-services/scene-detect'
+      url: '/api/v1/optional-services/auto-subtitles'
     });
     expect(res.statusCode).toBe(200);
     const body = res.json() as { state: string; instanceName?: string };
     expect(body.state).toBe('configured');
-    expect(body.instanceName).toBe('scenes1');
+    expect(body.instanceName).toBe('subs1');
+  });
+
+  // Issue #1193: the retired scene-detection key is gone from the registry, so
+  // every per-service route 404s on it instead of provisioning anything.
+  it('404s on the retired scene-detect key (issue #1193)', async () => {
+    const { app } = await buildApp();
+    const status = await app.inject({
+      method: 'GET',
+      url: '/api/v1/optional-services/scene-detect'
+    });
+    expect(status.statusCode).toBe(404);
+    const provisionRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/optional-services/scene-detect/provision',
+      payload: { name: 'scenes1' }
+    });
+    expect(provisionRes.statusCode).toBe(404);
+    const deleteRes = await app.inject({
+      method: 'DELETE',
+      url: '/api/v1/optional-services/scene-detect'
+    });
+    expect(deleteRes.statusCode).toBe(404);
+    expect(createInstance).not.toHaveBeenCalled();
+    expect(removeInstance).not.toHaveBeenCalled();
   });
 
   it('returns configured (not throws) when the OSC lookup errors', async () => {
@@ -243,24 +267,6 @@ describe('POST /api/v1/optional-services/:key/provision', () => {
     expect(JSON.stringify(op.result)).not.toContain(AWS_SECRET);
   });
 
-  it('provisions scene-detect (name only, no secret)', async () => {
-    createInstance.mockResolvedValue({ name: 'scenes1' });
-    const { app, operationStore } = await buildApp();
-
-    const res = await app.inject({
-      method: 'POST',
-      url: '/api/v1/optional-services/scene-detect/provision',
-      payload: { name: 'scenes1' }
-    });
-    expect(res.statusCode).toBe(202);
-    const { operationId } = res.json() as { operationId: string };
-    const op = await waitForOperation(operationStore, operationId);
-    expect(op.status).toBe('done');
-    expect(saveSecret).not.toHaveBeenCalled();
-    const createBody = createInstance.mock.calls[0]![3] as Record<string, unknown>;
-    expect(createBody).toEqual({ name: 'scenes1' });
-  });
-
   it('returns 400 when a required field (openaikey) is missing', async () => {
     const { app } = await buildApp();
     const res = await app.inject({
@@ -315,13 +321,13 @@ describe('DELETE /api/v1/optional-services/:key', () => {
   });
 
   it('reports not_found (idempotent) when the instance is already gone', async () => {
-    process.env['SCENE_DETECT_INSTANCE_NAME'] = 'scenes1';
+    process.env['AUTO_SUBTITLES_INSTANCE_NAME'] = 'subs1';
     getInstance.mockResolvedValue(undefined);
     const { app, operationStore } = await buildApp();
 
     const res = await app.inject({
       method: 'DELETE',
-      url: '/api/v1/optional-services/scene-detect'
+      url: '/api/v1/optional-services/auto-subtitles'
     });
     const { operationId } = res.json() as { operationId: string };
     const op = await waitForOperation(operationStore, operationId);

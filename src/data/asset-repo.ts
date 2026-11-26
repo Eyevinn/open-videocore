@@ -387,10 +387,10 @@ export type TechnicalMetadata = {
 };
 
 // One scene/shot boundary produced by the scene-detection pipeline (issue #115,
-// eyevinn-function-scenes). A scene-detection tool reports the natural cut points
+// ADR-027). A scene-detection tool reports the natural cut points
 // of a video; each boundary describes one detected shot for use in the clip/trim
-// workflows. Fields are ALL optional/permissive because the runtime wire shape of
-// eyevinn-function-scenes is NOT contract-verified (see pipeline/scene-detector.ts):
+// workflows. Fields are ALL optional/permissive because a detector reports only
+// the timecodes it can derive (see pipeline/scene-detector.ts):
 //   - startSeconds / endSeconds: the [start, end) window of the shot in seconds.
 //     `endSeconds` may be absent for the final shot (no following cut).
 //   - keyframeSeconds: a representative keyframe timecode for the shot, typically
@@ -402,7 +402,7 @@ export type SceneBoundary = {
 };
 
 // Scene/shot-detection metadata extracted from the stored object by the OSC
-// eyevinn-function-scenes media function (issue #115). Populated asynchronously
+// scene-detection job (issue #115, ADR-027). Populated asynchronously
 // after ingest by the OPTIONAL, fire-and-forget scene-detect step; null until the
 // first successful detection (or after a failed one — see `sceneDetectionError`).
 // It is METADATA (mirrors TechnicalMetadata), not an asset-producing output, and

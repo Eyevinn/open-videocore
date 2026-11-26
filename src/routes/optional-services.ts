@@ -25,16 +25,15 @@ import { confirmInstanceAbsent } from '../services/deprovision.js';
 // same endpoints.
 //
 // INSTANCE-NAME DISCOVERY (why status queries OSC, not a param store):
-// This status endpoint reports the AUTO_SUBTITLES_INSTANCE_NAME /
-// SCENE_DETECT_INSTANCE_NAME env vars as the deployment's declared config for
-// the #187/#188 provision cards.
+// This status endpoint reports the AUTO_SUBTITLES_INSTANCE_NAME env var as the
+// deployment's declared config for the #187/#188 provision cards.
 //   - The provision request supplies the instance `name`; we create the OSC
 //     instance under it and RETURN that name.
 //   - The status endpoint reports the env var and probes OSC (getInstance) for
 //     the configured name to report whether the instance is live (`active`).
 // NOTE (issue #217): the PIPELINE steps no longer activate from these env vars —
 // the runtime derives activation from the ACTIVE stack record
-// (StackConfig.autoSubtitlesInstanceName / sceneDetectInstanceName), so a
+// (StackConfig.autoSubtitlesInstanceName), so a
 // freshly provisioned optional service is picked up on the next pipeline run
 // with NO restart. This card's env-var view therefore reflects the deployment's
 // declared intent, while actual step activation follows the provisioned stack.

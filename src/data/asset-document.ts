@@ -145,8 +145,8 @@ const EditorialSubtitleTrackSchema = z.object({
 });
 
 // Scene/shot-detection boundary (issue #115), persisted under the structural
-// namespace. All fields optional/permissive because the runtime wire shape of
-// eyevinn-function-scenes is NOT contract-verified (see pipeline/scene-detector.ts).
+// namespace. All fields optional/permissive because a detector reports only
+// the timecodes it can derive (see pipeline/scene-detector.ts).
 const SceneBoundarySchema = z.object({
   startSeconds: z.number().optional(),
   endSeconds: z.number().optional(),

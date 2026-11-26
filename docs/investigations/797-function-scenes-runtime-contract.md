@@ -4,6 +4,16 @@ Status: **contract confirmed** from the service's own source and OpenAPI documen
 No runtime behaviour changed here (per #797's acceptance criteria) — this record
 feeds the follow-on fix, #798.
 
+> **HISTORY ONLY, as of #1193 (2026-11-26).** This record is what proved the service
+> cannot return cut timecodes, which is why ADR-027 moved scene detection onto an
+> ephemeral `eyevinn-ffmpeg-s3` job (#1192) and #1193 deleted the old path: the runner,
+> its pinned request contract, its contract test and the vendored upstream `api.json`
+> snapshot under `docs/contracts/` are all gone, and nothing in the API calls this
+> service any more. The file paths cited below therefore no longer exist on `main`.
+> It is kept deliberately, as the only remaining description of the retired path and
+> of the catalog gap that made it hard to find — do not delete it, and do not treat
+> anything in it as a description of current behaviour.
+
 ## Headline
 
 **There is no source-URL query parameter, and the detection endpoint is not `GET /`.**

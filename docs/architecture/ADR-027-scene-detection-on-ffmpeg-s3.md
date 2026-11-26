@@ -1,6 +1,14 @@
 # ADR-027: Scene detection runs on `eyevinn-ffmpeg-s3`, not `eyevinn-function-scenes`
 
-**Status:** PROPOSED 2026-10-15, last amended 2026-10-19 — decision record only; no product code changes in this PR
+**Status:** PROPOSED 2026-10-15, last amended 2026-10-19 — decision record only; no product code changes in this PR.
+**Fully implemented as of 2026-11-26:** the detector rewrite landed with #1192 (PR #1306) and the
+old path was retired with #1193, which also carried the full ADR-023 §4 amendment
+[D5.2](#d5--adr-023-4-is-superseded-in-principle-now-and-retired-with-1193) requires. One
+deviation worth reading before D5: #1193 did **not** tear down the scene-detection instances
+existing stacks had already provisioned. Removing the retired service's id from the code is what
+AC1 of #1193 asked for, and teardown cannot name a service it no longer knows, so such an
+instance is left inert and must be removed once out of band; the stack's recorded instance name
+survives as a read-only activation marker so detection keeps working there with no migration.
 **Date:** 2026-10-15; amended 2026-10-19 (D1/D3/D6 moved to the merged #1191 spike result; review round 2 added [C6](#c6--the-poll-budget-and-the-two-input-url-lifetimes) and [D8](#d8--the-shared-5-minute-poll-budget-is-a-ceiling-on-which-assets-can-get-scenemetadata-1192-must-add-a-per-call-override) and corrected [D6 F1](#d6--fallbacks-f1-is-now-the-decision))
 **Author agent:** architect
 **Issue:** #1190 — *ADR-027: scene detection runs on `eyevinn-ffmpeg-s3`, not `eyevinn-function-scenes`*. Records the decision the maintainer took on **2026-10-14 in #883** (*re-scope `sceneMetadata` — `eyevinn-function-scenes` cannot return cut timecodes*, now closed). Grounded in #797 / `docs/investigations/797-function-scenes-runtime-contract.md` and in the partial fix #881. Supersedes ADR-001's silence on the scene-detect slot ([D4](#d4--supersedes-adr-001s-silence-on-the-scene-detect-slot)) and amends ADR-023 §4 ([D5](#d5--adr-023-4-is-superseded-in-principle-now-and-retired-with-1193)). Spike: **#1191** — **closed, merged as #1205**; D1, D3 and D6 amended 2026-10-19 to its result (see [§2 C5](#c5--the-ffmpeg-s3-runtime-job-contract-is-not-in-the-catalog-schema-it-is-pinned-by-the-merged-1191-snapshot)). Follow-ups: #1192 (detector rewrite), #1193 (retire the old path). Related: #115 (the step), #798 (closed 2026-10-14 as *not planned* — superseded, see [§5](#5-follow-up-implementation-issues)), #799 (the pinned request contract).

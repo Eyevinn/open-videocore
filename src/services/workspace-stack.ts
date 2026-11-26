@@ -82,7 +82,11 @@ export type OptionalStepBuilders = {
   // S3 writer and then read with the stack's own credentials, exactly like the
   // clip and re-wrap runners. Those values are per-stack and only known here, so
   // they are passed to the builder rather than captured from boot-time env.
-  sceneDetector?: (instanceName: string, s3: SceneDetectObjectStore) => SceneDetector;
+  //
+  // It takes NO instance name (issue #1193): the job is ephemeral, so there is
+  // no long-lived scene-detection instance to address. Activation comes from the
+  // stack record's boolean marker, not from a name.
+  sceneDetector?: (s3: SceneDetectObjectStore) => SceneDetector;
 };
 
 // Per-stack object-store context handed to the scene-detector builder.
@@ -365,9 +369,19 @@ function buildConnectionsFromStack(
   // back out of this stack's source bucket with the stack's own credentials —
   // the same pair the job body carries for the native S3 writer — so the
   // object-store context is assembled here, where both are resolved.
+  //
+  // ACTIVATION (issue #1193) comes from EITHER marker: `sceneDetectEnabled`,
+  // written by stacks provisioned from #1193 onward, or the LEGACY
+  // `sceneDetectInstanceName` a pre-#1193 stack recorded for the retired
+  // media function. The name is no longer used to address anything — the job is
+  // ephemeral — so an existing stack keeps scene detection with no migration.
+  const sceneDetectActivated =
+    config.sceneDetectEnabled === true ||
+    (typeof config.sceneDetectInstanceName === 'string' &&
+      config.sceneDetectInstanceName.length > 0);
   const sceneDetector =
-    config.sceneDetectInstanceName && optionalSteps.sceneDetector
-      ? optionalSteps.sceneDetector(config.sceneDetectInstanceName, {
+    sceneDetectActivated && optionalSteps.sceneDetector
+      ? optionalSteps.sceneDetector({
           endpoint: config.minioEndpoint,
           accessKey: objectStoreCredential.accessKeyId,
           secretKey: objectStoreCredential.secretAccessKey,

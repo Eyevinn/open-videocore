@@ -132,7 +132,16 @@ export type StackConfig = {
   // back-compat, mirroring `status?`/isReadyStack: configs written before these
   // fields existed have no value here and MUST still load without error.
   autoSubtitlesInstanceName?: string;
+  // LEGACY (issue #1193): the instance name of the retired scene-detection
+  // media function. Written only by stacks provisioned BEFORE #1193; never
+  // written now. Still READ as those stacks' scene-detect activation marker so
+  // detection keeps running for them — on the ephemeral eyevinn-ffmpeg-s3
+  // runner (ADR-027 D1), which needs no instance.
   sceneDetectInstanceName?: string;
+  // Scene-detect activation for stacks provisioned from #1193 onward. A plain
+  // boolean, because the step provisions nothing: a per-detection ephemeral
+  // eyevinn-ffmpeg-s3 job has no long-lived instance name to record.
+  sceneDetectEnabled?: boolean;
   // Operator-supplied FULL Encore profiles-index URL (issue #315). When set,
   // scaler-spawned Encore instances fetch their transcode profiles from this
   // exact URL (used DIRECTLY, never re-derived), resolved at boot via

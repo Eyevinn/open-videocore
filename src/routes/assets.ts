@@ -1196,7 +1196,7 @@ const manifestUrlsSchema = z.object({
 });
 
 // Scene/shot-detection metadata (issue #115). Boundary fields are all optional
-// because the eyevinn-function-scenes runtime wire shape is not contract-verified
+// because a detector reports only the timecodes it can derive
 // (see pipeline/scene-detector.ts), so a boundary may carry only a subset.
 const sceneBoundarySchema = z.object({
   startSeconds: z.number().optional(),
@@ -1553,8 +1553,8 @@ type AssetsRouterOptions = {
   // Defaults to the real fire-and-forget generator.
   generateSubtitles?: typeof generateSubtitles;
   subtitleDeps?: Partial<GenerateSubtitlesDeps>;
-  // Scene detection (issue #115). `sceneDetector` calls the OSC
-  // eyevinn-function-scenes media function (a stub in tests). When absent (or no
+  // Scene detection (issue #115). `sceneDetector` runs an ephemeral OSC
+  // eyevinn-ffmpeg-s3 job (a stub in tests). When absent (or no
   // object storage), the OPTIONAL `scene-detect` pipeline step skips gracefully —
   // it is fire-and-forget and never throws into the ingest/pipeline path.
   sceneDetector?: SceneDetector;
@@ -1764,17 +1764,19 @@ function logStageForStep(name: PipelineStepName): PipelineLogStage {
 }
 
 // Skip reasons. They name the operator-facing knob that activates the step: the
-// per-stack instance name (StackConfig.autoSubtitlesInstanceName /
-// sceneDetectInstanceName, src/services/param-store.ts) or its deployment-wide
-// env equivalent (src/services/optional-services.ts registry).
+// per-stack activation marker (StackConfig.autoSubtitlesInstanceName for
+// subtitles; StackConfig.sceneDetectEnabled, or the legacy
+// sceneDetectInstanceName, for scene detection — src/services/param-store.ts)
+// or, for subtitles, its deployment-wide env equivalent
+// (src/services/optional-services.ts registry).
 const SUBTITLES_UNCONFIGURED_REASON =
   'subtitle generation skipped: no auto-subtitles service instance is configured for this stack ' +
   '(autoSubtitlesInstanceName / AUTO_SUBTITLES_INSTANCE_NAME is unset)';
 const SUBTITLES_NO_STORAGE_REASON =
   'subtitle generation skipped: object storage is not configured, so the source object cannot be read';
 const SCENE_DETECT_UNCONFIGURED_REASON =
-  'scene detection skipped: no scene-detection service instance is configured for this stack ' +
-  '(sceneDetectInstanceName / SCENE_DETECT_INSTANCE_NAME is unset)';
+  'scene detection skipped: scene detection is not activated for this stack ' +
+  '(sceneDetectEnabled is unset)';
 const SCENE_DETECT_NO_STORAGE_REASON =
   'scene detection skipped: object storage is not configured, so the source object cannot be read';
 
@@ -2908,8 +2910,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
   // Fire-and-forget scene/shot detection for a pipeline step (issue #115).
   // Detached, never blocks the caller, and the detector itself never throws
-  // (records failures on the asset as `sceneDetectionError`). No-op when the OSC
-  // eyevinn-function-scenes service or object storage is not configured —
+  // (records failures on the asset as `sceneDetectionError`). No-op when scene
+  // detection is not activated for the stack or object storage is not configured —
   // consistent with the OPTIONAL, opt-in nature of the step. Returns
   // `{ started: true }` when a detection was actually kicked off; otherwise
   // `{ started: false, reason }` naming WHY it was skipped (issue #789), so the
@@ -2917,8 +2919,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // reason on the asset.
   function triggerSceneDetect(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): OptionalStepOutcome {
     // Activation is derived from the ACTIVE stack record (issue #217): the
-    // resolver builds the detector from StackConfig.sceneDetectInstanceName and
-    // exposes it on request.connections, so a freshly provisioned service is
+    // resolver builds the detector when StackConfig.sceneDetectEnabled (or the
+    // legacy sceneDetectInstanceName) is set and
+    // exposes it on request.connections, so a newly activated step is
     // picked up on the next run with no restart. An injected opts.sceneDetector
     // (tests) still wins. Absent => skip gracefully (fire-and-forget).
     const detect = opts.sceneDetector ?? request.connections?.sceneDetector;
