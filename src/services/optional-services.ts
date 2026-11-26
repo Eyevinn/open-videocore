@@ -2,15 +2,20 @@
 //
 // These are long-lived service instances that are NOT part of the core
 // provisioned stack (STACK_SERVICES in stack.ts). Each is provisioned on its
-// own — auto-subtitles needs an OpenAI key; scene-detect needs nothing beyond a
-// name. The optional-services STATUS route reports the declared per-service
-// instance-name env var for the provision cards:
+// own — auto-subtitles needs an OpenAI key. The optional-services STATUS route
+// reports the declared per-service instance-name env var for the provision
+// cards:
 //   - AUTO_SUBTITLES_INSTANCE_NAME → eyevinn-auto-subtitles
-//   - SCENE_DETECT_INSTANCE_NAME   → eyevinn-function-scenes
 // NOTE (issue #217): the RUNTIME pipeline no longer activates these steps from
 // the env vars — activation is derived from the ACTIVE stack record
-// (StackConfig.autoSubtitlesInstanceName / sceneDetectInstanceName). The env var
-// on each descriptor below drives only the status card, not step activation.
+// (StackConfig.autoSubtitlesInstanceName). The env var on each descriptor below
+// drives only the status card, not step activation.
+//
+// NOTE (issue #1193): scene detection is NOT in this registry. It runs as an
+// ephemeral eyevinn-ffmpeg-s3 job per detection (ADR-027 D1,
+// pipeline/osc-scene-detect-ffmpeg-s3.ts), so it has no instance to provision,
+// no readiness wait and no deprovision surface. Its registry entry — and the
+// retired media function behind it — were removed with #1193.
 //
 // This module is the single source of truth for that mapping so the
 // optional-services route (per-service status/provision/deprovision) and #187 /
@@ -22,14 +27,9 @@
 //     2026-07-12): required `name` (^\w+$) and `openaikey` (SECRET); optional
 //     awsAccessKeyId / awsSecretAccessKey (SECRET) / awsRegion / s3Endpoint. No
 //     config update support (delete + create to change config).
-//   - get-service-schema for `eyevinn-function-scenes` (fetched by orchestrator
-//     2026-07-12): required `name` ONLY. No secret.
-//   - AUTO_SUBTITLES_SERVICE_ID / SCENE_DETECT_SERVICE_ID imported from stack.ts.
+//   - AUTO_SUBTITLES_SERVICE_ID imported from stack.ts.
 
-import {
-  AUTO_SUBTITLES_SERVICE_ID,
-  SCENE_DETECT_SERVICE_ID
-} from './stack.js';
+import { AUTO_SUBTITLES_SERVICE_ID } from './stack.js';
 
 // A single config field accepted by an optional service's provision request.
 //   name     — the createInstance body key (verbatim from get-service-schema).
@@ -61,7 +61,7 @@ export type OptionalServiceDescriptor = {
   fields: OptionalServiceField[];
 };
 
-// The registry. Two entries today; both #187 and #188 consume the same
+// The registry. One entry today; both #187 and #188 consume the same
 // endpoints by keying on `key`.
 export const OPTIONAL_SERVICES: readonly OptionalServiceDescriptor[] = [
   {
@@ -81,15 +81,6 @@ export const OPTIONAL_SERVICES: readonly OptionalServiceDescriptor[] = [
       { name: 'awsRegion', secret: false, required: false },
       { name: 's3Endpoint', secret: false, required: false }
     ]
-  },
-  {
-    key: 'scene-detect',
-    serviceId: SCENE_DETECT_SERVICE_ID,
-    displayName: 'Scene Detect Media Function',
-    instanceNameEnvVar: 'SCENE_DETECT_INSTANCE_NAME',
-    // get-service-schema for eyevinn-function-scenes: required `name` ONLY, no
-    // secret. `name` is supplied by the provision request path, not a field.
-    fields: []
   }
 ] as const;
 

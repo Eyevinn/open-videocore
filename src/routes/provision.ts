@@ -47,7 +47,6 @@ import {
   OBJECT_STORE_SERVICE_ID,
   PACKAGER_SERVICE_ID,
   QUEUE_SERVICE_ID,
-  SCENE_DETECT_SERVICE_ID,
   STACK_SERVICES
 } from '../services/stack.js';
 import {
@@ -253,10 +252,13 @@ const requestSchema = z.object({
   sourceStorage: externalStorageSchema.optional(),
   // Optional external packaged-output bucket. Omit for the MinIO default.
   packagedStorage: externalStorageSchema.optional(),
-  // Optional pipeline services the operator opts into at provision time (issue
-  // #216). Both flags default false: when opted out nothing is created (zero
-  // cost). When opted in, the corresponding OSC instance is provisioned AFTER
-  // the core stack is up and its name recorded in the stored StackConfig.
+  // Optional pipeline steps the operator opts into at provision time (issue
+  // #216). Both flags default false: when opted out the step stays disabled
+  // (zero cost). `autoSubtitles` provisions a long-lived OSC instance AFTER the
+  // core stack is up and records its name in the stored StackConfig.
+  // `sceneDetect` provisions NOTHING (issue #1193, ADR-027 D1/D5): detection
+  // runs as an ephemeral eyevinn-ffmpeg-s3 job per run, so the flag only records
+  // activation (StackConfig.sceneDetectEnabled) for the resolver to read.
   options: z
     .object({
       autoSubtitles: z.boolean().default(false),
@@ -575,9 +577,19 @@ const storedConfigSchema = z.object({
   packagedBucket: z.string(),
   // Optional pipeline service instance names (issue #215). Optional/back-compat:
   // stored configs written before these fields existed omit them and still
-  // validate. Mirrors StackConfig.autoSubtitlesInstanceName/sceneDetectInstanceName.
+  // validate. Mirrors StackConfig.autoSubtitlesInstanceName.
   autoSubtitlesInstanceName: z.string().optional(),
+  // LEGACY (issue #1193): the instance name of the retired scene-detection
+  // media function, written only by stacks provisioned before #1193. It is NOT
+  // written any more — it is still accepted and still read as that stack's
+  // scene-detect ACTIVATION marker so detection keeps working there on the
+  // ephemeral eyevinn-ffmpeg-s3 runner. New stacks record
+  // `sceneDetectEnabled` instead.
   sceneDetectInstanceName: z.string().optional(),
+  // Scene-detect activation for stacks provisioned from #1193 onward. A plain
+  // boolean because the step has no instance: it runs as an ephemeral
+  // eyevinn-ffmpeg-s3 job (ADR-027 D1), so there is no name to record.
+  sceneDetectEnabled: z.boolean().optional(),
   // Derived, read-only optional-service activation summary (issue #218). Surfaces
   // which opt-in services a stack has activated as plain booleans so a consumer
   // does not have to know that activation is signalled by the presence of the
@@ -1687,7 +1699,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       // stack (#216). Populated below only when opted in; folded into the
       // stored StackConfig so the resolver/pipeline can find them by name.
       let autoSubtitlesInstanceName: string | undefined;
-      let sceneDetectInstanceName: string | undefined;
+      // Scene detection has no instance name to record (issue #1193): the step
+      // runs as an ephemeral eyevinn-ffmpeg-s3 job, so opting in only sets this
+      // activation flag on the stored config.
+      let sceneDetectEnabled = false;
 
       let currentService = '';
       try {
@@ -2066,14 +2081,20 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           autoSubtitlesInstanceName = name;
         }
 
-        // 5b. eyevinn-function-scenes ("Scene Detect Media Function").
-        // Contract (get-service-schema, verified 2026-07-13): create config
-        // requires ONLY `name` — no external key dependency.
+        // 5b. Scene detection — NOTHING IS PROVISIONED (issue #1193, ADR-027
+        // D1/D5). The step runs as an ephemeral eyevinn-ffmpeg-s3 job created
+        // per detection (pipeline/osc-scene-detect-ffmpeg-s3.ts), the same
+        // runner that already serves probe, thumbnail, re-wrap and clip. So
+        // there is no instance to create, no readiness wait and no teardown
+        // obligation: opting in records activation only.
+        //
+        // Contract source: src/services/stack.ts FFPROBE_SERVICE_ID
+        // ('eyevinn-ffmpeg-s3') and the job body fields pinned in
+        // docs/contracts/eyevinn-ffmpeg-s3-job-and-logs.json
+        // (`job.createJob.bodyFields.*`), both consumed by the detector — not
+        // by this provision flow, which calls nothing for this step.
         if (wantSceneDetect) {
-          currentService = SCENE_DETECT_SERVICE_ID;
-          await provision(SCENE_DETECT_SERVICE_ID, {});
-          await awaitReady(SCENE_DETECT_SERVICE_ID, name, 'scene detection');
-          sceneDetectInstanceName = name;
+          sceneDetectEnabled = true;
         }
 
         // Source-reading services (#212). Encore (transcode job input) and
@@ -2226,7 +2247,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             ...(autoSubtitlesInstanceName
               ? { autoSubtitlesInstanceName }
               : {}),
-            ...(sceneDetectInstanceName ? { sceneDetectInstanceName } : {}),
+            // Scene detect is a BOOLEAN activation flag, not an instance name
+            // (issue #1193): the step provisions nothing. Omitted when opted
+            // out so an opted-out stack carries no field, exactly as before.
+            ...(sceneDetectEnabled ? { sceneDetectEnabled: true } : {}),
             // The object store's per-stack access key id (issue #1094).
             // NON-SECRET — an identifier. Its matching secret is NOT stored
             // (here or anywhere at rest): readers re-derive it from this id plus
@@ -2673,7 +2697,14 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       // (preserves the GET /:name response-equality contract). The raw
       // *InstanceName fields are already passed through verbatim above.
       const autoSubtitles = Boolean(config.autoSubtitlesInstanceName);
-      const sceneDetect = Boolean(config.sceneDetectInstanceName);
+      // Scene detect reads BOTH markers (issue #1193): the boolean a stack
+      // provisioned from #1193 onward records, OR the legacy instance name a
+      // pre-#1193 stack recorded for the retired media function — which still
+      // means "this stack activated scene detection", now served by the
+      // ephemeral eyevinn-ffmpeg-s3 runner. So the derived summary is unchanged
+      // for every existing stack.
+      const sceneDetect =
+        Boolean(config.sceneDetectEnabled) || Boolean(config.sceneDetectInstanceName);
       const withOptions =
         autoSubtitles || sceneDetect
           ? { ...config, options: { autoSubtitles, sceneDetect } }
@@ -3078,10 +3109,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
 
           // Teardown order and the instance set come from what was actually
           // provisioned (the stored services[]), not the static STACK_SERVICES.
-          // Optional opt-in services (issue #218) recorded on the config are
+          // Optional opt-in INSTANCES (issue #218) recorded on the config are
           // torn down too: their instance names are passed alongside services[]
           // and deprovisionStackFromConfig merges (and dedupes) them so a stack
-          // that activated auto-subtitles or scene-detect is fully removed.
+          // that activated auto-subtitles is fully removed. Scene detection is
+          // not in that set any more (issue #1193) — it holds no instance.
           //
           // The on-demand packager torn down above is NOT in that stored list,
           // so its outcome is folded in here (issue #1056) and the stack status
@@ -3101,9 +3133,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                         config.autoSubtitlesInstanceName
                     }
                   : {}),
-                ...(config.sceneDetectInstanceName
-                  ? { sceneDetectInstanceName: config.sceneDetectInstanceName }
-                  : {})
+                // Scene detection contributes NOTHING to teardown (issue
+                // #1193): the step holds no instance. A pre-#1193 stack's
+                // legacy scene-detection instance is not torn down here —
+                // this API no longer carries the retired service's id, so it
+                // is removed once out of band.
               },
               teardownBounds
             ),

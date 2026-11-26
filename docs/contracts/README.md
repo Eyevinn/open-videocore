@@ -14,9 +14,8 @@ anything material fails CI and has to be dealt with deliberately.
 
 | File | Upstream | Pinned commit | Consumed by |
 |---|---|---|---|
-| `eyevinn-function-scenes-api.json` | [`Eyevinn/function-scenes`](https://github.com/Eyevinn/function-scenes) `api.json` — the OpenAPI 3.0 document the function serves at `/api/docs/` | `492a18f23e253194c27800563ea0c96bef187aef` (`master` HEAD on 2026-09-26) | `src/pipeline/function-scenes-contract.ts`, `test/scene-detect-contract.test.ts` |
 | `encore-findbystatus-paging.json` | [`svt/encore`](https://github.com/svt/encore) — the `findByStatus` paging semantics, read out of the source (see `source.symbols` in the file) | `8dd7c596c51a8c31bae805e31ff0969564f68229` (`master` HEAD on 2026-09-29) | `src/encore-scaler/encore-paging-contract.ts`, `test/encore-findbystatus-contract.test.ts` |
-| `eyevinn-ffmpeg-s3-job-and-logs.json` | [`Eyevinn/ffmpeg-s3`](https://github.com/Eyevinn/ffmpeg-s3) — the create-job body fields and which ffmpeg stream reaches `/logs/:name`, read out of the source (see `source.symbols` in the file) | `95ede50d3486cc4b2145871af08a4138ba5e3b9d` (`main` HEAD on 2026-10-14) | no code consumer yet — recorded by the issue #1191 spike (`docs/investigations/1191-ffmpeg-s3-scene-cut-timestamps.md`); the consumer lands with the detector rewrite |
+| `eyevinn-ffmpeg-s3-job-and-logs.json` | [`Eyevinn/ffmpeg-s3`](https://github.com/Eyevinn/ffmpeg-s3) — the create-job body fields and which ffmpeg stream reaches `/logs/:name`, read out of the source (see `source.symbols` in the file) | `95ede50d3486cc4b2145871af08a4138ba5e3b9d` (`main` HEAD on 2026-10-14) | `src/pipeline/osc-scene-detect-ffmpeg-s3.ts`, `test/scene-detect-ffmpeg-s3.test.ts` — recorded by the issue #1191 spike (`docs/investigations/1191-ffmpeg-s3-scene-cut-timestamps.md`) and consumed by the #1192 detector |
 
 ### Not every artefact here can be byte-identical
 
@@ -47,16 +46,19 @@ re-downloading a file.
 
 ## Refreshing a snapshot
 
+For a snapshot that IS a byte-identical copy of an upstream document, re-download
+it at the newer commit and re-run the test that diffs it, e.g.:
+
 ```bash
-curl -sS -o docs/contracts/eyevinn-function-scenes-api.json \
-  https://raw.githubusercontent.com/Eyevinn/function-scenes/<sha>/api.json
-npx vitest run test/scene-detect-contract.test.ts
+curl -sS -o docs/contracts/<file>.json \
+  https://raw.githubusercontent.com/<owner>/<repo>/<sha>/<path>
+npx vitest run test/<its-contract-test>.test.ts
 ```
 
-Update the pinned commit in the table above **and** in
-`FUNCTION_SCENES_CONTRACT_SOURCE` (`src/pipeline/function-scenes-contract.ts`) in
-the same change. If the test now fails, the service has changed under us: fix the
-recorded contract and the call together — do not relax the test.
+Update the pinned commit in the table above **and** in the contract-source
+constant the consuming module records it in, in the same change. If the test now
+fails, the service has changed under us: fix the recorded contract and the call
+together — do not relax the test.
 
 Keep the file exactly as upstream serves it (no reformatting), so a refresh diff
 shows only what the service actually changed.

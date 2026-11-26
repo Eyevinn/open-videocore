@@ -13,7 +13,7 @@
 // `subtitles` pipeline.
 //
 // `scene-detect` (issue #115) is likewise an OPTIONAL, fire-and-forget step: it
-// runs the OSC eyevinn-function-scenes media function to produce keyframe +
+// runs an ephemeral OSC eyevinn-ffmpeg-s3 job (ADR-027) to produce
 // scene-boundary metadata (for clip/trim workflows) and writes it onto the asset
 // as `sceneMetadata`. Like `extract-metadata` and `subtitles` it settles
 // immediately and never blocks the ingest path, so it is deliberately NOT part of

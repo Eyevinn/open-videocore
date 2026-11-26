@@ -1,10 +1,11 @@
 // Default SceneDetector backed by an ephemeral OSC eyevinn-ffmpeg-s3 job
 // (issue #1192, decided by ADR-027).
 //
-// WHY THIS REPLACES THE FUNCTION-SCENES RUNNER
-// eyevinn-function-scenes cannot return cut timecodes through any documented
-// endpoint (#797), so the old runner in osc-scene-detect.ts starts a job and
-// then deliberately throws. ADR-027 D1 moves the slot to eyevinn-ffmpeg-s3 —
+// WHY THIS IS THE ONLY RUNNER FOR THE SLOT
+// The dedicated scene-detection media function that previously held this slot
+// could not return cut timecodes through any documented endpoint (#797), so its
+// runner started a job and then deliberately threw; #1193 retired it, leaving
+// this the only implementation. ADR-027 D1 moved the slot to eyevinn-ffmpeg-s3 —
 // the same ephemeral create-run-read-delete runner that already serves probe,
 // thumbnail, re-wrap and clip — and keeps `sceneMetadata` exactly as it is
 // (ADR-027 D2: no type, schema or openapi.json change).
@@ -73,8 +74,8 @@ import { sceneUrlTtlSeconds } from './scene-detector.js';
 import type { SceneDetector, SceneDetectorResult } from './scene-detector.js';
 
 // Scene-change threshold for ffmpeg's `select` filter. Held at the value the
-// retired eyevinn-function-scenes service used for its own invocation
-// (investigation 797) so moving services does not silently change results —
+// retired scene-detection media function used for its own invocation
+// (investigation 797, kept as history under docs/investigations/) so moving services does not silently change results —
 // ADR-027 D1 makes that explicit ("must stay at the upstream service's 0.4").
 export const SCENE_SELECT_THRESHOLD = 0.4;
 

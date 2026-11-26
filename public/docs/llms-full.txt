@@ -187,25 +187,10 @@ Response 200 (application/json)
   },
   "autoSubtitlesInstanceName": "string",
   "sceneDetectInstanceName": "string",
+  "sceneDetectEnabled": true,
   "options": {
     "autoSubtitles": true,
     "sceneDetect": true
-  },
-  "storage": {
-    "source": {
-      "backend": "minio",
-      "bucket": "string",
-      "endpointUrl": "string",
-      "region": "string",
-      "publicBaseUrl": "string"
-    },
-    "packaged": {
-      "backend": "minio",
-      "bucket": "string",
-      "endpointUrl": "string",
-      "region": "string",
-      "publicBaseUrl": "string"
-    }
   }
 }
 

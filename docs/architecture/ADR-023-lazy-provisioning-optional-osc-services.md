@@ -1,7 +1,8 @@
 # ADR-023: Lazy provisioning of the optional OSC service instances (scene detection, subtitles)
 
-**Status:** PROPOSED 2026-09-24
-**Date:** 2026-09-24
+**Status:** PROPOSED 2026-09-24 — **§4 (scene detection) RETIRED 2026-11-26 by #1193**,
+superseded by ADR-027; §5 (subtitles) still stands
+**Date:** 2026-09-24; §4 amended 2026-11-26 (#1193)
 **Author agent:** surface-infra
 **Issue:** #791 — *evaluate lazy provisioning of optional OSC service instances
 (scene detection, subtitles) on first use*. Broken out from #781; sibling of
@@ -13,6 +14,17 @@ exactly #791's acceptance criteria: decide, per service, whether lazy (on-demand
 provisioning is possible **today**, and — where it is — hand a
 surface-data-pipeline/surface-infra implementation issue a design it can build
 from without re-deriving anything.
+
+> **Reading this record after #1193.** The scene-detection half of this ADR is
+> **history**, not a description of the code. The dedicated scene-detection media
+> function it evaluates was retired by #1193 (ADR-027): scene detection now runs as
+> an ephemeral `eyevinn-ffmpeg-s3` job, which provisions nothing. §1–§3 are left
+> verbatim because they record what was true and what was fetched on 2026-09-25 —
+> a decision record that is edited to agree with later code stops being evidence —
+> and the named symbols (`SCENE_DETECT_SERVICE_ID`, `src/pipeline/osc-scene-detect.ts`)
+> no longer exist. See the amendment note at the head of [§4](#4-design-for-scene-detection-ready-for-an-implementation-issue)
+> for exactly what changed, including how stacks provisioned before #1193 are handled.
+> §5 and everything about `eyevinn-auto-subtitles` is unaffected.
 
 ---
 
@@ -344,155 +356,56 @@ and `services[]` without risking a double teardown.
 
 ## 4. Design for scene detection (ready for an implementation issue)
 
-> **SUPERSEDED IN PRINCIPLE 2026-10-15 — see ADR-027 (#1190, decision taken in #883).**
-> Scene detection moves off `eyevinn-function-scenes` onto the `eyevinn-ffmpeg-s3`
-> **ephemeral per-job** runner. An ffmpeg-s3 job is created per run and deleted on
-> completion, so there is no optional long-lived service to provision lazily for this
-> slot: §4.1 (`ensureSceneDetectProvisioned`), §4.2 (single-flight), §4.3 (trigger
-> point), §4.5 (readiness deadline), §4.6 (persisted `sceneDetectInstanceName`) and
-> §4.7 (acceptance criteria) all fall away with the old path.
+> **RETIRED 2026-11-26 by #1193 — superseded by ADR-027 (#1190, decision taken in #883).**
+> Scene detection runs on the `eyevinn-ffmpeg-s3` **ephemeral per-job** runner
+> (`src/pipeline/osc-scene-detect-ffmpeg-s3.ts`, landed by #1192). A job is created per
+> run and deleted on completion, so there is **no optional long-lived service to
+> provision lazily for this slot**: no ensure function, no single-flight guard, no
+> sanitize-and-truncate name helper, no readiness deadline, no persisted instance name
+> and no teardown obligation.
 >
-> **§4.4 survives unchanged** — scene detection is still an optional, fire-and-forget
-> step whose failures settle as `skipped` + `skipReason` and never fail the pipeline
-> run. ADR-027 D3 builds on it.
+> **§4.1–§4.3 and §4.5–§4.7 are struck** (their bodies are removed below; the headings
+> are kept so links into this record still resolve). The module they designed was never
+> built. **§4.4 survives unchanged** and is now normative via ADR-027 D3: scene detection
+> is an optional, fire-and-forget step whose failures settle as `skipped` + `skipReason`
+> and never fail the pipeline run.
 >
-> This section is **left in place as the accurate description of the code on `main`**,
-> which still uses `eyevinn-function-scenes` until the rewrite (#1192) lands. **The
-> full amendment — striking §4.1–§4.3 and §4.5–§4.7 — happens as part of #1193**
-> (*retire the `eyevinn-function-scenes` path and its lazy provisioning*), whose scope
-> already includes "amend ADR-023 §4 accordingly". §5 (subtitles) is unaffected.
+> **What the retirement actually changed in the code (#1193):**
+> - `src/pipeline/osc-scene-detect.ts`, `src/pipeline/function-scenes-contract.ts`,
+>   `test/scene-detect-contract.test.ts` and the vendored upstream contract under
+>   `docs/contracts/` are deleted, together with the retired service's id in
+>   `src/services/stack.ts` and its entry in the `src/services/optional-services.ts`
+>   registry (so `/api/v1/optional-services/scene-detect` now 404s).
+> - `POST /api/v1/provision` keeps `options.sceneDetect` but provisions **nothing** for
+>   it. Activation is recorded as `StackConfig.sceneDetectEnabled` (boolean) instead of
+>   an instance name.
+> - **Existing stacks:** a stack provisioned before #1193 still carries
+>   `StackConfig.sceneDetectInstanceName`. That field is now READ-ONLY and treated purely
+>   as that stack's scene-detect activation marker, so detection keeps working there on
+>   the ephemeral runner with no data migration. Its orphaned long-lived instance is NOT
+>   torn down by stack teardown any more — this API no longer carries the retired
+>   service's id — so it must be removed **once, out of band** (OSC web console, or
+>   `osc service instance remove` for that service). It is inert: nothing in the API
+>   calls it.
+> - The investigation record `docs/investigations/797-function-scenes-runtime-contract.md`
+>   is **kept as history** and is the only remaining description of the retired path.
+>
+> §5 (subtitles) is unaffected: `eyevinn-auto-subtitles` is still explicitly provisioned.
 
-This section is the hand-off. It is deliberately written against real symbols and
-line numbers so an implementer does not have to re-derive the wiring.
+This section is kept as a record of a design that was superseded before it was
+implemented. Only §4.4 below is still in force.
 
 ### 4.1 New module, modelled 1:1 on the packager
 
-Add `src/services/scene-detect-provisioning.ts` exporting
-`ensureSceneDetectProvisioned()`, a direct analogue of
-`ensurePackagerProvisioned` (`src/services/packager-provisioning.ts:222-318`)
-with the secret handling removed:
-
-- Narrow injected OSC surface (`getServiceAccessToken`, `getInstance`,
-  `createInstance`, `waitForInstanceReady`, `removeInstance`) declared as an
-  interface exactly like `PackagerOscApi`
-  (`src/services/packager-provisioning.ts:125-147`) plus the
-  `...FromContext(osc)` adapter (`:150-165`), so it is unit-testable with no live
-  OSC.
-- **Create body: `{ name: stackName }` and nothing else.** Per §2.2. No
-  `saveSecret` call, no `{{secrets.*}}` reference, no `buildCreateBody` inputs
-  beyond the stack name.
-- Sequence and error tolerances copied verbatim from the packager: ground-truth
-  `getInstance` first (return `exists`), `createInstance`, treat
-  `"already taken"`/`"already exists"` as `exists`, then `waitForInstanceReady`,
-  then `recordInInventory`, then return
-  `{ status: 'created' | 'exists', instanceName }`.
-- Per-phase structured logging (`attempt` / `ready` / `failure`) via the same
-  optional logger interface (`src/services/packager-provisioning.ts:180-184`).
-  Issue #335 exists precisely because a silent no-provision is undebuggable.
-
-**Instance name MUST be the stack name.** Eager provisioning already establishes
-this invariant (`src/routes/provision.ts:1123-1125` — the `provision()` helper
-spreads `{ name, ... }` where `name` is the stack name, and
-`sceneDetectInstanceName = name`), and the packager ensure step depends on the
-same invariant for its ground-truth check
-(`src/services/packager-provisioning.ts:215-219`). Keeping it means
-`getInstance(SCENE_DETECT_SERVICE_ID, stackName)` is a complete existence check,
-OSC's own name uniqueness makes more than one instance per stack impossible by
-construction, and the existing teardown path (§2.6) keeps working unchanged.
-
-**Caveat — the 20-character platform limit (pre-existing, must be handled here).**
-Per §2.3a, OSC sanitizes instance names to `^[a-z0-9]+$` and enforces
-`maxLength: 20` **post-sanitization**. Stack names are validated at
-`src/routes/provision.ts:158-162` as `.max(63).regex(/^[a-z0-9]+$/)`. The charset
-agrees; **the length does not.** A stack name of 21–63 characters is therefore
-truncated by OSC, which breaks the invariant above in a specific and silent way:
-
-- `getInstance(SCENE_DETECT_SERVICE_ID, stackName)` probes the **un**truncated
-  name, so the ground-truth existence check **misses** an instance that does
-  exist under the truncated name;
-- the `"already taken"`/`"already exists"` tolerance (§2.4) partly masks this —
-  the duplicate create is swallowed — but the persisted
-  `sceneDetectInstanceName` then does not match the real instance, so runtime
-  activation and teardown both address a name OSC does not have.
-
-This is **pre-existing in the eager path** (`provision.ts:1123-1125` has the same
-mismatch) and is not introduced by lazy provisioning. But since this section
-promises an implementer they need not re-derive the wiring, the implementation
-MUST apply the same derivation OSC does — sanitize to `^[a-z0-9]+$`, lowercase,
-then truncate to 20 — in **one shared helper** used by the create call, the
-`getInstance` probe, the persisted `sceneDetectInstanceName`, and teardown. Do
-not sanitize at only one of those four sites; that is exactly the drift described
-above. Whether to additionally tighten the stack-name validator to `.max(20)` is
-a separate, breaking-change decision and is out of scope here.
+**Struck by #1193** (ADR-027 D1/D5.2). Designed `src/services/scene-detect-provisioning.ts` with an `ensureSceneDetectProvisioned()` modelled 1:1 on the packager ensure. Never built: an ephemeral per-job runner has nothing to provision, so there is no module, no guard and no trigger.
 
 ### 4.2 Reuse the single-flight guard
 
-Concurrent first executions for one stack must produce exactly one instance.
-Recommended: **extract** the existing `PackagerEnsureSingleFlight`
-(`src/services/packager-provisioning.ts:354-392`) into a generic
-`EnsureSingleFlight<T>` keyed on a caller-supplied string
-(`${serviceId}:${stackName}`) and have both the packager and scene detection use
-it. Copying the class is acceptable but duplicates the clear-on-settle subtlety
-(`:381-389`) that stops a failed ensure wedging a stack.
-
-The two-layer safety property must be preserved as documented at
-`src/services/packager-provisioning.ts:320-352`: the in-process lock does not
-survive a restart, but because every run reconciles against the live OSC
-instance, a restart mid-provision self-heals instead of orphaning or duplicating.
+**Struck by #1193** (ADR-027 D1/D5.2). Designed reuse of the packager single-flight guard so N concurrent first runs create one instance. Never built: an ephemeral per-job runner has nothing to provision, so there is no module, no guard and no trigger.
 
 ### 4.3 Trigger point
 
-The trigger is **the first scene-detect pipeline step executed for a stack whose
-record lacks `sceneDetectInstanceName`**.
-
-Concretely, mirror `ensurePackaging`:
-
-- Declare `ensureSceneDetect?: () => Promise<SceneDetector | undefined>` on the
-  asset-router options next to `ensurePackaging?: () => Promise<void>`
-  (`src/routes/assets.ts:943`).
-- Wire the closure in `src/main.ts`, in the same activation block that wires
-  `ensurePackaging` (`src/main.ts:1382-1505`) — that is the one place where
-  `paramStore`, `oscContext` and `optionalStepBuilders` (`src/main.ts:377-392`)
-  are all in scope.
-- Consume it inside the `scene-detect` branch of the execute loop
-  (`src/routes/assets.ts:2153-2173`), before `triggerSceneDetect`.
-
-Two differences from the packager that the implementer must handle:
-
-1. **The step is currently synchronous.** `triggerSceneDetect`
-   (`src/routes/assets.ts:1730`) returns `OptionalStepOutcome`
-   (`src/routes/assets.ts:982`) *synchronously* and the loop settles the step
-   immediately. It has exactly one call site (`src/routes/assets.ts:2159`), so
-   making it `async` and awaiting it is a contained change.
-2. **Provisioning is not enough — the detector must be rebuilt.**
-   `request.connections.sceneDetector` was built at *resolve* time from
-   `config.sceneDetectInstanceName` (`src/services/workspace-stack.ts:230-233`),
-   which is absent on first use, so it is `undefined` and stays `undefined` for
-   this request no matter what the ensure step does. The ensure closure must
-   therefore **return a usable `SceneDetector`**, constructed via the same
-   builder the resolver uses — `optionalStepBuilders.sceneDetector(instanceName)`
-   (`src/main.ts:386-391`) — rather than the caller relying on the stale resolved
-   connections. Returning the built detector (not just a name) keeps the
-   un-contract-verified runtime wire shape isolated in
-   `src/pipeline/osc-scene-detect.ts` exactly as
-   `src/pipeline/osc-scene-detect.ts:11-29` requires.
-
-Resolution order inside the closure (cheap path first):
-
-1. No `paramStore` → return `undefined` (structurally unconfigurable; the step
-   skips with the existing reason). Note this diverges from the packager, which
-   throws here (`src/main.ts:1404-1409`) — see §4.4.
-2. Resolve the stack name + config exactly as the packager closure does
-   (`listStackNames` / `loadStackConfig` under `STACK_CONFIG_NAMESPACE`,
-   `src/services/workspace-stack.ts:378`; `src/main.ts:1411-1425`).
-3. If `cfg.sceneDetectInstanceName` is set → build and return the detector with
-   **no OSC call at all**. This is the steady state after the first use, and it
-   is what makes the lazy path cost one provision per stack, ever.
-4. Otherwise → run `ensureSceneDetectProvisioned` under the single-flight guard
-   with the bounded deadline from §4.5, persist per §4.6, invalidate the
-   per-workspace resolver cache (the same invalidation provision/teardown already
-   performs, `src/main.ts:760-763`) so later requests take path 3 without
-   re-probing, and return the built detector.
+**Struck by #1193** (ADR-027 D1/D5.2). Designed the resolve-time/step-time trigger that would call the ensure function. Never built: an ephemeral per-job runner has nothing to provision, so there is no module, no guard and no trigger.
 
 ### 4.4 Failure handling — this is where scene detection MUST diverge from the packager
 
@@ -537,125 +450,15 @@ an optional step skips (`src/routes/assets.ts:2253-2258`).
 
 ### 4.5 Timeout and back-pressure
 
-This is the sharpest constraint, and the reason the design cannot be a
-copy-paste of the packager.
-
-**`waitForInstanceReady` has no deadline.** It is the `@osaas/client-core`
-function, and every call site in this repo passes only
-`(serviceId, name, ctx)` — `src/main.ts:321`,
-`src/services/packager-provisioning.ts:157-158` and `:288`,
-`src/routes/provision.ts:903`, `:1031`, `:1119`, `:1124`,
-`src/encore-scaler/instance-pool.ts:199` and `:250`. There is no timeout
-parameter to pass. A `package` step absorbs an unbounded wait because it is
-already asynchronous and callback-advanced (`src/routes/assets.ts:2238-2240`
-settles it as `running` and breaks). A `scene-detect` step settles **inside** the
-`POST /:id/execute` request, so an unbounded wait would hold that request open
-for a cold start of unknown length.
-
-Required design:
-
-- **Bound the ensure in an explicit race** against a configurable deadline —
-  `SCENE_DETECT_PROVISION_TIMEOUT_MS`, suggested default `120000`. Precedent for
-  a hand-rolled bounded wait around OSC readiness is
-  `ENCORE_CALLBACK_TRUST_TIMEOUT_MS` (`src/main.ts:793`, default 60s, quarantines
-  an instance on timeout rather than dispatching to it).
-- **On timeout, do NOT cancel the provisioning and do NOT remove the instance.**
-  The instance keeps coming up; the next execution's ground-truth `getInstance`
-  check (§4.1) adopts it and returns `exists`. Settle *this* execution's step as
-  `skipped` with the "provisioning in progress" reason. First use becomes
-  *eventually consistent* rather than slow — which is the right trade for an
-  optional metadata step.
-- **The single-flight guard *is* the back-pressure** (§4.2): N concurrent first
-  executions for a stack produce one `createInstance`; the losers await the same
-  bounded promise and each independently honour the deadline. There is no
-  unbounded fan-out of OSC create calls, and the one-instance-per-stack naming
-  invariant (§4.1) caps the blast radius at one instance per stack regardless of
-  request volume.
-- **12-factor knobs** (both new env vars, per the project's env-var-only
-  configuration rule): `SCENE_DETECT_PROVISION_TIMEOUT_MS` and a kill switch
-  `SCENE_DETECT_LAZY_PROVISION` (recommended default enabled, with `false`
-  restoring today's skip-only behaviour). These sit alongside the existing
-  non-activation runner knobs `SCENE_DETECT_PATH` (`src/main.ts:390`) and
-  `SCENE_URL_TTL_SECONDS` (`src/pipeline/scene-detector.ts:46-54`).
+**Struck by #1193** (ADR-027 D1/D5.2). Designed a bounded readiness deadline for `waitForInstanceReady` so a fire-and-forget step could not wait unboundedly. Never built. The runner the slot now uses has its OWN bounded poll budget, derived per call from the presigned source-URL lifetime (ADR-027 D8, `SCENE_POLL_BUDGET_SECONDS` / `SCENE_URL_TTL_SECONDS`), and records no instance name — so the 20-character truncation hazard this design had to mitigate no longer exists.
 
 ### 4.6 Where the derived instance name is persisted
 
-On a successful ensure, write **both** fields on the stack record, via a
-read-modify-write against `paramStore.loadStackConfig` /
-`paramStore.storeStackConfig` under `STACK_CONFIG_NAMESPACE`, mirroring the
-packager's `recordInInventory` closure (`src/main.ts:1470-1502`):
-
-1. **`StackConfig.sceneDetectInstanceName`** (`src/services/param-store.ts:72`) —
-   set to the stack name. This is the field that:
-   - activates the step on every subsequent run
-     (`src/services/workspace-stack.ts:230-233`), so the second execution needs
-     no OSC call;
-   - drives `options.sceneDetect` on `GET /stacks/:name`
-     (`src/routes/provision.ts:1495-1499`);
-   - is passed to teardown (`src/routes/provision.ts:1742-1744` →
-     `src/services/deprovision.ts:181-189`).
-2. **`StackConfig.services[]`** (`src/services/param-store.ts:94`) — append
-   `{ serviceId: SCENE_DETECT_SERVICE_ID, instanceName }`, idempotently (skip if
-   already present), exactly as the packager does. This is the inventory
-   `computeStackReadiness` and the stored-config teardown read.
-
-Writing both is safe: `deprovisionStackFromConfig` dedupes by
-`serviceId`+`instanceName` (§2.6, `src/services/deprovision.ts:214-219`), so the
-instance is enumerated — and removed — exactly once.
-
-**Persist-failure handling.** An instance that exists in OSC but is recorded
-nowhere is a **cost-leaking orphan**: whole-stack teardown enumerates
-`services[]` plus the two optional instance-name fields
-(`src/routes/provision.ts:1734-1745`) and would never see it. So:
-
-- Log the persist failure as an error with the stack name and serviceId (the
-  packager rethrows here, `src/main.ts:1477-1484` /
-  `src/services/packager-provisioning.ts:304-318`).
-- Still run the detection for this execution — the instance exists and the work
-  is legitimate.
-- **Add a ground-truth teardown probe** so an unrecorded instance can never leak:
-  a `teardownOnDemandSceneDetect(osc, stackName)` modelled on
-  `teardownOnDemandPackager` (`src/services/packager-provisioning.ts:415-435`) —
-  `getInstance(SCENE_DETECT_SERVICE_ID, stackName)`, `removeInstance` if present,
-  return `removed | not_found | failed` — called from the stack DELETE path
-  alongside the existing packager teardown (`src/routes/provision.ts:1695-1724`).
-  This probe is **not optional**; it is what makes the design safe against a
-  partial persist, and it is idempotent for stacks that never used scene
-  detection (they get `not_found`).
+**Struck by #1193** (ADR-027 D1/D5.2). Designed persistence of the derived `sceneDetectInstanceName` (with a sanitize-and-truncate name helper) into `StackConfig`. Never built. The runner the slot now uses has its OWN bounded poll budget, derived per call from the presigned source-URL lifetime (ADR-027 D8, `SCENE_POLL_BUDGET_SECONDS` / `SCENE_URL_TTL_SECONDS`), and records no instance name — so the 20-character truncation hazard this design had to mitigate no longer exists.
 
 ### 4.7 Acceptance criteria the implementation issue should carry
 
-1. Executing a `scene-detect` step against a stack with no
-   `sceneDetectInstanceName` provisions `eyevinn-function-scenes` with body
-   `{ name: <stackName> }`, waits for readiness within the deadline, and runs the
-   detection; the step settles `done`.
-2. `StackConfig.sceneDetectInstanceName` and `StackConfig.services[]` both carry
-   the instance afterwards; `GET /stacks/:name` reports
-   `options.sceneDetect: true`.
-3. A second execution provisions nothing (zero `createInstance` calls) and still
-   runs the detection.
-4. N concurrent first executions for one stack produce exactly one
-   `createInstance` (single-flight test against an injected counting fake, as
-   `PackagerEnsureSingleFlight` was designed for).
-5. A `createInstance` failure settles the step `skipped` with a
-   provisioning-failure `skipReason`, records it on the asset as
-   `sceneDetectionError`, and **does not** fail the pipeline execution or return
-   5xx.
-6. Exceeding `SCENE_DETECT_PROVISION_TIMEOUT_MS` settles the step `skipped` with
-   the in-progress reason and leaves the instance in place; a later execution
-   adopts it (`status: 'exists'`).
-7. `SCENE_DETECT_LAZY_PROVISION=false` restores today's behaviour exactly.
-8. Stack teardown removes a lazily-provisioned instance in **both** cases: when
-   it was persisted, and when the persist failed (ground-truth probe, §4.6).
-9. No change to `openapi.json` step/status schemas (they already carry `skipped`
-   and `skipReason`).
-10. **A stack whose name exceeds the 20-character OSC limit (§2.3a, §4.1) still
-    round-trips.** With a stack name of 21+ characters: the create call, the
-    `getInstance` existence probe, the persisted `sceneDetectInstanceName` and
-    teardown all use the **same** sanitized-and-truncated name; a second
-    execution resolves `status: 'exists'` and issues **zero** `createInstance`
-    calls; and teardown removes the instance OSC actually holds. A test at the
-    boundary (exactly 20) and just over it (21) is the cheapest way to pin this.
+**Struck by #1193** (ADR-027 D1/D5.2). Carried acceptance criteria written against provisioning the retired service on first use. Never built. The runner the slot now uses has its OWN bounded poll budget, derived per call from the presigned source-URL lifetime (ADR-027 D8, `SCENE_POLL_BUDGET_SECONDS` / `SCENE_URL_TTL_SECONDS`), and records no instance name — so the 20-character truncation hazard this design had to mitigate no longer exists.
 
 ---
 

@@ -102,28 +102,14 @@ export const FFPROBE_SERVICE_ID = 'eyevinn-ffmpeg-s3' as const;
 // `/transcribe/s3` endpoint for S3 sources; does NOT support config updates.
 export const AUTO_SUBTITLES_SERVICE_ID = 'eyevinn-auto-subtitles' as const;
 
-// eyevinn-function-scenes ("Scene Detect Media Function"): the serverless media
-// function used by the OPTIONAL scene/shot-detection pipeline step (issue #115).
-// It produces keyframe IMAGES for the clip/trim workflows — note it does NOT
-// return scene-boundary timecodes over its API (confirmed #797, see below).
-// Like eyevinn-auto-subtitles it is a resolvable instance called over HTTP at its
-// instance URL (see pipeline/osc-scene-detect.ts), NOT an ephemeral job like
-// eyevinn-ffmpeg-s3. It is NOT part of the long-lived provisioned stack above — it
-// is an opt-in consumer function, provisioned separately — so it is exported
-// separately rather than added to STACK_SERVICES (mirrors the FFPROBE_SERVICE_ID
-// and AUTO_SUBTITLES_SERVICE_ID treatment).
-//
-// Contract source: get-service-schema for `eyevinn-function-scenes`.
-// create-service-instance config: required `name` (string) ONLY — it is a
-// serverless media function. NOTE: get-service-schema exposes ONLY this
-// provisioning config, NOT the runtime endpoint's request/response wire shape.
-// That runtime shape was confirmed separately (#797) from the upstream service
-// source `Eyevinn/function-scenes` @ 492a18f2 (`api.json` + `index.js`): an async
-// job API — POST /api/v1 `{medialocator}` -> `{thumbnails,status}`, then poll.
-// See docs/investigations/797-function-scenes-runtime-contract.md. The (still
-// non-conforming) call is isolated in pipeline/osc-scene-detect.ts behind the
-// injected SceneDetector interface, pending the #798 fix.
-export const SCENE_DETECT_SERVICE_ID = 'eyevinn-function-scenes' as const;
+// NOTE (issue #1193): there is no scene-detection SERVICE ID here any more. The
+// OPTIONAL scene/shot-detection step (issue #115) runs as an ephemeral
+// FFPROBE_SERVICE_ID job (pipeline/osc-scene-detect-ffmpeg-s3.ts) decided by
+// ADR-027 D1, so the slot needs no long-lived instance, no provisioning and no
+// teardown obligation. The dedicated media function that previously held the
+// slot could not return cut timecodes through any documented endpoint
+// (docs/investigations/797-function-scenes-runtime-contract.md) and was retired
+// with its lazy-provisioning wiring in #1193.
 
 // Teardown order is the reverse of provision order: consumers are removed
 // before the producers they depend on (packager -> queue -> database ->

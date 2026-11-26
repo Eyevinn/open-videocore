@@ -15,38 +15,34 @@
 // records it on the asset as `sceneDetectionError` (leaving `sceneMetadata`
 // null). It never drives the lifecycle state machine.
 //
-// OSC wiring: detection runs on the eyevinn-function-scenes serverless "media
-// function" (see services/stack.ts SCENE_DETECT_SERVICE_ID). As with the ffprobe
+// OSC wiring: detection runs as an ephemeral eyevinn-ffmpeg-s3 job (ADR-027 D1,
+// see services/stack.ts FFPROBE_SERVICE_ID and
+// pipeline/osc-scene-detect-ffmpeg-s3.ts). As with the ffprobe
 // and auto-subtitles paths we do NOT stream bytes through the API. We mint a
 // short-lived presigned GET URL for the MinIO source object and hand that URL to
-// the detector; the function reads it directly. The presigned URL is the only
+// the detector; the job reads it directly as ffmpeg's `-i`. The presigned URL is the only
 // credential the function ever sees and it expires quickly, so a leaked URL has
 // a small blast radius (mirrors the probe-URL / subtitle-URL / upload-URL TTL
 // rationale).
 //
 // The OSC call itself is injected as a `SceneDetector` so it can be stubbed in
 // tests and swapped without touching the orchestration logic, and — crucially —
-// so the un-contract-verified runtime wire shape stays isolated in exactly one
-// place (osc-scene-detect.ts).
+// so the service-specific job and wire details stay isolated in exactly one
+// place (osc-scene-detect-ffmpeg-s3.ts).
 //
-// Contract sources (runtime shape confirmed 2026-09-25, issue #797):
-//   - eyevinn-function-scenes ("Scene Detect Media Function"), get-service-schema:
-//     a serverless media function whose create-service-instance config requires
-//     `name` (string) ONLY. get-service-schema exposes ONLY the provisioning
-//     config, NOT the runtime endpoint's request/response wire shape.
-//   - The runtime shape was instead confirmed from the upstream service source
-//     `Eyevinn/function-scenes` @ 492a18f23e253194c27800563ea0c96bef187aef —
-//     `api.json` (`#/model/request.medialocator`, `#/model/createJobResponse`) and
-//     the `index.js` route table. It is an ASYNC JOB API rooted at `/api/v1`, and
-//     it returns only keyframe image URIs — see
-//     docs/investigations/797-function-scenes-runtime-contract.md.
-//   - services/stack.ts SCENE_DETECT_SERVICE_ID.
+// Contract sources for the runner this orchestrator drives:
+//   - docs/contracts/eyevinn-ffmpeg-s3-job-and-logs.json
+//     (`job.createJob.bodyFields.*`, `job.logs.carriesFfmpegStderr`,
+//     `sceneCutReadback.viaS3Object.liveRun`), pinned at Eyevinn/ffmpeg-s3
+//     @95ede50d3486cc4b2145871af08a4138ba5e3b9d.
+//   - services/stack.ts FFPROBE_SERVICE_ID ('eyevinn-ffmpeg-s3').
+//   - pipeline/osc-scene-detect-ffmpeg-s3.ts, which cites both per field.
 //
-// NOTE (#798): the confirmed service returns NO scene-boundary timecodes, so the
-// `scenes`/`cuts` result modelled below cannot be populated from it as things
-// stand. `sceneMetadata` needs re-scoping (keyframe URIs, or a different source
-// for cut timecodes) before this step can work end to end; the types are left
-// unchanged here because #797 is contract-confirmation only.
+// HISTORY (issues #797, #883, #1192, #1193): the slot was originally wired to a
+// dedicated scene-detection media function that could not return cut timecodes
+// through any documented endpoint. ADR-027 moved it to eyevinn-ffmpeg-s3 and
+// #1193 retired the old path; the investigation record is kept as history at
+// docs/investigations/797-function-scenes-runtime-contract.md.
 
 import type { AssetRepository, SceneMetadata, SceneBoundary } from '../data/asset-repo.js';
 import type { WorkspaceStorage } from '../data/storage.js';
@@ -64,9 +60,9 @@ export function sceneUrlTtlSeconds(): number {
 
 // The raw result a `SceneDetector` returns for one detection run. Kept permissive
 // (every field optional) — originally because the wire shape was unverified, and
-// now because the confirmed eyevinn-function-scenes contract produces NEITHER of
-// these fields (see file header + #798): the parser below defends every field, so
-// a real run degrades to "no scenes" rather than throwing. A detector may report
+// kept that way because the active runner emits `cuts` only (ADR-027 D2) while a
+// stub or a future runner may report `scenes`: the parser below defends every
+// field, so a partial result degrades rather than throwing. A detector may report
 // boundaries as either a list of structured cut
 // points (`scenes`) or a bare list of cut timecodes in seconds (`cuts`); the
 // orchestrator normalizes either into our SceneMetadata shape.
@@ -85,10 +81,10 @@ export type SceneDetectorResult = {
   cuts?: number[];
 };
 
-// Calls the OSC scene-detection function against a presigned source URL and
-// returns its raw result. Injected so tests stub it and the OSC HTTP/job
-// specifics stay in one place (osc-scene-detect.ts). Throws on a transport/
-// function failure; the orchestrator turns that into a recorded error.
+// Runs scene detection against a presigned source URL and returns its raw
+// result. Injected so tests stub it and the OSC job specifics stay in one place
+// (osc-scene-detect-ffmpeg-s3.ts). Throws on a transport/job failure; the
+// orchestrator turns that into a recorded error.
 export type SceneDetector = (presignedUrl: string) => Promise<SceneDetectorResult>;
 
 function isFiniteNumber(value: unknown): value is number {

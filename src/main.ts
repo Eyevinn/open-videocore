@@ -494,14 +494,12 @@ const optionalStepBuilders = storageBackedForOptionalSteps
           writesToS3: process.env['AUTO_SUBTITLES_WRITES_S3'] === 'true'
         }),
       // Scene detection runs as an ephemeral eyevinn-ffmpeg-s3 job (issue
-      // #1192, ADR-027 D1) — NOT against an eyevinn-function-scenes instance,
-      // which cannot return cut timecodes through any documented endpoint
-      // (#797). `instanceName` therefore no longer selects the service: it stays
-      // the stack record's ACTIVATION flag for this optional step (issue #217),
-      // and retiring the field itself is #1193's job. The legacy runner
-      // (makeOscSceneDetector) and its pinned request contract are left in place
-      // for that issue to remove.
-      sceneDetector: (instanceName: string, s3: SceneDetectObjectStore): SceneDetector =>
+      // #1192, ADR-027 D1): a job is created per detection and deleted on
+      // completion, so this builder takes NO instance name (issue #1193 —
+      // the retired dedicated media function, the only thing that name ever
+      // addressed, is gone). Activation still comes from the ACTIVE stack
+      // record (issue #217); see services/workspace-stack.ts.
+      sceneDetector: (s3: SceneDetectObjectStore): SceneDetector =>
         makeFfmpegS3SceneDetector({
           context: oscContext,
           createJob,
@@ -811,8 +809,8 @@ await app.register(provisionRouter, {
 // Shared contract for the #187 (auto-subtitles) and #188 (scene-detect)
 // provision cards. Reuses the SAME OperationStore as the whole-stack provision
 // route so 202 operations poll the same GET /api/v1/provision/operations/:id.
-// Status reports the AUTO_SUBTITLES_INSTANCE_NAME / SCENE_DETECT_INSTANCE_NAME
-// env vars via the optional-services registry. NOTE: as of issue #217 the
+// Status reports the AUTO_SUBTITLES_INSTANCE_NAME env var via the
+// optional-services registry. NOTE: as of issue #217 the
 // PIPELINE steps are activated from the stack record (StackConfig), not these
 // env vars — so the card's env-var view reflects the deployment's intended
 // configuration, while the runtime step activation follows what was actually
@@ -1034,13 +1032,14 @@ const clipRunner = storageAvailable
 
 // Auto-subtitles (issue #114) and scene detection (issue #115) are OPTIONAL,
 // opt-in pipeline steps. As of issue #217 their activation is derived from the
-// STACK RECORD (StackConfig.autoSubtitlesInstanceName / sceneDetectInstanceName)
-// rather than boot-time env vars: the stack resolver builds the per-stack
-// generator (via optionalStepBuilders above) at resolve time and exposes it on
-// request.connections, so the assets router reads it live per pipeline run. A
-// freshly provisioned optional service is therefore picked up on the next run
-// with NO restart; when the record carries no instance name the step stays
-// disabled and skips gracefully (fire-and-forget, never throws).
+// STACK RECORD (StackConfig.autoSubtitlesInstanceName for subtitles;
+// StackConfig.sceneDetectEnabled, or the legacy sceneDetectInstanceName, for
+// scene detection) rather than boot-time env vars: the stack resolver builds
+// the per-stack generator (via optionalStepBuilders above) at resolve time and
+// exposes it on request.connections, so the assets router reads it live per
+// pipeline run. A freshly provisioned optional service is therefore picked up
+// on the next run with NO restart; when the record carries no marker the step
+// stays disabled and skips gracefully (fire-and-forget, never throws).
 
 // ABR transcoding via auto-scaling Encore pool (ADR-006). The scaler exposes
 // the same EncoreClient interface as the old static client but manages a

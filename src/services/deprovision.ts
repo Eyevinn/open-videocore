@@ -6,7 +6,6 @@ import {
 } from '@osaas/client-core';
 import {
   AUTO_SUBTITLES_SERVICE_ID,
-  SCENE_DETECT_SERVICE_ID,
   STACK_SERVICES,
   TEARDOWN_ORDER,
   type StackService
@@ -372,10 +371,17 @@ export async function deprovisionStack(
 // part of STACK_SERVICES (they are provisioned on their own) but are recorded on
 // the stored config so whole-stack teardown can remove them too.
 //   autoSubtitlesInstanceName → eyevinn-auto-subtitles (AUTO_SUBTITLES_SERVICE_ID)
-//   sceneDetectInstanceName   → eyevinn-function-scenes (SCENE_DETECT_SERVICE_ID)
+//
+// NOTE (issue #1193): scene detection no longer appears here. It runs as an
+// ephemeral eyevinn-ffmpeg-s3 job per detection (ADR-027 D1), so a stack has no
+// scene-detection instance to tear down. Stacks provisioned BEFORE #1193 may
+// still carry a legacy `sceneDetectInstanceName` from the retired media
+// function; this API no longer knows that service id, so such an instance is
+// left untouched by teardown and must be removed once out of band (see the
+// migration note in docs/architecture/ADR-023-lazy-provisioning-optional-osc-services.md
+// §4).
 export type OptionalStackInstances = {
   autoSubtitlesInstanceName?: string;
-  sceneDetectInstanceName?: string;
 };
 
 // Map the optional instance-name fields onto StoredService entries so they can
@@ -396,15 +402,6 @@ function optionalStoredServices(
     entries.push({
       serviceId: AUTO_SUBTITLES_SERVICE_ID,
       instanceName: optional.autoSubtitlesInstanceName
-    });
-  }
-  if (
-    typeof optional.sceneDetectInstanceName === 'string' &&
-    optional.sceneDetectInstanceName.length > 0
-  ) {
-    entries.push({
-      serviceId: SCENE_DETECT_SERVICE_ID,
-      instanceName: optional.sceneDetectInstanceName
     });
   }
   return entries;
