@@ -196,7 +196,32 @@ async function mapEndpointForTranscoder(
 // REFUSES with ObjectStoreStackMismatchError (issue #1093) instead of
 // substituting the first-provisioned stack's credential — see the refusal block
 // below for why that substitution is the mis-route that surfaces as NoSuchKey.
+// TWO VIEWS OF THE SAME RESOLUTION (#1287 review).
+//
+// `resolveEncoreS3ConfigWithSecretRef` is the full result: the endpoint +
+// credential, plus `secretAccessKeyRef` — the name of the OSC secret the
+// PROVISIONING path already minted for that credential under serviceId
+// 'encore'. The scaler spawn path needs the ref, because OSC service secrets
+// are write-once with no update path (ADR-002-credential-storage.md:46,48,
+// 155,174; @osaas/client-core 0.24.0 `saveSecret` is a bare POST, no PUT —
+// lib/core.d.ts:154, lib/core.js:355-369), so the name must have exactly one
+// writer and that writer is provisioning.
+//
+// `resolveEncoreS3Config` is the credential-only view: endpoint + access key id
+// + secret, with no provisioning artefact attached. That is the contract its
+// existing callers and tests resolve against, so it is kept as-is and the ref
+// is additive on the spawn-path entry point.
 export async function resolveEncoreS3Config(
+  deps: ResolveEncoreS3ConfigDeps,
+  stackKey: string
+): Promise<EncoreS3Config | undefined> {
+  const resolved = await resolveEncoreS3ConfigWithSecretRef(deps, stackKey);
+  if (!resolved) return undefined;
+  const { secretAccessKeyRef: _preMintedName, ...credentialOnly } = resolved;
+  return credentialOnly;
+}
+
+export async function resolveEncoreS3ConfigWithSecretRef(
   deps: ResolveEncoreS3ConfigDeps,
   stackKey: string
 ): Promise<EncoreS3Config | undefined> {
@@ -393,10 +418,44 @@ export async function resolveEncoreS3Config(
       requestedStackName: stackKey
     });
 
+    // #1287 review: hand the scaler the NAME of the OSC secret the provisioning
+    // path already minted for this stack, instead of letting the scaler write
+    // that same deterministic name itself. OSC service secrets are write-once
+    // with no update path and no read-back (ADR-002-credential-storage.md:46,48
+    // "Service secrets are write-once, never-read-back" and :155,174 "Rotation =
+    // new secret name + reprovision. There is no in-place secret update."), and
+    // `saveSecret` in the pinned SDK is a bare POST that rejects on any non-2xx
+    // (@osaas/client-core lib/core.d.ts:154, lib/core.js:355-369) — there is no
+    // PUT counterpart to upsert with.
+    //
+    // ONLY for the per-stack credential: `resolveObjectStoreCredential` returns
+    // the stored access key id on that branch and the legacy deployment-wide id
+    // otherwise (object-store-credentials.ts resolveObjectStoreCredential), and
+    // provisioning mints the object-store secret under exactly the same
+    // condition (`objectStorePlan.perStack`). A pre-#1094 stack on the legacy
+    // credential gets no ref, so the scaler keeps writing its own secret.
+    //
+    // The name mirrors provision.ts's `secretRef` convention verbatim:
+    // `${stackName}.${rolePurpose}.s3secretaccesskey`, with rolePurpose
+    // `objectstore` (provision.ts OBJECT_STORE) and the `.s3secretaccesskey`
+    // suffix from encoreCredentialMapping
+    // (src/services/external-storage-credentials.ts). It is keyed on
+    // `resolvedStackName` — the stack the config was actually loaded under —
+    // because that is the stack whose provision run minted the secret.
+    const storedAccessKeyId = config.objectStoreAccessKeyId?.trim();
+    const secretAccessKeyRef =
+      storedAccessKeyId &&
+      storedAccessKeyId.length > 0 &&
+      credential.accessKeyId === storedAccessKeyId &&
+      resolvedStackName
+        ? `${resolvedStackName}.objectstore.s3secretaccesskey`
+        : undefined;
+
     return {
       endpoint,
       accessKeyId: credential.accessKeyId,
-      secretAccessKey: credential.secretAccessKey
+      secretAccessKey: credential.secretAccessKey,
+      ...(secretAccessKeyRef ? { secretAccessKeyRef } : {})
     };
   }
 
