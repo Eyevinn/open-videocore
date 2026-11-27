@@ -106,6 +106,35 @@ export function isTransientOscError(err: unknown): boolean {
   return TRANSIENT_MESSAGE_MARKERS.some((marker) => message.includes(marker));
 }
 
+// Fastify's default not-found body, as served by an OSC service's own instance
+// API. The framework answers an unregistered route with
+// `{"message":"Route <METHOD>:<path> not found","error":"Not Found","statusCode":404}`,
+// which @osaas/client-core's defaultErrorFactory (lib/fetch.js, JSON branch)
+// turns into `FetchError { message: 'Route GET:/minioinstance not found',
+// httpCode: 404 }`.
+const ROUTE_NOT_FOUND_MESSAGE = /^Route\s+[A-Z]+:\/\S*\s+not found$/;
+
+// Did the call 404 because the ROUTE does not exist on that service's API, as
+// opposed to the addressed RESOURCE not existing?
+//
+// The distinction matters wherever a 404 is read as "the thing is gone": a
+// missing route says nothing at all about the resource, so believing it would
+// invent an answer the control plane never gave. Observed on `minio-minio`,
+// whose instance API serves no collection read — `listInstances` GETs the
+// service's `apiUrl` (lib/core.js:160-170) and is answered
+// `Route GET:/minioinstance not found` (issue #1211, reported from the stable
+// channel on 2026-10-07 in #1166).
+//
+// Matched on the message because the status alone cannot separate the two
+// cases, and gated on the 404 so a resource-level body that happens to quote a
+// route is not misread. A transport failure carries no httpCode and is never
+// classified here.
+export function isRouteNotFoundError(err: unknown): boolean {
+  if (oscHttpCode(err) !== 404) return false;
+  const message = err instanceof Error ? err.message : String(err ?? '');
+  return ROUTE_NOT_FOUND_MESSAGE.test(message.trim());
+}
+
 // Did an instance REMOVAL fail because the instance is already gone?
 //
 // `removeInstance` has no "already absent" success path: it DELETEs the instance
@@ -123,6 +152,15 @@ export function isTransientOscError(err: unknown): boolean {
 // `getService`'s "Service X not found in your subscriptions" (lib/core.js
 // getService), which is thrown INSIDE removeInstance before any request is sent
 // and means the instance cannot exist either.
+//
+// NOTE: this answers "is the RESOURCE gone?", which is a different question
+// from isRouteNotFoundError above ("does the API even serve this route?"). A
+// route-level 404 satisfies both predicates, so a caller that must not read a
+// missing route as a missing instance has to exclude it explicitly — which is
+// what the stack teardown does (src/services/deprovision.ts `removedAlready`,
+// #1211). The scaler's instance pool (#1213) deliberately does not: there the
+// 404 comes from the instance URL of a service whose DELETE route is known to
+// exist, so only the resource can be missing.
 export function isInstanceAlreadyGoneError(err: unknown): boolean {
   const httpCode = oscHttpCode(err);
   // 410 Gone is included for the same reason as 404: it states the resource is
